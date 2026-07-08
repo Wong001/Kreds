@@ -939,3 +939,22 @@ def test_friend_add_css_present():
     for sel in (".friendadd-tabs", ".friendadd-tab", ".friendadd-body",
                 ".friendadd-code", ".friendadd-countdown", ".ceremony-manual"):
         assert sel in css
+
+
+def test_circle_world_scales_with_count():
+    # Spec 2026-07-08-kreds-circle-zoom: the overlay circle gets BIGGER
+    # with friend count, never denser - ring radius derives from occupancy
+    # (constant node spacing), and the world size is published on the svg
+    # for the camera. The rail's call must NOT opt in.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "CIRCLE_SPACING = 64" in js
+    assert "CIRCLE_RING_GAP = 78" in js
+    assert "CIRCLE_MARGIN = 60" in js
+    assert "function ringRadius(" in js
+    assert "scaleWithCount" in js
+    assert "dataset.worldSize" in js
+    # overlay call opts in; rail call does not
+    overlay_call = js.split("function openCircleOverlay")[1][:400]
+    assert "scaleWithCount: true" in overlay_call
+    rail_fn = js.split("function renderCircleRail")[1][:900]
+    assert "scaleWithCount" not in rail_fn

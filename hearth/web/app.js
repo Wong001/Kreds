@@ -725,12 +725,34 @@ function placeRing(items, cx, cy, r) {
   });
 }
 
+// World-scaling constants (spec 2026-07-08-kreds-circle-zoom): the circle
+// grows with friend count instead of packing nodes tighter. SPACING is the
+// world-unit distance between adjacent node centers on a ring; RING_GAP the
+// minimum inner->outer separation; MARGIN clears ring/name labels at the rim.
+const CIRCLE_SPACING = 64;
+const CIRCLE_RING_GAP = 78;
+const CIRCLE_MARGIN = 60;
+
+// Radius that gives `count` nodes CIRCLE_SPACING of arc each, never below
+// the ring's cosmetic base radius (small circles keep today's proportions).
+function ringRadius(count, baseR) {
+  return Math.max(baseR, (count * CIRCLE_SPACING) / (2 * Math.PI));
+}
+
 // Renders the radial map into `svg` (an <svg> element, cleared first).
 // `big` selects the full-overlay markup (.node/.younode/.ringlabel, with
 // name labels and keyboard-focusable nodes) vs the compact rail's
 // .mm-node/.mm-you markup (smaller, no labels).
 function buildCircle(svg, kreds, opts) {
-  const {size, innerR, outerR, youR, nodeR, big} = opts;
+  let {size, innerR, outerR, youR, nodeR, big} = opts;
+  if (opts.scaleWithCount) {
+    const nInner = kreds.filter(k => k.ring === "inner").length;
+    innerR = ringRadius(nInner, innerR);
+    outerR = Math.max(ringRadius(kreds.length - nInner, outerR),
+                      innerR + CIRCLE_RING_GAP);
+    size = 2 * (outerR + CIRCLE_MARGIN);
+  }
+  svg.dataset.worldSize = size;
   svg.setAttribute("viewBox", "0 0 " + size + " " + size);
   svg.replaceChildren();
   const cx = size / 2, cy = size / 2;
@@ -836,7 +858,8 @@ function renderCircleRail() {
 
 function openCircleOverlay() {
   const svg = document.getElementById("circle-overlay-svg");
-  buildCircle(svg, KREDS, {size: 440, innerR: 92, outerR: 170, youR: 24, nodeR: 21, big: true});
+  buildCircle(svg, KREDS, {size: 440, innerR: 92, outerR: 170, youR: 24,
+                           nodeR: 21, big: true, scaleWithCount: true});
   document.getElementById("circle-overlay").classList.add("open");
 }
 function closeCircleOverlay() {
