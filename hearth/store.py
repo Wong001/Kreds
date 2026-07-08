@@ -1,0 +1,820 @@
+"""SQLite persistence for one Hearth node (one device)."""
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+from .identity import (
+    DeviceView, EnrollmentCert, RevocationCert, SeenSet, SignedMessage,
+    Verifier,
+)
+from .messages import (
+    KIND_DELETE, KIND_DM, KIND_ENCKEY, KIND_POST, KIND_PROFILE,
+    KIND_PROFILE_LAYOUT, KIND_RING, KIND_STORY, MAX_BLOB_BYTES, blob_hash,
+    validate_payload,
+)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS identities(
+  identity_pub TEXT PRIMARY KEY, is_self INTEGER NOT NULL,
+  added_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS device_views(
+  identity_pub TEXT NOT NULL, device_pub TEXT NOT NULL,
+  cert_json TEXT, revocation_json TEXT, seen_json TEXT NOT NULL,
+  PRIMARY KEY(identity_pub, device_pub));
+CREATE TABLE IF NOT EXISTS messages(
+  msg_id TEXT PRIMARY KEY, identity_pub TEXT NOT NULL,
+  device_pub TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
+  target_id TEXT, recipient TEXT, msg_json TEXT NOT NULL,
+  created_at REAL NOT NULL, expires_at REAL);
+CREATE TABLE IF NOT EXISTS tombstones(
+  msg_id TEXT PRIMARY KEY, reason TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS blobs(hash TEXT PRIMARY KEY, data BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS peers(address TEXT PRIMARY KEY,
+  identity_pub TEXT);
+CREATE INDEX IF NOT EXISTS idx_delete_guard
+  ON messages(kind, target_id, identity_pub);
+CREATE TABLE IF NOT EXISTS dm_keys(
+  msg_id TEXT PRIMARY KEY, sealed_key TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS defriend_outbox(
+  target_identity TEXT PRIMARY KEY, address TEXT NOT NULL,
+  notice_json TEXT NOT NULL, created_at REAL NOT NULL,
+  expires_at REAL NOT NULL, next_attempt_at REAL NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS disconnected(
+  identity_pub TEXT PRIMARY KEY, name TEXT NOT NULL);
+"""
+
+
+@dataclass
+class IngestResult:
+    accepted: bool
+    reason: str
+    msg_id: Optional[str] = None
+    retro_dropped: List[str] = field(default_factory=list)
+    deleted_target: Optional[str] = None
+
+
+class Store:
+    def __init__(self, path):
+        self._lock = threading.RLock()
+        self._db = sqlite3.connect(str(path), check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.executescript(_SCHEMA)
+        # Migration for a defriend_outbox table created before the
+        # next_attempt_at retry-backoff column existed (whole-branch
+        # review, Fix 3): CREATE TABLE IF NOT EXISTS above is a no-op on
+        # an already-existing table, so a pre-upgrade DB needs this ALTER
+        # instead. Guarded because it errors ("duplicate column") on a
+        # table that already has the column -- including every freshly
+        # created DB, since the CREATE above already includes it there.
+        try:
+            self._db.execute(
+                "ALTER TABLE defriend_outbox ADD COLUMN"
+                " next_attempt_at REAL NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        self._db.commit()
+
+    # -- meta ---------------------------------------------------------------
+
+    def set_meta(self, k: str, v: str):
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO meta VALUES(?,?)", (k, v))
+            self._db.commit()
+
+    def get_meta(self, k: str) -> Optional[str]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+            return row[0] if row else None
+
+    # -- identities -----------------------------------------------------------
+
+    def add_identity(self, identity_pub: str, is_self: bool = False):
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO identities VALUES(?,?,?)",
+                (identity_pub, 1 if is_self else 0, time.time()))
+            self._db.commit()
+
+    def known_identities(self) -> List[str]:
+        with self._lock:
+            return [r[0] for r in
+                    self._db.execute("SELECT identity_pub FROM identities")]
+
+    def is_known(self, identity_pub: str) -> bool:
+        with self._lock:
+            return self._db.execute(
+                "SELECT 1 FROM identities WHERE identity_pub=?",
+                (identity_pub,)).fetchone() is not None
+
+    def self_identity(self) -> Optional[str]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT identity_pub FROM identities WHERE is_self=1"
+            ).fetchone()
+            return row[0] if row else None
+
+    def remove_identity(self, identity_pub: str):
+        with self._lock:
+            self._db.execute("DELETE FROM identities WHERE identity_pub=?",
+                             (identity_pub,))
+            self._db.commit()
+
+    # -- device views ----------------------------------------------------------
+
+    def load_views(self, identity_pub: str) -> Dict[str, DeviceView]:
+        with self._lock:
+            out: Dict[str, DeviceView] = {}
+            for dpub, cj, rj, sj in self._db.execute(
+                    "SELECT device_pub, cert_json, revocation_json, seen_json"
+                    " FROM device_views WHERE identity_pub=?",
+                    (identity_pub,)):
+                out[dpub] = DeviceView(
+                    cert=(EnrollmentCert.from_dict(json.loads(cj))
+                          if cj else None),
+                    revocation=(RevocationCert.from_dict(json.loads(rj))
+                                if rj else None),
+                    seen=SeenSet.from_json(json.loads(sj)))
+            return out
+
+    def save_views(self, identity_pub: str, views: Dict[str, DeviceView],
+                   commit: bool = True):
+        with self._lock:
+            for dpub, v in views.items():
+                self._db.execute(
+                    "INSERT OR REPLACE INTO device_views VALUES(?,?,?,?,?)",
+                    (identity_pub, dpub,
+                     json.dumps(v.cert.to_dict()) if v.cert else None,
+                     json.dumps(v.revocation.to_dict()) if v.revocation
+                     else None,
+                     json.dumps(v.seen.to_json())))
+            if commit:
+                self._db.commit()
+
+    def all_summaries(self) -> dict:
+        with self._lock:
+            out: dict = {}
+            for ipub, dpub, sj in self._db.execute(
+                    "SELECT identity_pub, device_pub, seen_json"
+                    " FROM device_views"):
+                out.setdefault(ipub, {})[dpub] = json.loads(sj)
+            return out
+
+    def list_revocations(self) -> List[RevocationCert]:
+        with self._lock:
+            return [RevocationCert.from_dict(json.loads(rj))
+                    for (rj,) in self._db.execute(
+                        "SELECT revocation_json FROM device_views"
+                        " WHERE revocation_json IS NOT NULL")]
+
+    # -- peers ------------------------------------------------------------------
+
+    def add_peer(self, address: str, identity_pub: Optional[str] = None):
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO peers VALUES(?,?)",
+                             (address, identity_pub))
+            self._db.commit()
+
+    def list_peers(self) -> List[dict]:
+        with self._lock:
+            return [{"address": a, "identity_pub": i} for a, i in
+                    self._db.execute(
+                        "SELECT address, identity_pub FROM peers")]
+
+    def remove_peer(self, address: str):
+        with self._lock:
+            self._db.execute("DELETE FROM peers WHERE address=?", (address,))
+            self._db.commit()
+
+    def address_for(self, identity_pub: str) -> Optional[str]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT address FROM peers WHERE identity_pub=?",
+                (identity_pub,)).fetchone()
+            return row[0] if row else None
+
+    # -- blobs --------------------------------------------------------------------
+
+    def put_blob(self, data: bytes) -> str:
+        if len(data) > MAX_BLOB_BYTES:
+            raise ValueError("blob exceeds 5 MB cap")
+        h = blob_hash(data)
+        with self._lock:
+            self._db.execute("INSERT OR IGNORE INTO blobs VALUES(?,?)",
+                             (h, data))
+            self._db.commit()
+        return h
+
+    def get_blob(self, h: str) -> Optional[bytes]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT data FROM blobs WHERE hash=?", (h,)).fetchone()
+            return bytes(row[0]) if row else None
+
+    def has_blob(self, h: str) -> bool:
+        return self.get_blob(h) is not None
+
+    # -- tombstones ---------------------------------------------------------------
+
+    def is_tombstoned(self, msg_id: str) -> bool:
+        with self._lock:
+            return self._db.execute(
+                "SELECT 1 FROM tombstones WHERE msg_id=?",
+                (msg_id,)).fetchone() is not None
+
+    def _tombstone(self, msg_id: str, reason: str):
+        self._db.execute("INSERT OR IGNORE INTO tombstones VALUES(?,?,?)",
+                         (msg_id, reason, time.time()))
+        self._db.execute("DELETE FROM messages WHERE msg_id=?", (msg_id,))
+        self._db.execute("DELETE FROM dm_keys WHERE msg_id=?", (msg_id,))
+
+    # -- ingest ---------------------------------------------------------------------
+
+    def ingest_message(self, msg: SignedMessage,
+                       now: Optional[float] = None) -> IngestResult:
+        now = now if now is not None else time.time()
+        with self._lock:
+            identity = msg.cert.identity_pub
+            if not self.is_known(identity):
+                return IngestResult(False, "unknown identity")
+            mid = msg.msg_id
+            if self.is_tombstoned(mid):
+                return IngestResult(False, "tombstoned", mid)
+            if self._db.execute("SELECT 1 FROM messages WHERE msg_id=?",
+                                (mid,)).fetchone():
+                return IngestResult(False, "duplicate", mid)
+            ok, why = validate_payload(msg.payload)
+            if not ok:
+                return IngestResult(False, why, mid)
+            views = self.load_views(identity)
+            ok, why = Verifier(identity, views).verify_message(msg)
+            if not ok:
+                self.save_views(identity, views)     # commits as before
+                return IngestResult(False, why, mid)
+            self.save_views(identity, views, commit=False)
+
+            kind = msg.payload["kind"]
+            target = (msg.payload.get("target")
+                      if kind == KIND_DELETE else None)
+            recipient = (msg.payload.get("to")
+                         if kind == KIND_DM else None)
+            deleted_target = None
+            if kind == KIND_DELETE:
+                row = self._db.execute(
+                    "SELECT identity_pub FROM messages WHERE msg_id=?",
+                    (target,)).fetchone()
+                if row is not None:
+                    if row[0] != identity:
+                        self._db.commit()
+                        return IngestResult(False, "delete not authorized",
+                                            mid)
+                    self._tombstone(target, "deleted")
+                    deleted_target = target
+            else:
+                # A delete tag for this message may have gossiped in first
+                # (out-of-order delivery hits every kind, not just posts).
+                # The identity_pub match keeps delete authorization intact:
+                # only the author's own tag can kill content on arrival.
+                if self._db.execute(
+                        "SELECT 1 FROM messages WHERE kind=? AND target_id=?"
+                        " AND identity_pub=?",
+                        (KIND_DELETE, mid, identity)).fetchone():
+                    self._tombstone(mid, "deleted")
+                    self._db.commit()
+                    self.gc_blobs()
+                    return IngestResult(True, "deleted on arrival", mid,
+                                        deleted_target=mid)
+
+            self._db.execute(
+                "INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (mid, identity, msg.cert.device_pub, msg.seq, kind, target,
+                 recipient, json.dumps(msg.to_dict()),
+                 msg.payload.get("created_at", now),
+                 msg.payload.get("expires_at")))
+            self._db.commit()
+            if deleted_target:
+                self.gc_blobs()
+            return IngestResult(True, "ok", mid,
+                                deleted_target=deleted_target)
+
+    def ingest_revocation(self, rev: RevocationCert) -> IngestResult:
+        with self._lock:
+            identity = rev.identity_pub
+            if not self.is_known(identity):
+                return IngestResult(False, "unknown identity")
+            views = self.load_views(identity)
+            ok, why = Verifier(identity, views).process_revocation(rev)
+            if not ok:
+                return IngestResult(False, why)
+            self.save_views(identity, views)
+            dropped = []
+            for (mid,) in self._db.execute(
+                    "SELECT msg_id FROM messages WHERE device_pub=?"
+                    " AND seq>?", (rev.device_pub, rev.last_valid_seq)):
+                dropped.append(mid)
+            for mid in dropped:
+                self._tombstone(mid, "retro-drop")
+            self._db.commit()
+            if dropped:
+                self.gc_blobs()
+            return IngestResult(True, "ok", retro_dropped=dropped)
+
+    def sweep_expired(self, now: Optional[float] = None) -> List[str]:
+        now = now if now is not None else time.time()
+        with self._lock:
+            swept = [mid for (mid,) in self._db.execute(
+                "SELECT msg_id FROM messages WHERE expires_at IS NOT NULL"
+                " AND expires_at<=?", (now,))]
+            for mid in swept:
+                self._tombstone(mid, "expired")
+            self._db.commit()
+            if swept:
+                self.gc_blobs()
+            return swept
+
+    # -- reads -----------------------------------------------------------------------
+
+    def profiles(self) -> Dict[str, str]:
+        with self._lock:
+            best: Dict[str, tuple] = {}
+            for ipub, seq, dpub, mj in self._db.execute(
+                    "SELECT identity_pub, seq, device_pub, msg_json"
+                    " FROM messages WHERE kind=?", (KIND_PROFILE,)):
+                p = json.loads(mj)["payload"]
+                key = (p["created_at"], seq, dpub)
+                if ipub not in best or key > best[ipub][0]:
+                    best[ipub] = (key, p["name"])
+            return {k: v[1] for k, v in best.items()}
+
+    def profile(self, identity_pub: str) -> Optional[dict]:
+        with self._lock:
+            best = None
+            best_key = None
+            for seq, dpub, mj in self._db.execute(
+                    "SELECT seq, device_pub, msg_json FROM messages"
+                    " WHERE kind=? AND identity_pub=?",
+                    (KIND_PROFILE, identity_pub)):
+                p = json.loads(mj)["payload"]
+                key = (p["created_at"], seq, dpub)
+                if best is None or key > best_key:
+                    best = p
+                    best_key = key
+            if best is None:
+                return None
+            return {
+                "name": best.get("name", identity_pub[:8]),
+                "bio": best.get("bio", ""),
+                "accent": best.get("accent", "#2743d6"),
+                "avatar": best.get("avatar"),
+                "avatar_shape": best.get("avatar_shape", "circle"),
+                "avatar_size": best.get("avatar_size", "m"),
+                "avatar_align": best.get("avatar_align", "left"),
+                "banner": best.get("banner"),
+            }
+
+    def profile_layout(self, identity_pub: str) -> dict:
+        """Latest-wins {order: [...], grids: {msg_id: layout},
+        sizes: {msg_id: size}} for this author's wall. Empty when never
+        arranged."""
+        with self._lock:
+            best, best_key = None, None
+            for seq, dpub, mj in self._db.execute(
+                    "SELECT seq, device_pub, msg_json FROM messages"
+                    " WHERE kind=? AND identity_pub=?",
+                    (KIND_PROFILE_LAYOUT, identity_pub)):
+                p = json.loads(mj)["payload"]
+                key = (p["created_at"], seq, dpub)
+                if best is None or key > best_key:
+                    best = {"order": p.get("order", []),
+                            "grids": p.get("grids", {}),
+                            "sizes": p.get("sizes", {})}
+                    best_key = key
+            return best or {"order": [], "grids": {}, "sizes": {}}
+
+    def messages_not_in(self, summaries: dict, entitled: Set[str],
+                        peer_identity: str) -> List[SignedMessage]:
+        with self._lock:
+            out = []
+            peer_devices = set(self.load_views(peer_identity).keys())
+            for ipub, dpub, seq, kind, rcpt, mj in self._db.execute(
+                    "SELECT identity_pub, device_pub, seq, kind, recipient,"
+                    " msg_json FROM messages ORDER BY seq ASC"):
+                if ipub not in entitled:
+                    continue
+                if kind == KIND_DM and peer_identity not in (ipub, rcpt):
+                    continue          # DMs never relay through friends
+                if kind == KIND_RING and peer_identity != ipub:
+                    continue          # ring records are author-private
+                if kind == KIND_POST:
+                    wr = set(json.loads(mj)["payload"].get("wraps", {}))
+                    if peer_identity != ipub and not (peer_devices & wr):
+                        continue      # only the wrap-set audience + author
+                dev = summaries.get(ipub, {}).get(dpub)
+                if dev is not None and SeenSet.summary_has(dev, seq):
+                    continue
+                out.append(SignedMessage.from_dict(json.loads(mj)))
+            return out
+
+    # -- DM support -----------------------------------------------------------
+
+    def enckey_records(self, identity_pub: str) -> Dict[str, Tuple[float, str]]:
+        """device_pub -> (created_at, enc_pub) for non-revoked devices,
+        latest-wins by (created_at, seq) — rotation makes same-timestamp
+        ties realistic, so bare created_at is not enough."""
+        with self._lock:
+            revoked = {dpub for dpub, v in
+                       self.load_views(identity_pub).items()
+                       if v.revocation is not None}
+            best: Dict[str, tuple] = {}
+            for dpub, seq, mj in self._db.execute(
+                    "SELECT device_pub, seq, msg_json FROM messages"
+                    " WHERE kind=? AND identity_pub=?",
+                    (KIND_ENCKEY, identity_pub)):
+                if dpub in revoked:
+                    continue
+                p = json.loads(mj)["payload"]
+                rank = (p["created_at"], seq)
+                if dpub not in best or rank > best[dpub][0]:
+                    best[dpub] = (rank, p["enc_pub"])
+            return {d: (rank[0], pub) for d, (rank, pub) in best.items()}
+
+    def enckeys(self, identity_pub: str) -> Dict[str, str]:
+        return {d: pub for d, (_, pub) in
+                self.enckey_records(identity_pub).items()}
+
+    def rings(self, identity_pub: str) -> Dict[str, str]:
+        """member_identity -> 'inner'|'kreds' for this author, latest-wins
+        by (created_at, seq, device_pub) -- same tie-break as profiles(),
+        needed because two of the author's own devices can publish a ring
+        record for the same member with an identical (created_at, seq).
+        Absent members default to 'kreds' at the caller. Author-private;
+        never disclosed to friends (see routing)."""
+        with self._lock:
+            best: Dict[str, tuple] = {}
+            for seq, dpub, mj in self._db.execute(
+                    "SELECT seq, device_pub, msg_json FROM messages"
+                    " WHERE kind=? AND identity_pub=?",
+                    (KIND_RING, identity_pub)):
+                p = json.loads(mj)["payload"]
+                rank = (p["created_at"], seq, dpub)
+                member = p["member"]
+                if member not in best or rank > best[member][0]:
+                    best[member] = (rank, p["ring"])
+            return {m: r for m, (rank, r) in best.items()}
+
+    def ring_since(self, self_identity: str, member: str) -> Optional[float]:
+        """Return the created_at of the latest ring record for that member if
+        one exists, else the member's added_at from identities, else None."""
+        with self._lock:
+            best = None
+            for seq, mj in self._db.execute(
+                    "SELECT seq, msg_json FROM messages"
+                    " WHERE kind=? AND identity_pub=?",
+                    (KIND_RING, self_identity)):
+                p = json.loads(mj)["payload"]
+                if p["member"] != member:
+                    continue
+                rank = (p["created_at"], seq)
+                if best is None or rank > best[0]:
+                    best = (rank, p["created_at"])
+            if best is not None:
+                return best[1]
+            row = self._db.execute(
+                "SELECT added_at FROM identities WHERE identity_pub=?",
+                (member,)).fetchone()
+            return row[0] if row else None
+
+    def cache_message_key(self, msg_id: str, sealed_hex: str):
+        """Message-scoped content-key cache (DMs and posts alike); the
+        underlying table stays named dm_keys -- renaming it is churn for
+        no behavioral gain, the accessor names are what read as
+        message-scoped."""
+        with self._lock:
+            if self.is_tombstoned(msg_id):
+                return          # a delete may have landed in the meantime
+            self._db.execute("INSERT OR IGNORE INTO dm_keys VALUES(?,?)",
+                             (msg_id, sealed_hex))
+            self._db.commit()
+
+    def replace_message_key(self, msg_id: str, sealed_hex: str):
+        """Overwrite a cached row (healing a corrupt/unopenable one) --
+        unlike cache_message_key's INSERT OR IGNORE, this always takes the
+        new value."""
+        with self._lock:
+            if self.is_tombstoned(msg_id):
+                return          # a delete may have landed in the meantime
+            self._db.execute("INSERT OR REPLACE INTO dm_keys VALUES(?,?)",
+                             (msg_id, sealed_hex))
+            self._db.commit()
+
+    def cached_message_key(self, msg_id: str) -> Optional[str]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT sealed_key FROM dm_keys WHERE msg_id=?",
+                (msg_id,)).fetchone()
+            return row[0] if row else None
+
+    def uncached_message_ids(self, self_identity: str) -> List[str]:
+        """msg_id list, kind-agnostic: DM rows where self is a party, plus
+        post rows authored by self or whose wraps contains one of self's
+        devices -- with no cached key yet."""
+        with self._lock:
+            out = []
+            for mid, kind, ipub, rcpt, mj in self._db.execute(
+                    "SELECT msg_id, kind, identity_pub, recipient, msg_json"
+                    " FROM messages WHERE kind IN (?,?)"
+                    " AND msg_id NOT IN (SELECT msg_id FROM dm_keys)",
+                    (KIND_DM, KIND_POST)):
+                if kind == KIND_DM:
+                    if self_identity in (ipub, rcpt):
+                        out.append(mid)
+                else:                                    # post
+                    if ipub == self_identity:
+                        out.append(mid); continue
+                    my_devs = set(self.load_views(self_identity).keys())
+                    if my_devs & set(json.loads(mj)["payload"].get("wraps", {})):
+                        out.append(mid)
+            return out
+
+    def post_messages(
+            self, identity_pub: Optional[str] = None) -> List[SignedMessage]:
+        with self._lock:
+            if identity_pub is None:
+                rows = self._db.execute(
+                    "SELECT msg_json FROM messages WHERE kind=?"
+                    " ORDER BY created_at DESC", (KIND_POST,))
+            else:
+                rows = self._db.execute(
+                    "SELECT msg_json FROM messages WHERE kind=?"
+                    " AND identity_pub=? ORDER BY created_at DESC",
+                    (KIND_POST, identity_pub))
+            return [SignedMessage.from_dict(json.loads(mj)) for (mj,) in rows]
+
+    def messages_by_author(self, identity_pub: str) -> List[SignedMessage]:
+        with self._lock:
+            return [SignedMessage.from_dict(json.loads(mj)) for (mj,) in
+                    self._db.execute(
+                        "SELECT msg_json FROM messages WHERE identity_pub=?",
+                        (identity_pub,))]
+
+    def get_message(self, msg_id: str) -> Optional[SignedMessage]:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT msg_json FROM messages WHERE msg_id=?",
+                (msg_id,)).fetchone()
+            return (SignedMessage.from_dict(json.loads(row[0]))
+                    if row else None)
+
+    def dm_thread(self, a_identity: str,
+                  b_identity: str) -> List[SignedMessage]:
+        with self._lock:
+            return [SignedMessage.from_dict(json.loads(mj))
+                    for (mj,) in self._db.execute(
+                        "SELECT msg_json FROM messages WHERE kind=?"
+                        " AND ((identity_pub=? AND recipient=?)"
+                        "  OR (identity_pub=? AND recipient=?))"
+                        " ORDER BY created_at ASC",
+                        (KIND_DM, a_identity, b_identity,
+                         b_identity, a_identity))]
+
+    def dm_conversations(self, self_identity: str) -> List[str]:
+        with self._lock:
+            out: List[str] = []
+            for ipub, rcpt in self._db.execute(
+                    "SELECT identity_pub, recipient FROM messages"
+                    " WHERE kind=? AND (identity_pub=? OR recipient=?)"
+                    " ORDER BY created_at ASC",
+                    (KIND_DM, self_identity, self_identity)):
+                other = rcpt if ipub == self_identity else ipub
+                if other != self_identity and other not in out:
+                    out.append(other)
+            return out
+
+    # -- unfriend / defriend -------------------------------------------------
+
+    def purge_authored_by(self, identity_pub: str) -> int:
+        """Delete every message this identity authored (posts, profile,
+        enckey, dm, ring, etc.) then GC any blobs that fall out of
+        reference. Also drops the dm_keys sealed-key rows for those exact
+        messages (mirrors _tombstone's own dm_keys cleanup) so no
+        orphaned cached content key survives a "delete everything" op
+        (whole-branch review, Fix 6). Returns the row count deleted."""
+        with self._lock:
+            ids = [r[0] for r in self._db.execute(
+                "SELECT msg_id FROM messages WHERE identity_pub=?",
+                (identity_pub,))]
+            if ids:
+                self._db.executemany(
+                    "DELETE FROM dm_keys WHERE msg_id=?",
+                    [(mid,) for mid in ids])
+            cur = self._db.execute(
+                "DELETE FROM messages WHERE identity_pub=?", (identity_pub,))
+            self._db.commit()
+        self.gc_blobs()
+        return cur.rowcount
+
+    def remove_peer_identity(self, identity_pub: str):
+        """Forget every peer address on file for this identity (whole-
+        branch review, Fix 4/5 use this from both teardown paths so an
+        ex-friend's IP is never dialed again)."""
+        with self._lock:
+            self._db.execute("DELETE FROM peers WHERE identity_pub=?",
+                             (identity_pub,))
+            self._db.commit()
+
+    def remove_device_views(self, identity_pub: str):
+        """Forget every device_views row (enrollment certs + seen-state +
+        any revocation) for this identity (whole-branch review, Fix 5):
+        left behind, a stale row's revocation could even make a later
+        session wrongly refuse this identity's device as "revoked"."""
+        with self._lock:
+            self._db.execute("DELETE FROM device_views WHERE identity_pub=?",
+                             (identity_pub,))
+            self._db.commit()
+
+    def unfriend_teardown(self, self_identity: str, other: str):
+        """Local-side removal: drop `other` from identities, delete
+        everything they authored, the DM thread with them, and any ring
+        records I authored about them; forget their peer address and
+        device views (enrollment certs / seen-state / revocations)."""
+        with self._lock:
+            self._db.execute("DELETE FROM identities WHERE identity_pub=?",
+                             (other,))
+            # dm_keys cleanup (Fix 6) for every message about to be
+            # deleted below -- both what `other` authored AND what I sent
+            # them (a DM's cached content key is stored by msg_id
+            # regardless of which party authored it).
+            ids = [r[0] for r in self._db.execute(
+                "SELECT msg_id FROM messages WHERE identity_pub=?"
+                " OR (kind='dm' AND recipient=?)", (other, other))]
+            if ids:
+                self._db.executemany(
+                    "DELETE FROM dm_keys WHERE msg_id=?",
+                    [(mid,) for mid in ids])
+            self._db.execute("DELETE FROM messages WHERE identity_pub=?",
+                             (other,))
+            self._db.execute(
+                "DELETE FROM messages WHERE kind='dm' AND recipient=?",
+                (other,))
+            self._db.execute(
+                "DELETE FROM messages WHERE kind='ring' AND identity_pub=?"
+                " AND json_extract(msg_json,'$.payload.member')=?",
+                (self_identity, other))
+            self._db.commit()
+        self.remove_peer_identity(other)
+        self.remove_device_views(other)          # Fix 5
+        self.gc_blobs()
+
+    def add_disconnected(self, identity_pub: str, name: str):
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO disconnected VALUES(?,?)",
+                (identity_pub, name))
+            self._db.commit()
+
+    def list_disconnected(self) -> List[dict]:
+        with self._lock:
+            return [{"identity_pub": r[0], "name": r[1]} for r in
+                    self._db.execute(
+                        "SELECT identity_pub, name FROM disconnected")]
+
+    def remove_disconnected(self, identity_pub: str):
+        with self._lock:
+            self._db.execute("DELETE FROM disconnected WHERE identity_pub=?",
+                             (identity_pub,))
+            self._db.commit()
+
+    def add_outbox(self, notice, address: str, expires_at: float):
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO defriend_outbox VALUES(?,?,?,?,?,?)",
+                (notice.target_identity, address, json.dumps(notice.to_dict()),
+                 notice.created_at, expires_at, 0))
+            self._db.commit()
+
+    def list_outbox(self) -> List[dict]:
+        with self._lock:
+            return [{"target_identity": r[0], "address": r[1],
+                     "notice": json.loads(r[2]), "created_at": r[3],
+                     "expires_at": r[4], "next_attempt_at": r[5]}
+                    for r in self._db.execute(
+                        "SELECT target_identity, address, notice_json,"
+                        " created_at, expires_at, next_attempt_at"
+                        " FROM defriend_outbox")]
+
+    def drop_outbox(self, target_identity: str):
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM defriend_outbox WHERE target_identity=?",
+                (target_identity,))
+            self._db.commit()
+
+    def set_outbox_retry(self, target_identity: str, next_attempt_at: float):
+        """Back off a still-pending record so the gossip-cadence delivery
+        pass does not re-dial the same (possibly offline) address every
+        round (whole-branch review, Fix 3)."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE defriend_outbox SET next_attempt_at=?"
+                " WHERE target_identity=?", (next_attempt_at, target_identity))
+            self._db.commit()
+
+    def wipe_all(self):
+        with self._lock:
+            for table in ("meta", "identities", "device_views", "messages",
+                          "tombstones", "blobs", "peers", "dm_keys",
+                          "defriend_outbox", "disconnected"):
+                self._db.execute(f"DELETE FROM {table}")
+            self._db.commit()
+
+    # -- blob GC -----------------------------------------------------------------------
+
+    def referenced_blobs(self) -> Set[str]:
+        with self._lock:
+            refs: Set[str] = set()
+            for (mj,) in self._db.execute(
+                    "SELECT msg_json FROM messages WHERE kind IN (?,?)",
+                    (KIND_POST, KIND_DM)):
+                p = json.loads(mj)["payload"]
+                refs.update(p.get("blobs", []))
+                # video blocks (KIND_POST, media="video") carry a poster
+                # blob referenced only by this field, not by `blobs` -- a
+                # video block's poster must sync just like its mp4, the
+                # same class of blob referenced_blobs() already handles
+                # for KIND_STORY and KIND_PROFILE below. Guard the type: this
+                # query also spans KIND_DM, whose payload is NOT poster-
+                # validated on ingest, so a modified friend client could
+                # persist a junk (non-str) poster -- adding that to `refs`
+                # would brick every sync round + gc_blobs() (unhashable, or
+                # str/int compare in sorted(missing_blobs())).
+                poster = p.get("poster")
+                if isinstance(poster, str) and poster:
+                    refs.add(poster)
+            for (mj,) in self._db.execute(
+                    "SELECT msg_json FROM messages WHERE kind=?",
+                    (KIND_PROFILE,)):
+                p = json.loads(mj)["payload"]
+                for h in (p.get("avatar"), p.get("banner")):
+                    if h:
+                        refs.add(h)
+            for (mj,) in self._db.execute(
+                    "SELECT msg_json FROM messages WHERE kind=?",
+                    (KIND_STORY,)):
+                p = json.loads(mj)["payload"]
+                for h in (p.get("media"), p.get("poster")):
+                    if h:
+                        refs.add(h)
+            return refs
+
+    def missing_blobs(self) -> Set[str]:
+        with self._lock:
+            have = {h for (h,) in
+                    self._db.execute("SELECT hash FROM blobs")}
+            return self.referenced_blobs() - have
+
+    def gc_blobs(self) -> int:
+        with self._lock:
+            refs = self.referenced_blobs()
+            gone = [h for (h,) in self._db.execute("SELECT hash FROM blobs")
+                    if h not in refs]
+            for h in gone:
+                self._db.execute("DELETE FROM blobs WHERE hash=?", (h,))
+            self._db.commit()
+            return len(gone)
+
+    def active_stories(self, now: Optional[float] = None) -> List[dict]:
+        now = now if now is not None else time.time()
+        with self._lock:
+            groups: Dict[str, dict] = {}
+            for mid, ipub, mj in self._db.execute(
+                    "SELECT msg_id, identity_pub, msg_json FROM messages"
+                    " WHERE kind=? ORDER BY created_at ASC", (KIND_STORY,)):
+                p = json.loads(mj)["payload"]
+                if p.get("expires_at") is not None and p["expires_at"] <= now:
+                    continue
+                g = groups.setdefault(ipub, {"identity_pub": ipub,
+                                             "items": [], "_last": 0})
+                g["items"].append({
+                    "msg_id": mid, "media_kind": p["media_kind"],
+                    "media": p["media"], "poster": p.get("poster"),
+                    "caption": p.get("caption", ""),
+                    "created_at": p["created_at"],
+                })
+                g["_last"] = max(g["_last"], p["created_at"])
+            out = sorted(groups.values(), key=lambda g: g["_last"],
+                         reverse=True)
+            for g in out:
+                del g["_last"]
+            return out
+
+    def close(self):
+        with self._lock:
+            self._db.close()

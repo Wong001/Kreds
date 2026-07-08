@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.superpowers/
+run/
+run_demo.log
+run_demo.err.log
+release_private_key*
+run_serve.log
+run_serve.err.log
+build/
+dist/
+release/
+packaging/tor/
+dist.zip

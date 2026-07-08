@@ -1,0 +1,155 @@
+"""Wire one node's daemon: gossip listener + loop + localhost HTTP."""
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import uvicorn
+
+from .api import build_app
+from .node import HearthNode
+from .sync import SyncService
+from .transport import TorTransport
+from .tor import TorProcess, ensure_tor_binary, publish_onion
+
+
+async def run_node(data_dir, gossip_port: int, http_port: int,
+                   interval: float = 3.0, tor: bool = False,
+                   tor_process: "TorProcess | None" = None,
+                   publish: bool = True,
+                   shutdown: "asyncio.Event | None" = None,
+                   web_dir=None):
+    node = HearthNode(data_dir)
+    own_tor = None
+    sync = None
+    try:
+        if tor:
+            if tor_process is None:
+                exe = ensure_tor_binary()
+                own_tor = TorProcess(exe, node.data_dir / "tordata")
+                await own_tor.start()          # inside try: a failed start
+                tor_process = own_tor          # is stopped by the finally
+            sync = SyncService(node,
+                               transport=TorTransport(tor_process.socks_port))
+            # Bind the FIXED gossip_port: the onion service maps to it, so the
+            # published address must point at the port we actually listen on.
+            await sync.start("127.0.0.1", gossip_port)
+            if publish:
+                service_id, blob = await publish_onion(
+                    tor_process.control_port, tor_process.cookie_path,
+                    gossip_port, node.onion_key)
+                if blob and blob != node.onion_key:
+                    node.save_onion_key(blob)
+                node.store.set_meta(
+                    "gossip_addr", f"{service_id}.onion:{gossip_port}")
+            # else: the caller already published (detached) and set gossip_addr
+        else:
+            sync = SyncService(node)
+            port = await sync.start("127.0.0.1", gossip_port)
+            node.store.set_meta("gossip_addr", f"127.0.0.1:{port}")
+        server = uvicorn.Server(uvicorn.Config(
+            build_app(node, web_dir=web_dir), host="127.0.0.1", port=http_port,
+            log_level="warning"))
+        watcher = None
+        if shutdown is not None:
+            async def _watch():
+                await shutdown.wait()
+                server.should_exit = True
+            watcher = asyncio.create_task(_watch())
+        loop_task = asyncio.create_task(sync.gossip_loop(interval))
+        try:
+            await server.serve()
+        finally:
+            loop_task.cancel()
+            try:
+                await loop_task
+            except BaseException:
+                pass
+            if watcher:
+                watcher.cancel()
+                try:
+                    await watcher
+                except BaseException:
+                    pass
+    finally:
+        if sync is not None:
+            await sync.stop()
+        if own_tor is not None:
+            await own_tor.stop()
+
+
+def _enrolled(data_dir) -> bool:
+    """True once keys.json holds an ENROLLED identity (cert non-null) --
+    not merely once keys.json exists. pair_request writes an unenrolled
+    keys.json mid-pairing (device keys with no cert yet), so existence
+    alone would skip the bootstrap phase before pairing has completed."""
+    kp = Path(data_dir) / "keys.json"
+    if not kp.exists():
+        return False
+    try:
+        return json.loads(kp.read_text()).get("cert") is not None
+    except Exception:
+        return False
+
+
+async def run_serve(data_dir, gossip_port: int, http_port: int,
+                    interval: float = 3.0, tor: bool = False,
+                    shutdown: "asyncio.Event | None" = None,
+                    web_dir=None):
+    """Two-phase `hearth serve`: if no identity is enrolled yet, run the
+    node-less bootstrap app (create/pair endpoints) on http_port until a
+    create or pair-install completes, then shut it down and hand off to
+    the full node app on the same port. If already enrolled, skip
+    straight to run_node."""
+    if not _enrolled(data_dir):
+        from .bootstrap import build_bootstrap_app
+        ready = asyncio.Event()
+        app = build_bootstrap_app(data_dir, ready.set, web_dir=web_dir)
+        server = uvicorn.Server(uvicorn.Config(
+            app, host="127.0.0.1", port=http_port, log_level="warning"))
+        task = asyncio.create_task(server.serve())
+        ready_task = asyncio.create_task(ready.wait())
+        # Whole-branch review, MINOR #6: awaiting ONLY ready.wait() hangs
+        # forever if server.serve() returns early (e.g. http_port already
+        # in use) without ever calling on_ready. Wait on both and fail
+        # loud instead of hanging if the server exits first.
+        waiters = {ready_task, task}
+        sd_task = asyncio.create_task(shutdown.wait()) if shutdown is not None else None
+        if sd_task:
+            waiters.add(sd_task)
+        done, pending = await asyncio.wait(
+            waiters, return_when=asyncio.FIRST_COMPLETED)
+        if sd_task and sd_task in done:   # user quit during first-run
+            server.should_exit = True
+            ready_task.cancel()
+            try:
+                await ready_task
+            except asyncio.CancelledError:
+                pass
+            await asyncio.gather(task, return_exceptions=True)
+            return
+        if task in done:
+            ready_task.cancel()
+            try:
+                await ready_task
+            except asyncio.CancelledError:
+                pass
+            if sd_task:
+                sd_task.cancel()
+                try:
+                    await sd_task
+                except asyncio.CancelledError:
+                    pass
+            raise RuntimeError(
+                "bootstrap server exited before an identity was created")
+        if sd_task:
+            sd_task.cancel()
+            try:
+                await sd_task
+            except asyncio.CancelledError:
+                pass
+        server.should_exit = True
+        await task                        # graceful shutdown frees the port
+    await run_node(data_dir, gossip_port, http_port, interval, tor=tor,
+                   shutdown=shutdown, web_dir=web_dir)

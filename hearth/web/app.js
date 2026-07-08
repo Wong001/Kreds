@@ -1,0 +1,2880 @@
+// Kreds client - journal-first shell (v3 reskin).
+//
+// Preserved from the pre-reskin client (re-homed into the new view
+// containers, not deleted): DM chat (loadConversations/openThread/dm
+// compose), stories strip + viewer, the friend-add ceremony, the profile
+// editor, the revocation self-logout banner, and the theme toggle.
+//
+// People are destinations (Task 4, now a full page - Kreds Me/profile
+// Slice A): openProfile is the one function every "open this person"
+// click site calls (journal, chips, friends, circle nodes); it navigates
+// to the #view-profile page. The circle (Task 5): buildCircle() renders
+// the radial map from
+// /api/kreds for both the compact rail (#circle-rail) and the full
+// .overlay; the mobile tab bar's Circle tab shows the same rail.
+
+let STATE = null;
+let KREDS = [];       // /api/kreds rows: {identity_pub, name, ring, since}
+let FEED = [];        // /api/feed rows
+let ACTIVE_FILTER = "all";   // "all" | "inner" | an identity_pub
+let CURRENT_DM = null;
+let CURRENT_DM_NAME = "";
+let PRIOR_VIEW = "journal";   // where the profile page's Back button returns
+let CURRENT_PROFILE = null;   // identity of the profile page currently shown
+let ARRANGING = false;        // self-only Wall Arrange mode (Up/Down controls shown)
+let BLOCK_SETTINGS_OPENER = null;   // #5: element to return focus to when the block-settings modal closes
+let NEEDS_WIZARD = false;   // set by boot() when onboarding_done is false; Task 3's bootData() consumes it
+
+async function j(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+const DELETE_CONFIRM =
+  "Delete for everyone? This removes it from your friends' devices " +
+  "running Kreds. A modified app or a screenshot can still have kept a copy.";
+
+// Honest copy for the Unfriend confirm dialog - verbatim, do not edit
+// without updating the spec/plan copy it's sourced from.
+function unfriendConfirm(name) {
+  return "Remove " + name + " from your kreds? They leave your circle and "
+    + "messages, and you both stop exchanging. Their Kreds app is sent a "
+    + "signed removal notice and deletes what you shared as soon as it "
+    + "receives it - we keep trying privately for up to 14 days. An honest "
+    + "app deletes on receipt, but a modified client or a screenshot can still keep a copy, "
+    + "and if their device is never reachable their copy may remain. "
+    + "You can re-add them later if they share their code again.";
+}
+
+// A person present in STATE.disconnected has had the relationship end
+// (either side unfriended) - {identity_pub, name} or undefined.
+function disconnectedInfo(identityPub) {
+  return (STATE && STATE.disconnected || [])
+    .find(d => d.identity_pub === identityPub);
+}
+
+// Every deletion affordance must route through this helper so the honest
+// boundary is always shown (spec: 2026-07-03 deletion hardening). When
+// DMs/stories grow delete buttons, they call this too.
+async function deleteEverywhere(msgId) {
+  if (!confirm(DELETE_CONFIRM)) return false;
+  await j("/api/delete", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({msg_id: msgId})});
+  return true;
+}
+
+// -- identity color: the ONE place this derivation lives. Same formula on
+// every device, so a person renders in the same hue everywhere (avatars,
+// chips, and - Task 5 - the circle map). Not returned by any API; the
+// client always derives it from the identity fingerprint.
+function identityColor(fp) {
+  const h = parseInt(fp.slice(0, 6), 16) % 360;
+  return `hsl(${h} 55% 45%)`;
+}
+
+// -- unread watermark: an honest, per-device localStorage stopgap (NOT
+// synced across devices, NOT backed by any server field). Key prefix
+// "kreds_opened:" + either a chip's filter value ("inner") or an
+// identity_pub.
+function lastOpened(key) {
+  return Number(localStorage.getItem("kreds_opened:" + key) || 0);
+}
+function markOpenedNow(key) {
+  localStorage.setItem("kreds_opened:" + key, String(Date.now() / 1000));
+}
+
+const SUN = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" '
+  + 'stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+  + '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2'
+  + 'M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>';
+const MOON = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" '
+  + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+  + 'stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 '
+  + 'a7 7 0 0 0 9.8 9.8z"/></svg>';
+const ICONS = {
+  attach: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    + 'stroke-linejoin="round"><path d="M21 8l-9.5 9.5a3.5 3.5 0 0 1-5-5'
+    + 'L15 3.5a2.5 2.5 0 0 1 3.5 3.5L9 16"/></svg>',
+  send: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    + 'stroke-linejoin="round"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4z"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+    + '<path d="M12 5v14M5 12h14"/></svg>',
+  cog: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    + 'stroke-linejoin="round"><circle cx="12" cy="12" r="3"/>'
+    + '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83'
+    + 'l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0'
+    + 'v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83'
+    + 'l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09'
+    + 'A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83'
+    + 'l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09'
+    + 'a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83'
+    + 'l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4'
+    + 'h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+};
+const MARK_SVG = '<svg class="mark" viewBox="0 0 100 100" aria-hidden="true">'
+  + '<path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>'
+  + '<path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>'
+  + '<path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>'
+  + '<circle class="dot" cx="50" cy="50" r="9"/></svg>';
+const SCOPE_ICON = {
+  inner: '<svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/></svg>',
+  kreds: '<svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/>'
+    + '<circle class="r" cx="10" cy="10" r="7"/></svg>',
+};
+
+// -- theme: apply/toggle/persist (unchanged behavior, renamed storage key).
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  const btn = document.getElementById("theme-toggle");
+  if (btn) btn.innerHTML = (t === "dark") ? SUN : MOON;
+}
+function accentFg(hex) {
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16),
+        b = parseInt(hex.slice(5, 7), 16);
+  return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? "#17191e" : "#ffffff";
+}
+function setAccent(node, hex) {
+  node.style.setProperty("--me", hex);
+  node.style.setProperty("--me-fg", accentFg(hex));
+}
+function currentTheme() {
+  return localStorage.getItem("kreds_theme")
+    || (window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark" : "light");
+}
+function toggleTheme() {
+  const next = (document.documentElement.dataset.theme === "dark")
+    ? "light" : "dark";
+  localStorage.setItem("kreds_theme", next);
+  applyTheme(next);
+}
+
+function expiryLabel(expiresAt) {
+  if (!expiresAt) return "";
+  const s = expiresAt - Date.now() / 1000;
+  if (s <= 0) return "expired";
+  if (s < 3600) return "expires in " + Math.ceil(s / 60) + "m";
+  if (s < 86400) return "expires in " + Math.ceil(s / 3600) + "h";
+  return "expires in " + Math.ceil(s / 86400) + "d";
+}
+
+// ---------------------------------------------------------------------
+// Journal (day-grouped feed)
+// ---------------------------------------------------------------------
+
+function dayLabel(date) {
+  const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const diffDays = Math.round(
+    (startOfDay(new Date()) - startOfDay(date)) / 86400000);
+  const weekday = date.toLocaleDateString(undefined, {weekday: "long"});
+  const full = date.toLocaleDateString(undefined,
+    {day: "numeric", month: "long"});
+  if (diffDays === 0) return "Today · " + weekday + " " + full;
+  if (diffDays === 1) return "Yesterday · " + weekday + " " + full;
+  return weekday + " · " + full;
+}
+
+function groupByDay(rows) {
+  // `rows` is already newest-first (as /api/feed returns it), so walking
+  // it in order and starting a new bucket on each date change preserves
+  // that ordering both across and within days.
+  const groups = [];
+  let cur = null;
+  for (const p of rows) {
+    const d = new Date(p.created_at * 1000);
+    const key = d.toDateString();
+    if (!cur || cur.key !== key) { cur = {key, date: d, rows: []}; groups.push(cur); }
+    cur.rows.push(p);
+  }
+  return groups;
+}
+
+function buildEntry(p) {
+  const color = (p.mine && STATE && STATE.accent)
+    ? STATE.accent : identityColor(p.identity_pub);
+  const article = el("article", "entry");
+  article.dataset.author = p.identity_pub;
+
+  const avatar = el("button", "eavatar", (p.author_name || "?").slice(0, 1).toUpperCase());
+  avatar.style.background = color;
+  avatar.style.setProperty("--ring", color);
+  if (p.mine) {
+    avatar.disabled = true;
+    avatar.setAttribute("aria-label", "You");
+  } else {
+    avatar.setAttribute("aria-label", "Open " + p.author_name + "'s profile");
+    avatar.onclick = () => openProfile(p.identity_pub);
+  }
+
+  const body = el("div", "ebody");
+  const line = el("div", "eline");
+  let nameNode;
+  if (p.mine) {
+    nameNode = el("span", "ename", p.author_name);
+    nameNode.style.cursor = "default";
+  } else {
+    nameNode = el("button", "ename", p.author_name);
+    nameNode.onclick = () => openProfile(p.identity_pub);
+  }
+  const time = el("span", "etime", new Date(p.created_at * 1000)
+    .toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}));
+  line.append(nameNode, time);
+  const exp = expiryLabel(p.expires_at);
+  if (exp) line.append(el("span", "etime", exp));
+  const scope = el("span", "escope");
+  // Guarded lookup: a gossip-supplied p.scope of e.g. "constructor" would
+  // otherwise resolve via the prototype chain (Object.prototype.constructor
+  // is truthy) instead of falling through to the kreds default.
+  scope.innerHTML = Object.hasOwn(SCOPE_ICON, p.scope)
+    ? SCOPE_ICON[p.scope] : SCOPE_ICON.kreds;
+  scope.append(document.createTextNode(p.scope));
+  line.append(scope);
+  body.append(line, el("p", "etext", p.text));
+  for (const h of p.blobs) {
+    const img = document.createElement("img");
+    img.src = "/api/post-blob/" + p.msg_id + "/" + h;
+    img.alt = "";
+    body.append(img);
+  }
+  if (p.mine) {
+    const acts = el("div", "eacts");
+    const del = el("button", "pact del", "Delete everywhere");
+    del.onclick = async () => {
+      if (!await deleteEverywhere(p.msg_id)) return;
+      await refresh();
+      // refresh() re-renders journal/me/stories but not the profile page, and
+      // a Wall post's only delete affordance is here - re-open the profile so
+      // the deleted post actually disappears from the Wall/Journal.
+      if (currentView() === "profile" && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
+    };
+    acts.append(del);
+    body.append(acts);
+  }
+  article.append(avatar, body);
+  return article;
+}
+
+// Profile canvas block: a profile post rendered by inferred type - text, or
+// photo (one big, several as a gallery). Distinct from the compact journal
+// buildEntry(). Delete-everywhere (self) routes through the shared helper.
+// Map a photo block's grid choice + photo count to its media-container CSS
+// class. Single photo always renders big regardless of grid. Shared by
+// renderBlock and the arrange-mode grid picker (which applies it in place).
+function photoGridClass(grid, count) {
+  if (count === 1) return "block-photo";
+  switch (grid) {
+    case "cols2": return "block-grid-2";
+    case "cols3": return "block-grid-3";
+    case "hero": return "block-hero";
+    case "masonry": return "block-masonry";
+    default: return "block-gallery";   // auto
+  }
+}
+
+function renderBlock(p) {
+  const block = el("article", "block");
+  block.dataset.msgId = p.msg_id;   // read back by Arrange mode's Done handler
+  block.classList.add("size-" + (p.size || "full"));   // bento width span
+  if (p.media === "video" && p.blobs && p.blobs.length) {
+    const wrap = el("div", "block-video");
+    const v = document.createElement("video");
+    v.controls = true; v.playsInline = true; v.preload = "metadata";
+    if (p.poster) v.poster = "/api/post-blob/" + p.msg_id + "/" + p.poster;
+    const src = document.createElement("source");
+    src.src = "/api/post-blob/" + p.msg_id + "/" + p.blobs[0];
+    v.append(src); wrap.append(v); block.append(wrap);
+  } else if (p.blobs && p.blobs.length) {
+    const media = el("div", photoGridClass(p.grid || "auto", p.blobs.length));
+    p.blobs.forEach((h, idx) => {
+      const img = document.createElement("img");
+      img.src = "/api/post-blob/" + p.msg_id + "/" + h;
+      img.alt = "";
+      // whole-branch review IMPORTANT #3: images are draggable by default,
+      // so a real-mouse block drag in Arrange mode would start a native
+      // HTML5 image drag instead of our own pointer-drag reorder.
+      img.draggable = false;
+      img.style.cursor = "zoom-in";
+      img.tabIndex = -1;   // scriptable focus target so the lightbox can return focus here on close
+      img.onclick = () => { if (!ARRANGING) openLightbox(p.msg_id, p.blobs, idx, img); };
+      media.append(img);
+    });
+    block.append(media);
+  }
+  if (p.text) block.append(el("p", "block-text-body", p.text));
+  if (p.mine) {
+    const badge = el("span", "block-scope", p.scope === "inner" ? "Inner" : "Kreds");
+    block.append(badge);
+    const del = el("button", "pact del", "Delete everywhere");
+    del.onclick = async () => {
+      if (!await deleteEverywhere(p.msg_id)) return;
+      await refresh();
+      if (currentView() === "profile" && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
+    };
+    block.append(del);
+  }
+  if (ARRANGING && p.mine) {
+    block.classList.add("arranging");
+    block.style.touchAction = "none";
+    // #5(a): tabindex="-1" makes the block a valid programmatic focus
+    // target (closeBlockSettings' opener.focus()) without adding it to
+    // the normal Tab sequence - a tap-opened modal remembers the block
+    // itself as its opener, since there's no more specific control to
+    // credit for a whole-block tap.
+    block.tabIndex = -1;
+    // Keyboard-focusable affordance (a11y fix): tap-to-open has no keyboard
+    // path, so give the modal a real <button> entry point too. The
+    // pointerdown handler below already bails on "button, a, select, video"
+    // targets, so this doesn't get mistaken for a drag start.
+    const cog = el("button", "block-settings-btn");
+    cog.innerHTML = ICONS.cog;
+    cog.type = "button";
+    cog.setAttribute("aria-label", "Block settings");
+    cog.onclick = () => openBlockSettings(p, block, cog);   // remembers the gear as the opener (#5a)
+    block.append(cog);
+    // A small drag reorders; a tap (sub-threshold release) opens settings.
+    block.addEventListener("pointerdown", (ev) => {
+      if ((ev.button != null && ev.button !== 0) || !ev.isPrimary) return;
+      if (ev.target.closest("button, a, select, video")) return;   // let controls work
+      // IMPORTANT #3(c): preventDefault SYNCHRONOUSLY here, not inside the
+      // eventual startBlockDrag handoff - by the time that call happens,
+      // the browser's default action for this same event (native image
+      // drag start, text-selection drag) has already committed, so calling
+      // it there is a no-op.
+      ev.preventDefault();
+      const sx = ev.clientX, sy = ev.clientY;
+      let handed = false;
+      // MINOR #6: capture the pointer for the tap phase, not just the
+      // eventual drag phase - without this, a sub-threshold press that
+      // releases outside the window never delivers pointerup, and the
+      // stale `up` closure below can later fire on some unrelated click.
+      // Not fatal if unsupported/inactive - fall through uncaptured.
+      try { block.setPointerCapture(ev.pointerId); } catch (e) { /* not fatal */ }
+      const move = (e) => {
+        if (e.pointerId !== ev.pointerId) return;   // ignore a concurrent second touch
+        if (!handed && Math.hypot(e.clientX - sx, e.clientY - sy) > 6) {
+          handed = true; teardown(); startBlockDrag(block, ev);    // hand off to the drag controller
+        }
+      };
+      const up = (e) => {
+        if (e.pointerId !== ev.pointerId) return;   // ignore a concurrent second touch
+        teardown(); if (!handed) openBlockSettings(p, block, block);   // block itself is the opener (#5a)
+      };
+      // IMPORTANT #2: pointercancel is an ABORTED gesture, not a tap - it
+      // must never open the modal. The old code reused `up` for both
+      // events, so a cancelled gesture (e.g. the browser taking over for
+      // a system gesture) popped the settings modal anyway. `cancel` only
+      // tears down.
+      const cancel = (e) => {
+        if (e.pointerId !== ev.pointerId) return;   // ignore a concurrent second touch
+        teardown();
+      };
+      const teardown = () => {
+        // Release capture BEFORE startBlockDrag (called right after, on
+        // the `move` handoff path) takes its own capture on the wall -
+        // two elements holding capture on the same pointerId at once is
+        // unspecified behavior we don't want to rely on (#6).
+        try { block.releasePointerCapture(ev.pointerId); } catch (e) { /* already released/inactive */ }
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", cancel);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", cancel);
+    });
+  }
+  return block;
+}
+
+// Hand-rolled Pointer-Events block drag (mouse + touch + pen) - the sleek,
+// dependency-free path (native HTML5 DnD has no touch + an uncustomizable
+// ghost). Live reorder by nearest-center (2D, Task 3); the settings modal's
+// Move Up/Down remain the keyboard path; "Done" reads the resulting DOM
+// order and publishes as in Slice 2.
+function startBlockDrag(block, ev) {
+  // Primary pointer only; ignore secondary touches so a second finger can't
+  // start a concurrent, incoherent drag.
+  if ((ev.button != null && ev.button !== 0) || !ev.isPrimary) return;
+  ev.preventDefault();
+  const wall = document.getElementById("profile-wall");
+  const before = [...wall.children];                  // snapshot for cancel-restore
+  // Capture on the WALL, not the dragged block: reordering moves `block`
+  // itself via insertBefore/appendChild below, and a captured element that
+  // gets reparented mid-drag silently loses pointer capture in Chromium -
+  // found live (Task 3 2D-reorder smoke: capture was lost after exactly one
+  // reorder hop, killing the rest of the gesture). `wall` never moves, so
+  // capturing there survives every reorder for the whole gesture.
+  // Capture BEFORE marking .dragging: if capture throws (inactive pointer),
+  // bail out clean rather than leaving a lifted block with no way to end.
+  try { wall.setPointerCapture(ev.pointerId); } catch (e) { return; }
+  block.classList.add("dragging");
+
+  // 2D-aware: the wall is a multi-column bento grid (not a vertical list), so
+  // pick the non-dragging block whose CENTER is nearest the pointer (x,y) and
+  // decide insert-before vs insert-after from there, instead of Y-midpoint
+  // alone (which broke cross-column reorder - see Task 2's report).
+  const afterElement = (x, y) => {
+    const els = [...wall.querySelectorAll(".block:not(.dragging)")];
+    let best = null, bestDist = Infinity, after = false;
+    for (const child of els) {
+      const b = child.getBoundingClientRect();
+      const cx = b.left + b.width/2, cy = b.top + b.height/2;
+      const d = Math.hypot(x - cx, y - cy);
+      if (d < bestDist) { bestDist = d; best = child;
+        after = (y > cy + b.height*0.25) || (Math.abs(y - cy) <= b.height*0.5 && x > cx); }
+    }
+    if (!best) return null;
+    return after ? best.nextElementSibling : best;   // insert BEFORE this (null => append)
+  };
+
+  const onMove = (e) => {
+    // IMPORTANT #4: these listeners are on the WALL (see the capture
+    // comment above), not the dragged block, so without a pointerId check
+    // a second concurrent finger anywhere on the wall would drive this
+    // same drag - teleporting or cancelling it mid-gesture.
+    if (e.pointerId !== ev.pointerId) return;
+    const after = afterElement(e.clientX, e.clientY);
+    if (after == null) { if (block !== wall.lastElementChild) wall.appendChild(block); }
+    else if (after !== block.nextSibling) wall.insertBefore(block, after);
+    // edge auto-scroll so a long canvas stays reorderable
+    const M = 70;
+    if (e.clientY < M) window.scrollBy(0, -12);
+    else if (e.clientY > window.innerHeight - M) window.scrollBy(0, 12);
+  };
+  let done = false;
+  const finish = () => {           // idempotent: pointerup AND lostpointercapture can both fire
+    if (done) return;
+    done = true;
+    wall.removeEventListener("pointermove", onMove);
+    wall.removeEventListener("pointerup", onUp);
+    wall.removeEventListener("pointercancel", onCancel);
+    wall.removeEventListener("lostpointercapture", onLost);
+    block.classList.remove("dragging");
+  };
+  const onUp = (e) => { if (e.pointerId !== ev.pointerId) return; finish(); };   // #4: filter concurrent pointers
+  const onCancel = (e) => {                             // restore pre-drag order
+    if (e.pointerId !== ev.pointerId) return;   // #4: filter concurrent pointers
+    before.forEach((el2) => wall.appendChild(el2));
+    finish();
+  };
+  // Safety net: lostpointercapture fires when capture is released even if the
+  // browser drops the terminating pointerup/pointercancel (observed during
+  // edge auto-scroll) - without this the block could stay stuck in .dragging
+  // with listeners attached. On a dropped up we keep the current (dragged)
+  // order, which is the right outcome for a completed drag.
+  const onLost = () => finish();
+  wall.addEventListener("pointermove", onMove);
+  wall.addEventListener("pointerup", onUp);
+  wall.addEventListener("pointercancel", onCancel);
+  wall.addEventListener("lostpointercapture", onLost);
+}
+
+// Per-block settings modal (self+Arrange-only): opened by a TAP on a block
+// (see the pointerdown handler in renderBlock) - replaces the old inline
+// drag handle button, Up/Down arrows, and grid-<select> on the block face
+// itself. Size and grid apply in place (swap classes on the live DOM node)
+// so a pending, uncommitted reorder from this Arrange session survives,
+// matching the prior inline photo-layout picker's behavior (see dc49210).
+function closeBlockSettings() {
+  document.getElementById("block-settings").classList.add("hidden");
+  // IMPORTANT #5(e): return focus to whatever opened the modal (the gear
+  // button, or the block itself for a tap-open) - without this, Esc/
+  // backdrop/close-button all drop focus to <body>, losing the user's
+  // place in Arrange mode.
+  const opener = BLOCK_SETTINGS_OPENER;
+  BLOCK_SETTINGS_OPENER = null;
+  if (opener && opener.isConnected) opener.focus();
+}
+// Build a labelled button group; onPick(value) fires on click. `groupKey`
+// (optional) tags the group with data-group so a rebuild can refocus the
+// specific option that was just picked (see openBlockSettings' focusSel).
+function settingsGroup(label, options, current, onPick, groupKey) {
+  const wrap = el("div", "settings-group");
+  if (groupKey) wrap.dataset.group = groupKey;
+  wrap.append(el("div", "settings-label", label));
+  const row = el("div", "settings-row");
+  for (const [v, text] of options) {
+    const b = el("button", "settings-opt" + (v === current ? " on" : ""), text);
+    b.type = "button";
+    b.onclick = () => onPick(v);
+    row.append(b);
+  }
+  wrap.append(row); return wrap;
+}
+async function postJSON(url, body) {
+  const r = await fetch(url, {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  if (!r.ok) alert("Couldn't save: " + await r.text());
+  return r.ok;
+}
+// `opener` (#5a, only passed on a fresh open - gear click or block tap)
+// is remembered so closeBlockSettings can return focus to it. `focusSel`
+// (only passed by this function's own post-pick refresh calls below) is a
+// selector for the option to refocus after the body is rebuilt (#5d); a
+// fresh open (no focusSel) focuses the close button (#5b) instead.
+function openBlockSettings(p, block, opener, focusSel) {
+  if (opener) BLOCK_SETTINGS_OPENER = opener;
+  const body = document.getElementById("block-settings-body");
+  body.textContent = "";
+  // Size (all blocks)
+  body.append(settingsGroup("Size",
+    [["small","Small"],["wide","Wide"],["full","Full"]], p.size || "full",
+    async (v) => {
+      if (await postJSON("/api/block-size", {msg_id: p.msg_id, size: v})) {
+        p.size = v;
+        block.classList.remove("size-small","size-wide","size-full");
+        block.classList.add("size-" + v);            // apply in place (keep pending order)
+        // refresh the highlighted option, refocusing the picked size (#5d)
+        openBlockSettings(p, block, null, '[data-group="size"] .settings-opt.on');
+      }
+    }, "size"));
+  // Photo grid (multi-photo blocks only)
+  if (p.media !== "video" && p.blobs && p.blobs.length > 1) {
+    body.append(settingsGroup("Photo layout",
+      [["auto","Auto"],["cols2","2 cols"],["cols3","3 cols"],["hero","Hero"],["masonry","Masonry"]],
+      p.grid || "auto",
+      async (v) => {
+        if (await postJSON("/api/block-grid", {msg_id: p.msg_id, grid: v})) {
+          p.grid = v;
+          const media = block.querySelector(".block-photo,.block-gallery,"
+            + ".block-grid-2,.block-grid-3,.block-hero,.block-masonry");
+          if (media) media.className = photoGridClass(p.grid, p.blobs.length);
+          // refresh the highlighted option, refocusing the picked grid (#5d)
+          openBlockSettings(p, block, null, '[data-group="grid"] .settings-opt.on');
+        }
+      }, "grid"));
+  }
+  // Move (keyboard/touch-accessible reorder; DOM-only until Done, like Up/Down
+  // was). The modal shows one block at a time, so end-of-list disabling is
+  // just this pair's own sibling check - refreshed after each move, no
+  // page-wide bookkeeping needed (the old updateArrowStates() this replaced
+  // queried per-block arrow-button elements that no longer exist).
+  const move = el("div", "settings-group");
+  move.append(el("div", "settings-label", "Move"));
+  const row = el("div", "settings-row");
+  const up = el("button", "settings-opt", "Up"); up.type = "button";
+  const down = el("button", "settings-opt", "Down"); down.type = "button";
+  const refreshMoveState = () => {
+    up.disabled = !block.previousElementSibling;
+    down.disabled = !block.nextElementSibling;
+  };
+  // Disabling the focused button blurs it to <body> (outside the modal),
+  // silently breaking the Tab trap below - so if a move just disabled the
+  // button the user is on, hop focus to its still-enabled sibling.
+  up.onclick = () => { const prev = block.previousElementSibling;
+    if (prev) { block.parentNode.insertBefore(block, prev); refreshMoveState();
+      if (up.disabled) down.focus(); } };
+  down.onclick = () => { const next = block.nextElementSibling;
+    if (next) { block.parentNode.insertBefore(next, block); refreshMoveState();
+      if (down.disabled) up.focus(); } };
+  refreshMoveState();
+  row.append(up, down); move.append(row); body.append(move);
+  document.getElementById("block-settings").classList.remove("hidden");
+  // IMPORTANT #5(b)/(d): move focus into the dialog. A fresh open (no
+  // focusSel) goes to the close button; a post-pick rebuild (focusSel set)
+  // goes back to the option just picked, falling back to the close button
+  // if that selector doesn't resolve for some reason.
+  const closeBtn = document.getElementById("block-settings-close");
+  const target = (focusSel && body.querySelector(focusSel)) || closeBtn;
+  target.focus();
+}
+document.getElementById("block-settings-close").onclick = closeBlockSettings;
+document.getElementById("block-settings").addEventListener("click", (ev) => {
+  if (ev.target.id === "block-settings") closeBlockSettings();   // backdrop
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") closeBlockSettings();
+});
+// IMPORTANT #5(c): trap Tab within the card while the modal is open. Scoped
+// naturally - this only fires when the Tab keydown bubbles up from a
+// focused descendant of #block-settings, which can't happen while it's
+// hidden (nothing inside it can hold focus).
+document.getElementById("block-settings").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Tab") return;
+  const card = document.querySelector("#block-settings .block-settings-card");
+  if (!card) return;
+  const focusables = [...card.querySelectorAll(
+    'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
+  )];
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  if (ev.shiftKey && document.activeElement === first) {
+    ev.preventDefault(); last.focus();
+  } else if (!ev.shiftKey && document.activeElement === last) {
+    ev.preventDefault(); first.focus();
+  }
+});
+
+function endState() {
+  const wrap = el("div", "theend");
+  wrap.innerHTML = MARK_SVG;
+  wrap.append(
+    el("div", "endtitle", "That's everything."),
+    el("div", "endsub",
+      "Your kreds is quiet. No algorithm, nothing more to scroll."));
+  return wrap;
+}
+
+function filteredFeed() {
+  if (ACTIVE_FILTER === "all") return FEED;
+  if (ACTIVE_FILTER === "inner")
+    return FEED.filter(p => p.scope === "inner");
+  return FEED.filter(p => p.identity_pub === ACTIVE_FILTER);
+}
+
+function renderJournal() {
+  const root = document.getElementById("journal");
+  root.replaceChildren();
+  for (const day of groupByDay(filteredFeed())) {
+    root.append(el("div", "dayhead", dayLabel(day.date)));
+    for (const p of day.rows) root.append(buildEntry(p));
+  }
+  root.append(endState());
+}
+
+// ---------------------------------------------------------------------
+// Chip bar (Everyone / Inner kreds / per-person, from /api/kreds)
+// ---------------------------------------------------------------------
+
+function renderChipbar() {
+  const bar = document.getElementById("chipbar");
+  bar.replaceChildren();
+  const mkPlain = (label, filter) => {
+    const b = el("button",
+      "fchip plain" + (ACTIVE_FILTER === filter ? " active" : ""), label);
+    b.dataset.filter = filter;
+    return b;
+  };
+  bar.append(mkPlain("Everyone", "all"), mkPlain("Inner kreds", "inner"));
+  for (const k of KREDS) {
+    const chip = el("button",
+      "fchip" + (ACTIVE_FILTER === k.identity_pub ? " active" : ""));
+    chip.dataset.filter = k.identity_pub;
+    const cav = el("span", "cav", (k.name || "?").slice(0, 1).toUpperCase());
+    cav.style.background = identityColor(k.identity_pub);
+    chip.append(cav, document.createTextNode(k.name));
+    if (isFresh(k.identity_pub)) chip.append(el("span", "fdot"));
+    bar.append(chip);
+  }
+  bar.querySelectorAll(".fchip").forEach(c => c.onclick = () => {
+    ACTIVE_FILTER = c.dataset.filter;
+    if (ACTIVE_FILTER !== "all" && ACTIVE_FILTER !== "inner")
+      markOpenedNow(ACTIVE_FILTER);
+    renderChipbar();
+    renderJournal();
+    renderCircleRail();   // clear the fresh dot for the person just opened
+  });
+}
+
+// ---------------------------------------------------------------------
+// Circle: radial map built from /api/kreds. Ported markup/CSS: docs/
+// design/kreds_design_v3.html's .rail/.minimap/.ringguide/.mm-node
+// (compact rail) and .overlay/.node/.younode/.ringlabel (full map).
+//
+// buildCircle() is the one place the SVG geometry is computed, shared by
+// the compact rail and the full overlay: you at the center, inner-ring
+// kreds on the inner radius, kreds-ring kreds on the outer radius, spread
+// evenly by angle within each ring. Both callers pass live KREDS/FEED
+// data - no invented people, no server-side layout.
+//
+// Freshness dot: honesty guard - it is computed ONLY from lastOpened()
+// (localStorage, see above) vs this friend's FEED post times. There is no
+// server "unread" field.
+// ---------------------------------------------------------------------
+
+const SVGNS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs) {
+  const e = document.createElementNS(SVGNS, tag);
+  if (attrs) for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+function meInitial() {
+  return ((STATE && STATE.profile_name) || "?").slice(0, 1).toUpperCase();
+}
+
+function isFresh(identityPub) {
+  const latest = FEED.filter(p => p.identity_pub === identityPub)
+    .reduce((m, p) => Math.max(m, p.created_at), 0);
+  return latest > lastOpened(identityPub);
+}
+
+// Evenly distributes `items` by angle around (cx, cy) at radius `r`,
+// starting just off the top and going clockwise. Not dead-center top: the
+// ring label ("inner kreds" / "kreds") sits there, and with few members
+// (e.g. exactly one) an even split from -90 would land a node right on
+// top of that label.
+function placeRing(items, cx, cy, r) {
+  const n = items.length;
+  return items.map((k, i) => {
+    const angle = (-50 + (360 / n) * i) * Math.PI / 180;
+    return {k, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle)};
+  });
+}
+
+// Renders the radial map into `svg` (an <svg> element, cleared first).
+// `big` selects the full-overlay markup (.node/.younode/.ringlabel, with
+// name labels and keyboard-focusable nodes) vs the compact rail's
+// .mm-node/.mm-you markup (smaller, no labels).
+function buildCircle(svg, kreds, opts) {
+  const {size, innerR, outerR, youR, nodeR, big} = opts;
+  svg.setAttribute("viewBox", "0 0 " + size + " " + size);
+  svg.replaceChildren();
+  const cx = size / 2, cy = size / 2;
+  svg.append(
+    svgEl("circle", {class: "ringguide", cx, cy, r: innerR}),
+    svgEl("circle", {class: "ringguide", cx, cy, r: outerR}));
+  if (big) {
+    const inLbl = svgEl("text",
+      {class: "ringlabel", x: cx, y: cy - innerR - 9, "text-anchor": "middle"});
+    inLbl.textContent = "inner kreds";
+    const outLbl = svgEl("text",
+      {class: "ringlabel", x: cx, y: cy - outerR - 9, "text-anchor": "middle"});
+    outLbl.textContent = "kreds";
+    svg.append(inLbl, outLbl);
+  }
+  if (big) {
+    const g = svgEl("g", {class: "younode"});
+    const t = svgEl("text", {x: cx, y: cy + 1});
+    t.textContent = meInitial();
+    g.append(svgEl("circle", {cx, cy, r: youR}), t);
+    svg.append(g);
+  } else {
+    const t = svgEl("text", {class: "mm-youtext", x: cx, y: cy + 0.5});
+    t.textContent = meInitial();
+    svg.append(svgEl("circle", {class: "mm-you", cx, cy, r: youR}), t);
+  }
+  const inner = kreds.filter(k => k.ring === "inner");
+  const outer = kreds.filter(k => k.ring !== "inner");
+  const placed = placeRing(inner, cx, cy, innerR).concat(placeRing(outer, cx, cy, outerR));
+  for (const {k, x, y} of placed) {
+    const color = identityColor(k.identity_pub);
+    const initial = (k.name || "?").slice(0, 1).toUpperCase();
+    const g = svgEl("g", {class: big ? "node" : "mm-node", "data-open": k.identity_pub});
+    if (big) {
+      g.tabIndex = 0;
+      g.setAttribute("role", "button");
+      g.setAttribute("aria-label", k.name);
+    }
+    const circle = svgEl("circle", big
+      ? {class: "face", cx: x, cy: y, r: nodeR, fill: color}
+      : {cx: x, cy: y, r: nodeR, fill: color});
+    const text = svgEl("text", big
+      ? {class: "init", x, y: y + 0.5}
+      : {x, y: y + 0.5});
+    text.textContent = initial;
+    g.append(circle, text);
+    if (isFresh(k.identity_pub))
+      g.append(svgEl("circle",
+        {class: "fresh", cx: x + nodeR * 0.75, cy: y - nodeR * 0.75, r: big ? 5 : 3.4}));
+    if (big) {
+      const label = svgEl("text", {class: "nlabel", x, y: y + nodeR + 16});
+      label.textContent = k.name;
+      g.append(label);
+    }
+    svg.append(g);
+  }
+}
+
+function renderCircleRail() {
+  const rail = document.getElementById("circle-rail");
+  if (!rail) return;
+  rail.replaceChildren();
+
+  const title = el("div", "railtitle", "Your kreds · " + KREDS.length + " ");
+  const expand = el("button", "expandbtn", "Expand ↗");
+  expand.type = "button";
+  expand.onclick = openCircleOverlay;
+  title.append(expand);
+
+  const mini = el("div", "minimap");
+  mini.tabIndex = 0;
+  mini.setAttribute("role", "button");
+  mini.setAttribute("aria-label", "Open the circle");
+  const svg = svgEl("svg", {viewBox: "0 0 200 200", "aria-hidden": "true"});
+  buildCircle(svg, KREDS, {size: 200, innerR: 44, outerR: 78, youR: 13, nodeR: 11, big: false});
+  mini.append(svg);
+  // A click on a person node opens their profile; a click anywhere else on
+  // the minimap (or the Expand button) opens the full overlay.
+  mini.addEventListener("click", (ev) => {
+    const node = ev.target.closest("[data-open]");
+    if (node) openProfile(node.getAttribute("data-open"));
+    else openCircleOverlay();
+  });
+  mini.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openCircleOverlay(); }
+  });
+
+  const freshCount = KREDS.filter(k => isFresh(k.identity_pub)).length;
+  const note = el("p", "railnote");
+  if (!KREDS.length) {
+    note.textContent = "Add a friend in Me to start your circle.";
+  } else if (freshCount > 0) {
+    note.append(el("b", "", freshCount + " new"), document.createTextNode(
+      " since you last looked. Click the circle to expand — click a " +
+      "person anywhere to open their profile."));
+  } else {
+    note.textContent = "Click the circle to expand — click a person " +
+      "anywhere to open their profile.";
+  }
+
+  rail.append(title, mini, note);
+}
+
+function openCircleOverlay() {
+  const svg = document.getElementById("circle-overlay-svg");
+  buildCircle(svg, KREDS, {size: 440, innerR: 92, outerR: 170, youR: 24, nodeR: 21, big: true});
+  document.getElementById("circle-overlay").classList.add("open");
+}
+function closeCircleOverlay() {
+  document.getElementById("circle-overlay").classList.remove("open");
+}
+
+document.getElementById("circle-overlay-svg").addEventListener("click", (ev) => {
+  const node = ev.target.closest("[data-open]");
+  if (node) openProfile(node.getAttribute("data-open"));
+});
+document.getElementById("circle-overlay-svg").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const node = ev.target.closest("[data-open]");
+  if (node) { ev.preventDefault(); openProfile(node.getAttribute("data-open")); }
+});
+document.getElementById("close-overlay").onclick = closeCircleOverlay;
+document.getElementById("circle-overlay").addEventListener("click", (ev) => {
+  if (ev.target.id === "circle-overlay") closeCircleOverlay();
+});
+
+// ---------------------------------------------------------------------
+// People: profile PAGE (identity-color banner, bio, ring status,
+// Message + move-between-rings, scope-filtered posts). Every "open this
+// person" click site in this file (journal avatar/name, friend rows in
+// Me, circle map nodes) calls openProfile, which navigates to the
+// #view-profile page - not a modal.
+//
+// Honesty guard: no "who holds this post" receipts popover here or
+// anywhere else - Wall/Journal render only what the server already
+// decrypt-filtered into p.wall / p.journal.
+// ---------------------------------------------------------------------
+
+function currentView() {
+  // The mobile "Circle" tab is the journal view with a .show-circle modifier,
+  // not its own container - report it as "circle" so Back restores it.
+  const vj = document.getElementById("view-journal");
+  if (!vj.classList.contains("hidden") && vj.classList.contains("show-circle"))
+    return "circle";
+  for (const v of ["journal", "messages", "profile"])
+    if (!document.getElementById("view-" + v).classList.contains("hidden")) return v;
+  return "journal";
+}
+
+async function openProfile(identityPub) {
+  // Leaving a profile (or opening someone else's) exits Arrange mode. Compared
+  // against the OLD CURRENT_PROFILE, before it's overwritten below - the
+  // Arrange button's own handler re-renders the SAME profile on purpose
+  // (ARRANGING = true; openProfile(CURRENT_PROFILE)) and must not have that
+  // undone by this reset.
+  if (identityPub !== CURRENT_PROFILE) ARRANGING = false;
+  const from = currentView();
+  if (from !== "profile") PRIOR_VIEW = from;   // where Back returns
+  CURRENT_PROFILE = identityPub;
+  // A person can be opened from the expanded circle overlay, which is an
+  // absolute layer inside #app; close it so the profile page isn't hidden
+  // behind it (the old modal escaped #app's stacking context; the page does
+  // not).
+  closeCircleOverlay();
+  let p;
+  try {
+    p = await j("/api/profile/" + identityPub);
+  } catch (e) {
+    // Known friend, no synced profile record yet (e.g. freshly added) ->
+    // /api/profile 404s. Show a minimal fallback (always a non-self profile)
+    // instead of leaving the click silently do nothing.
+    p = fallbackProfile(identityPub);
+  }
+  renderProfilePage(p);
+  setView("profile");
+  applyProfileNav(p.mine);   // runs on BOTH the loaded and fallback paths
+}
+
+// Your own profile keeps the "Me" nav context (desktop nav + mobile tab);
+// anyone else's profile shows no active tab (Back is the way back). Called
+// after setView("profile") so it isn't clobbered by setView clearing navlinks.
+function applyProfileNav(mine) {
+  const meTab = document.querySelector('.navlinks button[data-view="me"]');
+  if (meTab) meTab.classList.toggle("active", !!mine);
+  document.querySelectorAll(".tabbar-mobile button").forEach(b =>
+    b.classList.toggle("active", !!mine && b.dataset.tab === "me"));
+}
+
+// Minimal fallback for when /api/profile 404s (see openProfile's catch
+// above). Uses only client-known data: the friend/kreds name (or the
+// identity's short fingerprint), the deterministic identity color, and a
+// Message action - no bio, ring status, or posts to show.
+function fallbackProfile(identityPub) {
+  const disc = disconnectedInfo(identityPub);
+  if (disc) {
+    // No longer a known identity server-side (unfriended, either side) -
+    // an inert profile: no bio/ring/posts/Message, just the marker.
+    return {identity_pub: identityPub, name: disc.name, bio: "", mine: false,
+            avatar: null, banner: null, avatar_shape: "circle",
+            avatar_size: "m", avatar_align: "left", ring: null, since: null,
+            wall: [], journal: [], disconnected: true};
+  }
+  const known = (STATE && STATE.friends || []).find(f => f.identity_pub === identityPub)
+    || KREDS.find(k => k.identity_pub === identityPub);
+  return {identity_pub: identityPub, name: (known && known.name) || identityPub.slice(0, 8),
+          bio: "", mine: false, avatar: null, banner: null,
+          avatar_shape: "circle", avatar_size: "m", avatar_align: "left",
+          ring: null, since: null, wall: [], journal: [], unavailable: true};
+}
+
+function renderProfilePage(p) {
+  const color = p.accent || identityColor(p.identity_pub);   // owner's chosen accent for all viewers
+  const page = document.getElementById("profile-page");
+  page.style.setProperty("--pcolor", color);
+
+  const banner = document.getElementById("profile-banner");
+  banner.style.backgroundImage = p.banner ? `url(/api/blob/${p.banner})` : "";
+
+  const head = document.getElementById("profile-head");
+  head.className = "profile-head align-" + (p.avatar_align || "left");
+  const av = document.getElementById("profile-avatar");
+  av.className = "profile-avatar " + (p.avatar_shape || "circle") + " " + (p.avatar_size || "m");
+  av.style.background = color;
+  av.replaceChildren();
+  if (p.avatar) { const img = document.createElement("img");
+    img.src = "/api/blob/" + p.avatar; av.append(img); }
+  else av.append(document.createTextNode((p.name || "?").slice(0, 1).toUpperCase()));
+
+  document.getElementById("profile-name-view").textContent = p.name;
+  document.getElementById("profile-hash").textContent =
+    "identity " + p.identity_pub.slice(0, 8) + "…";
+  document.getElementById("profile-bio").textContent = p.bio || "";
+
+  // Cogwheel: self-only entry into the editor overlay. Header/bio above
+  // render identically for self and others (see comment above); the only
+  // self-specific chrome is this button, not an inline dump.
+  const cog = document.getElementById("profile-cog");
+  cog.classList.toggle("hidden", !p.mine);
+  cog.onclick = p.mine ? () => openProfileEditor(p) : null;
+
+  // Arrange/Done toggle: self-only, its click handler is wired once at load
+  // (see below) and reads CURRENT_PROFILE - this just reflects state.
+  const arrangeBtn = document.getElementById("profile-arrange");
+  arrangeBtn.textContent = ARRANGING ? "Done" : "Arrange";
+  arrangeBtn.classList.toggle("hidden", !p.mine);
+
+  // Right column: the Journal rail shows on EVERY profile; Friends/Devices
+  // panels are self-only. The Back button still hides on your own profile.
+  document.getElementById("profile-back").classList.toggle("hidden", !!p.mine);
+  document.getElementById("profile-layout").classList.add("has-side");   // always two-col on desktop
+  document.querySelectorAll("#profile-side .selfonly").forEach(el2 =>
+    el2.classList.toggle("hidden", !p.mine));
+  if (p.mine) renderMeStrip();     // fills #friends / #devices / #ceremony
+
+  const meta = document.getElementById("profile-meta");
+  const acts = document.getElementById("profile-actions");
+  meta.replaceChildren(); acts.replaceChildren();
+
+  if (p.disconnected) {
+    // Unfriended (either side) - an inert marker, no actions: Message is
+    // disabled since there's no one left to message on this identity.
+    meta.append(el("div", "profile-ring disconnected", "no longer connected"));
+  } else if (p.unavailable) {
+    meta.append(el("div", "hint", "Profile unavailable yet."));
+    const msg = el("button", "btn-accent", "Message");
+    msg.onclick = () => { goView("messages"); openThread(p.identity_pub, p.name); };
+    acts.append(msg);
+  } else if (!p.mine) {
+    const ringLabel = p.ring === "inner" ? "Inner kreds" : "Kreds";
+    const since = p.since ? new Date(p.since * 1000)
+      .toLocaleDateString(undefined, {month: "long", year: "numeric"}) : "";
+    const ring = el("div", "profile-ring", ringLabel + (since ? " · since " + since : ""));
+    meta.append(ring);
+    const msg = el("button", "btn-accent", "Message");
+    msg.onclick = () => { goView("messages"); openThread(p.identity_pub, p.name); };
+    const move = el("button", "", p.ring === "inner" ? "Move to kreds" : "Move to inner kreds");
+    move.onclick = async () => {
+      const next = p.ring === "inner" ? "kreds" : "inner";
+      await j("/api/ring", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({identity_pub: p.identity_pub, ring: next})});
+      await refresh();
+      openProfile(p.identity_pub);
+    };
+    const unfriendBtn = el("button", "btn-danger", "Unfriend");
+    unfriendBtn.onclick = async () => {
+      if (!confirm(unfriendConfirm(p.name))) return;
+      await j("/api/unfriend", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({identity_pub: p.identity_pub})});
+      goView(PRIOR_VIEW);
+      await refresh();
+    };
+    acts.append(msg, move, unfriendBtn);
+  }
+  // p.mine falls through with no meta/acts row: editing now lives behind
+  // the cogwheel overlay, not an inline dump here.
+
+  // Wall composer: self-only, posts with placement=profile.
+  const compose = document.getElementById("profile-wall-compose");
+  compose.replaceChildren();
+  if (p.mine) compose.append(profilePostComposer());
+
+  const wall = document.getElementById("profile-wall");
+  wall.replaceChildren();
+  if (!p.wall.length) wall.append(el("div", "hint",
+    p.mine ? "Your profile is a blank canvas - post something above." : "Nothing here yet."));
+  for (const post of p.wall) wall.append(renderBlock(post));
+
+  const rail = document.getElementById("profile-journal-rail");
+  rail.replaceChildren();
+  // Reset the mobile disclosure per profile so B's rail isn't pre-expanded
+  // just because A's was opened.
+  rail.classList.remove("open");
+  document.getElementById("profile-journal-toggle").setAttribute("aria-expanded", "false");
+  if (!p.journal.length) rail.append(el("div", "hint", "No journal posts here."));
+  for (const post of p.journal) rail.append(buildEntry(post));
+}
+
+// Cogwheel editor overlay (self only): reuses the existing profileEditor()
+// form, just re-homed from an inline #profile-actions dump into a modal
+// layer so self and others render the same profile page underneath.
+function openProfileEditor(p) {
+  const wrap = document.getElementById("profile-edit-wrap");
+  wrap.replaceChildren(profileEditor(p));
+  document.getElementById("profile-edit-overlay").classList.remove("hidden");
+}
+function closeEditOverlay() {
+  document.getElementById("profile-edit-overlay").classList.add("hidden");
+}
+document.getElementById("profile-edit-overlay").addEventListener("click", (ev) => {
+  if (ev.target.id === "profile-edit-overlay") closeEditOverlay();
+});
+
+// Wall composer (self only): same keeps-button (inner/kreds) pattern as the
+// journal composer in index.html, but built in JS since this composer only
+// exists on the self profile page, and posts with placement=profile.
+function profilePostComposer() {
+  const form = el("form", "composer profile-composer");
+  const input = document.createElement("input");
+  input.type = "text"; input.autocomplete = "off";
+  input.placeholder = "Post to your profile…";
+  form.append(input);
+
+  const bar = el("div", "composerbar");
+  bar.append(el("span", "keeps-label", "keeps"));
+  let scope = "kreds";                              // default kreds, per spec
+  const keepBtns = [];
+  for (const [val, label] of [["inner", "Inner"], ["kreds", "Kreds"]]) {
+    const b = el("button", "keep" + (val === scope ? " active" : ""));
+    b.type = "button";
+    b.innerHTML = SCOPE_ICON[val] + "<span>" + label + "</span>";
+    b.onclick = () => {
+      scope = val;
+      keepBtns.forEach(x => x.classList.remove("active"));
+      b.classList.add("active");
+    };
+    keepBtns.push(b);
+    bar.append(b);
+  }
+  form.append(el("div", "composer-note",
+    "Inner posts reach only your Inner kreds. Moving someone into a ring reveals only future posts."));
+  const photoLabel = el("label", "keep");
+  photoLabel.textContent = "Photo";
+  const photoInput = document.createElement("input");
+  photoInput.type = "file"; photoInput.accept = "image/*"; photoInput.multiple = true;
+  photoInput.className = "visually-hidden";   // keyboard-reachable (not display:none)
+  photoLabel.append(photoInput);
+  bar.append(photoLabel);
+  // Layout picker: only meaningful once 2+ photos are attached, so it stays
+  // hidden until the photo input says so.
+  const gridSelect = document.createElement("select");
+  // Task 3 renamed this class: the old identifier is now specifically the
+  // removed arrange-mode inline picker's - this is the unrelated compose-time
+  // layout preselect, kept as its own distinct class.
+  gridSelect.className = "layout-pick"; gridSelect.setAttribute("aria-label", "Photo layout");
+  gridSelect.hidden = true;
+  for (const [v, label] of [["auto","Auto"],["cols2","2 columns"],
+      ["cols3","3 columns"],["hero","Hero"],["masonry","Masonry"]]) {
+    const o = document.createElement("option"); o.value = v; o.textContent = label;
+    gridSelect.append(o);
+  }
+  bar.append(gridSelect);
+  // Video attach: one medium per block, video wins. Picking a video clears
+  // any chosen photos (and hides the now-meaningless grid picker); picking
+  // photos clears a previously-chosen video. The cue makes the winner explicit.
+  const videoLabel = el("label", "keep");
+  videoLabel.textContent = "Video";
+  const videoInput = document.createElement("input");
+  videoInput.type = "file"; videoInput.accept="video/*";
+  videoInput.className = "visually-hidden";   // keyboard-reachable (not display:none)
+  videoLabel.append(videoInput);
+  bar.append(videoLabel);
+  const videoCue = el("span", "video-cue");
+  videoCue.hidden = true;
+  bar.append(videoCue);
+  photoInput.onchange = () => {
+    gridSelect.hidden = photoInput.files.length < 2;
+    if (photoInput.files.length) { videoInput.value = ""; videoCue.hidden = true; }
+  };
+  videoInput.onchange = () => {
+    const f = videoInput.files[0];
+    if (!f) { videoCue.hidden = true; return; }
+    videoCue.textContent = "video attached: " + f.name;
+    videoCue.hidden = false;
+    photoInput.value = ""; gridSelect.hidden = true;
+  };
+  const btn = el("button", "postbtn", "Post to profile"); btn.type = "submit";
+  bar.append(btn);
+  form.append(bar);
+
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const fd = new FormData();
+    fd.append("text", input.value);
+    fd.append("scope", scope);
+    fd.append("placement", "profile");
+    const videoFile = videoInput.files[0];
+    if (videoFile) fd.append("video", videoFile);
+    else for (const f of photoInput.files) fd.append("photos", f);
+    const r = await fetch("/api/post", {method: "POST", body: fd});
+    if (!r.ok) { alert("Post failed: " + await r.text()); return; }
+    const { msg_id } = await r.json();
+    if (!videoFile && gridSelect.value !== "auto") {   // grid seed only applies to photos
+      const gr = await fetch("/api/block-grid", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({msg_id, grid: gridSelect.value})});
+      if (!gr.ok) alert("Posted, but couldn't set the layout: " + await gr.text());
+    }
+    input.value = "";
+    photoInput.value = "";
+    videoInput.value = ""; videoCue.hidden = true;
+    gridSelect.value = "auto"; gridSelect.hidden = true;
+    openProfile(STATE.identity_pub);                // re-render the wall
+  };
+  return form;
+}
+
+document.getElementById("profile-back").onclick = () => goView(PRIOR_VIEW);
+// Arrange/Done toggle (self-only Wall canvas reordering): wired once here,
+// like the other topbar handlers - it reads CURRENT_PROFILE to know which
+// profile to re-render/publish against, rather than being rebound per render.
+document.getElementById("profile-arrange").onclick = async () => {
+  if (ARRANGING) {
+    // Publish the current DOM order. Only leave arrange mode on success -
+    // on a failed POST, keep ARRANGING + the DOM order so the user's work
+    // survives for a retry instead of being silently discarded.
+    const order = [...document.getElementById("profile-wall").children]
+      .map(b => b.dataset.msgId).filter(Boolean);
+    const r = await fetch("/api/profile-layout", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({order})});
+    if (!r.ok) { alert("Couldn't save the arrangement: " + await r.text()); return; }
+    ARRANGING = false;
+    await refresh();
+    if (CURRENT_PROFILE) await openProfile(CURRENT_PROFILE);
+  } else {
+    ARRANGING = true;
+    if (CURRENT_PROFILE) await openProfile(CURRENT_PROFILE);   // re-render with controls
+  }
+};
+// Mobile journal disclosure: the rail is always open on desktop (CSS hides
+// the toggle there); on narrow screens it starts collapsed behind this button.
+document.getElementById("profile-journal-toggle").onclick = () => {
+  const rail = document.getElementById("profile-journal-rail");
+  const btn = document.getElementById("profile-journal-toggle");
+  const open = rail.classList.toggle("open");
+  btn.setAttribute("aria-expanded", String(open));
+};
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") { closeCircleOverlay(); closeEditOverlay(); }
+});
+
+// ---------------------------------------------------------------------
+// Stories (unchanged behavior, re-homed into the journal view)
+// ---------------------------------------------------------------------
+
+function seenSet() {
+  try { return new Set(JSON.parse(localStorage.getItem("kreds_seen") || "[]")); }
+  catch (e) { return new Set(); }
+}
+function markSeen(ids) {
+  const s = seenSet(); ids.forEach(i => s.add(i));
+  localStorage.setItem("kreds_seen", JSON.stringify([...s]));
+}
+
+async function renderStories() {
+  let strip = document.getElementById("stories");
+  if (!strip) {
+    strip = el("div"); strip.id = "stories";
+    const journal = document.querySelector("#view-journal .journal");
+    journal.insertBefore(strip, journal.firstChild);
+  }
+  const groups = await j("/api/stories");
+  const liveIds = new Set(groups.flatMap(g => g.items.map(i => i.msg_id)));
+  const pruned = [...seenSet()].filter(id => liveIds.has(id));
+  localStorage.setItem("kreds_seen", JSON.stringify(pruned));
+  const seen = seenSet();
+  strip.replaceChildren();
+  // own "add" tile always first
+  const me = groups.find(g => g.mine);
+  const addTile = el("div", "story-tile");
+  const addRing = el("div", "story-ring add");
+  addRing.textContent = "+";
+  const addInput = document.createElement("input");
+  addInput.type = "file"; addInput.accept = "image/*,video/*";
+  addInput.style.display = "none";
+  const addName = el("div", "story-name", "Your story");
+  addInput.onchange = async () => {
+    if (!addInput.files[0]) return;
+    const isVideo = !addInput.files[0].type.startsWith("image/");
+    addRing.classList.add("busy");
+    addRing.textContent = "";
+    addName.textContent = isVideo ? "Processing video..." : "Uploading...";
+    const fd = new FormData(); fd.append("media", addInput.files[0]);
+    fd.append("caption", "");
+    try {
+      const r = await fetch("/api/story", {method: "POST", body: fd});
+      if (r.ok) { renderStories(); return; }
+      const body = await r.text();
+      if (r.status === 400 && /longer than 15/i.test(body))
+        alert("That video is longer than 15 seconds. In-app trimming is "
+          + "coming soon - for now, please shorten it to 15s or less.");
+      else if (r.status === 413)
+        alert("That file is too large (5 MB max for now).");
+      else alert("Could not post story: " + body);
+    } catch (e) {
+      alert("Could not post story: " + e.message);
+    }
+    addInput.value = "";
+    renderStories();
+  };
+  addRing.onclick = () => addInput.click();
+  addTile.append(addRing, addInput, addName);
+  strip.append(addTile);
+  for (const g of groups) {
+    if (g.mine && (!me || !me.items.length)) continue;
+    const unseen = !g.mine && g.items.some(i => !seen.has(i.msg_id));
+    const tile = el("div", "story-tile");
+    const ring = el("div", "story-ring" + (unseen ? " unseen" : ""));
+    if (g.avatar) { const im = document.createElement("img");
+      im.src = "/api/blob/" + g.avatar; ring.append(im); }
+    else ring.textContent = (g.name || "?").slice(0, 1).toUpperCase();
+    ring.onclick = () => openStoryViewer(groups, g.identity_pub);
+    tile.append(ring, el("div", "story-name", g.mine ? "You" : g.name));
+    strip.append(tile);
+  }
+}
+
+function openStoryViewer(groups, startIdentity) {
+  const flat = [];
+  for (const g of groups)
+    for (const it of g.items) flat.push({...it, name: g.mine ? "You" : g.name});
+  let idx = flat.findIndex(x =>
+    groups.find(g => g.identity_pub === startIdentity).items
+      .some(i => i.msg_id === x.msg_id));
+  if (idx < 0) idx = 0;
+  const ov = el("div"); ov.id = "story-viewer";
+  let timer = null;
+  function show() {
+    if (idx < 0 || idx >= flat.length) { close(); return; }
+    const it = flat[idx];
+    markSeen([it.msg_id]);
+    ov.replaceChildren();
+    const bar = el("div", "sv-bars");
+    flat.forEach((_, i) => bar.append(
+      el("div", "sv-bar" + (i < idx ? " done" : i === idx ? " active" : ""))));
+    const media = el("div", "sv-media");
+    if (it.media_kind === "video") {
+      const v = document.createElement("video");
+      v.src = "/api/blob/" + it.media; v.autoplay = true; v.muted = true;
+      v.playsInline = true; v.onended = next; v.onerror = next; media.append(v);
+      v.onclick = () => { v.muted = !v.muted; };
+    } else {
+      const im = document.createElement("img"); im.src = "/api/blob/" + it.media;
+      media.append(im); clearTimeout(timer); timer = setTimeout(next, 5000);
+    }
+    const cap = it.caption ? el("div", "sv-cap", it.caption) : null;
+    const who = el("div", "sv-who", it.name);
+    const x = el("div", "sv-close", "×"); x.onclick = close;
+    const L = el("div", "sv-nav sv-left"); L.onclick = prev;
+    const R = el("div", "sv-nav sv-right"); R.onclick = next;
+    ov.append(bar, who, x, media, L, R);
+    if (cap) ov.append(cap);
+  }
+  function next() { clearTimeout(timer); idx++; show(); }
+  function prev() { clearTimeout(timer); idx = Math.max(0, idx - 1); show(); }
+  function close() { clearTimeout(timer); ov.remove();
+    document.body.classList.remove("sv-open"); renderStories(); }
+  document.body.append(ov); document.body.classList.add("sv-open");
+  show();
+}
+
+// Fullscreen photo lightbox: click a photo in a profile photo block to enlarge
+// it and swipe/arrow through THAT block's photos (p.blobs). Fit-to-screen, no
+// zoom; clamped at the ends; view-only (own + others). Mirrors #story-viewer.
+function openLightbox(msgId, blobs, index, opener) {
+  if (!blobs || !blobs.length) return;
+  let i = Math.max(0, Math.min(index, blobs.length - 1));
+  opener = opener || document.activeElement;          // restore focus on close (the clicked photo)
+  const ov = el("div"); ov.id = "lightbox";
+  ov.setAttribute("role", "dialog");
+  ov.setAttribute("aria-modal", "true");
+  ov.setAttribute("aria-label", "Photo");
+  const img = document.createElement("img"); img.id = "lightbox-img"; img.alt = "";
+  const prev = el("button", "lb-nav lb-prev", "‹"); prev.type = "button";
+  prev.setAttribute("aria-label", "Previous photo");
+  const next = el("button", "lb-nav lb-next", "›"); next.type = "button";
+  next.setAttribute("aria-label", "Next photo");
+  const count = el("div", "lb-count"); count.id = "lightbox-count";
+  const x = el("button", "lb-close", "×"); x.type = "button";
+  x.setAttribute("aria-label", "Close");
+  ov.append(img, prev, next, count, x);
+
+  function render() {
+    img.src = "/api/post-blob/" + msgId + "/" + blobs[i];
+    count.textContent = (i + 1) + " / " + blobs.length;
+    const multi = blobs.length > 1;
+    prev.style.display = next.style.display = count.style.display = multi ? "" : "none";
+    prev.disabled = i === 0;
+    next.disabled = i === blobs.length - 1;
+  }
+  function go(d) { i = Math.max(0, Math.min(i + d, blobs.length - 1)); render(); }
+  function close() {
+    document.removeEventListener("keydown", onKey);
+    ov.remove(); document.body.classList.remove("lb-open");
+    if (opener && opener.isConnected && opener.focus) opener.focus();
+  }
+  function onKey(e) {
+    if (e.key === "Escape") close();
+    else if (e.key === "ArrowLeft") go(-1);
+    else if (e.key === "ArrowRight") go(1);
+  }
+  prev.onclick = () => go(-1);
+  next.onclick = () => go(1);
+  x.onclick = close;
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });   // backdrop
+  let sx = null;                                                            // touch swipe
+  ov.addEventListener("pointerdown", (e) => { sx = e.clientX; });
+  ov.addEventListener("pointerup", (e) => {
+    if (sx == null) return;
+    const dx = e.clientX - sx; sx = null;
+    if (Math.abs(dx) > 40) go(dx < 0 ? 1 : -1);
+  });
+  document.addEventListener("keydown", onKey);
+  document.body.append(ov); document.body.classList.add("lb-open");
+  render(); x.focus();
+}
+
+// ---------------------------------------------------------------------
+// Chrome (nav whoami + identity strip) + Me strip (friends, devices - now
+// a self-only side strip on the profile page, not its own view; ceremony
+// + profile-editor functions preserved below)
+// ---------------------------------------------------------------------
+
+function renderChrome() {
+  document.getElementById("profile-name").textContent = STATE.profile_name;
+  document.getElementById("device-name").textContent = STATE.device_name;
+  document.getElementById("idstrip-fp").textContent =
+    "identity " + STATE.identity_pub;
+  const n = STATE.devices.length;
+  document.getElementById("idstrip-devcount").textContent =
+    n + (n === 1 ? " device" : " devices");
+}
+
+function renderMeStrip() {
+  if (!STATE) return;
+  const friends = document.getElementById("friends");
+  friends.replaceChildren();
+  if (!STATE.friends.length) friends.append(el("div", "hint",
+    "No friends yet. Exchange codes below - in person."));
+  for (const f of STATE.friends) {
+    const row = el("div", "friend");
+    row.append(el("span", "", f.name),
+               el("span", "dim tiny", f.identity_pub.slice(0, 8)));
+    row.style.cursor = "pointer";
+    row.onclick = () => openProfile(f.identity_pub);
+    friends.append(row);
+  }
+  // People who left (either side unfriended): an inert row, no Message -
+  // just the marker, matching the profile page's disconnected state.
+  for (const d of (STATE.disconnected || [])) {
+    const row = el("div", "friend disconnected");
+    row.append(el("span", "", d.name), el("span", "dim tiny", "no longer connected"));
+    friends.append(row);
+  }
+
+  const devices = document.getElementById("devices");
+  devices.replaceChildren();
+  for (const d of STATE.devices) {
+    const row = el("div", "device" + (d.revoked ? " revoked" : ""));
+    row.append(el("span", "",
+      d.name + (d.this_device ? " (this device)" : "")));
+    if (!d.revoked && !d.this_device) {
+      const btn = el("button", "", "revoke");
+      btn.onclick = async () => {
+        await j("/api/device/revoke", {method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({device_pub: d.device_pub})});
+        refresh();
+      };
+      row.append(btn);
+    }
+    devices.append(row);
+  }
+
+  renderApplockSettings();   // self-only App-lock panel (not awaited - independent of the rest)
+  renderDesktopSettings();   // self-only, desktop-only close-behavior toggle (Task 3)
+  renderUpdateSettings();    // self-only Updates panel (Task 3)
+}
+
+// ---------------------------------------------------------------------
+// First-run onboarding (Task 2): GET /api/bootstrap said
+// initialized:false - this node has no enrolled identity yet (a brand
+// new data dir, or one mid a Connect pairing). Builds Create New Node /
+// Connect to Existing into the static #fr-create-panel / #fr-connect-panel
+// shells (index.html), then drives the bootstrap app's endpoints and
+// polls across the bootstrap->full-node handoff before reloading into the
+// now-running full app. No secret (name, pairing code/package) is ever
+// persisted client-side - each lives only in its input until submitted.
+// ---------------------------------------------------------------------
+
+// The bootstrap->full-app handoff closes the bootstrap uvicorn and starts
+// the full node app on the SAME port (see runner.run_serve) - GET
+// /api/state throws or refuses for a beat mid-handoff, then 200s once the
+// full app is serving. Capped at 40 tries (~20s) so a genuinely stuck
+// handoff doesn't poll forever; statusEl (optional) gets an honest message
+// if it gives up.
+async function pollForFullApp(statusEl) {
+  for (let i = 0; i < 40; i++) {
+    try {
+      const r = await fetch("/api/state");
+      if (r.ok) { location.reload(); return; }
+    } catch (e) { /* mid-handoff: server briefly unreachable - keep polling */ }
+    await new Promise(res => setTimeout(res, 500));
+  }
+  if (statusEl) statusEl.textContent =
+    "Still starting up - this is taking longer than expected. You can leave this page open.";
+}
+
+function renderFirstRun() {
+  // Mirrors renderLockScreen's hide pattern: #app + the mobile tabbar
+  // (which lives outside #app) must be actually hidden, not just covered,
+  // so Tab/AT can't reach controls behind the gate.
+  document.getElementById("app").classList.add("hidden");
+  const tabbar = document.querySelector(".tabbar-mobile");
+  if (tabbar) tabbar.classList.add("hidden");
+  document.getElementById("first-run").classList.remove("hidden");
+
+  // -- Create New Node --
+  const createPanel = document.getElementById("fr-create-panel");
+  createPanel.replaceChildren();
+  const createForm = document.createElement("form");
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.placeholder = "Your name";
+  nameInput.autocomplete = "name";
+  nameInput.required = true;
+  nameInput.setAttribute("aria-label", "Your name");
+  const createBtn = el("button", "btn-accent", "Create");
+  createBtn.type = "submit";
+  const createStatus = el("div", "hint");
+  createForm.append(nameInput, createBtn, createStatus);
+  createForm.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const name = nameInput.value.trim();
+    if (!name) return;
+    nameInput.disabled = true;
+    createBtn.disabled = true;
+    createStatus.textContent = "Setting up...";
+    try {
+      const r = await fetch("/api/bootstrap/create", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({name, device: "desktop"})});
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+      await pollForFullApp(createStatus);
+    } catch (e) {
+      createStatus.textContent = "Could not create node: " + e.message;
+      nameInput.disabled = false;
+      createBtn.disabled = false;
+    }
+  };
+  createPanel.append(createForm);
+
+  // -- Connect to Existing Node --
+  const connectPanel = document.getElementById("fr-connect-panel");
+  connectPanel.replaceChildren();
+  const startBtn = el("button", "btn-accent", "Get pairing code");
+  const connectStatus = el("div", "hint");
+  connectPanel.append(startBtn, connectStatus);
+  startBtn.onclick = async () => {
+    startBtn.disabled = true;
+    try {
+      const r = await fetch("/api/bootstrap/pair-request", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({device: "desktop"})});
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+      const {request} = await r.json();
+      startBtn.remove();
+      connectStatus.textContent = "On your other device: Settings -> add device, "
+        + "paste this, paste the result back below.";
+      const reqField = document.createElement("input");
+      reqField.type = "text";
+      reqField.readOnly = true;
+      reqField.value = request;
+      reqField.setAttribute("aria-label", "Pairing request - copy this to your other device");
+      reqField.onfocus = () => reqField.select();
+      const pkgForm = document.createElement("form");
+      const pkgArea = document.createElement("textarea");
+      pkgArea.rows = 4;
+      pkgArea.placeholder = "Paste the result from your other device here";
+      pkgArea.setAttribute("aria-label", "Pairing package from your other device");
+      const installBtn = el("button", "btn-accent", "Connect");
+      installBtn.type = "submit";
+      const installStatus = el("div", "hint");
+      pkgForm.append(pkgArea, installBtn, installStatus);
+      pkgForm.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const pkg = pkgArea.value.trim();
+        if (!pkg) return;
+        pkgArea.disabled = true;
+        installBtn.disabled = true;
+        installStatus.textContent = "Connecting...";
+        const ir = await fetch("/api/bootstrap/pair-install", {method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({package: pkg})});
+        if (ir.ok) {
+          await pollForFullApp(installStatus);
+        } else {
+          const body = await ir.json().catch(() => ({}));
+          alert("Could not connect: " + (body.detail || ir.statusText));
+          installStatus.textContent = "";
+          pkgArea.disabled = false;
+          installBtn.disabled = false;
+        }
+      };
+      connectPanel.append(reqField, pkgForm);
+      reqField.focus();
+    } catch (e) {
+      connectStatus.textContent = "Could not start pairing: " + e.message;
+      startBtn.disabled = false;
+    }
+  };
+
+  nameInput.focus();   // keyboard-accessible: land in the primary (Create) field on show
+}
+
+// ---------------------------------------------------------------------
+// App-lock (Task 4): lock screen + self-only settings. The node
+// (hearth/node.py) is the sole source of truth for lock state - the
+// client only reflects GET /api/applock and reacts when the node says
+// locked (initial boot, an in-session 423 on any call, or the node's own
+// idle/sleep autolock noticed via the hooks below). The credential itself
+// is NEVER persisted client-side (no localStorage/sessionStorage) - it is
+// read from the input and sent only in the one POST body that needs it.
+// ---------------------------------------------------------------------
+
+const IDLE_OPTIONS = [[0, "Off"], [5, "5 minutes"], [10, "10 minutes"], [15, "15 minutes"]];
+let LOCK_THROTTLE_TIMER = null;     // countdown interval while unlock is throttled
+let APPLOCK_HEARTBEAT_LAST = null;  // wall-clock reference for the sleep-jump heartbeat
+
+async function getApplockStatus() {
+  const r = await fetch("/api/applock");
+  if (!r.ok) return {enabled: false, locked: false, cred_type: null,
+                      settings: {idle_minutes: 0, lock_on_sleep: true}, throttle_wait: 0};
+  return r.json();
+}
+
+function applyThrottle(seconds) {
+  clearInterval(LOCK_THROTTLE_TIMER);
+  LOCK_THROTTLE_TIMER = null;
+  const submit = document.getElementById("lock-submit");
+  const err = document.getElementById("lock-error");
+  let remaining = Math.ceil(seconds || 0);
+  const tick = () => {
+    if (remaining <= 0) {
+      submit.disabled = false;
+      if (LOCK_THROTTLE_TIMER) { clearInterval(LOCK_THROTTLE_TIMER); LOCK_THROTTLE_TIMER = null; }
+      return;
+    }
+    submit.disabled = true;
+    err.textContent = "Too many attempts - try again in " + remaining + "s.";
+    remaining--;
+  };
+  if (remaining > 0) { tick(); LOCK_THROTTLE_TIMER = setInterval(tick, 1000); }
+  else submit.disabled = false;
+}
+
+// Renders/updates the full-screen gate. Safe to call repeatedly (the
+// heartbeat/visibilitychange hooks and the 423 handler all call this) -
+// only resets the input/focus/error on the FIRST show, so a repeated call
+// (e.g. just to refresh the throttle countdown) doesn't yank focus or
+// clobber an in-progress PIN entry.
+function renderLockScreen(status) {
+  const screen = document.getElementById("lock-screen");
+  const wasHidden = screen.classList.contains("hidden");
+  screen.classList.remove("hidden");
+  // The overlay is opaque, but position:fixed does NOT remove #app's
+  // controls from the Tab order or from a screen reader's tree - without
+  // actually hiding #app (+ the mobile tabbar, which lives outside #app),
+  // Tab/AT could still reach the composer/nav behind the gate. Mirrors the
+  // existing revoked-banner treatment in refresh() below.
+  document.getElementById("app").classList.add("hidden");
+  const tabbar = document.querySelector(".tabbar-mobile");
+  if (tabbar) tabbar.classList.add("hidden");
+  // Whole-branch review, IMPORTANT #2: the one-time onboarding wizard
+  // shares #app's z-index and is NOT hidden by the lines above (it lives
+  // outside #app) - if App-lock got enabled at wizard Step A and the node
+  // autolocks (idle/sleep) before the wizard finishes, the wizard would
+  // otherwise paint over this lock screen with dead controls. Hide it too,
+  // and drop its Esc listener (mirrors how renderOnboardingWizard adds it)
+  // so a stray Esc while locked can't reach finishOnboardingWizard.
+  document.getElementById("onboarding-wizard").classList.add("hidden");
+  document.removeEventListener("keydown", onboardingWizardKeydown);
+  const cred = document.getElementById("lock-cred");
+  const isPin = status.cred_type === "pin";
+  document.getElementById("lock-keypad").classList.toggle("hidden", !isPin);
+  cred.inputMode = isPin ? "numeric" : "text";
+  cred.placeholder = isPin ? "PIN" : "Passphrase";
+  cred.setAttribute("aria-label", isPin ? "PIN" : "Passphrase");
+  if (wasHidden) {
+    cred.value = "";
+    document.getElementById("lock-error").textContent = "";
+  }
+  applyThrottle(status.throttle_wait || 0);
+  if (wasHidden) cred.focus();   // focus the field on show (keyboard-accessible)
+}
+
+function hideLockScreen() {
+  document.getElementById("lock-screen").classList.add("hidden");
+  // Restoring #app/.tabbar-mobile here is safe even in the revoked edge
+  // case: bootAfterUnlock()'s refresh() runs right after this and will
+  // re-hide them if STATE.revoked (a revoked node can't have App-lock
+  // enabled anyway - enter_revoked_state deletes applock.json).
+  document.getElementById("app").classList.remove("hidden");
+  const tabbar = document.querySelector(".tabbar-mobile");
+  if (tabbar) tabbar.classList.remove("hidden");
+  clearInterval(LOCK_THROTTLE_TIMER);
+  LOCK_THROTTLE_TIMER = null;
+}
+
+// Re-checks the node and shows the gate if it now says locked - shared by
+// the 423 handler, the visibility hook, and the heartbeat below. Never
+// hides an already-shown gate on its own (only a successful /api/unlock
+// does that) - a stray non-423 response while locked must not race the
+// gate away.
+async function recheckApplock() {
+  const status = await getApplockStatus();
+  if (status.locked) renderLockScreen(status);
+  return status;
+}
+
+// Any fetch getting a 423 means the node considers us locked right now
+// (idle/sleep autolock decided server-side, or another surface locked it)
+// - wrapping window.fetch ONCE here means no individual call site (post,
+// DM send, block-size, etc.) needs its own 423 check.
+(function installApplockGate() {
+  const realFetch = window.fetch.bind(window);
+  window.fetch = async function (...args) {
+    const r = await realFetch(...args);
+    // Not awaited (must not delay returning the response) and not allowed
+    // to become an unhandled rejection if the status re-check itself
+    // fails to reach the node (whole-branch review, minor #10).
+    if (r.status === 423) recheckApplock().catch(() => {});
+    return r;
+  };
+})();
+
+document.getElementById("lock-keypad").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  const cred = document.getElementById("lock-cred");
+  if (btn.id === "lock-backspace") cred.value = cred.value.slice(0, -1);
+  else if (btn.id === "lock-clear") cred.value = "";
+  else if (btn.dataset.digit !== undefined) cred.value += btn.dataset.digit;
+  cred.focus();
+});
+
+document.getElementById("lock-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const cred = document.getElementById("lock-cred");
+  const err = document.getElementById("lock-error");
+  const submit = document.getElementById("lock-submit");
+  const credential = cred.value;
+  if (!credential) { err.textContent = "Enter your credential."; return; }
+  submit.disabled = true;
+  try {
+    const r = await fetch("/api/unlock", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({credential})});
+    const body = await r.json();
+    cred.value = "";
+    if (r.ok) {
+      err.textContent = "";
+      hideLockScreen();
+      await bootAfterUnlock();
+    } else {
+      err.textContent = body.detail === "throttled"
+        ? "Too many attempts - please wait."
+        : "Wrong credential.";
+      applyThrottle(body.throttle_wait || 0);
+      cred.focus();
+    }
+  } catch (e) {
+    err.textContent = "Could not reach the node: " + e.message;
+    submit.disabled = false;
+  }
+};
+
+// Client hooks (node is the source of truth; these only prompt a re-check):
+// (a) tab going to background - so the gate is already correct by the time
+//     the user comes back, instead of flashing stale content first; and
+// (b) a heartbeat that notices the wall clock jumped further than its own
+//     tick could account for - the same "process was asleep" signal the
+//     node's own maybe_autolock uses (hearth/node.py), just client-side so
+//     a backgrounded/suspended TAB (not just the whole process) re-checks.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") recheckApplock().catch(() => {});
+});
+
+function startApplockHeartbeat(intervalMs = 5000) {
+  APPLOCK_HEARTBEAT_LAST = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const gap = now - APPLOCK_HEARTBEAT_LAST;
+    APPLOCK_HEARTBEAT_LAST = now;
+    if (gap > intervalMs + 30000) recheckApplock();
+  }, intervalMs);
+}
+
+// Idle auto-lock's activity signal (whole-branch review, IMPORTANT #5,
+// redone). The earlier approach touched last_activity server-side on
+// every allowed request except a denylist of tagged/background paths -
+// but a background WS-driven refresh() (see connectWs() above) and media
+// <img>/<video> GETs (/api/blob/, /api/post-blob/, /api/dm-blob/ - see
+// renderBlock/openThread/etc.) can't be tagged or excluded from a
+// denylist, so an abandoned tab with an active friend graph never idled
+// out. Inverted: the server now only touches on POST /api/activity (see
+// hearth/api.py), and this client only calls that route when GENUINE
+// user input - a pointerdown or keydown, tracked here at the document
+// level so it fires regardless of which element the input landed on -
+// has happened since the last ping.
+let LAST_INPUT = 0;
+document.addEventListener("pointerdown", () => { LAST_INPUT = Date.now(); });
+document.addEventListener("keydown", () => { LAST_INPUT = Date.now(); });
+
+function startActivityPing(intervalMs = 22000) {
+  let lastPinged = 0;
+  setInterval(() => {
+    if (LAST_INPUT <= lastPinged) return;   // no real input since last ping - let it idle
+    lastPinged = LAST_INPUT;
+    // Fire-and-forget, and deliberately not gated on checking app-lock
+    // status first: on a non-applock node this just touches a
+    // last_activity nothing ever reads (harmless), and on a LOCKED node
+    // it 423s (also harmless, and expected - see hearth/api.py's
+    // _APPLOCK_ALLOWLIST) - installApplockGate()'s fetch wrapper already
+    // reacts to that 423 the same way it does for any other route.
+    fetch("/api/activity", {method: "POST"}).catch(() => {});
+  }, intervalMs);
+}
+
+// Self-only settings panel (profile-side, mirrors Friends/Devices): fills
+// #applock-settings from the current GET /api/applock status. Rebuilt
+// wholesale on every state change (enable/change/disable) rather than
+// patched in place - this panel is small and rarely touched, unlike the
+// live journal/circle.
+async function renderApplockSettings() {
+  const panel = document.getElementById("applock-settings");
+  if (!panel) return;
+  const status = await getApplockStatus();
+  panel.replaceChildren();
+
+  if (!status.enabled) {
+    const hint = el("div", "hint", "Locks Kreds behind a PIN or passphrase on this device.");
+    const typeSel = document.createElement("select");
+    for (const [v, label] of [["pin", "PIN (numbers)"], ["passphrase", "Passphrase"]]) {
+      const o = document.createElement("option"); o.value = v; o.textContent = label;
+      typeSel.append(o);
+    }
+    const cred = document.createElement("input");
+    cred.type = "password"; cred.autocomplete = "off"; cred.placeholder = "Choose a credential";
+    const confirm = document.createElement("input");
+    confirm.type = "password"; confirm.autocomplete = "off"; confirm.placeholder = "Confirm";
+    const err = el("div", "hint");
+    const btn = el("button", "btn-accent", "Enable App-lock"); btn.type = "button";
+    btn.onclick = async () => {
+      err.textContent = "";
+      if (!cred.value) { err.textContent = "Enter a credential."; return; }
+      if (cred.value !== confirm.value) { err.textContent = "Credentials don't match."; return; }
+      const r = await fetch("/api/applock/setup", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({credential: cred.value, cred_type: typeSel.value})});
+      if (!r.ok) { err.textContent = "Couldn't enable: " + await r.text(); return; }
+      cred.value = ""; confirm.value = "";
+      renderApplockSettings();
+    };
+    panel.append(hint, el("div", "lbl", "Lock type"), typeSel,
+      el("div", "lbl", "Credential"), cred, confirm, btn, err);
+    return;
+  }
+
+  // -- enabled: idle timeout, lock-on-sleep, change, disable, lock now
+  const idleSel = document.createElement("select");
+  idleSel.setAttribute("aria-label", "Auto-lock after idle");
+  for (const [v, label] of IDLE_OPTIONS) {
+    const o = document.createElement("option"); o.value = v; o.textContent = label;
+    if (v === status.settings.idle_minutes) o.selected = true;
+    idleSel.append(o);
+  }
+  const sleepChk = document.createElement("input");
+  sleepChk.type = "checkbox"; sleepChk.id = "applock-lock-on-sleep";
+  sleepChk.checked = !!status.settings.lock_on_sleep;
+  const sleepLbl = document.createElement("label");
+  sleepLbl.htmlFor = "applock-lock-on-sleep";
+  sleepLbl.append(sleepChk, document.createTextNode(" Lock when the device sleeps"));
+  const settingsErr = el("div", "hint");
+  const saveSettings = async () => {
+    const r = await fetch("/api/applock/settings", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({idle_minutes: Number(idleSel.value), lock_on_sleep: sleepChk.checked})});
+    settingsErr.textContent = r.ok ? "" : "Couldn't save: " + await r.text();
+  };
+  idleSel.onchange = saveSettings;
+  sleepChk.onchange = saveSettings;
+
+  const lockNowBtn = el("button", "", "Lock now"); lockNowBtn.type = "button";
+  lockNowBtn.id = "applock-lock-now";
+  lockNowBtn.onclick = async () => {
+    const r = await fetch("/api/lock", {method: "POST"});
+    if (!r.ok) { alert("Couldn't lock: " + await r.text()); return; }
+    renderLockScreen(await getApplockStatus());
+  };
+
+  const oldCred = document.createElement("input");
+  oldCred.type = "password"; oldCred.autocomplete = "off"; oldCred.placeholder = "Current credential";
+  const newCred = document.createElement("input");
+  newCred.type = "password"; newCred.autocomplete = "off"; newCred.placeholder = "New credential";
+  const changeErr = el("div", "hint");
+  const changeBtn = el("button", "", "Change credential"); changeBtn.type = "button";
+  changeBtn.onclick = async () => {
+    changeErr.textContent = "";
+    if (!oldCred.value || !newCred.value) { changeErr.textContent = "Enter both credentials."; return; }
+    const r = await fetch("/api/applock/change", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({old: oldCred.value, new: newCred.value})});
+    oldCred.value = ""; newCred.value = "";
+    changeErr.textContent = r.ok ? "Changed." : "Couldn't change: " + await r.text();
+  };
+
+  const disableCred = document.createElement("input");
+  disableCred.type = "password"; disableCred.autocomplete = "off";
+  disableCred.placeholder = "Current credential";
+  const disableErr = el("div", "hint");
+  const disableBtn = el("button", "btn-danger", "Disable App-lock"); disableBtn.type = "button";
+  disableBtn.onclick = async () => {
+    disableErr.textContent = "";
+    if (!disableCred.value) { disableErr.textContent = "Enter your credential."; return; }
+    const r = await fetch("/api/applock/disable", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({credential: disableCred.value})});
+    if (!r.ok) { disableErr.textContent = "Couldn't disable: " + await r.text(); return; }
+    disableCred.value = "";
+    renderApplockSettings();
+  };
+
+  panel.append(
+    el("div", "lbl", "Auto-lock after idle"), idleSel,
+    sleepLbl, settingsErr,
+    lockNowBtn,
+    el("div", "lbl", "Change credential"), oldCred, newCred, changeBtn, changeErr,
+    el("div", "lbl", "Disable App-lock"), disableCred, disableBtn, disableErr);
+}
+
+// Self-only, desktop-only close-behavior toggle (Task 3, mirrors
+// renderApplockSettings' rebuild-wholesale pattern): what closing the
+// frameless window does. Gated on window.pywebview - in a plain browser
+// this returns immediately with no fetch at all, and #profile-desktop-
+// panel stays display:none via style.css's .desktop-only-panel default
+// regardless. The same GET /api/settings the titlebar's close handler
+// reads live, so the two stay in sync without any shared client state.
+async function renderDesktopSettings() {
+  const panel = document.getElementById("desktop-settings");
+  if (!panel || !window.pywebview) return;
+  const cur = (await j("/api/settings")).close_behavior;
+  panel.replaceChildren();
+  const sel = document.createElement("select");
+  sel.setAttribute("aria-label", "When you close the window");
+  for (const [v, label] of [["quit", "Quit the app"],
+                            ["keep", "Keep running in the background"]]) {
+    const o = document.createElement("option"); o.value = v; o.textContent = label;
+    if (v === cur) o.selected = true;
+    sel.append(o);
+  }
+  const err = el("div", "hint");
+  sel.onchange = async () => {
+    const r = await fetch("/api/settings", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({close_behavior: sel.value})});
+    err.textContent = r.ok ? "" : "Couldn't save: " + await r.text();
+  };
+  panel.append(el("div", "lbl", "When you close the window"), sel, err);
+}
+
+// Signed in-app updates (Task 3, mirrors renderApplockSettings/
+// renderDesktopSettings' rebuild-wholesale pattern): a manual "Check for
+// updates" button against GET /api/update/check, and - only once one's
+// available - an Apply button against POST /api/update/apply. A web
+// hot-swap reloads the page; a staged core update just needs a restart,
+// so it stays put and tells the user instead. No auto-check loop (Phase
+// 2a is manual-only per spec).
+async function renderUpdateSettings() {
+  const panel = document.getElementById("update-settings");
+  if (!panel) return;
+  panel.replaceChildren();
+
+  const status = el("div", "hint", "");
+  const checkBtn = el("button", "", "Check for updates");
+  checkBtn.type = "button";
+  const result = el("div", "update-result");
+  panel.append(checkBtn, status, result);
+
+  checkBtn.onclick = async () => {
+    checkBtn.disabled = true;
+    status.textContent = "Checking...";
+    result.replaceChildren();
+    let info;
+    try {
+      const r = await fetch("/api/update/check");
+      if (!r.ok) { status.textContent = "Couldn't check for updates: " + await r.text();
+        checkBtn.disabled = false; return; }
+      info = await r.json();
+    } catch (e) {
+      status.textContent = "Couldn't check for updates: " + e.message;
+      checkBtn.disabled = false;
+      return;
+    }
+    checkBtn.disabled = false;
+    status.textContent = "App core " + info.current
+      + "  ·  Web " + (info.web_version || info.current)
+      + (info.available ? "" : " (up to date)");
+    if (!info.available) return;
+
+    const verLine = el("div", "lbl", "Update available: " + info.version);
+    const notes = info.notes ? el("div", "hint update-notes", info.notes) : null;
+    const applyBtn = el("button", "btn-accent", "Apply update");
+    applyBtn.type = "button";
+    const applyErr = el("div", "hint");
+    applyBtn.onclick = async () => {
+      applyBtn.disabled = true;
+      applyErr.textContent = "";
+      let out;
+      try {
+        const r = await fetch("/api/update/apply", {method: "POST"});
+        if (!r.ok) { applyErr.textContent = "Couldn't apply update: " + await r.text();
+          applyBtn.disabled = false; return; }
+        out = await r.json();
+      } catch (e) {
+        applyErr.textContent = "Couldn't apply update: " + e.message;
+        applyBtn.disabled = false;
+        return;
+      }
+      if (out.reload) {
+        alert("Updated - reloading");
+        location.reload();
+        return;
+      }
+      if (out.restart_required) {
+        // window.pywebview.api.restart (Task 3, hearth/desktop.py) only
+        // exists in the desktop shell -- a plain browser (dev/demo) falls
+        // back to the text-only notice, since there's no launcher to
+        // relaunch there.
+        const api = window.pywebview && window.pywebview.api;
+        if (api && api.restart) {
+          applyErr.textContent = "";
+          const restartBtn = el("button", "btn-accent", "Restart now");
+          restartBtn.type = "button";
+          restartBtn.onclick = () => api.restart();
+          applyErr.replaceChildren(
+            el("span", "", "Downloaded - "), restartBtn,
+            el("span", "", " to finish."));
+        } else {
+          applyErr.textContent = "Downloaded - restart Kreds to finish.";
+        }
+      }
+      applyBtn.disabled = false;
+    };
+    result.append(verLine, ...(notes ? [notes] : []), applyBtn, applyErr);
+  };
+}
+
+const ACCENTS = ["#2743d6","#c0563b","#3e7c55","#8a5cd0","#17191e",
+  "#1f8a8a","#c79a2e","#c0567e","#4a5568","#7a4e8a",
+  "#2f80ed","#c0392b","#e2725b","#b52d8c","#1e6b5a","#6a4bb0"];
+
+// Profile editor (preserved from the pre-reskin client). It used to live
+// inside the full-page "profile view" (`.prof-wrap`); re-homed into the
+// Me view it now previews the accent directly on <html> (the same target
+// `refresh()` uses after save) instead of a `.prof-wrap` ancestor that no
+// longer exists.
+function profileEditor(p) {
+  const box = el("div", "editor");
+  box.append(el("h2", "", "Edit your profile"));
+  const name = document.createElement("input"); name.value = p.name;
+  const bio = document.createElement("textarea"); bio.rows = 2; bio.value = p.bio || "";
+  bio.placeholder = "Short bio";
+  box.append(el("div","lbl","Name"), name, el("div","lbl","Bio"), bio);
+  // accent
+  box.append(el("div","lbl","Your color"));
+  const sws = el("div","swatches"); let accent = p.accent;
+  for (const c of ACCENTS) { const s = el("div","sw" + (c===accent?" on":""));
+    s.style.background = c; s.onclick = () => { accent = c;
+      [...sws.children].forEach(x=>x.classList.remove("on")); s.classList.add("on");
+      setAccent(document.documentElement, c); }; sws.append(s); }
+  const custom = document.createElement("input");
+  custom.type = "color"; custom.value = /^#[0-9a-f]{6}$/.test(accent)
+    ? accent : "#2743d6"; custom.className = "sw-custom";
+  custom.oninput = () => { accent = custom.value.toLowerCase();
+    [...sws.children].forEach(x => x.classList.remove("on"));
+    setAccent(document.documentElement, accent); };
+  sws.append(custom);
+  box.append(sws);
+  // shape / size / align
+  const mk = (label, opts, cur) => { box.append(el("div","lbl",label));
+    const row = el("div","shapes"); const st = {v: cur};
+    for (const o of opts) { const b = el("div","opt"+(o===cur?" on":""), o);
+      b.onclick = () => { st.v = o; [...row.children].forEach(x=>x.classList.remove("on"));
+        b.classList.add("on"); }; row.append(b); } box.append(row); return st; };
+  const shape = mk("Picture shape", ["circle","squircle","square","triangle"], p.avatar_shape);
+  const size  = mk("Picture size", ["s","m","l"], p.avatar_size);
+  const align = mk("Placement", ["left","center","right"], p.avatar_align);
+  // uploads
+  box.append(el("div","lbl","Picture"));
+  const av = document.createElement("input"); av.type="file"; av.accept="image/*"; box.append(av);
+  box.append(el("div","lbl","Banner"));
+  const bn = document.createElement("input"); bn.type="file"; bn.accept="image/*"; box.append(bn);
+  const save = el("button","btn-accent","Save profile"); save.style.marginTop="14px";
+  save.onclick = async () => {
+    const fd = new FormData();
+    fd.append("name", name.value); fd.append("bio", bio.value);
+    fd.append("accent", accent.toLowerCase()); fd.append("avatar_shape", shape.v);
+    fd.append("avatar_size", size.v); fd.append("avatar_align", align.v);
+    if (av.files[0]) fd.append("avatar", av.files[0]);
+    if (bn.files[0]) fd.append("banner", bn.files[0]);
+    const r = await fetch("/api/profile", {method:"POST", body:fd});
+    if (r.ok) {
+      await refresh();
+      // The editor now lives in the cogwheel overlay, not inline on the
+      // page; re-render the profile underneath so the saved name/bio/
+      // avatar/banner show immediately, then close the overlay.
+      openProfile(STATE.identity_pub);
+      closeEditOverlay();
+    } else alert("Save failed: " + await r.text());
+  };
+  box.append(save);
+  return box;
+}
+
+// ---------------------------------------------------------------------
+// Friend-add (Task 3, re-homed into the profile side strip's #ceremony):
+// Share tab (POST /api/friend/invite -> code + live countdown) and Enter
+// tab (POST /api/friend/add -> auto-connect over Tor, or a manual
+// fallback code) are the DEFAULT two-mode flow. The original 4-box
+// copy-paste ceremony (respond/finalize/complete, unchanged server-side)
+// is kept reachable underneath as the offline fallback -- it's what the
+// "manual" branch's response code above walks the user through.
+// ---------------------------------------------------------------------
+
+function wireCopyButton(btn, getValue) {
+  const label = btn.textContent;
+  btn.onclick = async () => {
+    const text = getValue();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) {
+      // Clipboard API can be unavailable (insecure origin, permission
+      // denied) -- fall back to a hidden textarea + execCommand("copy").
+      const tmp = document.createElement("textarea");
+      tmp.value = text;
+      tmp.style.position = "fixed";
+      tmp.style.opacity = "0";
+      document.body.append(tmp);
+      tmp.select();
+      try { document.execCommand("copy"); } catch (e2) { /* best effort */ }
+      tmp.remove();
+    }
+    btn.textContent = "Copied";
+    setTimeout(() => { btn.textContent = label; }, 1500);
+  };
+}
+
+// Share tab: generate a code, show it with a copy button, and a live
+// "expires in MM:SS" countdown (setInterval updating textContent) computed
+// from the invite's expires_at. At 0 the countdown reads "Code expired"
+// and a Regenerate button (re-POSTs the same endpoint) appears. While
+// this is open, connectWs()'s ws.onmessage -> refresh() (the friends-
+// changed signal) keeps re-fetching /api/state, so A's entry appears in
+// the friends list the moment B auto-connects -- no polling of our own.
+function buildShareTab(container) {
+  container.replaceChildren();
+  const hint = el("div", "hint",
+    "Share this code with your friend. Once they connect, they'll appear " +
+    "in your friends list automatically.");
+  const getBtn = el("button", "btn-accent", "Get my code");
+  getBtn.type = "button";
+  const result = el("div", "friendadd-share-result hidden");
+  const codeLabel = document.createElement("label");
+  codeLabel.htmlFor = "friendadd-share-code";
+  codeLabel.className = "hint";
+  codeLabel.textContent = "Your code";
+  const code = document.createElement("textarea");
+  code.id = "friendadd-share-code";
+  code.className = "friendadd-code";
+  code.readOnly = true;
+  code.rows = 4;
+  const copyBtn = el("button", "", "Copy code");
+  copyBtn.type = "button";
+  wireCopyButton(copyBtn, () => code.value);
+  const countdown = el("div", "hint friendadd-countdown");
+  countdown.setAttribute("aria-live", "polite");
+  const regenBtn = el("button", "hidden", "Regenerate");
+  regenBtn.type = "button";
+  let timer = null;
+
+  const tickCountdown = (expiresAt) => {
+    const remaining = Math.max(0, Math.floor(expiresAt - Date.now() / 1000));
+    if (remaining <= 0) {
+      if (timer) { clearInterval(timer); timer = null; }
+      countdown.textContent = "Code expired";
+      regenBtn.classList.remove("hidden");
+      copyBtn.disabled = true;
+      return;
+    }
+    const mm = String(Math.floor(remaining / 60)).padStart(2, "0");
+    const ss = String(remaining % 60).padStart(2, "0");
+    countdown.textContent = "expires in " + mm + ":" + ss;
+  };
+
+  const getCode = async () => {
+    if (timer) { clearInterval(timer); timer = null; }
+    getBtn.disabled = true;
+    regenBtn.disabled = true;
+    try {
+      const r = await j("/api/friend/invite", {method: "POST"});
+      code.value = r.payload;
+      copyBtn.disabled = false;
+      regenBtn.classList.add("hidden");
+      result.classList.remove("hidden");
+      tickCountdown(r.expires_at);
+      timer = setInterval(() => tickCountdown(r.expires_at), 1000);
+    } catch (e) {
+      result.classList.remove("hidden");
+      countdown.textContent = "Couldn't get a code: " + e.message;
+    } finally {
+      getBtn.disabled = false;
+      regenBtn.disabled = false;
+    }
+  };
+  getBtn.onclick = getCode;
+  regenBtn.onclick = getCode;
+
+  result.append(codeLabel, code, copyBtn, countdown, regenBtn);
+  container.append(hint, getBtn, result);
+  container.friendaddFocus = () => getBtn.focus();
+}
+
+// Enter-code tab: paste A's code, Connect posts it to /api/friend/add.
+// "connected" -> honest confirmation + refresh() so the new friend shows
+// up immediately. "manual" (A unreachable right now) -> the honest
+// "they seem offline" note plus B's own response code (copy button), the
+// same code the manual box's step 2 would have produced -- A pastes it
+// into their own manual box (step 3) and hands the resulting final back.
+function buildEnterTab(container) {
+  container.replaceChildren();
+  const form = document.createElement("form");
+  form.id = "friendadd-enter-form";
+  const label = document.createElement("label");
+  label.htmlFor = "friendadd-enter-code";
+  label.className = "hint";
+  label.textContent = "Their code";
+  const ta = document.createElement("textarea");
+  ta.id = "friendadd-enter-code";
+  ta.rows = 4;
+  ta.placeholder = "Paste their code here";
+  // Enter submits (Shift+Enter still inserts a newline, since codes are
+  // single-line JSON anyway this just gives keyboard users a submit path
+  // without hunting for the button).
+  ta.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      if (form.requestSubmit) form.requestSubmit(); else submitBtn.click();
+    }
+  });
+  const submitBtn = el("button", "btn-accent", "Connect");
+  submitBtn.type = "submit";
+  const status = el("div", "hint");
+  status.setAttribute("aria-live", "polite");
+  const fallback = el("div", "friendadd-fallback hidden");
+  const fbLabel = document.createElement("label");
+  fbLabel.htmlFor = "friendadd-fallback-code";
+  fbLabel.className = "hint";
+  fbLabel.textContent = "They seem offline - send them this code:";
+  const fbCode = document.createElement("textarea");
+  fbCode.id = "friendadd-fallback-code";
+  fbCode.className = "friendadd-code";
+  fbCode.readOnly = true;
+  fbCode.rows = 4;
+  const fbCopy = el("button", "", "Copy code");
+  fbCopy.type = "button";
+  wireCopyButton(fbCopy, () => fbCode.value);
+  fallback.append(fbLabel, fbCode, fbCopy);
+
+  form.append(label, ta, submitBtn, status);
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    if (!ta.value.trim()) { status.textContent = "Paste a code first."; return; }
+    submitBtn.disabled = true;
+    fallback.classList.add("hidden");
+    status.textContent = "Connecting...";
+    try {
+      const r = await j("/api/friend/add", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({payload: ta.value})});
+      if (r.status === "connected") {
+        status.textContent = "You're now friends with " + r.friend;
+        ta.value = "";
+        refresh();
+      } else {
+        status.textContent = "";
+        fbCode.value = r.response;
+        fallback.classList.remove("hidden");
+      }
+    } catch (e) {
+      status.textContent = "Couldn't connect: " + e.message;
+    } finally {
+      submitBtn.disabled = false;
+    }
+  };
+  container.append(form, fallback);
+  container.friendaddFocus = () => ta.focus();
+}
+
+// The original 4-box copy-paste ceremony, unchanged apart from living in
+// its own builder so it can be re-homed under a "manual fallback"
+// disclosure instead of being the default view.
+function buildManualCeremony(container) {
+  container.replaceChildren();
+  const ta = document.createElement("textarea");
+  ta.rows = 4;
+  ta.placeholder = "Paste a code here, or click Show my code";
+  const status = el("div", "hint",
+    "Manual fallback: exchange codes in person, one paste at a time.");
+  const step = async (url, sendPayload, nextText, clearAfter) => {
+    try {
+      const body = sendPayload
+        ? {method: "POST", headers: {"Content-Type": "application/json"},
+           body: JSON.stringify({payload: ta.value})}
+        : {method: "POST"};
+      const r = await j(url, body);
+      ta.value = clearAfter ? "" : (r.payload || "");
+      status.textContent = nextText;
+      const qrWrap = document.getElementById("qr-wrap");
+      if (qrWrap) qrWrap.remove();
+      if (ta.value && !clearAfter) {
+        const w = el("div"); w.id = "qr-wrap";
+        const img = document.createElement("img");
+        img.id = "qr-img";
+        img.src = "/api/qr?text=" + encodeURIComponent(ta.value);
+        w.append(el("div", "hint",
+          "Show this QR in person (or copy the code):"), img);
+        status.after(w);
+      }
+      refresh();
+    } catch (e) { status.textContent = "Rejected: " + e.message; }
+  };
+  const mk = (label, fn) => {
+    const b = el("button", "", label);
+    b.type = "button";
+    b.onclick = fn;
+    return b;
+  };
+  container.append(ta,
+    mk("1. Show my code", () => step("/api/friend/invite", false,
+      "Give this code to your friend. They paste it and press 2.")),
+    mk("2. Respond", () => step("/api/friend/respond", true,
+      "Send this response back. They paste it and press 3.")),
+    mk("3. Finalize", () => step("/api/friend/finalize", true,
+      "Friend added on your side. Send this final code; they press 4.")),
+    mk("4. Complete", () => step("/api/friend/complete", true,
+      "Friend added.", true)),
+    status);
+}
+
+function ceremonyUI() {
+  const root = document.getElementById("ceremony");
+  root.replaceChildren();
+  const toggle = el("button", "btn-accent", "Add friend");
+  toggle.innerHTML = ICONS.plus + "<span>Add friend</span>";
+  const panel = el("div", "ceremony-panel hidden");
+  toggle.onclick = () => {
+    panel.classList.toggle("hidden");
+    if (!panel.classList.contains("hidden")) activeTab.friendaddFocus();
+  };
+  root.append(toggle, panel);
+
+  const tabs = el("div", "friendadd-tabs");
+  tabs.setAttribute("role", "tablist");
+  const shareTabBtn = el("button", "friendadd-tab active", "Share my code");
+  const enterTabBtn = el("button", "friendadd-tab", "Enter a code");
+  for (const b of [shareTabBtn, enterTabBtn]) { b.type = "button"; b.setAttribute("role", "tab"); }
+  tabs.append(shareTabBtn, enterTabBtn);
+
+  const shareTab = el("div", "friendadd-body");
+  const enterTab = el("div", "friendadd-body hidden");
+  buildShareTab(shareTab);
+  buildEnterTab(enterTab);
+  let activeTab = shareTab;   // tracks which tab the toggle button should focus on reopen
+
+  const showShare = () => {
+    shareTabBtn.classList.add("active"); shareTabBtn.setAttribute("aria-selected", "true");
+    enterTabBtn.classList.remove("active"); enterTabBtn.setAttribute("aria-selected", "false");
+    shareTab.classList.remove("hidden"); enterTab.classList.add("hidden");
+    activeTab = shareTab;
+    shareTab.friendaddFocus();
+  };
+  const showEnter = () => {
+    enterTabBtn.classList.add("active"); enterTabBtn.setAttribute("aria-selected", "true");
+    shareTabBtn.classList.remove("active"); shareTabBtn.setAttribute("aria-selected", "false");
+    enterTab.classList.remove("hidden"); shareTab.classList.add("hidden");
+    activeTab = enterTab;
+    enterTab.friendaddFocus();
+  };
+  shareTabBtn.onclick = showShare;
+  enterTabBtn.onclick = showEnter;
+  shareTabBtn.setAttribute("aria-selected", "true");
+  enterTabBtn.setAttribute("aria-selected", "false");
+
+  const fallbackToggle = el("button", "linklike", "Trouble connecting? Use the manual code exchange");
+  fallbackToggle.type = "button";
+  const manualPanel = el("div", "ceremony-manual hidden");
+  buildManualCeremony(manualPanel);
+  fallbackToggle.onclick = () => manualPanel.classList.toggle("hidden");
+
+  panel.append(tabs, shareTab, enterTab, fallbackToggle, manualPanel);
+}
+
+// ---------------------------------------------------------------------
+// Messages / DM chat (unchanged, re-homed into #view-messages)
+// ---------------------------------------------------------------------
+
+async function loadConversations() {
+  const convs = await j("/api/conversations");
+  const root = document.getElementById("conversations");
+  root.replaceChildren();
+  const friends = (STATE ? STATE.friends : []);
+  const seen = new Set(convs.map(c => c.identity_pub));
+  for (const f of friends)
+    if (!seen.has(f.identity_pub))
+      convs.push({identity_pub: f.identity_pub, name: f.name, last_text: null});
+  if (!convs.length) {
+    root.append(el("div", "hint", "No friends yet. Add someone to chat."));
+    return;
+  }
+  for (const c of convs) {
+    const row = el("div", "conv" + (c.identity_pub === CURRENT_DM ? " active" : ""));
+    const av = el("div", "conv-avatar");
+    av.textContent = (c.name || "?").slice(0, 1).toUpperCase();
+    const txt = el("div");
+    txt.append(el("div", "name", c.name),
+               el("div", "preview", c.last_text || "no messages yet"));
+    row.append(av, txt);
+    row.onclick = () => openThread(c.identity_pub, c.name);
+    root.append(row);
+  }
+}
+
+function dmPlaceholder() {
+  const t = document.getElementById("thread");
+  t.replaceChildren(el("div", "dm-empty", "Pick a conversation to start."));
+  document.getElementById("dm-compose").classList.add("hidden");
+  document.getElementById("thread-title").textContent = "Messages";
+}
+
+async function openThread(identity, name, keepScroll) {
+  CURRENT_DM = identity;
+  CURRENT_DM_NAME = name;
+  localStorage.setItem("hearth_dm", identity);
+  localStorage.setItem("hearth_dm_name", name);
+  document.getElementById("thread-title").textContent = "Chat with " + name;
+  document.getElementById("dm-compose").classList.remove("hidden");
+  const root = document.getElementById("thread");
+  const atBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 40;
+  const msgs = await j("/api/dm/" + identity);
+  root.replaceChildren();
+  for (const m of msgs) {
+    const b = el("div", "bubble" + (m.from_me ? " me" : ""));
+    if (m.undecryptable) b.append(el("div", "undec",
+      "(cannot decrypt on this device)"));
+    else {
+      b.append(el("div", "", m.text || ""));
+      for (const h of m.blobs) {
+        const img = document.createElement("img");
+        img.src = "/api/dm-blob/" + m.msg_id + "/" + h;
+        b.append(img);
+      }
+    }
+    b.append(el("div", "bt", new Date(m.created_at * 1000).toLocaleString()));
+    root.append(b);
+  }
+  if (!msgs.length) {
+    const e = el("div", "dm-empty", "No messages yet - say hi.");
+    root.append(e);
+  }
+  loadConversations();   // refresh the active highlight
+  // Auto-scroll to newest on an explicit open, or on a live update only when
+  // the reader was already at the bottom (don't yank them up mid-scroll).
+  if (!keepScroll || atBottom) root.scrollTop = root.scrollHeight;
+}
+
+document.getElementById("dm-compose").onsubmit = async (ev) => {
+  ev.preventDefault();
+  if (!CURRENT_DM) return;
+  const fd = new FormData();
+  fd.append("to", CURRENT_DM);
+  fd.append("text", document.getElementById("dm-text").value);
+  fd.append("expires_seconds", "");
+  for (const f of document.getElementById("dm-photos").files)
+    fd.append("photos", f);
+  const r = await fetch("/api/dm", {method: "POST", body: fd});
+  if (r.ok) {
+    document.getElementById("dm-text").value = "";
+    document.getElementById("dm-photos").value = "";
+    openThread(CURRENT_DM, CURRENT_DM_NAME);
+  } else { alert("Send failed: " + await r.text()); }
+};
+
+// ---------------------------------------------------------------------
+// Composer (keeps -> hidden #scope, submit -> /api/post)
+// ---------------------------------------------------------------------
+
+document.querySelectorAll("#composer .keep").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#composer .keep").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById("scope").value = btn.dataset.scope;
+  });
+});
+
+document.getElementById("composer").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const fd = new FormData();
+  fd.append("text", document.getElementById("post-text").value);
+  fd.append("scope", document.getElementById("scope").value);
+  fd.append("expires_seconds", document.getElementById("post-expiry").value);
+  for (const f of document.getElementById("post-photos").files)
+    fd.append("photos", f);
+  await fetch("/api/post", {method: "POST", body: fd});
+  document.getElementById("post-text").value = "";
+  document.getElementById("post-photos").value = "";
+  refresh();
+};
+
+// ---------------------------------------------------------------------
+// View switching: #view-journal / #view-messages / #view-profile, plus the
+// mobile Circle/Journal/Me tab bar (Circle's real content is Task 5's;
+// for now it just reveals the circle-rail stub in place of the journal).
+// Me is not its own view - it opens the self profile page (openMe below).
+// ---------------------------------------------------------------------
+
+function setView(which) {
+  if (which !== "profile") ARRANGING = false;   // leaving the profile exits arrange mode
+  for (const v of ["journal", "messages", "profile"])
+    document.getElementById("view-" + v).classList.toggle("hidden", v !== which);
+  document.querySelectorAll(".navlinks button").forEach(b =>
+    b.classList.toggle("active", b.dataset.view === which));
+  if (which !== "profile") localStorage.setItem("hearth_view", which);
+  if (which === "messages") { loadConversations(); if (!CURRENT_DM) dmPlaceholder(); }
+}
+
+function goView(tab) {
+  closeEditOverlay();   // a tab switch dismisses an open profile-edit overlay
+  const vj = document.getElementById("view-journal");
+  if (tab === "circle") { setView("journal"); vj.classList.add("show-circle"); }
+  else { vj.classList.remove("show-circle"); setView(tab); }
+  document.querySelectorAll(".tabbar-mobile button").forEach(b =>
+    b.classList.toggle("active", b.dataset.tab === tab));
+}
+
+// Me nav/tab entry point: opens your own profile page directly (Task 1)
+// instead of a separate card-summary view. Records "me" as the remembered
+// view so a reload lands back on your own profile (restoreView below).
+function openMe() {
+  closeEditOverlay();
+  localStorage.setItem("hearth_view", "me");   // remembered across reloads
+  if (STATE) openProfile(STATE.identity_pub);
+}
+
+function restoreView() {
+  const v = localStorage.getItem("hearth_view");
+  if (v === "messages") {
+    goView("messages");
+    const dm = localStorage.getItem("hearth_dm");
+    const name = localStorage.getItem("hearth_dm_name");
+    if (dm) openThread(dm, name || dm.slice(0, 8)).catch(() => dmPlaceholder());
+    else dmPlaceholder();
+  } else if (v === "me") {
+    openMe();
+  }
+}
+
+// ---------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------
+
+async function refresh() {
+  // No longer tags/skips activity here (whole-branch review, IMPORTANT #5,
+  // redone): idle auto-lock is now driven ONLY by explicit user input via
+  // startActivityPing()'s POST /api/activity, not by inferring "was this
+  // fetch background" from the call site. Every refresh() - WS-driven or
+  // user-triggered - fetches the same way.
+  STATE = await j("/api/state");
+  if (STATE.revoked) {
+    document.getElementById("app").classList.add("hidden");
+    document.getElementById("revoked-banner").classList.remove("hidden");
+    // .tabbar-mobile lives outside #app, so hiding #app alone leaves it
+    // visible on a revoked device - hide it too. The profile page lives
+    // inside #app (unlike the old modal), so hiding #app covers it.
+    document.querySelector(".tabbar-mobile").classList.add("hidden");
+    return;
+  }
+  if (STATE.accent) setAccent(document.documentElement, STATE.accent);
+  renderChrome();
+  FEED = await j("/api/feed");
+  KREDS = await j("/api/kreds");
+  renderChipbar();
+  renderJournal();
+  renderCircleRail();
+  renderMeStrip();
+  renderStories();
+  if (!document.getElementById("view-messages").classList.contains("hidden")) {
+    loadConversations();
+    // Keep the open conversation live: a WS "changed" (e.g. an incoming DM
+    // arriving over gossip) re-renders the thread in place, preserving the
+    // reader's scroll position unless they're already at the bottom.
+    if (CURRENT_DM) openThread(CURRENT_DM, CURRENT_DM_NAME, true);
+  }
+}
+
+function connectWs() {
+  const ws = new WebSocket("ws://" + location.host + "/ws");
+  ws.onmessage = () => refresh();
+  ws.onclose = () => setTimeout(connectWs, 2000);
+}
+
+applyTheme(currentTheme());
+document.getElementById("theme-toggle").onclick = toggleTheme;
+
+document.getElementById("nav-journal").onclick = () => goView("journal");
+document.getElementById("nav-messages").onclick = () => goView("messages");
+document.getElementById("nav-me").onclick = () => openMe();
+document.querySelectorAll(".tabbar-mobile button").forEach(
+  b => b.onclick = () => (b.dataset.tab === "me" ? openMe() : goView(b.dataset.tab)));
+
+document.querySelectorAll(".file-btn").forEach(l => {
+  l.insertAdjacentHTML("afterbegin", ICONS.attach);
+});
+const dmBtn = document.querySelector("#dm-compose button[type=submit]");
+if (dmBtn) dmBtn.innerHTML = ICONS.send + "<span>Send</span>";
+
+// ---------------------------------------------------------------------
+// Desktop custom chrome (Kreds Windows app shell, Task 3): everything
+// here is gated on window.pywebview - a plain browser (dev/demo) gets
+// none of it: no body.desktop class, #titlebar stays display:none via
+// its static .hidden class, and .desktop-only-panel (style.css) stays
+// display:none regardless of the panel's selfonly hidden-class state.
+// pywebview may not have injected window.pywebview by the time this
+// script runs, so wireDesktopChrome is called on BOTH the "pywebviewready"
+// event it fires on window AND a boot-time check right below in case
+// it's already there.
+// ---------------------------------------------------------------------
+
+function wireDesktopChrome() {
+  if (!window.pywebview) return;
+  document.body.classList.add("desktop");
+  const bar = document.getElementById("titlebar");
+  if (bar) bar.classList.remove("hidden");
+  const api = window.pywebview.api;
+  const minBtn = document.getElementById("titlebar-min");
+  const maxBtn = document.getElementById("titlebar-max");
+  const closeBtn = document.getElementById("titlebar-close");
+  if (minBtn) minBtn.onclick = () => api.minimize();
+  if (maxBtn) maxBtn.onclick = () => api.toggle_maximize();
+  if (closeBtn) closeBtn.onclick = async () => {
+    // Read the live pref every time (never cached) so a change made in
+    // Settings takes effect on the very next close, no reload needed.
+    let closeBehavior = "quit";
+    try { closeBehavior = (await j("/api/settings")).close_behavior; }
+    catch (e) { /* unreadable pref - fail safe to quit, never trap the app open */ }
+    if (closeBehavior === "keep") api.minimize();
+    else api.quit();
+  };
+}
+window.addEventListener("pywebviewready", wireDesktopChrome);
+if (window.pywebview) wireDesktopChrome();   // already ready before this script ran
+
+// ---------------------------------------------------------------------
+// One-time onboarding wizard (Task 3): shown once right after a fresh
+// node finishes create/pair-install, gated by the NEEDS_WIZARD module
+// flag (boot() below sets it from GET /api/bootstrap's onboarding_done -
+// Task 2). Two steps - (A) an optional, genuinely skippable App-lock
+// setup that posts to the same /api/applock/setup endpoint as the
+// Settings panel (renderApplockSettings above), and (B) an honest
+// "iPhone is in development" note - then POST /api/onboarding-done so it
+// never shows again. Mirrors the first-run/lock-screen hide-#app pattern
+// so nothing behind the gate is Tab/AT-reachable while it's up.
+// ---------------------------------------------------------------------
+
+function onboardingWizardKeydown(ev) {
+  // One-time setup: Esc must not silently dismiss without marking done
+  // (that would just re-show the wizard on the next boot) - it skips
+  // straight to Done instead, the same net effect as declining every step.
+  if (ev.key === "Escape") { ev.preventDefault(); finishOnboardingWizard(); }
+}
+
+async function finishOnboardingWizard() {
+  try { await fetch("/api/onboarding-done", {method: "POST"}); }
+  catch (e) { /* best-effort - a failed POST just means it may show again next boot */ }
+  NEEDS_WIZARD = false;
+  document.getElementById("onboarding-wizard").classList.add("hidden");
+  document.removeEventListener("keydown", onboardingWizardKeydown);
+  // Whole-branch review, IMPORTANT #2: if the node autolocked while the
+  // wizard was open, renderLockScreen already hid #app/tabbar and is
+  // showing #lock-screen right now - unconditionally unhiding #app/tabbar
+  // here would restore gated content to the Tab/AT tree BEHIND the lock
+  // overlay. Only unhide when the lock screen isn't the thing currently
+  // shown; onboarding_done is already marked above either way, so the
+  // wizard stays finished (once-only) once the node is unlocked.
+  if (document.getElementById("lock-screen").classList.contains("hidden")) {
+    document.getElementById("app").classList.remove("hidden");
+    const tabbar = document.querySelector(".tabbar-mobile");
+    if (tabbar) tabbar.classList.remove("hidden");
+  }
+}
+
+// Toggles the two step <section>s + dot indicator, and focuses the new
+// step's first control (keyboard-accessible, mirrors renderFirstRun/
+// renderLockScreen landing focus in the primary field on show).
+function showWizardStep(i) {
+  document.getElementById("wiz-step-applock").classList.toggle("hidden", i !== 0);
+  document.getElementById("wiz-step-phone").classList.toggle("hidden", i !== 1);
+  document.getElementById("wiz-step-desktop").classList.toggle("hidden", i !== 2);
+  document.getElementById("wiz-dot-0").classList.toggle("active", i === 0);
+  document.getElementById("wiz-dot-1").classList.toggle("active", i === 1);
+  // wiz-dot-2 (desktop-only close-behavior step) only exists once
+  // renderOnboardingWizard has appended it (window.pywebview) - a plain
+  // browser never creates it, so this step index is simply unreachable
+  // there and the null-check is enough.
+  const dot2 = document.getElementById("wiz-dot-2");
+  if (dot2) dot2.classList.toggle("active", i === 2);
+  const step = i === 0 ? document.getElementById("wiz-step-applock")
+             : i === 1 ? document.getElementById("wiz-step-phone")
+             : document.getElementById("wiz-step-desktop");
+  const first = step.querySelector("select, input, button");
+  if (first) first.focus();
+}
+
+async function renderOnboardingWizard() {
+  document.getElementById("app").classList.add("hidden");
+  const tabbar = document.querySelector(".tabbar-mobile");
+  if (tabbar) tabbar.classList.add("hidden");
+  document.getElementById("onboarding-wizard").classList.remove("hidden");
+  document.addEventListener("keydown", onboardingWizardKeydown);
+
+  // -- Step A: App-lock - genuinely skippable, Skip never calls setup --
+  const stepLock = document.getElementById("wiz-step-applock");
+  stepLock.replaceChildren();
+  stepLock.append(el("h2", "wiz-title", "Protect this device"));
+  const status = await getApplockStatus();
+  if (status.enabled) {
+    // Edge case: App-lock was already enabled before onboarding finished
+    // (e.g. a prior session set it up but never reached Done) - nothing
+    // to set up, just move on.
+    stepLock.append(el("p", "hint", "App-lock is already set up on this device."));
+    const nextBtn = el("button", "btn-accent", "Continue"); nextBtn.type = "button";
+    nextBtn.onclick = () => showWizardStep(1);
+    stepLock.append(nextBtn);
+  } else {
+    stepLock.append(el("p", "hint", "Protect this device with a PIN or passphrase."));
+    const typeSel = document.createElement("select");
+    typeSel.setAttribute("aria-label", "Lock type");
+    for (const [v, label] of [["pin", "PIN (numbers)"], ["passphrase", "Passphrase"]]) {
+      const o = document.createElement("option"); o.value = v; o.textContent = label;
+      typeSel.append(o);
+    }
+    const cred = document.createElement("input");
+    cred.type = "password"; cred.autocomplete = "off"; cred.placeholder = "Choose a credential";
+    cred.setAttribute("aria-label", "Credential");
+    const confirm = document.createElement("input");
+    confirm.type = "password"; confirm.autocomplete = "off"; confirm.placeholder = "Confirm";
+    confirm.setAttribute("aria-label", "Confirm credential");
+    const err = el("div", "hint");
+    const enableBtn = el("button", "btn-accent", "Enable App-lock"); enableBtn.type = "button";
+    enableBtn.onclick = async () => {
+      err.textContent = "";
+      if (!cred.value) { err.textContent = "Enter a credential."; return; }
+      if (cred.value !== confirm.value) { err.textContent = "Credentials don't match."; return; }
+      const r = await fetch("/api/applock/setup", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({credential: cred.value, cred_type: typeSel.value})});
+      if (!r.ok) { err.textContent = "Couldn't enable: " + await r.text(); return; }
+      showWizardStep(1);
+    };
+    const skipBtn = el("button", "", "Skip"); skipBtn.type = "button";
+    skipBtn.onclick = () => showWizardStep(1);   // genuinely skippable - no setup call at all
+    const row = el("div", "wiz-actions");
+    row.append(enableBtn, skipBtn);
+    stepLock.append(typeSel, cred, confirm, err, row);
+  }
+
+  // -- Step B: Phone/iOS card - honest informational note, no other action --
+  const stepPhone = document.getElementById("wiz-step-phone");
+  stepPhone.replaceChildren();
+  stepPhone.append(el("h2", "wiz-title", "Kreds for iPhone"));
+  stepPhone.append(el("p", "hint",
+    "Kreds for iPhone is in development. You'll pair your phone to this node when it ships; "
+    + "you can pair any device anytime from Settings."));
+  const doneBtn = el("button", "btn-accent", "Continue"); doneBtn.type = "button";
+  // Desktop-only (Task 3): the close-behavior step comes next instead of
+  // finishing straight away. A plain browser has no such step - Continue
+  // keeps its original behavior of finishing the wizard directly.
+  doneBtn.onclick = () => (window.pywebview ? showWizardStep(2) : finishOnboardingWizard());
+  stepPhone.append(doneBtn);
+
+  // -- Step C: close-behavior (desktop-only) - the Windows shell's Quit
+  // vs Keep-running-in-the-background choice for the frameless window,
+  // changeable later in Settings (renderDesktopSettings, same endpoint).
+  // Only reachable from Step B's Continue when window.pywebview exists;
+  // a plain browser never builds this step's content or its dot.
+  if (window.pywebview) {
+    let dot2 = document.getElementById("wiz-dot-2");
+    if (!dot2) {
+      dot2 = el("span", "wiz-dot"); dot2.id = "wiz-dot-2";
+      document.querySelector(".wiz-dots").append(dot2);
+    }
+    const stepDesktop = document.getElementById("wiz-step-desktop");
+    stepDesktop.replaceChildren();
+    stepDesktop.append(el("h2", "wiz-title", "When you close the window"));
+    stepDesktop.append(el("p", "hint",
+      "Quit stops Kreds entirely. Keep running in the background lets it keep "
+      + "syncing with your kreds while the window is minimized."));
+    const pickClose = async (v) => {
+      await fetch("/api/settings", {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({close_behavior: v})});
+      finishOnboardingWizard();
+    };
+    const quitBtn = el("button", "btn-accent", "Quit the app"); quitBtn.type = "button";
+    quitBtn.onclick = () => pickClose("quit");
+    const keepBtn = el("button", "", "Keep running in the background"); keepBtn.type = "button";
+    keepBtn.onclick = () => pickClose("keep");
+    const row = el("div", "wiz-actions");
+    row.append(quitBtn, keepBtn);
+    stepDesktop.append(row);
+  }
+
+  showWizardStep(0);
+}
+
+// APPLOCK_BOOTED guards connectWs/ceremonyUI/service-worker-registration
+// (and the WS-reconnect / heartbeat they start) from running twice: boot()
+// runs once at page load and may return early (locked); bootAfterUnlock()
+// then runs this same one-time tail once the node actually unlocks.
+let APPLOCK_BOOTED = false;
+
+async function bootData() {
+  if (APPLOCK_BOOTED) { await refresh(); return; }
+  APPLOCK_BOOTED = true;
+  // restoreView() (esp. the "me" case) needs STATE.identity_pub, which
+  // only exists after refresh()'s /api/state fetch resolves - await it
+  // rather than firing both at once.
+  await refresh();
+  restoreView();
+  connectWs();
+  ceremonyUI();
+  startApplockHeartbeat();
+  startActivityPing();
+  // PWA: register the service worker at the app ROOT. A worker served from
+  // under the static mount can only ever control paths under that mount;
+  // serving it at / lets its scope cover the whole app - see hearth/api.py's
+  // `GET /sw.js` route.
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
+  // One-time wizard (Task 3): #app is already populated above but was kept
+  // hidden by boot() below if NEEDS_WIZARD - render it now, on top of the
+  // (invisible-until-dismissed) real app, so there's no flash of app
+  // content before the wizard ever appears.
+  if (NEEDS_WIZARD) renderOnboardingWizard();
+}
+
+async function bootAfterUnlock() {
+  await bootData();
+}
+
+// Nothing else renders while locked: check GET /api/applock FIRST, before
+// any content fetch - a locked node shows only #lock-screen. Unlocking
+// (the lock-form submit handler above) calls bootAfterUnlock() to run the
+// deferred data boot.
+//
+// Before even the applock check, GET /api/bootstrap: a node with no
+// enrolled identity yet (first run, or mid a Connect pairing) answers
+// {initialized:false} and the client shows Create/Connect instead of any
+// app content. A fetch error here (node unreachable) defaults to
+// initialized:true rather than stranding a working, already-enrolled node
+// behind a screen meant only for brand-new installs.
+async function boot() {
+  let b;
+  try {
+    const r = await fetch("/api/bootstrap");
+    // A non-2xx (whole-branch review, IMPORTANT #1: e.g. 410 "device
+    // revoked" from revoked_gate - hearth/api.py - which does NOT
+    // allowlist /api/bootstrap, only /api/state) must not be parsed as a
+    // bootstrap body: its {"detail": "device revoked"} shape has no
+    // "initialized" key, so unconditionally parsing it would make
+    // !b.initialized true and wrongly render first-run over a revoked
+    // device instead of falling through to the applock/state path below,
+    // which already renders the revoked banner. Treat any non-2xx like
+    // the network-error case below.
+    b = r.ok ? await r.json() : {initialized: true, onboarding_done: true};
+  }
+  // A transient failure here defaults to initialized (never strand a
+  // working node behind first-run) AND onboarding_done (never re-flash the
+  // one-time wizard at an already-onboarded node over a flaky boot fetch).
+  catch (e) { b = {initialized: true, onboarding_done: true}; }
+  if (!b.initialized) { renderFirstRun(); return; }
+  const status = await getApplockStatus();
+  if (status.locked) { renderLockScreen(status); return; }
+  if (!b.onboarding_done) NEEDS_WIZARD = true;   // module flag consumed by bootData (Task 3)
+  hideLockScreen();
+  // hideLockScreen() just unhid #app - if the one-time wizard is about to
+  // run, re-hide it immediately (same task, before the browser paints) so
+  // bootData() below can populate #app in the background without ever
+  // flashing the real app underneath the wizard.
+  if (NEEDS_WIZARD) {
+    document.getElementById("app").classList.add("hidden");
+    const tabbar = document.querySelector(".tabbar-mobile");
+    if (tabbar) tabbar.classList.add("hidden");
+  }
+  await bootData();
+}
+
+boot().catch(err => console.error("boot failed", err));

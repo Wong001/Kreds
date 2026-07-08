@@ -1,0 +1,941 @@
+import re
+from pathlib import Path
+
+WEB = Path(__file__).resolve().parents[1] / "hearth" / "web"
+
+
+def _css_rule(css, selector):
+    """Pull a single top-level CSS rule's body by its exact selector text
+    (e.g. "#block-settings"), across however many lines it spans."""
+    m = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", css)
+    assert m, f"no CSS rule found for {selector!r}"
+    return m.group(1)
+
+
+def _js_fn_body(js, name):
+    """Extract a JS function's body (text between its outer braces) by
+    name, via brace counting - robust regardless of what function follows
+    it in the file (unlike a '\\nfunction '-style split, which silently
+    breaks if the next declaration's style ever changes)."""
+    m = re.search(r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\([^)]*\)\s*\{", js)
+    assert m, f"no function {name!r} found"
+    depth = 1
+    i = m.end()
+    while depth > 0:
+        if js[i] == "{": depth += 1
+        elif js[i] == "}": depth -= 1
+        i += 1
+    return js[m.end():i - 1]
+
+
+def test_title_and_no_loop():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert "<title>Kreds</title>" in html
+    assert "Loop" not in html                       # no user-facing Loop
+    assert 'class="mark"' in html                    # 3-arc mark present
+
+
+def test_no_cdn_fonts_selfhosted():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert "fonts.googleapis.com" not in css and "fonts.googleapis.com" not in html
+    assert "fonts.gstatic.com" not in css and "fonts.gstatic.com" not in html
+    assert "@font-face" in css
+
+
+def test_pwa_wired_in_html():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'rel="manifest"' in html
+    assert "apple-touch-icon" in html
+    assert 'name="theme-color"' in html
+
+
+def test_service_worker_registered():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "serviceWorker" in js and "sw.js" in js
+    # Root-scope requirement: a worker served under /static/ can only ever
+    # control /static/*. It must be registered at the app root (see the
+    # dedicated `GET /sw.js` route in hearth/api.py), never under /static/.
+    assert "/static/sw.js" not in js
+
+
+def test_round_icon_buttons_reset_form_padding():
+    # Root cause of the 0.3.x "tiny sun/moon, off-center cogwheel" bug: the
+    # base form-control rule (`textarea, input, select, button { padding:
+    # 8px 11px }`) also pads the fixed-size round icon buttons. A 30x30
+    # .themebtn then keeps only a 6px-wide content box, so its 20px svg
+    # flex-shrinks into a sliver; .profile-cog's 18px svg overflows a
+    # 10px-wide grid content box toward the right/bottom (grid content
+    # alignment defaults to start) and gets clipped by the border-radius.
+    # The svg display:block rule alone never fixed this - the padding must
+    # be reset on every fixed-size round icon button.
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    for selector in (".themebtn", ".profile-cog", ".block-settings-btn"):
+        rule = _css_rule(css, selector)
+        assert re.search(r"padding:\s*0\b", rule), \
+            f"{selector} must reset the base form-control padding (padding: 0)"
+
+
+def test_journal_shell_and_keeps():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="journal"' in html and 'id="chipbar"' in html
+    assert "That's everything" in js                 # end-state copy
+    # keeps selector offers inner + kreds (scope sent to /api/post)
+    assert "inner" in js and "kreds" in js
+
+
+def test_no_receipts_popover():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # honesty guard: the "who holds this post" popover is NOT shipped
+    assert "Who holds this post" not in html
+    assert "Who holds this post" not in js
+    assert ".receipts" not in css
+
+
+def test_identity_color_and_localstorage_unread():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "identityColor" in js                     # deterministic color fn
+    assert "localStorage" in js                      # unread watermark stopgap
+    # the watermark is a per-device stopgap, never a server-provided field:
+    # helpers are keyed off localStorage only, and there's exactly one
+    # identityColor implementation (single source of the color derivation).
+    assert "lastOpened" in js and "markOpenedNow" in js
+    assert js.count("function identityColor(") == 1
+
+
+def test_shipped_features_preserved():
+    # This is a full rewrite of the client; these are the honesty-relevant
+    # and previously-shipped behaviors the rewrite must not silently drop.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert "deleteEverywhere" in js                          # DM/post deletion
+    assert "A modified app or a screenshot can still have kept a copy." in js
+    assert "openThread" in js and "loadConversations" in js  # DM chat
+    assert "renderStories" in js and "openStoryViewer" in js  # stories
+    assert "ceremonyUI" in js and "Add friend" in js         # friend-add ceremony
+    assert "profileEditor" in js                             # profile editor
+    assert 'id="revoked-banner"' in html and "logged out of Kreds" in html
+
+
+def test_view_containers_present():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="view-journal"' in html
+    assert 'id="view-messages"' in html and 'id="view-profile"' in html
+    assert 'id="theme-toggle"' in html
+    assert 'id="circle-rail"' in html                # Task 5 fills this in
+
+
+def test_profile_page_and_ring_move():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="view-profile"' in html              # profile is a page, not a modal
+    assert "openProfile" in js
+    assert "/api/ring" in js                        # move between rings
+    assert "since" in js                            # ring status renders since
+
+
+def test_profile_is_a_page_not_a_modal():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="view-profile"' in html          # profile is a view/page
+    assert 'id="profile-body"' in html          # block-slice foundation container
+    # the compact modal is gone entirely
+    assert 'id="profile-modal"' not in html
+    assert ".modalback" not in css and ".pmodal" not in css
+    assert "closeProfile" not in js             # modal close code removed
+
+
+def test_profile_page_honors_banner_and_avatar_shape():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    # banner uses the uploaded image when present (references p.banner as a src)
+    assert "p.banner" in js
+    # avatar shape/size/placement are applied and styled
+    assert "avatar_shape" in js and "avatar_size" in js and "avatar_align" in js
+    assert "squircle" in css and "triangle" in css   # shape classes styled
+
+
+def test_setview_supports_profile_and_back():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert '"profile"' in js                    # setView knows the profile view
+    assert "PRIOR_VIEW" in js                    # Back returns to prior view
+
+
+def test_circle_rail_and_overlay():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="circle-rail"' in html
+    assert "overlay" in html.lower()                # expandable radial overlay
+    assert "buildCircle" in js or "renderCircle" in js   # SVG built from /api/kreds
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert ".ringguide" in css                      # radial ring guides (ported)
+
+
+def test_mobile_tabbar_present():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert "Circle" in html and "Journal" in html   # mobile tab labels
+
+
+def test_me_view_friends_label_and_right_column():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # friends section relabeled "Friends" in the profile self-strip (note:
+    # the circle rail legitimately still says "Your kreds", so only assert
+    # the positive)
+    assert ">Friends<" in html
+    # the card-summary Me view's own two-column grid + inline editor slot
+    # are gone; the self-only strip lives on the profile layout instead
+    assert 'id="profile-side"' in html and "has-side" in js
+    assert 'id="me-editor-slot"' not in html
+    # Me now opens the profile page directly (openMe -> openProfile)
+    assert "openMe" in js
+
+
+def test_unfriend_ui_and_honest_copy():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "/api/unfriend" in js
+    assert "no longer connected" in js.lower()
+    # the honest copy is present (a distinctive phrase from it)
+    assert "we keep trying privately for up to 14 days" in js.lower()
+    assert "a screenshot can still keep a copy" in js.lower()
+
+
+def test_profile_two_sections_and_cogwheel():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    # two distinct sections (journal now lives in the right-column rail)
+    assert 'id="profile-wall"' in html and 'id="profile-journal-rail"' in html
+    # cogwheel edit + overlay, not an inline dump / prominent button
+    assert "profile-cog" in html or "profile-cog" in js
+    assert "profile-edit-overlay" in html or "profile-edit-overlay" in js
+    # renders wall + journal splits from the profile payload
+    assert "p.wall" in js and "p.journal" in js
+    # profile-post composer posts with placement=profile
+    assert 'placement' in js and 'profile' in js
+
+
+def test_profile_post_composer_scope_selector():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # the wall composer sends a scope (inner/kreds) + placement=profile
+    assert "/api/post" in js
+
+
+def test_me_tab_opens_profile_with_self_strip():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # the card-summary Me view is gone; profile view gains a self-only side strip
+    assert 'id="view-me"' not in html
+    assert 'id="profile-side"' in html
+    # Friends + Devices live in the profile side strip now
+    assert 'id="friends"' in html and 'id="devices"' in html
+    # Me nav + mobile Me tab route to the profile (openProfile), not a card view
+    assert 'nav-me' in js and 'openProfile' in js
+    # Back is gated on p.mine (hidden on your own profile)
+    assert 'profile-back' in js
+    # setView no longer carries a "me" view
+    assert '"journal", "messages", "profile"' in js or "'journal', 'messages', 'profile'" in js
+
+
+def test_profile_composer_has_photos_and_block_canvas():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    # composer attaches photos to the profile post
+    assert "profilePostComposer" in js
+    assert 'fd.append("photos"' in js or "fd.append('photos'" in js
+    # a dedicated block renderer exists and the wall uses it (not buildEntry)
+    assert "function renderBlock" in js
+    # photo block distinguishes one (big) vs several (gallery)
+    assert "block-photo" in css and "block-gallery" in css
+
+
+def test_arrange_mode_and_fixes():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    # arrange mode + layout POST
+    assert "profile-arrange" in html or "profile-arrange" in js
+    assert "/api/profile-layout" in js
+    # Fix A: profile page uses the owner's accent (falling back to identityColor),
+    # not the viewer's identity-hue, for the page color
+    assert "p.accent || identityColor" in js
+    # Fix B: per-block scope badge + composer scope note
+    assert "block-scope" in js or "block-scope" in (WEB / "style.css").read_text(encoding="utf-8")
+
+
+def test_journal_rail_and_self_only_friends():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # journal rail lives in the right column; the main area no longer holds it
+    assert 'id="profile-journal-rail"' in html
+    # a journal disclosure control for mobile exists
+    assert 'profile-journal-toggle' in html or 'profile-journal-toggle' in js
+    # right column shows for everyone (journal), friends/devices gated to mine
+    assert 'renderMeStrip' in js
+
+
+def test_photo_grid_layouts():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "p.grid" in js                                    # render reads the grid
+    assert "/api/block-grid" in js                           # picker persists it
+    for k in ("block-grid-2", "block-grid-3", "block-hero", "block-masonry"):
+        assert k in css                                      # five layouts styled
+
+
+def test_pointer_dnd_present():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    # hand-rolled pointer-events drag (NOT native HTML5 DnD)
+    assert "setPointerCapture" in js
+    assert "pointermove" in js and "pointerup" in js and "pointercancel" in js
+    assert 'draggable="true"' not in js and "dragstart" not in js   # not native DnD
+    # Task 3: the standalone drag-handle button + inline Up/Down arrows are
+    # gone entirely (whole-block tap-vs-drag replaced them - see
+    # test_block_settings_modal) - the drag itself (startBlockDrag) and its
+    # touch-action guard remain, just no longer keyed to those old classes.
+    assert "drag-handle" not in js and "drag-handle" not in css
+    assert "arr-up" not in js and "arr-down" not in js
+    assert "startBlockDrag" in js
+    assert "touch-action" in css   # kept on .block.arranging now, not .drag-handle
+    # no new dependency (single app.js script)
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert html.count("<script") == 1
+
+
+def test_video_block_render_and_composer():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert 'p.media === "video"' in js or "p.media==='video'" in js
+    assert "createElement(\"video\")" in js or "createElement('video')" in js
+    assert "autoplay" not in js.split("renderBlock")[1][:1200]   # no autoplay in the block render
+    assert 'accept="video/*"' in js or "accept='video/*'" in js  # composer video picker
+    assert "block-video" in css
+
+
+def test_bento_grid_render():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "p.size" in js                                  # render reads the size
+    assert "size-" in js                                   # span class applied
+    assert "grid-auto-flow" in css                         # bento packing
+    for k in ("size-small", "size-wide", "size-full"):
+        assert k in css
+
+
+def test_block_settings_modal():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="block-settings"' in html                 # modal markup
+    assert "openBlockSettings" in js                     # opener
+    assert "/api/block-size" in js                       # size action
+    assert "drag-handle" not in js                       # inline 3-line handle removed
+    assert 'className = "grid-pick"' not in js and "grid-pick" not in js  # inline select removed
+
+
+def test_block_settings_keyboard_affordance():
+    # a11y regression fix: the modal was tap-only (pointerdown), leaving no
+    # keyboard path to open it. A focusable button must open it too.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "block-settings-btn" in js and "block-settings-btn" in css
+    # it's a real <button> that wires straight into the opener
+    assert 'el("button", "block-settings-btn"' in js
+    # opener arg added for focus-return (review fix #5) - gear remembers itself
+    assert "cog.onclick = () => openBlockSettings(p, block, cog);" in js
+    # not a reversion to the old cluttered handle/up-down/select controls
+    assert "drag-handle" not in js and "grid-pick" not in js
+
+
+def test_whole_branch_review_fixes():
+    # Whole-branch review (Kreds profile bento canvas, Phase A) - guards
+    # against each finding regressing silently.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+
+    # IMPORTANT #1: both self-only overlays are viewport-fixed, not
+    # absolute-inside-#app (which grows with content while the body
+    # scrolls, stranding a "centered" card thousands of px away on a tall
+    # wall). #story-viewer already used fixed; these two must match it.
+    assert "position: fixed" in _css_rule(css, "#block-settings")
+    assert "position: fixed" in _css_rule(css, "#profile-edit-overlay")
+
+    # IMPORTANT #2: pointercancel is an aborted gesture, not a tap - it
+    # must have its own handler that only tears down, never one shared
+    # with pointerup's open-the-modal branch.
+    assert 'window.addEventListener("pointercancel", cancel)' in js
+    assert 'window.addEventListener("pointercancel", up)' not in js
+
+    # IMPORTANT #3: native image-drag / text-selection can't hijack a
+    # whole-block mouse drag.
+    assert "img.draggable = false" in js               # (a) photo <img>s aren't natively draggable
+    arranging_rule = _css_rule(css, ".block.arranging")
+    assert "user-select: none" in arranging_rule        # (b) no text-selection smear
+    assert "-webkit-user-drag: none" in arranging_rule
+    # (c) preventDefault happens synchronously in the block's own
+    # pointerdown handler - ordered after the closest() bail (so controls
+    # still work) but before the tap/drag bookkeeping starts, not only
+    # (too late) inside startBlockDrag's own preventDefault.
+    handler_start = js.index('block.addEventListener("pointerdown"')
+    closest_idx = js.index('closest("button, a, select, video")', handler_start)
+    prevent_idx = js.index("ev.preventDefault()", handler_start)
+    move_def_idx = js.index("const move = (e) =>", handler_start)
+    assert closest_idx < prevent_idx < move_def_idx
+
+    # IMPORTANT #4: the drag controller's wall-level listeners filter by
+    # pointerId, so a second concurrent touch on the wall can't hijack an
+    # in-progress drag. onLost is exempt (per the fix spec) so it's not
+    # counted here.
+    drag_fn = js.split("function startBlockDrag(")[1].split("\nfunction ")[0]
+    assert 'const onUp = (e) => { if (e.pointerId !== ev.pointerId) return; finish(); };' in drag_fn
+    # onMove and onCancel each carry their own pointerId-filter line too
+    # (3 total: onMove, the onUp one-liner above, and onCancel).
+    assert drag_fn.count("if (e.pointerId !== ev.pointerId) return;") >= 3
+
+    # IMPORTANT #5: the modal manages focus - remembers its opener, moves
+    # focus in on open, traps Tab, and returns focus to the opener on close.
+    assert "BLOCK_SETTINGS_OPENER" in js
+    assert "opener.focus()" in js
+    assert 'if (ev.key !== "Tab") return;' in js        # Tab-trap keydown handler present
+    assert "target.focus()" in js                       # focus moved in on open/rebuild
+
+    # MINOR #6 (if implemented, not just deferred-with-a-comment): tap-phase
+    # pointer capture, released before the drag handoff takes the wall's.
+    assert "block.setPointerCapture(ev.pointerId)" in js
+    assert "block.releasePointerCapture(ev.pointerId)" in js
+
+
+def test_image_lightbox():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "openLightbox" in js                       # controller
+    assert 'id = "lightbox"' in js or 'ov.id = "lightbox"' in js
+    assert "!ARRANGING" in js                          # gated to normal view
+    assert "ArrowLeft" in js and "ArrowRight" in js    # keyboard nav
+    assert "zoom-in" in js                             # click affordance on photos
+    assert "#lightbox" in css and "object-fit: contain" in css
+
+
+# ---------------------------------------------------------------------
+# App-lock client (Task 4): lock screen (PIN/passphrase) + settings.
+# Node is the source of truth (GET /api/applock); the client only
+# reflects it and never persists the credential itself.
+# ---------------------------------------------------------------------
+
+def test_applock_lock_screen_markup():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="lock-screen"' in html
+    assert re.search(r'<form[^>]*id="lock-form"', html)   # real <form> - Enter submits
+    assert 'id="lock-cred"' in html
+    assert 'id="lock-keypad"' in html               # numeric PIN keypad, per cred_type
+    assert 'id="lock-submit"' in html
+    assert 'id="lock-error"' in html
+
+
+def test_applock_boot_check_and_unlock_wired():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "getApplockStatus" in js
+    assert "/api/applock" in js                     # on-load status check
+    assert "/api/unlock" in js
+    assert "renderLockScreen" in js
+    assert "hideLockScreen" in js
+    assert "cred.focus()" in js                      # focus the field on show
+
+
+def test_applock_423_gate_on_any_fetch():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # a wrapped fetch (or equivalent central check) reacts to ANY 423, not
+    # just the boot-time status call - so an autolock mid-session is caught.
+    assert "window.fetch" in js
+    assert "423" in js
+
+
+def test_applock_throttle_countdown():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "throttle_wait" in js
+    assert "applyThrottle" in js
+    assert "lock-submit" in js                       # disabled while throttled
+
+
+def test_applock_settings_section_present():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="profile-applock-panel"' in html      # self-only, mirrors Friends/Devices
+    assert "selfonly" in html.split('id="profile-applock-panel"')[0][-80:] \
+        or 'class="panel selfonly" id="profile-applock-panel"' in html
+    assert 'id="applock-settings"' in html
+    assert "renderApplockSettings" in js
+    assert "/api/applock/setup" in js
+    assert "/api/applock/settings" in js
+    assert "/api/applock/change" in js
+    assert "/api/applock/disable" in js
+    assert "applock-lock-now" in js
+
+
+def test_applock_idle_select_and_sleep_checkbox():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "IDLE_OPTIONS" in js
+    assert "idle_minutes" in js
+    assert "lock_on_sleep" in js
+    assert "applock-lock-on-sleep" in js
+
+
+def test_applock_client_hooks_visibility_and_heartbeat():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'addEventListener("visibilitychange"' in js
+    assert 'document.visibilityState === "hidden"' in js
+    assert "startApplockHeartbeat" in js
+    assert "setInterval" in js
+
+
+def test_applock_hides_app_and_tabbar_while_locked():
+    # position:fixed alone doesn't remove #app's controls from the Tab
+    # order / AT tree - the overlay must actually hide #app (+ the mobile
+    # tabbar, which lives outside #app) so nothing behind it is reachable.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    lock_render = js.split("function renderLockScreen(")[1].split("\nfunction ")[0]
+    assert 'document.getElementById("app").classList.add("hidden")' in lock_render
+    assert ".tabbar-mobile" in lock_render
+    lock_hide = js.split("function hideLockScreen(")[1].split("\nfunction ")[0]
+    assert 'document.getElementById("app").classList.remove("hidden")' in lock_hide
+    assert ".tabbar-mobile" in lock_hide
+
+
+# ---------------------------------------------------------------------
+# First-run onboarding (Task 2): a node with no enrolled identity yet
+# (GET /api/bootstrap -> initialized:false) shows Create/Connect instead
+# of the normal app. Node is the source of truth for /api/bootstrap; the
+# client only branches on it.
+# ---------------------------------------------------------------------
+
+def test_first_run_onboarding():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="first-run"' in html
+    assert "renderFirstRun" in js
+    assert "/api/bootstrap/create" in js and "/api/bootstrap/pair-request" in js
+    assert "/api/bootstrap/pair-install" in js
+
+
+# ---------------------------------------------------------------------
+# One-time onboarding wizard + logo animation + lock-screen restyle
+# (Task 3): shown once right after a fresh node's create/pair, gated by
+# NEEDS_WIZARD (Task 2 sets it in boot() from GET /api/bootstrap's
+# onboarding_done). Two steps - App-lock (genuinely skippable) and an
+# honest iPhone-in-development note - then POST /api/onboarding-done so
+# it never shows again.
+# ---------------------------------------------------------------------
+
+def test_onboarding_wizard_and_logo_anim():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "renderOnboardingWizard" in js and "/api/onboarding-done" in js
+    assert "Skip" in js                                   # app-lock is skippable
+    assert "prefers-reduced-motion" in css                # animation honors reduced motion
+    assert "@keyframes" in css                            # logo breathing/rotation
+
+
+def test_onboarding_wizard_markup_present():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="onboarding-wizard"' in html
+    wiz_html = html.split('id="onboarding-wizard"')[1][:900]
+    assert 'class="mark' in wiz_html                      # shares the logo treatment
+    assert 'id="wiz-step-applock"' in wiz_html and 'id="wiz-step-phone"' in wiz_html
+
+
+def test_onboarding_wizard_wired_into_bootdata():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    bootdata = _js_fn_body(js, "bootData")
+    assert "NEEDS_WIZARD" in bootdata and "renderOnboardingWizard()" in bootdata
+
+
+def test_onboarding_wizard_finish_marks_done_and_clears_flag():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    finish = _js_fn_body(js, "finishOnboardingWizard")
+    assert "/api/onboarding-done" in finish
+    assert "NEEDS_WIZARD = false" in finish
+    assert '"onboarding-wizard"' in finish                # dismisses the overlay
+
+
+def test_onboarding_wizard_applock_step_skippable_and_reuses_setup():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    wiz = _js_fn_body(js, "renderOnboardingWizard")
+    assert "Protect this device with a PIN or passphrase" in wiz
+    assert "/api/applock/setup" in wiz                     # reuses the same setup endpoint
+    assert "Skip" in wiz
+    # Skip's own handler must not call setup - it just advances (genuinely
+    # skippable, not "skip = silently enable with a default").
+    skip_onclick = wiz[wiz.index('el("button", "", "Skip")'):]
+    skip_onclick = skip_onclick[:skip_onclick.index(";", skip_onclick.index("onclick"))]
+    assert "/api/applock/setup" not in skip_onclick
+    assert "showWizardStep(1)" in skip_onclick
+
+
+def test_onboarding_wizard_phone_step_honest_copy():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    wiz = _js_fn_body(js, "renderOnboardingWizard")
+    assert "Kreds for iPhone is in development" in wiz
+    assert "pair your phone to this node when it ships" in wiz
+    assert "pair any device anytime from Settings" in wiz
+    assert "Continue" in wiz
+
+
+def test_onboarding_wizard_esc_skips_to_done_not_silent_dismiss():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    keydown = _js_fn_body(js, "onboardingWizardKeydown")
+    assert '"Escape"' in keydown
+    assert "finishOnboardingWizard()" in keydown
+
+
+def test_onboarding_wizard_focuses_first_control():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert ".focus()" in _js_fn_body(js, "showWizardStep")
+
+
+def test_onboarding_wizard_hides_app_and_tabbar_no_flash():
+    # Mirrors the applock lock-screen's own hide-#app pattern (position:fixed
+    # alone doesn't remove #app's controls from the Tab order/AT tree) - and
+    # boot() must pre-hide #app itself so bootData() populating it doesn't
+    # flash the real app before the wizard ever shows.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    render = _js_fn_body(js, "renderOnboardingWizard")
+    assert 'document.getElementById("app").classList.add("hidden")' in render
+    assert ".tabbar-mobile" in render
+    boot = _js_fn_body(js, "boot")
+    assert "NEEDS_WIZARD" in boot
+    assert 'document.getElementById("app").classList.add("hidden")' in boot
+
+
+def test_logo_breathing_animation_scoped_and_reduced_motion_aware():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "@keyframes" in css
+    # explicitly gated by a reduced-motion query (defense in depth on top of
+    # the existing blanket kill-switch)
+    assert re.search(r"prefers-reduced-motion:\s*(no-preference|reduce)", css)
+    assert "mark-anim" in css                              # scoped modifier, not the persistent nav mark
+
+
+def test_first_run_option_cards_have_hover_transition():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    fr_option_rule = _css_rule(css, ".fr-option")
+    assert "transition" in fr_option_rule
+    assert ".fr-option:hover" in css
+
+
+def test_lock_screen_keypad_structure_unchanged():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    # the existing PIN keypad + passphrase field structure is untouched -
+    # only the surrounding chrome was restyled (per brief Step 5)
+    assert 'id="lock-keypad"' in html
+    for digit in range(10):
+        assert f'data-digit="{digit}"' in html
+    assert 'id="lock-clear"' in html and 'id="lock-backspace"' in html
+    assert 'id="lock-cred"' in html and 'id="lock-submit"' in html and 'id="lock-error"' in html
+
+
+def test_lock_screen_shares_first_run_logo_treatment():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    lock_screen_html = html.split('id="lock-screen"')[1].split('id="lock-form"')[0]
+    assert 'class="mark' in lock_screen_html
+    assert "mark-anim" in lock_screen_html
+    assert "kreds" in lock_screen_html.lower()             # shares the first-run wordmark
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    # same background treatment as #first-run (var(--paper), fixed overlay)
+    fr_rule = _css_rule(css, "#first-run")
+    lock_rule = _css_rule(css, "#lock-screen")
+    assert "background: var(--paper)" in fr_rule
+    assert "background: var(--paper)" in lock_rule
+
+
+# ---------------------------------------------------------------------
+# Whole-branch review (Kreds desktop onboarding): guards against each
+# finding regressing silently.
+# ---------------------------------------------------------------------
+
+def test_boot_checks_response_status_before_parsing_bootstrap_json():
+    # IMPORTANT #1: a revoked device's GET /api/bootstrap gets a 410 from
+    # revoked_gate (hearth/api.py doesn't allowlist /api/bootstrap for a
+    # revoked device - only /api/state is exempt), body
+    # {"detail": "device revoked"} - no "initialized" key. Parsing that
+    # unconditionally makes !b.initialized true -> wrongly renders
+    # first-run over a revoked device. boot() must check r.ok first and
+    # fall through to the lock/state path (which shows the revoked banner)
+    # on any non-2xx, exactly like its existing network-error catch.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    boot = _js_fn_body(js, "boot")
+    assert "fetch(\"/api/bootstrap\")" in boot
+    assert "r.ok" in boot
+    assert "initialized: true" in boot and "onboarding_done: true" in boot
+
+
+def test_lock_screen_hides_onboarding_wizard_and_drops_its_keydown():
+    # IMPORTANT #2(a): the wizard shares #app's z-index and lives outside
+    # #app, so hiding #app/tabbar alone leaves the wizard painted on top of
+    # the lock screen with dead 423 controls if App-lock got enabled at
+    # wizard Step A and the node then autolocks before the wizard finishes.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    lock_render = _js_fn_body(js, "renderLockScreen")
+    assert 'document.getElementById("onboarding-wizard").classList.add("hidden")' in lock_render
+    assert 'document.removeEventListener("keydown", onboardingWizardKeydown)' in lock_render
+
+
+def test_finish_onboarding_wizard_does_not_unhide_app_under_lock():
+    # IMPORTANT #2(b): finishOnboardingWizard (Esc/Continue) must not
+    # unconditionally unhide #app/tabbar - if the lock screen is currently
+    # showing (autolock fired while the wizard was open), doing so would
+    # restore gated content to the Tab/AT tree behind the lock overlay.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    finish = _js_fn_body(js, "finishOnboardingWizard")
+    assert '"lock-screen"' in finish
+    guard_idx = finish.index('classList.contains("hidden")')
+    unhide_idx = finish.index('document.getElementById("app").classList.remove("hidden")')
+    assert guard_idx < unhide_idx                # the unhide is inside the guarded branch
+
+
+def test_applock_credential_never_persisted():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # the credential must never be written to persistent client storage
+    for m in re.finditer(r'(?:localStorage|sessionStorage)\.setItem\(([^)]*)\)', js):
+        args = m.group(1).lower()
+        assert "cred" not in args and "pin" not in args and "passphrase" not in args
+
+
+# ---------------------------------------------------------------------
+# Desktop custom chrome (Kreds Windows app shell, Task 3): frameless
+# title bar + traffic-light controls (minimize/maximize/close) + a
+# close_behavior setting (wizard step + Settings toggle). Everything here
+# is gated on window.pywebview -- a plain browser (dev/demo) must see
+# none of it.
+# ---------------------------------------------------------------------
+
+def test_desktop_custom_chrome():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert "window.pywebview" in js                       # desktop detection
+    assert "pywebview-drag-region" in html or "pywebview-drag-region" in js  # drag region
+    assert ".titlebar" in css                             # custom chrome styled
+    assert "close_behavior" in js and "/api/settings" in js
+
+
+def test_titlebar_markup_buttons_not_draggable():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="titlebar"' in html
+    titlebar_html = html.split('id="titlebar"')[1][:1200]   # comfortably covers the whole block
+    assert "pywebview-drag-region" in titlebar_html
+    assert 'id="titlebar-min"' in titlebar_html
+    assert 'id="titlebar-max"' in titlebar_html
+    assert 'id="titlebar-close"' in titlebar_html
+    # the three control buttons must NOT carry the drag class themselves,
+    # only the separate title/logo span does -- otherwise clicks on them
+    # would be swallowed by pywebview's window-drag handling instead of
+    # registering as clicks. Check each <button ...> tag's own class attr.
+    buttons = re.findall(r'<button\b[^>]*>', titlebar_html)
+    assert len(buttons) == 3
+    for btn in buttons:
+        assert "pywebview-drag-region" not in btn
+
+
+def test_titlebar_hidden_by_default_and_desktop_gated_in_js():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    titlebar_html = html.split('<div class="titlebar')[1][:40]
+    assert "hidden" in titlebar_html          # hidden by default (plain browser)
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "pywebviewready" in js             # wired on pywebview's ready event
+    assert '.classList.add("desktop")' in js  # reveals the bar / offsets content
+
+
+def test_close_reads_live_pref_each_time():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    chrome_fn = _js_fn_body(js, "wireDesktopChrome")
+    assert "/api/settings" in chrome_fn
+    assert '"keep"' in chrome_fn
+    assert "api.minimize()" in chrome_fn and "api.quit()" in chrome_fn
+
+
+def test_wizard_close_behavior_step_desktop_only():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    wiz = _js_fn_body(js, "renderOnboardingWizard")
+    assert "window.pywebview" in wiz
+    assert "Keep running in the background" in wiz
+    assert "/api/settings" in wiz
+
+
+def test_settings_toggle_desktop_only_in_me_area():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="profile-desktop-panel"' in html
+    assert 'id="desktop-settings"' in html
+    assert "renderDesktopSettings" in js
+    render = _js_fn_body(js, "renderDesktopSettings")
+    assert "window.pywebview" in render
+    assert "/api/settings" in render
+
+
+# ---------------------------------------------------------------------
+# Signed in-app updates (Task 3): a self-only Updates panel in the
+# profile side strip (mirrors App-lock/Desktop) -- "Check for updates"
+# hits GET /api/update/check, and an Apply button (shown only once an
+# update is available) hits POST /api/update/apply, reloading on a web
+# hot-swap or telling the user to restart on a staged core update.
+# ---------------------------------------------------------------------
+
+def test_updates_panel_markup_present():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="profile-updates-panel"' in html
+    assert 'id="update-settings"' in html
+    updates_html = html.split('id="profile-updates-panel"')[1][:200]
+    assert "selfonly" in html.split('id="profile-updates-panel"')[0][-80:] \
+        or 'class="panel selfonly" id="profile-updates-panel"' in html
+    assert "Updates" in updates_html or "<h2>Updates</h2>" in \
+        html.split('id="profile-updates-panel"')[1][:60]
+
+
+def test_updates_ui_wired_into_app():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "renderUpdateSettings" in js
+    assert "/api/update/check" in js
+    assert "/api/update/apply" in js
+    render = _js_fn_body(js, "renderUpdateSettings")
+    assert "/api/update/check" in render
+    assert "/api/update/apply" in render
+
+
+def test_updates_ui_wired_into_me_strip():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    me_strip = _js_fn_body(js, "renderMeStrip")
+    assert "renderUpdateSettings" in me_strip
+
+
+def test_updates_ui_apply_reload_vs_restart_paths():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    render = _js_fn_body(js, "renderUpdateSettings")
+    # web hot-swap -> reload
+    assert "location.reload()" in render
+    assert "out.reload" in render or "info.reload" in render or "reload" in render
+    # core staged -> restart notice, not a reload
+    assert "restart_required" in render
+    assert "restart Kreds" in render
+
+
+def test_updates_ui_check_button_keyboard_accessible():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    render = _js_fn_body(js, "renderUpdateSettings")
+    # real <button> elements (Tab/Enter/Space reachable), not div/span
+    # click-handler-only controls
+    assert 'el("button"' in render
+
+
+def test_updates_ui_checks_response_ok_before_parsing():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    render = _js_fn_body(js, "renderUpdateSettings")
+    assert "r.ok" in render
+
+
+# ---------------------------------------------------------------------
+# Easier friend-add (Task 3): a two-mode Add-friend panel is now the
+# default -- Share my code (POST /api/friend/invite, live expiry
+# countdown, Regenerate) and Enter a code (POST /api/friend/add,
+# connected/manual). The original 4-box copy-paste ceremony
+# (respond/finalize/complete, server-side unchanged) moves under a
+# "manual fallback" disclosure rather than being deleted.
+# ---------------------------------------------------------------------
+
+def test_friend_add_entry_point_and_tabs_present():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # ceremonyUI stays the one-time boot entry point (bootData calls it),
+    # and the toggle keeps saying "Add friend" (test_shipped_features_
+    # preserved already pins both strings at the top level).
+    ceremony = _js_fn_body(js, "ceremonyUI")
+    assert "friendadd-tab" in ceremony
+    assert "Share my code" in ceremony and "Enter a code" in ceremony
+    assert "buildShareTab" in ceremony and "buildEnterTab" in ceremony
+
+
+def test_friend_add_manual_fallback_still_reachable():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    ceremony = _js_fn_body(js, "ceremonyUI")
+    assert "buildManualCeremony" in ceremony
+    assert "manual code exchange" in ceremony
+    # the manual builder still drives the SAME four endpoints as before --
+    # this is the fallback the "manual" response from /api/friend/add
+    # walks the user through by hand.
+    manual = _js_fn_body(js, "buildManualCeremony")
+    for step_url in ("/api/friend/invite", "/api/friend/respond",
+                      "/api/friend/finalize", "/api/friend/complete"):
+        assert step_url in manual
+
+
+def test_friend_add_share_tab_code_copy_and_countdown():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    share = _js_fn_body(js, "buildShareTab")
+    assert "/api/friend/invite" in share
+    assert "Copy code" in share
+    assert "wireCopyButton" in share
+    # live countdown driven by setInterval, computed from expires_at,
+    # updates via textContent (not innerHTML)
+    assert "setInterval" in share
+    assert "r.expires_at" in share
+    assert 'countdown.textContent = "expires in "' in share
+
+
+def test_friend_add_share_tab_expiry_and_regenerate():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    share = _js_fn_body(js, "buildShareTab")
+    assert '"Code expired"' in share
+    assert "Regenerate" in share
+    # Regenerate re-POSTs the exact same getCode flow used for the first code
+    assert "regenBtn.onclick = getCode" in share
+
+
+def test_friend_add_enter_tab_connected_and_manual_paths():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    enter = _js_fn_body(js, "buildEnterTab")
+    assert "/api/friend/add" in enter
+    assert '"connected"' in enter
+    assert "You're now friends with " in enter
+    assert "refresh()" in enter
+    assert "They seem offline" in enter
+    assert "r.response" in enter
+    assert "Copy code" in enter and "wireCopyButton" in enter
+
+
+def test_friend_add_notes_use_textcontent_not_innerhtml():
+    # XSS-safe pattern check (matches the rest of the client): server-
+    # controlled/user-pasted values (friend name, response code, error
+    # messages) must land via textContent/.value, never innerHTML, across
+    # the code+status handling helpers. (ceremonyUI's own innerHTML use is
+    # the pre-existing static "+<span>Add friend</span>" icon markup, same
+    # established pattern as the Send/Attach button icons elsewhere.)
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    block_start = js.index("function wireCopyButton")
+    block_end = js.index("function ceremonyUI")
+    block = js[block_start:block_end]
+    assert "innerHTML" not in block
+    assert "buildShareTab" in block and "buildEnterTab" in block \
+        and "buildManualCeremony" in block   # sanity: didn't slice past the intended functions
+
+
+def test_friend_add_keyboard_accessible():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    enter = _js_fn_body(js, "buildEnterTab")
+    # real <label for=...> tied to the textarea's id
+    assert 'label.htmlFor = "friendadd-enter-code"' in enter
+    assert 'ta.id = "friendadd-enter-code"' in enter
+    # Enter submits (Shift+Enter still allowed to insert a newline)
+    assert '"keydown"' in enter
+    assert 'ev.key === "Enter" && !ev.shiftKey' in enter
+    assert "requestSubmit" in enter
+    # focus management: opening a tab focuses its first meaningful control
+    ceremony = _js_fn_body(js, "ceremonyUI")
+    assert "friendaddFocus" in ceremony
+
+
+def test_friend_add_css_present():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    for sel in (".friendadd-tabs", ".friendadd-tab", ".friendadd-body",
+                ".friendadd-code", ".friendadd-countdown", ".ceremony-manual"):
+        assert sel in css

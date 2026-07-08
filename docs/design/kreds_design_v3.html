@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="day">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kreds — design direction v3</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F3F4F1;--surface:#FFFFFF;--ink:#17191B;--ink-2:#5F6468;
+  --line:#E1E3DE;--line-2:#CFD2CC;--red:#C8102E;--red-soft:#F7E3E5;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;
+  --body:'Instrument Sans',system-ui,sans-serif;
+  --disp:'Bricolage Grotesque','Instrument Sans',system-ui,sans-serif;
+  --shadow:0 1px 2px rgba(20,22,24,.04),0 12px 40px -18px rgba(20,22,24,.14);
+}
+[data-theme="night"]{
+  --paper:#141517;--surface:#1C1E20;--ink:#EDEEEA;--ink-2:#9A9FA3;
+  --line:#2A2D30;--line-2:#373B3E;--red:#E5314A;--red-soft:#3A1A20;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 40px -18px rgba(0,0,0,.5);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+body{font-family:var(--body);background:var(--paper);color:var(--ink);line-height:1.55;transition:background .35s,color .35s}
+button{font-family:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--red);outline-offset:2px;border-radius:4px}
+
+.mark .arc{stroke:var(--red);stroke-width:7;fill:none;stroke-linecap:round}
+.mark .dot{fill:var(--ink)}
+
+/* ---------- page chrome ---------- */
+.brand-hero{max-width:1220px;margin:0 auto;padding:52px 32px 36px;display:flex;align-items:flex-end;justify-content:space-between;gap:30px;border-bottom:1px solid var(--line-2)}
+.lockup{display:flex;align-items:center;gap:16px}
+.lockup .mark{width:54px;height:54px}
+.wordmark{font-family:var(--disp);font-weight:700;font-size:46px;letter-spacing:-.03em;line-height:1}
+.tagline{font-size:14px;color:var(--ink-2);margin-top:6px;max-width:52ch}
+.seclabel{max-width:1220px;margin:0 auto;padding:38px 32px 14px;font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-2);display:flex;align-items:center;gap:12px}
+.seclabel::after{content:"";flex:1;height:1px;background:var(--line-2)}
+.pagegrid{max-width:1220px;margin:0 auto 24px;padding:0 32px;display:grid;grid-template-columns:1fr 330px;gap:26px;align-items:start}
+
+/* ---------- desktop app ---------- */
+.app{background:var(--paper);border:1px solid var(--line-2);border-radius:18px;overflow:hidden;box-shadow:var(--shadow);position:relative}
+.appnav{display:flex;align-items:center;gap:10px;padding:12px 20px;background:var(--surface);border-bottom:1px solid var(--line)}
+.appnav .mark{width:26px;height:26px}.appnav .mark .arc{stroke-width:9}
+.navword{font-family:var(--disp);font-weight:700;font-size:19px;letter-spacing:-.02em}
+.navlinks{display:flex;gap:2px;margin-left:14px}
+.navlinks button{border:none;background:transparent;color:var(--ink-2);font-size:13.5px;font-weight:500;padding:7px 13px;border-radius:99px;transition:.15s}
+.navlinks button:hover{color:var(--ink)}
+.navlinks button.active{background:var(--ink);color:var(--paper)}
+.navspacer{flex:1}
+.whoami{font-family:var(--mono);font-size:11.5px;color:var(--ink-2)}
+.whoami b{color:var(--ink);font-weight:500}
+.themebtn{border:1px solid var(--line-2);background:var(--surface);color:var(--ink);width:30px;height:30px;border-radius:50%;font-size:13px;margin-left:8px;transition:transform .2s}
+.themebtn:hover{transform:rotate(30deg)}
+
+.appmain{display:grid;grid-template-columns:1fr 218px;gap:0}
+.journal{padding:20px 24px 26px;background:var(--surface);min-height:560px}
+
+/* filter chips */
+.chipbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.fchip{display:flex;align-items:center;gap:7px;border:1px solid var(--line-2);background:transparent;color:var(--ink-2);font-size:12.5px;font-weight:500;padding:5px 12px 5px 6px;border-radius:99px;transition:.15s}
+.fchip .cav{width:20px;height:20px;border-radius:50%;display:grid;place-items:center;font-family:var(--disp);font-weight:600;font-size:9.5px;color:#fff}
+.fchip:hover{color:var(--ink);border-color:var(--ink-2)}
+.fchip.active{color:var(--red);border-color:var(--red);background:var(--red-soft)}
+.fchip.plain{padding:5px 12px}
+.fchip .fdot{width:6px;height:6px;border-radius:50%;background:var(--red)}
+
+/* composer */
+.composer{border:1px solid var(--line);border-radius:12px;padding:12px 14px 10px;background:var(--paper);margin-bottom:6px}
+.composer input{width:100%;border:none;background:transparent;font-family:var(--body);font-size:15px;color:var(--ink)}
+.composer input::placeholder{color:var(--ink-2)}
+.composer input:focus{outline:none}
+.composerbar{display:flex;align-items:center;gap:6px;margin-top:10px}
+.keeps-label{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-2)}
+.keep{display:flex;align-items:center;gap:5px;border:1px solid var(--line-2);background:transparent;color:var(--ink-2);font-size:12px;font-weight:500;padding:4px 9px 4px 6px;border-radius:99px;transition:.15s}
+.keep svg{width:15px;height:15px}
+.keep .r{fill:none;stroke:currentColor;stroke-width:1.6}.keep .rf{fill:currentColor}
+.keep:hover{color:var(--ink);border-color:var(--ink-2)}
+.keep.active{color:var(--red);border-color:var(--red);background:var(--red-soft)}
+.postbtn{margin-left:auto;border:none;background:var(--ink);color:var(--paper);font-size:12.5px;font-weight:600;padding:7px 16px;border-radius:99px;transition:transform .12s}
+.postbtn:hover{transform:translateY(-1px)}
+
+/* entries */
+.dayhead{display:flex;align-items:center;gap:12px;margin:20px 0 4px;font-family:var(--mono);font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-2)}
+.dayhead::after{content:"";flex:1;height:1px;background:var(--line)}
+.entry{display:flex;gap:12px;padding:12px 2px;border-bottom:1px solid var(--line);transition:opacity .2s}
+.entry:last-of-type{border-bottom:none}
+.entry.hidden{display:none}
+.eavatar{width:34px;height:34px;border-radius:50%;flex:none;display:grid;place-items:center;font-family:var(--disp);font-weight:600;font-size:13px;color:#fff;position:relative;cursor:pointer;border:none}
+.eavatar::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:1.5px solid var(--ring)}
+.ebody{flex:1;min-width:0}
+.eline{display:flex;align-items:baseline;gap:8px}
+.ename{font-weight:600;font-size:14px;cursor:pointer;background:none;border:none;color:var(--ink);font-family:var(--body);padding:0}
+.ename:hover{color:var(--red)}
+.etime{font-family:var(--mono);font-size:10.5px;color:var(--ink-2)}
+.escope{margin-left:auto;display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:9.5px;color:var(--ink-2);border:1px solid var(--line);border-radius:99px;padding:2px 8px;background:none;transition:.15s;position:relative}
+.escope svg{width:11px;height:11px}
+.escope .r{fill:none;stroke:currentColor;stroke-width:1.8}.escope .rf{fill:currentColor}
+.escope:hover{color:var(--ink);border-color:var(--ink-2)}
+.etext{font-size:14.5px;margin-top:2px}
+.eacts{display:flex;gap:2px;margin-top:4px;margin-left:-8px}
+.pact{border:none;background:transparent;color:var(--ink-2);font-size:12px;font-weight:500;padding:4px 8px;border-radius:7px;transition:.15s}
+.pact:hover{color:var(--ink);background:var(--paper)}
+.pact.del:hover{color:var(--red);background:var(--red-soft)}
+.theend{margin-top:26px;display:flex;flex-direction:column;align-items:center;gap:8px;padding:18px 0 6px;text-align:center}
+.theend .mark{width:30px;height:30px;opacity:.85}
+.theend .mark .arc{stroke:var(--line-2);stroke-width:8}
+.theend .mark .dot{fill:var(--ink-2)}
+.endtitle{font-family:var(--disp);font-weight:600;font-size:15px}
+.endsub{font-size:12px;color:var(--ink-2)}
+
+/* circle rail (compact) */
+.rail{border-left:1px solid var(--line);background:var(--paper);padding:16px 14px;display:flex;flex-direction:column;gap:10px}
+.railtitle{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-2);display:flex;justify-content:space-between;align-items:center}
+.expandbtn{border:none;background:none;color:var(--red);font-size:11px;font-weight:600;letter-spacing:0;text-transform:none;font-family:var(--body);padding:2px 4px}
+.minimap{width:100%;cursor:pointer;border:none;background:none;padding:0}
+.minimap svg{width:100%;height:auto;display:block}
+.ringguide{fill:none;stroke:var(--line-2);stroke-width:1;stroke-dasharray:2 5}
+.mm-node circle{stroke:var(--paper);stroke-width:2.5}
+.mm-node text{font-family:var(--disp);font-weight:600;font-size:11px;fill:#fff;text-anchor:middle;dominant-baseline:central}
+.mm-you{fill:var(--ink)}
+.mm-youtext{font-family:var(--disp);font-weight:700;font-size:10px;fill:var(--paper);text-anchor:middle;dominant-baseline:central}
+.fresh{fill:var(--red)}
+.railnote{font-size:11.5px;color:var(--ink-2);line-height:1.5}
+.railnote b{color:var(--ink);font-weight:500}
+
+/* identity strip */
+.idstrip{display:flex;align-items:center;gap:12px;padding:10px 20px;border-top:1px solid var(--line);background:var(--surface);font-family:var(--mono);font-size:10.5px;color:var(--ink-2)}
+.idstrip .keychip{width:8px;height:8px;border-radius:2.5px;background:var(--red)}
+.idstrip .fp{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.idstrip .devs{margin-left:auto;white-space:nowrap}
+.idstrip .devs b{color:var(--ink);font-weight:500}
+
+/* ---------- circle overlay ---------- */
+.overlay{position:absolute;inset:0;background:color-mix(in srgb,var(--paper) 88%,transparent);backdrop-filter:blur(6px);display:none;place-items:center;z-index:20}
+.overlay.open{display:grid}
+.bigmapwrap{text-align:center}
+.bigmapwrap svg{width:min(76%,470px);height:auto}
+.node{cursor:pointer}
+.node circle.face{stroke:var(--paper);stroke-width:3;transition:transform .18s}
+.node:hover circle.face{transform:scale(1.1);transform-box:fill-box;transform-origin:center}
+.node text.init{font-family:var(--disp);font-weight:600;font-size:15px;fill:#fff;text-anchor:middle;dominant-baseline:central;pointer-events:none}
+.node text.nlabel{font-family:var(--body);font-weight:500;font-size:11.5px;fill:var(--ink);text-anchor:middle}
+.ringlabel{font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;fill:var(--ink-2);text-transform:uppercase}
+.younode circle{fill:var(--ink)}
+.younode text{font-family:var(--disp);font-weight:700;font-size:14px;fill:var(--paper);text-anchor:middle;dominant-baseline:central}
+.closeoverlay{position:absolute;top:16px;right:18px;border:1px solid var(--line-2);background:var(--surface);color:var(--ink);width:32px;height:32px;border-radius:50%;font-size:14px}
+.overlayhint{font-size:12.5px;color:var(--ink-2);margin-top:4px}
+
+/* ---------- profile modal ---------- */
+.modalback{position:fixed;inset:0;background:rgba(15,17,19,.45);display:none;place-items:center;z-index:50;padding:20px}
+.modalback.open{display:grid}
+.pmodal{background:var(--surface);border:1px solid var(--line-2);border-radius:16px;width:min(430px,100%);box-shadow:var(--shadow);overflow:hidden;position:relative}
+.pmbanner{height:74px;background:var(--pcolor,#2E6E5E);opacity:.9}
+.pmclose{position:absolute;top:12px;right:12px;border:none;background:rgba(255,255,255,.85);color:#17191B;width:28px;height:28px;border-radius:50%;font-size:13px}
+.pmhead{padding:0 22px 6px;margin-top:-26px;display:flex;align-items:flex-end;gap:14px}
+.pmavatar{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-family:var(--disp);font-weight:700;font-size:22px;color:#fff;border:4px solid var(--surface);background:var(--pcolor)}
+.pmname{font-family:var(--disp);font-weight:700;font-size:21px;line-height:1.1}
+.pmhash{font-family:var(--mono);font-size:10.5px;color:var(--ink-2)}
+.pmbody{padding:10px 22px 20px}
+.pmbio{font-size:13.5px;color:var(--ink-2)}
+.pmring{display:inline-flex;align-items:center;gap:6px;margin-top:10px;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);border:1px dashed var(--line-2);border-radius:99px;padding:4px 11px}
+.pmring svg{width:12px;height:12px}
+.pmring .r{fill:none;stroke:var(--red);stroke-width:1.8}.pmring .rf{fill:var(--red)}
+.pmacts{display:flex;gap:8px;margin-top:14px}
+.pmbtn{flex:1;border:1px solid var(--line-2);background:transparent;color:var(--ink);font-size:13px;font-weight:500;padding:8px;border-radius:9px;transition:.15s}
+.pmbtn:hover{border-color:var(--ink-2)}
+.pmbtn.primary{background:var(--ink);border-color:var(--ink);color:var(--paper)}
+.pmrecent{margin-top:16px;border-top:1px solid var(--line);padding-top:12px}
+.pmrecent h4{font-family:var(--mono);font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-2);font-weight:500;margin-bottom:8px}
+.pmpost{font-size:13.5px;padding:7px 0;border-bottom:1px solid var(--line)}
+.pmpost:last-child{border-bottom:none}
+.pmpost .t{font-family:var(--mono);font-size:10px;color:var(--ink-2);margin-right:8px}
+
+/* ---------- receipts popover ---------- */
+.receipts{position:absolute;top:calc(100% + 8px);right:0;z-index:30;background:var(--surface);border:1px solid var(--line-2);border-radius:12px;box-shadow:var(--shadow);padding:13px 15px;width:250px;text-align:left;display:none}
+.receipts.open{display:block}
+.receipts h5{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-2);font-weight:500;margin-bottom:8px}
+.rcpt{display:flex;align-items:center;gap:8px;font-size:12px;padding:3px 0;color:var(--ink)}
+.rcpt .rdot{width:6px;height:6px;border-radius:50%;background:#3B8C5A;flex:none}
+.rcpt .rdev{font-family:var(--mono);font-size:11px}
+.rcptsum{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:11px;color:var(--ink-2);line-height:1.45}
+
+/* ---------- phone concept ---------- */
+.phonecol{display:flex;flex-direction:column;gap:14px;align-items:center}
+.phone{width:272px;background:var(--surface);border:1px solid var(--line-2);border-radius:34px;box-shadow:var(--shadow);overflow:hidden;padding:14px 0 0}
+.phead{display:flex;align-items:center;justify-content:space-between;padding:4px 20px 8px}
+.phead .mark{width:22px;height:22px}.phead .mark .arc{stroke-width:10}
+.phead .pw{font-family:var(--disp);font-weight:700;font-size:15px}
+.phead .pt{font-family:var(--mono);font-size:9.5px;color:var(--ink-2)}
+.pmap{padding:2px 6px}
+.pmap svg{width:100%;height:auto}
+.pcap{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;fill:var(--ink-2)}
+.ptabs{display:flex;border-top:1px solid var(--line);margin-top:6px}
+.ptab{flex:1;border:none;background:none;color:var(--ink-2);font-size:11px;font-weight:500;padding:11px 0 13px;display:flex;flex-direction:column;align-items:center;gap:3px}
+.ptab svg{width:19px;height:19px}
+.ptab.active{color:var(--red)}
+.ptab .ico{fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round}
+.phonenote{font-size:12.5px;color:var(--ink-2);max-width:34ch;text-align:center;line-height:1.55}
+.phonenote b{color:var(--ink);font-weight:600}
+
+/* rationale */
+.rationale{max-width:1220px;margin:0 auto;padding:16px 32px 72px;display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+.rat{font-size:13.5px;color:var(--ink-2);line-height:1.6}
+.rat b{display:block;font-family:var(--disp);font-weight:600;font-size:15px;color:var(--ink);margin-bottom:5px}
+
+@media (max-width:1020px){
+  .pagegrid{grid-template-columns:1fr}
+  .phonecol{align-items:flex-start;flex-direction:row;flex-wrap:wrap}
+}
+@media (max-width:760px){
+  .brand-hero{flex-direction:column;align-items:flex-start;padding:40px 16px 28px}
+  .seclabel,.rationale{padding-left:16px;padding-right:16px}
+  .pagegrid{padding:0 16px}
+  .appmain{grid-template-columns:1fr}
+  .rail{border-left:none;border-top:1px solid var(--line);flex-direction:row;align-items:center}
+  .minimap{max-width:170px}
+  .navlinks{display:none}
+  .rationale{grid-template-columns:1fr}
+  .escope{display:none}
+}
+</style>
+</head>
+<body>
+
+<header class="brand-hero">
+  <div>
+    <div class="lockup">
+      <svg class="mark" viewBox="0 0 100 100" role="img" aria-label="Kreds mark">
+        <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+        <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+        <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+        <circle class="dot" cx="50" cy="50" r="9"/>
+      </svg>
+      <div class="wordmark">kreds</div>
+    </div>
+    <p class="tagline">v3 — journal-first. The circle becomes navigation: compact on desktop, expandable to a full map; on the phone it <b>is</b> the home screen. People open as profiles wherever you meet them.</p>
+  </div>
+</header>
+
+<div class="seclabel">Desktop · journal-first, circle as expandable navigation</div>
+<div class="pagegrid">
+
+  <!-- ================= DESKTOP APP ================= -->
+  <div class="app" id="app">
+    <nav class="appnav">
+      <svg class="mark" viewBox="0 0 100 100" aria-hidden="true">
+        <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+        <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+        <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+        <circle class="dot" cx="50" cy="50" r="9"/>
+      </svg>
+      <span class="navword">kreds</span>
+      <div class="navlinks">
+        <button class="active">Journal</button>
+        <button>Messages</button>
+        <button>Me</button>
+      </div>
+      <div class="navspacer"></div>
+      <span class="whoami"><b>Wong</b> on wong-phone</span>
+      <button class="themebtn" id="themeToggle" aria-label="Switch theme">☀</button>
+    </nav>
+
+    <div class="appmain">
+      <section class="journal">
+
+        <!-- filter chips: the circle's everyday form -->
+        <div class="chipbar" role="group" aria-label="Filter journal">
+          <button class="fchip plain active" data-filter="all">Everyone</button>
+          <button class="fchip plain" data-filter="inner">Inner kreds</button>
+          <button class="fchip" data-filter="freja"><span class="cav" style="background:#2E6E5E">F</span>Freja<span class="fdot" title="new"></span></button>
+          <button class="fchip" data-filter="josh"><span class="cav" style="background:#3B4E8C">J</span>Josh</button>
+          <button class="fchip" data-filter="mikkel"><span class="cav" style="background:#8C5A2E">M</span>Mikkel<span class="fdot" title="new"></span></button>
+          <button class="fchip" data-filter="sofia"><span class="cav" style="background:#71368C">S</span>Sofia</button>
+        </div>
+
+        <div class="composer">
+          <input type="text" placeholder="Say something to your kreds…" aria-label="Write a post">
+          <div class="composerbar">
+            <span class="keeps-label">keeps</span>
+            <button class="keep"><svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/></svg>Inner</button>
+            <button class="keep active"><svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/><circle class="r" cx="10" cy="10" r="7"/></svg>Kreds</button>
+            <button class="keep"><svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="2.6"/><circle class="r" cx="10" cy="10" r="5.4"/><circle class="r" cx="10" cy="10" r="8.6"/></svg>Open</button>
+            <button class="postbtn">Post</button>
+          </div>
+        </div>
+
+        <div class="dayhead" data-day>Today · Saturday 4 July</div>
+
+        <article class="entry" data-author="mikkel">
+          <button class="eavatar" style="background:#8C5A2E;--ring:#8C5A2E" data-open="mikkel" aria-label="Open Mikkel's profile">M</button>
+          <div class="ebody">
+            <div class="eline">
+              <button class="ename" data-open="mikkel">Mikkel</button><span class="etime">14:02</span>
+              <button class="escope" data-receipt aria-haspopup="true" aria-expanded="false">
+                <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/><circle class="r" cx="10" cy="10" r="7"/></svg>kreds
+                <span class="receipts" role="tooltip">
+                  <h5>Who holds this post</h5>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">mikkel-phone</span></span>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">mikkel-homenode</span></span>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">wong-homenode</span></span>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">freja-homenode</span></span>
+                  <span class="rcptsum">4 copies · encrypted to Mikkel's kreds. No server holds it — scope is physics, not policy.</span>
+                </span>
+              </button>
+            </div>
+            <p class="etext">Nogen der vil med ud at løbe ved søerne i morgen tidlig?</p>
+            <div class="eacts"><button class="pact">Reply</button></div>
+          </div>
+        </article>
+
+        <article class="entry" data-author="freja" data-ring="inner">
+          <button class="eavatar" style="background:#2E6E5E;--ring:#2E6E5E" data-open="freja" aria-label="Open Freja's profile">F</button>
+          <div class="ebody">
+            <div class="eline">
+              <button class="ename" data-open="freja">Freja</button><span class="etime">09:12</span>
+              <button class="escope" data-receipt aria-haspopup="true" aria-expanded="false">
+                <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/></svg>inner
+                <span class="receipts" role="tooltip">
+                  <h5>Who holds this post</h5>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">freja-phone</span></span>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">wong-phone</span></span>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">wong-homenode</span></span>
+                  <span class="rcptsum">3 copies · inner kreds only. Sofia and Mikkel's devices never receive it.</span>
+                </span>
+              </button>
+            </div>
+            <p class="etext">Kaffe på taget, solen er fremme ☀</p>
+            <div class="eacts"><button class="pact">Reply</button></div>
+          </div>
+        </article>
+
+        <div class="dayhead" data-day>Yesterday · Friday 3 July</div>
+
+        <article class="entry" data-author="wong">
+          <button class="eavatar" style="background:#C8102E;--ring:#C8102E" aria-label="You">W</button>
+          <div class="ebody">
+            <div class="eline">
+              <span class="ename" style="cursor:default">Wong</span><span class="etime">18:15</span>
+              <button class="escope" data-receipt aria-haspopup="true" aria-expanded="false">
+                <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/><circle class="r" cx="10" cy="10" r="7"/></svg>kreds
+                <span class="receipts" role="tooltip">
+                  <h5>Who holds this post</h5>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">wong-phone</span></span>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">wong-homenode</span></span>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">freja-phone · freja-homenode</span></span>
+                  <span class="rcpt"><span class="rdot"></span><span class="rdev">josh-node · mikkel-phone …</span></span>
+                  <span class="rcptsum">8 copies across your kreds. "Delete everywhere" asks each one — and shows you who confirmed.</span>
+                </span>
+              </button>
+            </div>
+            <p class="etext">Velkommen til Kreds, Freja.</p>
+            <div class="eacts"><button class="pact">Reply</button><button class="pact del">Delete everywhere</button></div>
+          </div>
+        </article>
+
+        <article class="entry" data-author="freja" data-ring="inner">
+          <button class="eavatar" style="background:#2E6E5E;--ring:#2E6E5E" data-open="freja" aria-label="Open Freja's profile">F</button>
+          <div class="ebody">
+            <div class="eline">
+              <button class="ename" data-open="freja">Freja</button><span class="etime">18:15</span>
+            </div>
+            <p class="etext">Hej Wong! Fint at være her.</p>
+            <div class="eacts"><button class="pact">Reply</button></div>
+          </div>
+        </article>
+
+        <div class="theend">
+          <svg class="mark" viewBox="0 0 100 100" aria-hidden="true">
+            <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+            <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+            <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+            <circle class="dot" cx="50" cy="50" r="9"/>
+          </svg>
+          <div class="endtitle">That's everything.</div>
+          <div class="endsub">Your kreds is quiet. No algorithm, nothing more to scroll.</div>
+        </div>
+      </section>
+
+      <!-- compact circle rail -->
+      <aside class="rail">
+        <div class="railtitle">Your kreds · 4 <button class="expandbtn" id="expandCircle">Expand ↗</button></div>
+        <button class="minimap" id="miniMap" aria-label="Open the circle">
+          <svg viewBox="0 0 200 200" aria-hidden="true">
+            <circle class="ringguide" cx="100" cy="100" r="44"/>
+            <circle class="ringguide" cx="100" cy="100" r="78"/>
+            <circle class="mm-you" cx="100" cy="100" r="13"/>
+            <text class="mm-youtext" x="100" y="100.5">W</text>
+            <g class="mm-node"><circle cx="136" cy="79" r="11" fill="#2E6E5E"/><text x="136" y="79.5">F</text><circle class="fresh" cx="145" cy="70" r="3.4"/></g>
+            <g class="mm-node"><circle cx="66" cy="122" r="11" fill="#3B4E8C"/><text x="66" y="122.5">J</text></g>
+            <g class="mm-node"><circle cx="120" cy="174" r="11" fill="#8C5A2E"/><text x="120" y="174.5">M</text><circle class="fresh" cx="129" cy="165" r="3.4"/></g>
+            <g class="mm-node"><circle cx="159" cy="50" r="11" fill="#71368C"/><text x="159" y="50.5">S</text></g>
+          </svg>
+        </button>
+        <p class="railnote"><b>2 new</b> since you last looked. Click the circle to expand — click a person anywhere to open their profile.</p>
+      </aside>
+    </div>
+
+    <div class="idstrip">
+      <span class="keychip"></span>
+      <span class="fp">identity a0041d0c8d2fc32f2d21ca3d3503759ff79dff6b401e</span>
+      <span class="devs"><b>2 devices</b> hold your keys · manage in Me</span>
+    </div>
+
+    <!-- expanded circle overlay -->
+    <div class="overlay" id="circleOverlay" role="dialog" aria-label="Your kreds, expanded">
+      <button class="closeoverlay" id="closeOverlay" aria-label="Close">✕</button>
+      <div class="bigmapwrap">
+        <svg viewBox="0 0 440 440">
+          <circle class="ringguide" cx="220" cy="220" r="92"/>
+          <circle class="ringguide" cx="220" cy="220" r="170"/>
+          <text class="ringlabel" x="220" y="119" text-anchor="middle">inner kreds</text>
+          <text class="ringlabel" x="220" y="41" text-anchor="middle">kreds</text>
+          <g class="younode"><circle cx="220" cy="220" r="24"/><text x="220" y="221">W</text></g>
+          <g class="node" data-open="freja" tabindex="0" role="button" aria-label="Freja">
+            <circle class="face" cx="299.7" cy="174" r="21" fill="#2E6E5E"/><text class="init" x="299.7" y="174.5">F</text>
+            <circle class="fresh" cx="316" cy="158" r="5"/><text class="nlabel" x="299.7" y="211">Freja</text>
+          </g>
+          <g class="node" data-open="josh" tabindex="0" role="button" aria-label="Josh">
+            <circle class="face" cx="146" cy="266" r="21" fill="#3B4E8C"/><text class="init" x="146" y="266.5">J</text>
+            <text class="nlabel" x="146" y="303">Josh</text>
+          </g>
+          <g class="node" data-open="mikkel" tabindex="0" role="button" aria-label="Mikkel">
+            <circle class="face" cx="264" cy="384" r="21" fill="#8C5A2E"/><text class="init" x="264" y="384.5">M</text>
+            <circle class="fresh" cx="280" cy="368" r="5"/><text class="nlabel" x="264" y="421">Mikkel</text>
+          </g>
+          <g class="node" data-open="sofia" tabindex="0" role="button" aria-label="Sofia">
+            <circle class="face" cx="350.2" cy="110.7" r="21" fill="#71368C"/><text class="init" x="350.2" y="111.2">S</text>
+            <text class="nlabel" x="350.2" y="147.7">Sofia</text>
+          </g>
+        </svg>
+        <div class="overlayhint">Click a person to open their profile · Esc to close</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= PHONE CONCEPT ================= -->
+  <div class="phonecol">
+    <div class="phone" aria-label="Phone concept: the circle is home">
+      <div class="phead">
+        <svg class="mark" viewBox="0 0 100 100" aria-hidden="true">
+          <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+          <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+          <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+          <circle class="dot" cx="50" cy="50" r="9"/>
+        </svg>
+        <span class="pw">kreds</span>
+        <span class="pt">wong-phone</span>
+      </div>
+      <div class="pmap">
+        <svg viewBox="0 0 300 300">
+          <circle class="ringguide" cx="150" cy="150" r="64"/>
+          <circle class="ringguide" cx="150" cy="150" r="116"/>
+          <text class="pcap" x="150" y="80" text-anchor="middle">inner kreds</text>
+          <circle cx="150" cy="150" r="18" fill="var(--ink)"/>
+          <text x="150" y="151" text-anchor="middle" dominant-baseline="central" style="font-family:var(--disp);font-weight:700;font-size:12px;fill:var(--paper)">W</text>
+          <g class="mm-node"><circle cx="205" cy="118" r="15" fill="#2E6E5E"/><text x="205" y="118.5" style="font-size:12px">F</text><circle class="fresh" cx="217" cy="106" r="4.2"/></g>
+          <g class="mm-node"><circle cx="103" cy="182" r="15" fill="#3B4E8C"/><text x="103" y="182.5" style="font-size:12px">J</text></g>
+          <g class="mm-node"><circle cx="178" cy="259" r="15" fill="#8C5A2E"/><text x="178" y="259.5" style="font-size:12px">M</text><circle class="fresh" cx="190" cy="247" r="4.2"/></g>
+          <g class="mm-node"><circle cx="239" cy="76" r="15" fill="#71368C"/><text x="239" y="76.5" style="font-size:12px">S</text></g>
+        </svg>
+      </div>
+      <div class="ptabs">
+        <button class="ptab active">
+          <svg viewBox="0 0 24 24"><circle class="ico" cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.6" fill="currentColor"/></svg>
+          Circle
+        </button>
+        <button class="ptab">
+          <svg viewBox="0 0 24 24"><path class="ico" d="M5 7h14M5 12h14M5 17h9"/></svg>
+          Journal
+        </button>
+        <button class="ptab">
+          <svg viewBox="0 0 24 24"><circle class="ico" cx="12" cy="9" r="3.6"/><path class="ico" d="M5.5 19c1.3-3 3.8-4.5 6.5-4.5s5.2 1.5 6.5 4.5"/></svg>
+          Me
+        </button>
+      </div>
+    </div>
+    <p class="phonenote">On the phone, <b>the circle is home</b> — tap a person to land on their profile and posts; Journal is one tab away when you'd rather read by time.</p>
+  </div>
+</div>
+
+<!-- ================= PROFILE MODAL ================= -->
+<div class="modalback" id="modalBack">
+  <div class="pmodal" role="dialog" aria-modal="true" aria-labelledby="pmName" style="--pcolor:#2E6E5E">
+    <div class="pmbanner"></div>
+    <button class="pmclose" id="pmClose" aria-label="Close profile">✕</button>
+    <div class="pmhead">
+      <div class="pmavatar" id="pmAvatar">F</div>
+      <div>
+        <div class="pmname" id="pmName">Freja</div>
+        <div class="pmhash" id="pmHash">identity 381856f0…</div>
+      </div>
+    </div>
+    <div class="pmbody">
+      <p class="pmbio" id="pmBio">Fotograf i København.</p>
+      <span class="pmring" id="pmRing">
+        <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/></svg>
+        <span id="pmRingText">Inner kreds · since May 2026</span>
+      </span>
+      <div class="pmacts">
+        <button class="pmbtn primary">Message</button>
+        <button class="pmbtn" id="pmMove">Move to kreds</button>
+      </div>
+      <div class="pmrecent">
+        <h4>Recent</h4>
+        <div id="pmPosts">
+          <div class="pmpost"><span class="t">09:12</span>Kaffe på taget, solen er fremme ☀</div>
+          <div class="pmpost"><span class="t">i går</span>Hej Wong! Fint at være her.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="seclabel">Why this hierarchy</div>
+<section class="rationale">
+  <div class="rat"><b>Filter is the function</b>
+  The everyday job of the circle is choosing whom to read — so its everyday form is a chip bar that costs 40 pixels. The radial map is the expanded state: orientation, onboarding, and brand, summoned when wanted.</div>
+  <div class="rat"><b>People are destinations</b>
+  Two navigation axes: Journal moves through time, Circle moves through people. Click a person anywhere — chip, avatar, node — and their profile opens in place. On the phone the circle is the launcher; the destinations of Kreds are people, not pages.</div>
+  <div class="rat"><b>Receipts, not promises</b>
+  Click a post's scope pill: Kreds shows which devices actually hold it, because scope here is physics — encrypted to keys, existing on named machines. That's the one thing a server platform can't draw. Friend-lists they have; receipts they can't.</div>
+</section>
+
+<script>
+/* theme */
+const btn=document.getElementById('themeToggle');
+btn.addEventListener('click',()=>{
+  const r=document.documentElement,n=r.getAttribute('data-theme')==='night';
+  r.setAttribute('data-theme',n?'day':'night');btn.textContent=n?'☀':'☾';
+});
+/* keeps */
+document.querySelectorAll('.keep').forEach(k=>k.addEventListener('click',()=>{
+  document.querySelectorAll('.keep').forEach(x=>x.classList.remove('active'));k.classList.add('active');
+}));
+/* chip filtering */
+const chips=document.querySelectorAll('.fchip'),ents=document.querySelectorAll('.entry');
+chips.forEach(c=>c.addEventListener('click',()=>{
+  chips.forEach(x=>x.classList.remove('active'));c.classList.add('active');
+  const f=c.dataset.filter;
+  ents.forEach(e=>{
+    const show=f==='all'||(f==='inner'?e.dataset.ring==='inner'||e.dataset.author==='wong':e.dataset.author===f);
+    e.classList.toggle('hidden',!show);
+  });
+}));
+/* circle overlay */
+const ov=document.getElementById('circleOverlay');
+document.getElementById('expandCircle').addEventListener('click',()=>ov.classList.add('open'));
+document.getElementById('miniMap').addEventListener('click',()=>ov.classList.add('open'));
+document.getElementById('closeOverlay').addEventListener('click',()=>ov.classList.remove('open'));
+/* profile modal */
+const people={
+  freja:{n:'Freja',i:'F',c:'#2E6E5E',h:'identity 381856f0…',b:'Fotograf i København.',ring:'Inner kreds · since May 2026',move:'Move to kreds',posts:[['09:12','Kaffe på taget, solen er fremme ☀'],['i går','Hej Wong! Fint at være her.']]},
+  josh:{n:'Josh',i:'J',c:'#3B4E8C',h:'identity 9c22e1ab…',b:'Game dev. Duck-te\'s Inferno.',ring:'Inner kreds · since May 2026',move:'Move to kreds',posts:[['tors','Demo feedback-tråden er åben.']]},
+  mikkel:{n:'Mikkel',i:'M',c:'#8C5A2E',h:'identity 5fd0a913…',b:'Løber. Nørrebro.',ring:'Kreds · since June 2026',move:'Move to inner kreds',posts:[['14:02','Nogen der vil med ud at løbe ved søerne i morgen tidlig?']]},
+  sofia:{n:'Sofia',i:'S',c:'#71368C',h:'identity c47b22e8…',b:'Arkitekt.',ring:'Kreds · since June 2026',move:'Move to inner kreds',posts:[['ons','Tegnestuen holder åbent hus på fredag.']]}
+};
+const mb=document.getElementById('modalBack'),pm=mb.querySelector('.pmodal');
+function openProfile(id){
+  const p=people[id];if(!p)return;
+  pm.style.setProperty('--pcolor',p.c);
+  document.getElementById('pmAvatar').textContent=p.i;
+  document.getElementById('pmName').textContent=p.n;
+  document.getElementById('pmHash').textContent=p.h;
+  document.getElementById('pmBio').textContent=p.b;
+  document.getElementById('pmRingText').textContent=p.ring;
+  document.getElementById('pmMove').textContent=p.move;
+  document.getElementById('pmPosts').innerHTML=p.posts.map(x=>'<div class="pmpost"><span class="t">'+x[0]+'</span>'+x[1]+'</div>').join('');
+  mb.classList.add('open');
+}
+document.addEventListener('click',e=>{
+  const t=e.target.closest('[data-open]');
+  if(t){openProfile(t.dataset.open);return;}
+  if(e.target===mb)mb.classList.remove('open');
+});
+document.getElementById('pmClose').addEventListener('click',()=>mb.classList.remove('open'));
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){mb.classList.remove('open');ov.classList.remove('open');closeReceipts();}});
+/* receipts */
+function closeReceipts(){document.querySelectorAll('.receipts.open').forEach(r=>r.classList.remove('open'));
+  document.querySelectorAll('[data-receipt]').forEach(b=>b.setAttribute('aria-expanded','false'));}
+document.querySelectorAll('[data-receipt]').forEach(b=>{
+  b.addEventListener('click',e=>{
+    e.stopPropagation();
+    const r=b.querySelector('.receipts'),was=r.classList.contains('open');
+    closeReceipts();
+    if(!was){r.classList.add('open');b.setAttribute('aria-expanded','true');}
+  });
+});
+document.addEventListener('click',e=>{if(!e.target.closest('.escope'))closeReceipts();});
+</script>
+</body>
+</html>

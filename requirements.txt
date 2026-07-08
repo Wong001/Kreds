@@ -1,0 +1,9 @@
+cryptography
+fastapi
+uvicorn[standard]
+httpx
+python-multipart
+pytest
+qrcode[pil]
+imageio-ffmpeg
+pywebview

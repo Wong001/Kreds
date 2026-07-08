@@ -1,0 +1,2 @@
+# Build-time / dev-only dependencies (not needed to run `hearth` from source).
+pyinstaller

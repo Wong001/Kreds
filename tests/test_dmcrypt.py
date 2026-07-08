@@ -1,0 +1,100 @@
+import os
+
+from hearth.dmcrypt import (
+    decrypt_blob, decrypt_body, dm_aad, encrypt_blob, encrypt_body,
+    gen_enc_keypair, new_content_key, post_aad, seal_content_key,
+    open_content_key, unwrap_key, wrap_key,
+)
+
+
+def setup():
+    a_priv, a_pub = gen_enc_keypair()
+    b_priv, b_pub = gen_enc_keypair()
+    aad = dm_aad("aa" * 32, "bb" * 32, 1000.0)
+    key = new_content_key()
+    return a_priv, a_pub, b_priv, b_pub, aad, key
+
+
+def test_body_roundtrip_and_tamper():
+    *_, aad, key = setup()
+    nonce, ct = encrypt_body(key, {"text": "hej", "blobs": []}, aad)
+    assert decrypt_body(key, nonce, ct, aad) == {"text": "hej", "blobs": []}
+    bad_ct = ("00" if ct[:2] != "00" else "11") + ct[2:]
+    assert decrypt_body(key, nonce, bad_ct, aad) is None
+
+
+def test_aad_mismatch_rejected():
+    *_, aad, key = setup()
+    nonce, ct = encrypt_body(key, {"text": "x", "blobs": []}, aad)
+    other_aad = dm_aad("aa" * 32, "bb" * 32, 2000.0)   # different created_at
+    assert decrypt_body(key, nonce, ct, other_aad) is None
+
+
+def test_wrap_unwrap_per_device():
+    a_priv, a_pub, b_priv, b_pub, aad, key = setup()
+    wraps = wrap_key(key, {"d1" + "0" * 62: a_pub, "d2" + "0" * 62: b_pub},
+                     aad)
+    assert unwrap_key(wraps, "d1" + "0" * 62, a_priv, aad) == key
+    assert unwrap_key(wraps, "d2" + "0" * 62, b_priv, aad) == key
+    # device not in wraps
+    assert unwrap_key(wraps, "d3" + "0" * 62, a_priv, aad) is None
+    # right device slot, wrong private key
+    assert unwrap_key(wraps, "d1" + "0" * 62, b_priv, aad) is None
+
+
+def test_ephemeral_keys_differ_per_wrap():
+    a_priv, a_pub, b_priv, b_pub, aad, key = setup()
+    wraps = wrap_key(key, {"d1" + "0" * 62: a_pub, "d2" + "0" * 62: b_pub},
+                     aad)
+    assert (wraps["d1" + "0" * 62]["eph_pub"]
+            != wraps["d2" + "0" * 62]["eph_pub"])
+
+
+def test_blob_roundtrip_and_tamper():
+    *_, key = setup()
+    data = b"\x89PNG-secret-photo-bytes"
+    ct = encrypt_blob(key, data)
+    assert ct != data and decrypt_blob(key, ct) == data
+    tampered = ct[:-1] + bytes([ct[-1] ^ 1])
+    assert decrypt_blob(key, tampered) is None
+    assert decrypt_blob(key, b"short") is None
+
+
+def test_wrap_skips_malformed_enc_pub():
+    *_, aad, key = setup()
+    _, good_pub = gen_enc_keypair()
+    wraps = wrap_key(key, {"d1" + "0" * 62: good_pub,
+                           "d2" + "0" * 62: "not-hex",
+                           "d3" + "0" * 62: "ab"},     # valid hex, wrong length
+                     aad)
+    assert set(wraps) == {"d1" + "0" * 62}             # only the good device
+
+
+def test_content_key_seal_open_roundtrip():
+    sk = os.urandom(32).hex()
+    key = os.urandom(32)
+    sealed = seal_content_key(sk, "aa" * 32, key)
+    assert open_content_key(sk, "aa" * 32, sealed) == key
+
+
+def test_content_key_seal_binds_msg_id():
+    sk = os.urandom(32).hex()
+    sealed = seal_content_key(sk, "aa" * 32, os.urandom(32))
+    assert open_content_key(sk, "bb" * 32, sealed) is None
+
+
+def test_content_key_wrong_storage_key_or_garbage_rejected():
+    sk = os.urandom(32).hex()
+    sealed = seal_content_key(sk, "aa" * 32, os.urandom(32))
+    assert open_content_key(os.urandom(32).hex(), "aa" * 32,
+                            sealed) is None
+    assert open_content_key(sk, "aa" * 32, "00ff") is None
+    assert open_content_key(sk, "aa" * 32, "zz-not-hex") is None
+
+
+def test_post_aad_binds_author_scope_time():
+    a = post_aad("aa" * 32, "inner", 100.0)
+    assert a != post_aad("aa" * 32, "kreds", 100.0)      # scope bound
+    assert a != post_aad("bb" * 32, "inner", 100.0)      # author bound
+    assert a != post_aad("aa" * 32, "inner", 101.0)      # time bound
+    assert isinstance(a, (bytes, bytearray))

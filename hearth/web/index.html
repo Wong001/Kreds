@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kreds</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<meta name="theme-color" content="#C8102E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<!-- Frameless desktop chrome (Kreds Windows shell, Task 3): hidden by
+     default (a plain browser never gets body.desktop, so this stays
+     display:none via .hidden) - app.js's wireDesktopChrome() reveals it
+     only when window.pywebview exists. The drag span carries pywebview's
+     own supported drag-region class; the three control buttons do NOT,
+     so clicks on them register instead of starting a window drag. -->
+<div class="titlebar hidden" id="titlebar">
+  <span class="titlebar-drag pywebview-drag-region">
+    <svg class="mark" viewBox="0 0 100 100" aria-hidden="true">
+      <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+      <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+      <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+      <circle class="dot" cx="50" cy="50" r="9"/>
+    </svg>
+    <span class="titlebar-title">kreds</span>
+  </span>
+  <div class="titlebar-controls">
+    <button class="titlebar-btn" id="titlebar-min" aria-label="Minimize" title="Minimize">&#8212;</button>
+    <button class="titlebar-btn" id="titlebar-max" aria-label="Maximize" title="Maximize">&#9633;</button>
+    <button class="titlebar-btn titlebar-close" id="titlebar-close" aria-label="Close" title="Close">&times;</button>
+  </div>
+</div>
+<div class="app" id="app">
+  <nav class="appnav">
+    <svg class="mark" viewBox="0 0 100 100" aria-hidden="true">
+      <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+      <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+      <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+      <circle class="dot" cx="50" cy="50" r="9"/>
+    </svg>
+    <span class="navword">kreds</span>
+    <div class="navlinks">
+      <button id="nav-journal" data-view="journal" class="active">Journal</button>
+      <button id="nav-messages" data-view="messages">Messages</button>
+      <button id="nav-me" data-view="me">Me</button>
+    </div>
+    <div class="navspacer"></div>
+    <span class="whoami"><b id="profile-name"></b> on <span id="device-name"></span></span>
+    <button class="themebtn" id="theme-toggle" aria-label="Switch theme"></button>
+  </nav>
+
+  <div class="appmain">
+
+    <div id="view-journal">
+      <section class="journal">
+        <div class="chipbar" id="chipbar" role="group" aria-label="Filter journal"></div>
+
+        <form class="composer" id="composer">
+          <input type="text" id="post-text" autocomplete="off"
+            placeholder="Say something to your kreds&hellip;" aria-label="Write a post">
+          <input type="hidden" id="scope" value="kreds">
+          <div class="composerbar">
+            <span class="keeps-label">keeps</span>
+            <button type="button" class="keep" data-scope="inner">
+              <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/></svg>Inner
+            </button>
+            <button type="button" class="keep active" data-scope="kreds">
+              <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/><circle class="r" cx="10" cy="10" r="7"/></svg>Kreds
+            </button>
+            <label class="keep" id="post-photo-btn" title="Add a photo">
+              <svg viewBox="0 0 20 20"><rect class="r" x="3" y="4" width="14" height="12" rx="2"/><circle class="r" cx="7.5" cy="8.5" r="1.6"/><path class="r" d="M4 15l4-4 3 3 3-3 2 2" fill="none"/></svg>Photo
+              <input type="file" id="post-photos" accept="image/*" multiple class="visually-hidden">
+            </label>
+            <select id="post-expiry" class="keep-select" aria-label="Auto-delete after">
+              <option value="">keep</option>
+              <option value="3600">1 hour</option>
+              <option value="86400">1 day</option>
+              <option value="604800">7 days</option>
+            </select>
+            <button type="submit" class="postbtn">Post</button>
+          </div>
+        </form>
+
+        <div id="journal"></div>
+      </section>
+
+      <aside id="circle-rail" aria-label="Your kreds"></aside>
+    </div>
+
+    <div id="view-messages" class="hidden">
+      <div class="dm-shell">
+        <aside class="conv-col"><h2>Conversations</h2>
+          <div id="conversations"></div></aside>
+        <section class="thread-col">
+          <div id="thread-title" class="thread-title">Messages</div>
+          <div id="thread" class="thread-scroll"></div>
+          <form id="dm-compose" class="dm-compose-bar hidden">
+            <label class="file-btn"><span class="fi-label">Photo</span>
+              <input type="file" id="dm-photos" accept="image/*" multiple class="visually-hidden"></label>
+            <textarea id="dm-text" rows="1"
+              placeholder="Encrypted message..."></textarea>
+            <button type="submit">Send</button>
+          </form>
+        </section>
+      </div>
+    </div>
+
+    <div id="view-profile" class="hidden">
+      <div class="profile-topbar">
+        <button class="profile-back" id="profile-back">&larr; Back</button>
+        <button class="profile-arrange hidden" id="profile-arrange">Arrange</button>
+        <button class="profile-cog hidden" id="profile-cog" aria-label="Edit profile" title="Edit profile">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+      </div>
+      <div class="profile-layout" id="profile-layout">
+        <div class="profile-page" id="profile-page">
+          <div class="profile-banner" id="profile-banner"></div>
+          <div class="profile-head" id="profile-head">
+            <div class="profile-avatar" id="profile-avatar"></div>
+            <div class="profile-id">
+              <div class="profile-name" id="profile-name-view"></div>
+              <div class="profile-hash" id="profile-hash"></div>
+            </div>
+          </div>
+          <div class="profile-bio" id="profile-bio"></div>
+          <div class="profile-meta" id="profile-meta"></div>
+          <div class="profile-actions" id="profile-actions"></div>
+          <div class="profile-body" id="profile-body">
+            <div id="profile-wall-compose"></div>
+            <h4 class="profile-section-h">Wall</h4>
+            <div id="profile-wall"></div>
+          </div>
+        </div>
+        <aside class="profile-side" id="profile-side">
+          <div class="panel journal-rail">
+            <button class="journal-toggle" id="profile-journal-toggle" aria-expanded="false">Journal</button>
+            <div id="profile-journal-rail"></div>
+          </div>
+          <div class="panel selfonly" id="profile-friends-panel">
+            <h2>Friends</h2>
+            <div id="friends"></div>
+            <div id="ceremony"></div>
+          </div>
+          <div class="panel selfonly" id="profile-devices-panel">
+            <h2>Devices</h2>
+            <div id="devices"></div>
+          </div>
+          <div class="panel selfonly" id="profile-applock-panel">
+            <h2>App-lock</h2>
+            <div id="applock-settings"></div>
+          </div>
+          <!-- Desktop close-behavior (Task 3): selfonly (same as the
+               panels above) AND desktop-only - style.css's
+               .desktop-only-panel defaults to display:none and only
+               body.desktop (set by app.js's wireDesktopChrome, gated on
+               window.pywebview) reveals it, so a plain browser never
+               shows this panel regardless of the selfonly hidden-class
+               toggling in openProfile(). -->
+          <div class="panel selfonly desktop-only-panel" id="profile-desktop-panel">
+            <h2>Desktop</h2>
+            <div id="desktop-settings"></div>
+          </div>
+          <!-- Signed in-app updates (Task 3): self-only, mirrors the
+               App-lock/Desktop panels above. Manual "Check for updates"
+               only (no auto-check loop) - GET /api/update/check, then
+               POST /api/update/apply if one's available. -->
+          <div class="panel selfonly" id="profile-updates-panel">
+            <h2>Updates</h2>
+            <div id="update-settings"></div>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="idstrip">
+    <span class="keychip"></span>
+    <span class="fp" id="idstrip-fp"></span>
+    <span class="devs"><b id="idstrip-devcount"></b> &middot; manage in Me</span>
+  </div>
+
+  <!-- Full circle overlay (Task 5) - ported from docs/design/
+       kreds_design_v3.html's .overlay/.bigmapwrap/.closeoverlay. The SVG
+       itself is built by buildCircle() in app.js from live /api/kreds
+       data; nodes call openProfile. -->
+  <div class="overlay" id="circle-overlay" role="dialog" aria-label="Your kreds, expanded">
+    <button class="closeoverlay" id="close-overlay" aria-label="Close">&times;</button>
+    <div class="bigmapwrap">
+      <svg id="circle-overlay-svg" viewBox="0 0 440 440"></svg>
+      <div class="overlayhint">Click a person to open their profile &middot; Esc to close</div>
+    </div>
+  </div>
+
+  <!-- Per-block settings modal (Phase A Task 3): tapping a block in Arrange
+       mode (self-only) opens this instead of the old inline handle/Up-Down/
+       grid-select on the block face. Mirrors #circle-overlay's role/close
+       pattern. -->
+  <div class="hidden" id="block-settings" role="dialog" aria-modal="true" aria-label="Block settings">
+    <div class="block-settings-card">
+      <button class="closeoverlay" id="block-settings-close" aria-label="Close">&times;</button>
+      <h3 class="block-settings-title">Block</h3>
+      <div id="block-settings-body"></div>
+    </div>
+  </div>
+
+  <!-- Self-only profile editor overlay (Task 3): the cogwheel on the
+       profile topbar (and the Me card) opens profileEditor(p) in here
+       instead of dumping it inline in #profile-actions. -->
+  <div class="hidden" id="profile-edit-overlay" role="dialog" aria-label="Edit profile">
+    <div class="profile-editcard" id="profile-edit-wrap"></div>
+  </div>
+</div>
+
+<div id="revoked-banner" class="hidden">
+  This device has been revoked. It is logged out of Kreds.
+</div>
+
+<!-- App-lock (Task 4): full-screen gate, shown whenever the node reports
+     locked (initial boot, a 423 from any call, "Lock now", or an idle/
+     sleep autolock the node decided on its own - see app.js's applock
+     section for the client hooks). Static markup, toggled via .hidden;
+     the node is the source of truth, this only reflects GET /api/applock. -->
+<!-- First-run screen (Task 2): shown when GET /api/bootstrap answers
+     initialized:false - no enrolled identity on this node yet. Static
+     shell only (logo + two option cards); app.js's renderFirstRun()
+     builds the interactive Create/Connect controls into
+     #fr-create-panel / #fr-connect-panel. Toggled via .hidden, same
+     pattern as #lock-screen below. -->
+<div id="first-run" class="hidden">
+  <div class="fr-card">
+    <svg class="mark mark-anim" viewBox="0 0 100 100" aria-hidden="true">
+      <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+      <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+      <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+      <circle class="dot" cx="50" cy="50" r="9"/>
+    </svg>
+    <div class="fr-word">kreds</div>
+    <p class="hint fr-tagline">Set up this node to begin.</p>
+    <div class="fr-options">
+      <section class="fr-option" id="fr-create">
+        <h2>Create New Node</h2>
+        <p class="hint">Start a fresh identity on this device.</p>
+        <div class="fr-panel" id="fr-create-panel"></div>
+      </section>
+      <section class="fr-option" id="fr-connect">
+        <h2>Connect to Existing Node</h2>
+        <p class="hint">Pair this device with a node you already run.</p>
+        <div class="fr-panel" id="fr-connect-panel"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div id="lock-screen" class="hidden" role="dialog" aria-modal="true" aria-label="Kreds is locked">
+  <div class="lock-card">
+    <svg class="mark mark-anim" viewBox="0 0 100 100" aria-hidden="true">
+      <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+      <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+      <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+      <circle class="dot" cx="50" cy="50" r="9"/>
+    </svg>
+    <div class="fr-word">kreds</div>
+    <h2 class="lock-title">Kreds is locked</h2>
+    <form id="lock-form">
+      <input type="password" id="lock-cred" autocomplete="off" aria-label="Credential">
+      <div class="lock-keypad hidden" id="lock-keypad">
+        <button type="button" data-digit="1">1</button>
+        <button type="button" data-digit="2">2</button>
+        <button type="button" data-digit="3">3</button>
+        <button type="button" data-digit="4">4</button>
+        <button type="button" data-digit="5">5</button>
+        <button type="button" data-digit="6">6</button>
+        <button type="button" data-digit="7">7</button>
+        <button type="button" data-digit="8">8</button>
+        <button type="button" data-digit="9">9</button>
+        <button type="button" id="lock-clear">Clear</button>
+        <button type="button" data-digit="0">0</button>
+        <button type="button" id="lock-backspace" aria-label="Backspace">&larr;</button>
+      </div>
+      <button type="submit" class="btn-accent" id="lock-submit">Unlock</button>
+    </form>
+    <div class="hint" id="lock-error"></div>
+  </div>
+</div>
+
+<!-- One-time onboarding wizard (Task 3): shown once, right after a fresh
+     node finishes bootstrap/create or pair-install, gated by NEEDS_WIZARD
+     (boot() sets it from GET /api/bootstrap's onboarding_done - Task 2).
+     Shares the first-run look (mark + wordmark + paper background).
+     Static shell only, same pattern as #first-run/#lock-screen - app.js's
+     renderOnboardingWizard() builds the interactive step content into
+     #wiz-step-applock / #wiz-step-phone. Toggled via .hidden. -->
+<div id="onboarding-wizard" class="hidden" role="dialog" aria-modal="true" aria-label="Set up Kreds">
+  <div class="wiz-card">
+    <svg class="mark mark-anim" viewBox="0 0 100 100" aria-hidden="true">
+      <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
+      <path class="arc" d="M 79.72 76.76 A 40 40 0 0 1 20.28 76.76"/>
+      <path class="arc" d="M 11.96 62.36 A 40 40 0 0 1 41.68 10.88"/>
+      <circle class="dot" cx="50" cy="50" r="9"/>
+    </svg>
+    <div class="fr-word">kreds</div>
+    <div class="wiz-dots" aria-hidden="true">
+      <span class="wiz-dot" id="wiz-dot-0"></span>
+      <span class="wiz-dot" id="wiz-dot-1"></span>
+    </div>
+    <section id="wiz-step-applock"></section>
+    <section id="wiz-step-phone" class="hidden"></section>
+    <!-- Desktop-only (Task 3): built + shown only when window.pywebview
+         exists (renderOnboardingWizard appends the wiz-dot-2 indicator
+         dynamically too, so a browser install never shows a 3rd dot for
+         a step it can never reach). -->
+    <section id="wiz-step-desktop" class="hidden"></section>
+  </div>
+</div>
+
+<nav class="tabbar-mobile">
+  <button data-tab="circle">Circle</button>
+  <button data-tab="journal">Journal</button>
+  <button data-tab="me">Me</button>
+</nav>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
