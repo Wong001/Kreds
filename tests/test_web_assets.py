@@ -993,3 +993,30 @@ def test_circle_camera_core():
     # opening the overlay initializes the camera at fit
     overlay_fn = js.split("function openCircleOverlay")[1][:600]
     assert "circleCamera" in overlay_fn
+
+
+def test_circle_gestures_and_labels():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "function wireCircleGestures" in js
+    g = js.split("function wireCircleGestures")[1].split("\nconst circleCamera")[0] \
+        if js.index("function wireCircleGestures") < js.index("const circleCamera") \
+        else js.split("function wireCircleGestures")[1][:5000]
+    # pointer-events discipline (profile-drag lessons): cancel + capture-loss
+    # both tear down; per-pointer bookkeeping for pinch; 6px tap threshold
+    for token in ("pointerdown", "pointermove", "pointerup",
+                  "pointercancel", "lostpointercapture",
+                  "setPointerCapture", "Math.hypot"):
+        assert token in g, token
+    assert "> 6" in g
+    # drag must not fire the node click that follows pointerup
+    assert "CIRCLE_DRAGGED" in js
+    click_handler = js.split('document.getElementById("circle-overlay-svg").addEventListener("click"')[1][:400]
+    assert "CIRCLE_DRAGGED" in click_handler
+    # double-tap reset for touch
+    assert "300" in g
+    # label threshold: on-screen node pitch vs 56px, toggling labels-off
+    assert "labels-off" in js and "56" in js
+    labels_fn = js.split("function updateCircleLabels")[-1][:600]
+    assert "CIRCLE_SPACING" in labels_fn and "classList.toggle" in labels_fn
+    # no native DnD anywhere in the gesture code
+    assert "dragstart" not in g and 'draggable="true"' not in g

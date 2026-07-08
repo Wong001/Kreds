@@ -873,7 +873,16 @@ function closeCircleOverlay() {
 // click/keyboard/hover behavior is untouched. State is the viewBox origin
 // (x, y) and width w (the viewport is square, height mirrors width).
 // ---------------------------------------------------------------------
-function updateCircleLabels() {}   // filled in by the gesture/labels pass
+// Labels show only when nodes are far enough apart on SCREEN to carry
+// them (spec: node pitch >= 56 css px). Pitch = world spacing * px/world.
+function updateCircleLabels() {
+  const svg = circleCamera.svg;
+  if (!svg) return;
+  const r = svg.getBoundingClientRect();
+  if (!r.width) return;
+  const pitchPx = CIRCLE_SPACING * (r.width / circleCamera.w);
+  svg.classList.toggle("labels-off", pitchPx < 56);
+}
 
 const circleCamera = {
   svg: null, x: 0, y: 0, w: 440, fitW: 440,
@@ -932,9 +941,69 @@ const circleCamera = {
   },
 };
 
+// One-shot flag: a pan/pinch gesture ends in a browser-generated click on
+// whatever is under the pointer - swallow exactly that one click so a drag
+// that started on a person node doesn't ALSO open their profile.
+let CIRCLE_DRAGGED = false;
+
+function wireCircleGestures(svg) {
+  const pts = new Map();       // pointerId -> {x, y, sx, sy} (current + start)
+  let moved = false;           // past the 6px tap threshold this gesture?
+  let pinchDist = 0;
+  let lastTap = 0;             // for double-tap reset (touch)
+
+  const gone = (ev) => {
+    pts.delete(ev.pointerId);
+    if (pts.size < 2) pinchDist = 0;
+    if (pts.size === 0) { CIRCLE_DRAGGED = moved; moved = false; }
+  };
+
+  svg.addEventListener("pointerdown", (ev) => {
+    svg.setPointerCapture(ev.pointerId);
+    pts.set(ev.pointerId, {x: ev.clientX, y: ev.clientY,
+                           sx: ev.clientX, sy: ev.clientY});
+    if (pts.size === 2) {
+      const [a, b] = [...pts.values()];
+      pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+    }
+  });
+
+  svg.addEventListener("pointermove", (ev) => {
+    const p = pts.get(ev.pointerId);
+    if (!p) return;
+    const prevX = p.x, prevY = p.y;
+    p.x = ev.clientX; p.y = ev.clientY;
+    if (!moved && Math.hypot(p.x - p.sx, p.y - p.sy) > 6) moved = true;
+    if (!moved) return;
+    if (pts.size === 1) {
+      circleCamera.panBy(p.x - prevX, p.y - prevY);
+    } else if (pts.size === 2) {
+      const [a, b] = [...pts.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (pinchDist > 0 && dist > 0) {
+        circleCamera.zoomAt((a.x + b.x) / 2, (a.y + b.y) / 2, dist / pinchDist);
+      }
+      pinchDist = dist;
+    }
+  });
+
+  svg.addEventListener("pointerup", (ev) => {
+    // double-tap (touch) resets to fit - two clean taps within 300ms
+    if (!moved && ev.pointerType === "touch" && pts.size === 1) {
+      const now = performance.now();
+      if (now - lastTap < 300) { circleCamera.fit(); lastTap = 0; }
+      else lastTap = now;
+    }
+    gone(ev);
+  });
+  svg.addEventListener("pointercancel", gone);
+  svg.addEventListener("lostpointercapture", gone);
+}
+
 {
   const svg = document.getElementById("circle-overlay-svg");
   circleCamera.init(svg);
+  wireCircleGestures(svg);
   svg.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     circleCamera.zoomAt(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.15 : 1 / 1.15);
@@ -948,6 +1017,7 @@ const circleCamera = {
 }
 
 document.getElementById("circle-overlay-svg").addEventListener("click", (ev) => {
+  if (CIRCLE_DRAGGED) { CIRCLE_DRAGGED = false; return; }   // that "click" was a drag ending
   const node = ev.target.closest("[data-open]");
   if (node) openProfile(node.getAttribute("data-open"));
 });
