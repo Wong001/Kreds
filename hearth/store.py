@@ -365,6 +365,36 @@ class Store:
                 self.gc_blobs()
             return swept
 
+    def prune_superseded_enckeys(self) -> int:
+        """Tombstone (reason 'superseded') every enckey row that is not the
+        latest for its (identity_pub, device_pub), by the same
+        (created_at, seq) tie-break enckey_records resolves with. Rotation
+        is daily (maintain_enckey), so without this the table grows one row
+        per device per day forever, replicated to every friend. Tombstone,
+        never DELETE: a bare row-delete reads as "missing" to the next
+        summary diff and peers re-send it forever; a tombstone stops both
+        the holding and the offering, so superseded rows evaporate
+        network-wide as each node prunes independently. Safe: nothing reads
+        superseded rows (senders wrap to latest; recipients decrypt with
+        retired PRIVATE keys, client-side, untouched here)."""
+        rows = self._db.execute(
+            "SELECT msg_id, identity_pub, device_pub, created_at, seq "
+            "FROM messages WHERE kind=?", (KIND_ENCKEY,)).fetchall()
+        latest = {}
+        for mid, ident, dpub, created, seq in rows:
+            cur = latest.get((ident, dpub))
+            if cur is None or (created, seq) > cur[1]:
+                latest[(ident, dpub)] = (mid, (created, seq))
+        keep = {v[0] for v in latest.values()}
+        pruned = 0
+        for mid, *_rest in rows:
+            if mid not in keep:
+                self._tombstone(mid, "superseded")
+                pruned += 1
+        if pruned:
+            self._db.commit()
+        return pruned
+
     # -- reads -----------------------------------------------------------------------
 
     def profiles(self) -> Dict[str, str]:
