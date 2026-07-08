@@ -7,8 +7,9 @@
 Kreds is a peer-to-peer, end-to-end-encrypted social app. Your data lives
 on hardware you own, reachable over the Tor network — there is no server,
 no company database, no feed algorithm, and no way to "go viral." You can
-only add people you have met in person. The influencer economy is
-impossible by architecture, not by policy.
+only add people you already know — connection takes a single-use invite
+code that expires in ten minutes. The influencer economy is impossible by
+architecture, not by policy.
 
 Website: [kreds.eu](https://kreds.eu) · Status: **alpha (0.3.x)** — the
 protocol is still evolving and breaking changes between versions are
@@ -28,8 +29,10 @@ possible.
 - **Tor-native** — every node is a `.onion` service; no relay of ours
   ever sees who talks to whom. Tor is bundled and managed; you never
   install it.
-- **In-person friend-adding** — one short-lived, single-use code,
-  exchanged in the room. No discovery, no search, no friend suggestions.
+- **Invite-code friend-adding** — one short-lived, single-use code,
+  shared in person or over any channel you already trust (it works once
+  and dies in ten minutes). No discovery, no search, no friend
+  suggestions.
 - **Structural deletion & unfriending** — signed delete notices gossip to
   every holder; unfriending purges both sides and blocks resurrection.
 - **App-lock** — key material encrypted at rest under scrypt + Windows

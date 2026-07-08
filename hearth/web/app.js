@@ -1622,7 +1622,7 @@ function renderMeStrip() {
   const friends = document.getElementById("friends");
   friends.replaceChildren();
   if (!STATE.friends.length) friends.append(el("div", "hint",
-    "No friends yet. Exchange codes below - in person."));
+    "No friends yet. Share a code below - in person or over a chat you already trust."));
   for (const f of STATE.friends) {
     const row = el("div", "friend");
     row.append(el("span", "", f.name),
@@ -2503,7 +2503,7 @@ function buildManualCeremony(container) {
   ta.rows = 4;
   ta.placeholder = "Paste a code here, or click Show my code";
   const status = el("div", "hint",
-    "Manual fallback: exchange codes in person, one paste at a time.");
+    "Manual fallback: exchange codes directly, one paste at a time.");
   const step = async (url, sendPayload, nextText, clearAfter) => {
     try {
       const body = sendPayload
@@ -2521,7 +2521,7 @@ function buildManualCeremony(container) {
         img.id = "qr-img";
         img.src = "/api/qr?text=" + encodeURIComponent(ta.value);
         w.append(el("div", "hint",
-          "Show this QR in person (or copy the code):"), img);
+          "Show this QR (or copy the code):"), img);
         status.after(w);
       }
       refresh();

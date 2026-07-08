@@ -2,7 +2,7 @@
 
 *Product name: Kreds (renamed from Loop). Package/module names are still `hearth`. Last updated: 2026-07-08.*
 
-Kreds is a private, non-commercial, peer-to-peer social platform: friends-only (added in person via QR — no discovery, no lookup), data on hardware you own, no follower/like/view metrics by architecture. This doc is the single source of truth for what's built, what's honest about its limits, and what's next.
+Kreds is a private, non-commercial, peer-to-peer social platform: friends-only (added via short-lived, single-use invite codes — no discovery, no lookup), data on hardware you own, no follower/like/view metrics by architecture. This doc is the single source of truth for what's built, what's honest about its limits, and what's next.
 
 See `docs/superpowers/specs/` and `docs/superpowers/plans/` for the per-feature design + implementation history.
 

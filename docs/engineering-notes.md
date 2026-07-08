@@ -1,7 +1,8 @@
 # Kreds — vertical slice v0.1
 
 Private, non-commercial, peer-to-peer social space. Your data lives on
-hardware you own; you can only add people you have physically met; the
+hardware you own; you can only add people you already know (a single-use
+invite code that expires in ten minutes — no discovery, no lookup); the
 influencer economy is impossible by architecture. This repo holds the
 concept documents, the D2 identity spike, and the local vertical slice:
 four real node processes gossiping signed posts and encrypted DMs over TCP.
@@ -465,13 +466,16 @@ unit-tested offline; the live re-confirmation is pending.
 
 ## Adding a friend
 
-Shipped as **0.3.0**. Becoming friends still starts the same way as always
-- in person, so there is no server-side discovery or lookup and the
-security model stays "you can only add people you have physically met" -
-but it now takes one code instead of a two-way paste.
+Shipped as **0.3.0**. Becoming friends still starts with someone you
+already know - there is no server-side discovery or lookup, so a stranger
+has no way in - and it now takes one code instead of a two-way paste. The
+code is deliberately safe to send over an existing channel: single-use,
+single-active, and expired after ten minutes, so sharing it means trusting
+that channel for ten minutes at most (in person removes even that
+dependency - share it like a house key, not a flyer).
 
 **A** opens Add Friend and shares **one code** - read aloud, AirDropped,
-texted, whatever's convenient in the room. **B** pastes that single code
+texted, whatever's convenient. **B** pastes that single code
 in and hits Add. From there B's node dials A directly over Tor and
 delivers its half of the handshake automatically: A verifies it, both
 sides add each other, and B sees "Connected" - **A never pastes anything
