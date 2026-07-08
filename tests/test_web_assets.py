@@ -1052,7 +1052,12 @@ def test_desktop_keep_close_hides_to_tray_with_fallback():
     # minimize. The titlebar minimize button itself stays minimize.
     js = (WEB / "app.js").read_text(encoding="utf-8")
     chrome = _js_fn_body(js, "wireDesktopChrome")
-    assert "hide_to_tray" in chrome
-    assert "api.minimize()" in chrome
+    # pin the GUARDED call structure inside the keep-branch itself - a
+    # whole-function substring would pass on the comment text alone, or on
+    # the unrelated titlebar minimize-button line (task review, Important)
+    keep_branch = chrome[chrome.index('if (closeBehavior === "keep")'):]
+    keep_branch = keep_branch[:keep_branch.index("api.quit()")]
+    assert "if (api.hide_to_tray) api.hide_to_tray();" in keep_branch
+    assert "else api.minimize();" in keep_branch
     # user-facing copy names the tray (wizard step + Settings label)
     assert js.count("in the system tray") >= 2
