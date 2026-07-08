@@ -230,6 +230,13 @@ class Store:
                 "SELECT 1 FROM tombstones WHERE msg_id=?",
                 (msg_id,)).fetchone() is not None
 
+    def message_kind(self, msg_id: str):
+        """Kind of a held message row, or None if not held (tombstoned or
+        never seen). Used by the delete-creation guard and tests."""
+        row = self._db.execute(
+            "SELECT kind FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+        return row[0] if row else None
+
     def _tombstone(self, msg_id: str, reason: str):
         self._db.execute("INSERT OR IGNORE INTO tombstones VALUES(?,?,?)",
                          (msg_id, reason, time.time()))
@@ -269,9 +276,18 @@ class Store:
             deleted_target = None
             if kind == KIND_DELETE:
                 row = self._db.execute(
-                    "SELECT identity_pub FROM messages WHERE msg_id=?",
+                    "SELECT identity_pub, kind FROM messages WHERE msg_id=?",
                     (target,)).fetchone()
                 if row is not None:
+                    if row[1] == KIND_DELETE:
+                        # Wart 1: delete tags are immune to deletion.
+                        # Tombstones are permanent (no undelete), so a
+                        # delete-of-a-delete can only halt the tag's
+                        # propagation -> permanent divergence.
+                        self._db.commit()
+                        return IngestResult(
+                            False, "delete tag cannot target a delete tag",
+                            mid)
                     if row[0] != identity:
                         self._db.commit()
                         return IngestResult(False, "delete not authorized",
@@ -299,6 +315,15 @@ class Store:
                  recipient, json.dumps(msg.to_dict()),
                  msg.payload.get("created_at", now),
                  msg.payload.get("expires_at")))
+            if kind == KIND_DELETE:
+                # Hygiene: any held meta-delete targeting THIS tag is now
+                # provably invalid - tombstone it (reason 'invalid') so it
+                # stops gossiping. Tombstone, not DELETE: a bare row-delete
+                # would be re-fetched from peers on the next summary diff.
+                for (bad,) in self._db.execute(
+                        "SELECT msg_id FROM messages WHERE kind=?"
+                        " AND target_id=?", (KIND_DELETE, mid)).fetchall():
+                    self._tombstone(bad, "invalid")
             self._db.commit()
             if deleted_target:
                 self.gc_blobs()

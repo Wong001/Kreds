@@ -31,6 +31,17 @@ def test_compose_feed_delete_with_photo(tmp_path):
     assert n.store.get_blob(ref) is None    # blob GC'd
 
 
+def test_delete_post_refuses_a_held_delete_target(tmp_path):
+    # Wart 1 (spec 2026-07-09-protocol-warts): delete tags are immune to
+    # deletion -- refuse the creation before it ever hits the wire, rather
+    # than relying only on the ingest-side guard.
+    n = HearthNode.create(tmp_path / "n", "Wong", "phone")
+    mid = n.compose_post("hello hearth")
+    tag_id = n.delete_post(mid)
+    with pytest.raises(ValueError, match="cannot delete a delete tag"):
+        n.delete_post(tag_id)
+
+
 def test_seq_survives_restart(tmp_path):
     d = tmp_path / "n"
     n = HearthNode.create(d, "Wong", "phone")

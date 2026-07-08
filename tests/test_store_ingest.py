@@ -195,3 +195,38 @@ def test_foreign_delete_tag_does_not_censor_unarrived_message(tmp_path):
     r = s.ingest_message(post)
     assert (r.accepted, r.reason) == (True, "ok")
     assert [m.msg_id for m in s.post_messages()] == [post.msg_id]
+
+
+def test_delete_tag_cannot_target_a_delete_tag_when_held(tmp_path):
+    # Wart 1 (spec 2026-07-09-protocol-warts): a meta-delete that lands
+    # AFTER the tag it targets must be refused - pre-fix it tombstoned the
+    # tag, halting its propagation and permanently diverging the network.
+    s, phone, _ = wong(tmp_path)
+    post = _post(phone)
+    s.ingest_message(post)
+    tag = make_delete(phone, post.msg_id)
+    assert s.ingest_message(tag).accepted
+    meta = make_delete(phone, tag.msg_id)
+    res = s.ingest_message(meta)
+    assert not res.accepted and "cannot target a delete tag" in res.reason
+    # the original tag row is still held and still offered (not tombstoned)
+    assert s.message_kind(tag.msg_id) == "delete"
+
+
+def test_arriving_delete_tag_is_immune_to_a_lurking_meta_delete(tmp_path):
+    # Pin the (already-correct) behavior: the delete-on-arrival guard sits
+    # in the non-delete branch, so a meta-delete held BEFORE its target tag
+    # arrives never tombstones-on-arrival the tag itself...
+    s, phone, _ = wong(tmp_path)
+    post = _post(phone)
+    s.ingest_message(post)
+    tag = make_delete(phone, post.msg_id)
+    meta = make_delete(phone, tag.msg_id)
+    assert s.ingest_message(meta).accepted           # lurks (target unknown)
+    res = s.ingest_message(tag)
+    assert res.accepted and res.reason != "deleted on arrival"
+    # ...the post is gone (the real tag applied) and the tag row survives
+    assert s.message_kind(tag.msg_id) == "delete"
+    # ...and the now-provably-invalid meta-delete was tombstoned as hygiene
+    assert s.message_kind(meta.msg_id) is None
+    assert s.is_tombstoned(meta.msg_id)

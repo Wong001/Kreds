@@ -10,7 +10,7 @@ import asyncio
 import json as _json
 
 from hearth.identity import DeviceKeys, DeviceView
-from hearth.messages import make_story
+from hearth.messages import make_delete, make_story
 from hearth.node import HearthNode
 from hearth.sync import SyncService
 
@@ -117,5 +117,67 @@ def test_story_delete_tag_beats_late_content(tmp_path):
         assert freja.store.is_tombstoned(story.msg_id)
         assert not freja.store.has_blob(media)
         for s in (sf2, sm):
+            await s.stop()
+    asyncio.run(scenario())
+
+
+def test_meta_delete_on_a_synced_tag_refused_everywhere_no_resurrection(
+        tmp_path):
+    """Wart 1 (spec 2026-07-09-protocol-warts) system-level regression: a
+    delete tag is immune to deletion. Wong posts and deletes it; the tag
+    reaches Freja and Mads by real gossip. A meta-delete targeting the tag
+    (delete_post itself now refuses to create one, so it is crafted
+    directly and injected via ingest_message, as a modified/hostile client
+    might) is refused the moment it is offered. Further sync rounds must
+    show every node agreeing: the post stays gone, the tag stays held, and
+    the meta-delete never gets a foothold anywhere to diverge the network.
+    """
+    async def scenario():
+        wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+        freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+        mads = HearthNode.create(tmp_path / "m", "Mads", "mads-phone")
+        befriend(wong, freja); befriend(wong, mads); befriend(freja, mads)
+        for n in (wong, freja, mads):
+            n.ensure_enckey()
+        sw, wa = await started(wong)
+        sf, fa = await started(freja)
+        sm, ma = await started(mads)
+        # everyone learns everyone's enckeys before the post is composed,
+        # so it wraps to Freja's and Mads's devices too
+        await sw.sync_with(fa); await sw.sync_with(ma)
+
+        mid = wong.compose_post("fortryd mig")
+        await sf.sync_with(wa); await sm.sync_with(wa)
+        assert freja.store.get_message(mid) is not None
+        assert mads.store.get_message(mid) is not None
+
+        tag_id = wong.delete_post(mid)
+        await sf.sync_with(wa); await sm.sync_with(wa)
+        assert freja.store.get_message(mid) is None
+        assert freja.store.is_tombstoned(mid)
+        assert freja.store.message_kind(tag_id) == "delete"
+        assert mads.store.get_message(mid) is None
+        assert mads.store.is_tombstoned(mid)
+        assert mads.store.message_kind(tag_id) == "delete"
+
+        # a hostile/modified client crafts a meta-delete and injects it
+        # directly at Mads -- delete_post itself now refuses to build one
+        meta = make_delete(wong.device, tag_id)
+        res = mads.store.ingest_message(meta)
+        assert not res.accepted
+        assert "cannot target a delete tag" in res.reason
+
+        # further sync rounds all around: the refused meta-delete never
+        # took hold anywhere, so it has nothing to gossip
+        await sw.sync_with(fa); await sw.sync_with(ma)
+        await sf.sync_with(ma)
+        for n in (wong, freja, mads):
+            assert n.store.get_message(mid) is None
+            assert n.store.is_tombstoned(mid)
+            assert n.store.message_kind(tag_id) == "delete"
+            assert n.store.message_kind(meta.msg_id) is None
+            assert not n.store.is_tombstoned(meta.msg_id)
+
+        for s in (sw, sf, sm):
             await s.stop()
     asyncio.run(scenario())

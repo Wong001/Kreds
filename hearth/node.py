@@ -17,11 +17,11 @@ from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        canonical, _sig_ok)
 from .imagegate import AVATAR_MAX, BANNER_MAX, transcode
 from .videogate import STORY_IMAGE_MAX, transcode_video
-from .messages import (DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS, KIND_DM,
-                       KIND_POST, MAX_CAPTION, MAX_LAYOUT, SIZE_LAYOUTS,
-                       make_delete, make_dm, make_enckey, make_post,
-                       make_profile, make_profile_layout, make_ring,
-                       make_story)
+from .messages import (DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
+                       KIND_DELETE, KIND_DM, KIND_POST, MAX_CAPTION,
+                       MAX_LAYOUT, SIZE_LAYOUTS, make_delete, make_dm,
+                       make_enckey, make_post, make_profile,
+                       make_profile_layout, make_ring, make_story)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -684,6 +684,8 @@ class HearthNode:
                 "journal": self.posts_by(identity_pub, "journal")}
 
     def delete_post(self, target_msg_id: str) -> str:
+        if self.store.message_kind(target_msg_id) == KIND_DELETE:
+            raise ValueError("cannot delete a delete tag")
         return self._publish(make_delete(self.device, target_msg_id))
 
     def _decrypt_post_row(self, msg, names, now):
