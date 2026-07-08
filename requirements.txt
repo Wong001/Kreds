@@ -7,3 +7,4 @@ pytest
 qrcode[pil]
 imageio-ffmpeg
 pywebview
+pystray

@@ -43,6 +43,10 @@ else:
           "find a bundled tor.exe. Run packaging/build.ps1 instead of "
           "invoking pyinstaller directly, or stage tor.exe manually.")
 
+# Tray icon at runtime (hearth/paths.py's tray_icon_path expects
+# resource_dir()/packaging/kreds.ico when frozen).
+datas.append((os.path.join(PACKAGING_DIR, "kreds.ico"), "packaging"))
+
 # imageio_ffmpeg locates its bundled ffmpeg binary via
 # importlib.resources.files("imageio_ffmpeg.binaries"), so the ffmpeg exe
 # must land at the SAME relative path (imageio_ffmpeg/binaries/...) inside

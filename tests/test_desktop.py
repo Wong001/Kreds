@@ -408,3 +408,139 @@ def test_launch_frozen_tor_on_passes_nonzero_gossip_port_to_run_serve(tmp_path, 
 
     assert captured["tor"] is True
     assert captured["gossip_port"] != 0
+
+
+# ---- system tray (spec 2026-07-08-kreds-tray-icon) ----
+
+class _FakeWindow:
+    def __init__(self):
+        self.hidden = self.shown = self.restored = False
+        self.minimized = self.destroyed = False
+    def hide(self): self.hidden = True
+    def show(self): self.shown = True
+    def restore(self): self.restored = True
+    def minimize(self): self.minimized = True
+    def destroy(self): self.destroyed = True
+
+
+class _FakeTray:
+    def __init__(self, raise_on_stop=False, raise_on_notify=False):
+        self.stopped = False
+        self.notes = []
+        self._rs, self._rn = raise_on_stop, raise_on_notify
+    def stop(self):
+        if self._rs: raise RuntimeError("wedged tray")
+        self.stopped = True
+    def notify(self, message, title=None):
+        if self._rn: raise RuntimeError("no balloon support")
+        self.notes.append(message)
+
+
+class _FakeTrayThread:
+    def __init__(self, alive): self._alive = alive
+    def is_alive(self): return self._alive
+
+
+def _tray_api(tmp_path, tray=None, thread_alive=True):
+    from hearth import desktop
+    api = desktop.Api({"loop": None, "ev": None})
+    api.window = _FakeWindow()
+    api._data_dir = tmp_path
+    api._tray = tray
+    api._tray_thread = _FakeTrayThread(thread_alive) if tray is not None else None
+    return api
+
+
+def test_hide_to_tray_hides_and_balloons_exactly_once(tmp_path):
+    from hearth import desktop
+    api = _tray_api(tmp_path, tray=_FakeTray())
+    api.hide_to_tray()
+    assert api.window.hidden and not api.window.minimized
+    assert api._tray.notes == [
+        "Kreds keeps running in the background. Click the tray icon to open it again."]
+    assert (tmp_path / desktop.TRAY_NOTIFIED_FLAG).exists()
+    api.hide_to_tray()
+    assert len(api._tray.notes) == 1        # flag file makes it one-time
+
+
+def test_hide_to_tray_falls_back_to_minimize_when_tray_dead(tmp_path):
+    # A hidden window with no living tray has NO way back - never strand
+    # the user (spec edge case).
+    api = _tray_api(tmp_path, tray=_FakeTray(), thread_alive=False)
+    api.hide_to_tray()
+    assert api.window.minimized and not api.window.hidden
+
+
+def test_hide_to_tray_without_tray_at_all_minimizes(tmp_path):
+    api = _tray_api(tmp_path, tray=None)
+    api.hide_to_tray()
+    assert api.window.minimized and not api.window.hidden
+
+
+def test_balloon_failure_never_breaks_the_hide(tmp_path):
+    api = _tray_api(tmp_path, tray=_FakeTray(raise_on_notify=True))
+    api.hide_to_tray()                      # must not raise
+    assert api.window.hidden
+
+
+def test_quit_stops_tray_best_effort_and_always_destroys(tmp_path):
+    api = _tray_api(tmp_path, tray=_FakeTray(raise_on_stop=True))
+    api.quit()                              # wedged tray must not block quit
+    assert api.window.destroyed
+    api2 = _tray_api(tmp_path, tray=_FakeTray())
+    api2.quit()
+    assert api2._tray.stopped and api2.window.destroyed
+
+
+def test_quit_survives_a_raising_window_destroy(tmp_path):
+    # quit() is reachable from the tray thread: a pre-start race or a
+    # double-quit can make destroy() raise - shutdown must complete
+    # (tray stopped) and nothing may propagate out of a tray callback.
+    api = _tray_api(tmp_path, tray=_FakeTray())
+
+    class _ExplodingWindow(_FakeWindow):
+        def destroy(self):
+            raise RuntimeError("window already disposed")
+
+    api.window = _ExplodingWindow()
+    api.quit()                          # must not raise
+    assert api._tray.stopped
+
+
+def test_show_window_shows_and_restores(tmp_path):
+    api = _tray_api(tmp_path, tray=_FakeTray())
+    api.show_window()
+    assert api.window.shown and api.window.restored
+
+
+def test_show_window_preserves_maximized_state(tmp_path):
+    # Reopening from the tray must not force a maximized window to Normal
+    # (whole-branch review, Important: restore() desyncs _maximized).
+    api = _tray_api(tmp_path, tray=_FakeTray())
+    api._maximized = True
+    api.show_window()
+    assert api.window.shown and not api.window.restored
+    api2 = _tray_api(tmp_path, tray=_FakeTray())
+    api2.show_window()
+    assert api2.window.shown and api2.window.restored
+
+
+def test_pystray_import_is_lazy():
+    # import hearth.desktop must never require pystray (mirror of the lazy
+    # `import webview` rule): the only `import pystray` sits inside
+    # _create_tray's body.
+    import inspect
+    from hearth import desktop
+    src = inspect.getsource(desktop)
+    assert src.count("import pystray") == 1
+    # the import line must be indented (function-local), never at column 0
+    for line in src.splitlines():
+        if "import pystray" in line:
+            assert line.startswith((" ", "\t")), "pystray import must be function-local"
+
+
+def test_already_running_notice_mentions_tray():
+    import inspect
+    from hearth import desktop
+    src = inspect.getsource(desktop._notify_already_running)
+    assert "system tray" in src

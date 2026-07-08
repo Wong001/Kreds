@@ -114,9 +114,9 @@ route, and the onboarding-done round trip.
 browser tab/window, exactly as described above. A separate **Windows
 desktop app** (`hearth app`) now also exists as an additional path, not
 a replacement - see "Windows desktop app" below, and "Windows desktop
-app (packaged)" for the distributable `Kreds.exe` built from it. What's
-still missing: a real system-tray icon backing "Keep running" (see
-"Windows desktop app (packaged)" and ROADMAP).
+app (packaged)" for the distributable `Kreds.exe` built from it,
+including its system-tray icon backing "Keep running" (see
+"Quit vs. Keep-running" below).
 
 ## Windows desktop app
 
@@ -145,10 +145,23 @@ loop, on a free localhost port `hearth/desktop.py` picks automatically
 /api/settings`, read live, never cached, so a change in Settings takes
 effect on the very next close) what closing should mean: **Quit** stops
 the node and closes the window, or **Keep running in the background**
-minimizes the window instead while the node keeps syncing - there is no
-system-tray icon yet, so today "kept running" is reachable only by
-restoring the minimized window from the taskbar; a real tray icon is a
-Phase 2 follow-up (see ROADMAP). The choice defaults to Quit, is asked
+hides the window fully (no taskbar entry) while the node keeps syncing,
+backed by an **always-present system-tray icon**
+(`hearth/desktop.py`'s `_create_tray()`, on `pystray`, imported lazily
+inside that one function so the test suite never needs the GUI dep).
+The tray's menu is just **Open Kreds** (also the default action, so a
+double-click does the same thing) and **Quit Kreds**; the first time a
+window is hidden to tray, a one-time balloon explains where it went
+("Kreds keeps running in the background...") via a flag file in the
+data dir, never shown again after that. If the tray thread isn't alive
+for any reason, `hide_to_tray()` falls back to a plain
+taskbar-minimize instead of stranding the user with a hidden window and
+no way back (an older frozen shell missing `hide_to_tray` entirely -
+web/core version skew - gets the same minimize fallback from the JS
+side). The tray icon is stopped on every exit path - a normal quit, a
+tray-menu quit, and the Updates panel's "restart to finish" (which
+calls `quit()` under the hood) - so closing or restarting the app never
+leaves an orphaned icon behind. The choice defaults to Quit, is asked
 once as the last step of the one-time setup wizard (desktop-only - a
 plain browser never sees this step), and can be changed anytime after
 in Settings (`renderDesktopSettings()`, same `/api/settings` endpoint).
@@ -188,9 +201,10 @@ install step is needed on the machines this targets today.
 has since built a real PyInstaller-packaged, distributable `Kreds.exe`
 on top of this exact same `hearth/desktop.py` machinery (bundled
 `tor.exe`, the node running over Tor, a writable auto-updatable web
-copy) - see "Windows desktop app (packaged)" below. Still missing: a
-real system-tray icon backing "Keep running" (restoring from the
-taskbar remains the only way back today) - see ROADMAP.
+copy) - see "Windows desktop app (packaged)" below. The system-tray
+icon backing "Keep running" described above (see "Quit vs.
+Keep-running") is the same code path in both the source run and the
+packaged build - it's not a packaged-only addition.
 
 **The GUI itself - the actual window, its chrome, dragging, minimize/
 maximize/close, the wizard step's look - is not exercised by automated
@@ -259,10 +273,18 @@ update on its own fresh start.
 **Honest, stated plainly.** This build is currently **unsigned** - no
 Authenticode code-signing certificate yet - so Windows SmartScreen shows
 an "unknown publisher" warning on first run; that's expected for the
-friend test, not a bug. **Authenticode signing, a real installer (Inno
-Setup - Start Menu entry, uninstaller, auto-start), and macOS packaging
-are public-release follow-ups**, not built yet. There is still no real
-system-tray icon (see "Windows desktop app" above). Proven so far: the
+friend test, not a bug. **The Inno Setup installer is built** (`dist/
+KredsSetup.exe` via `build.ps1` - Start Menu entry, uninstaller,
+auto-start); **Authenticode signing is in progress** (certificate
+identity validation underway as of 2026-07-08); **macOS packaging
+remains a follow-up**. The system-tray icon
+(see "Windows desktop app" above, "Quit vs. Keep-running") is bundled
+into this build too: `pystray` ships compiled into `Kreds.exe` itself
+(PyInstaller only extracts non-Python assets like DLLs into
+`_internal`; pure-Python dependencies such as `pystray` are zipped
+straight into the executable), confirmed both by PyInstaller's own
+module analysis picking up `pystray._win32` and by a packaged run
+producing no "tray unavailable" entry in `app.log`. Proven so far: the
 build launches end-to-end (polled for its listening port, `GET
 /api/bootstrap` -> `200`, both `tor.exe` and the WebView2 host process
 confirmed running as children, then cleanly killed) and the full signed
