@@ -191,9 +191,12 @@
        data; nodes call openProfile. -->
   <div class="overlay" id="circle-overlay" role="dialog" aria-label="Your kreds, expanded">
     <button class="closeoverlay" id="close-overlay" aria-label="Close">&times;</button>
+    <button class="fitbtn" id="circle-fit" aria-label="Zoom to fit">Fit</button>
     <div class="bigmapwrap">
       <svg id="circle-overlay-svg" viewBox="0 0 440 440"></svg>
-      <div class="overlayhint">Click a person to open their profile &middot; Esc to close</div>
+      <div class="overlayhint">Click a person to open their profile &middot;
+        scroll or pinch to zoom &middot; drag to move &middot;
+        double-click to reset &middot; Esc to close</div>
     </div>
   </div>
 

@@ -208,8 +208,24 @@ body.desktop .desktop-only-panel { display: block; }
   background: color-mix(in srgb, var(--paper) 88%, transparent);
   backdrop-filter: blur(6px); display: none; place-items: center; z-index: 20; }
 .overlay.open { display: grid; }
-.bigmapwrap { text-align: center; }
-.bigmapwrap svg { width: min(76%, 470px); height: auto; }
+.bigmapwrap { text-align: center; width: min(94vmin, 94%); }
+/* The svg is a square viewport (viewBox is square); touch-action:none so
+   the camera's pointer gestures never fight page scroll while open. */
+.bigmapwrap svg { width: 100%; height: auto; display: block; touch-action: none; }
+/* Camera-driven label visibility (spec: labels hide when on-screen node
+   pitch < 56px). Opacity so the fade can transition; pointer-events off so
+   hidden labels never eat a node tap. */
+.bigmapwrap svg .nlabel, .bigmapwrap svg .ringlabel {
+  transition: opacity .18s; pointer-events: none; }
+.bigmapwrap svg.labels-off .nlabel, .bigmapwrap svg.labels-off .ringlabel {
+  opacity: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .bigmapwrap svg .nlabel, .bigmapwrap svg .ringlabel { transition: none; }
+}
+.fitbtn { position: absolute; top: 16px; left: 18px; border: 1px solid var(--line-2);
+  background: var(--surface); color: var(--ink-2); border-radius: 999px;
+  padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.fitbtn:hover { color: var(--ink); border-color: var(--ink-2); }
 .node { cursor: pointer; }
 .node circle.face { stroke: var(--paper); stroke-width: 3; transition: transform .18s; }
 .node:hover circle.face, .node:focus-visible circle.face { transform: scale(1.1);

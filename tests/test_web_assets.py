@@ -958,3 +958,18 @@ def test_circle_world_scales_with_count():
     assert "scaleWithCount: true" in overlay_call
     rail_fn = js.split("function renderCircleRail")[1][:900]
     assert "scaleWithCount" not in rail_fn
+
+
+def test_circle_overlay_fills_screen_and_label_css():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    # the fixed 470px cap is gone; vmin-square viewport instead
+    assert "min(76%, 470px)" not in css
+    assert "94vmin" in css
+    assert "touch-action: none" in _css_rule(css, ".bigmapwrap svg")
+    # label visibility contract + reduced-motion opt-out
+    assert ".labels-off" in css
+    assert re.search(r"prefers-reduced-motion[^}]*\.nlabel", css, re.S)
+    # Fit reset is a real, labeled <button>; hint teaches the gestures
+    assert re.search(r'<button[^>]*id="circle-fit"', html)
+    assert "pinch to zoom" in html and "drag to move" in html
