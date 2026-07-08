@@ -81,12 +81,56 @@ class Api:
         self._holder = holder          # {"loop": asyncio loop, "ev": shutdown Event}
         self.window = None
         self._maximized = False
+        self._tray = None              # pystray.Icon, set by launch()
+        self._tray_thread = None       # its daemon thread, set by launch()
+        self._data_dir = None          # set by launch(); one-time balloon flag lives here
 
     def is_desktop(self):
         return True
 
     def minimize(self):
         if self.window: self.window.minimize()
+
+    def show_window(self):
+        """Tray 'Open Kreds' / double-click: restore a hidden window.
+        pywebview marshals show/hide/restore onto the GUI thread, so
+        calling from the pystray thread is safe (verify against the
+        installed pywebview at implementation time and update this note
+        if that ever changes)."""
+        if not self.window: return
+        try:
+            self.window.show()
+            self.window.restore()
+        except Exception:
+            pass                        # window mid-teardown; nothing to do
+
+    def hide_to_tray(self):
+        """Close with close_behavior=keep: hide fully (no taskbar entry).
+        A hidden window with no living tray has no way back, so fall back
+        to a plain taskbar-minimize when the tray thread is dead - never
+        strand the user (spec edge case)."""
+        if not self.window: return
+        alive = self._tray_thread is not None and self._tray_thread.is_alive()
+        if not alive:
+            self.minimize()
+            return
+        self.window.hide()
+        self._notify_first_hide()
+
+    def _notify_first_hide(self):
+        """One-time balloon per data dir. The flag is shell-owned state in
+        the data dir (like instance.lock), deliberately not node meta.
+        Balloon failures never break the hide - pystray notify support
+        varies by platform/backend."""
+        try:
+            flag = self._data_dir / TRAY_NOTIFIED_FLAG
+            if flag.exists(): return
+            flag.write_text("1")
+            if self._tray is not None:
+                self._tray.notify("Kreds keeps running in the background. "
+                                  "Click the tray icon to open it again.", "Kreds")
+        except Exception:
+            pass
 
     def toggle_maximize(self):
         # pywebview's maximize API varies by version; verify against the installed
@@ -103,6 +147,11 @@ class Api:
                 loop.call_soon_threadsafe(ev.set)  # ask the node to shut down cleanly
             except RuntimeError:
                 pass                                # loop already closed (node died/raced us)
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass                    # a wedged tray must never block shutdown
         if self.window: self.window.destroy()      # ALWAYS runs, even if the signal above failed --
                                                      # otherwise a dead node loop leaves the frameless
                                                      # (no OS close button) window unclosable
@@ -189,9 +238,44 @@ def _notify_already_running() -> None:
     try:
         import ctypes
         ctypes.windll.user32.MessageBoxW(
-            0, "Kreds is already running.", "Kreds", 0x40)  # MB_ICONINFORMATION
+            0, "Kreds is already running. It may be in the background - "
+            "check your system tray.", "Kreds", 0x40)  # MB_ICONINFORMATION
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------
+# System tray (spec 2026-07-08-kreds-tray-icon): always present while the
+# app runs. pystray loading is LAZY (inside _create_tray only), mirroring
+# launch()'s lazy `import webview` - the test suite never needs GUI deps.
+# --------------------------------------------------------------------------
+
+TRAY_NOTIFIED_FLAG = "tray_notified"
+
+def _tray_icon_image():
+    """packaging/kreds.ico (bundled when frozen, repo-resolved from
+    source); a missing file gets a Pillow-drawn 3-arc placeholder so a
+    dev checkout never crashes the shell over an icon."""
+    from PIL import Image
+    p = paths.tray_icon_path()
+    if p.is_file():
+        return Image.open(p)
+    from PIL import ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.arc((6, 6, 58, 58), 300, 240, fill=(200, 16, 46, 255), width=7)
+    d.ellipse((26, 26, 38, 38), fill=(23, 25, 27, 255))
+    return img
+
+def _create_tray(api):
+    """Build (not run) the tray icon: Open Kreds (default item -> a
+    double-click triggers it) + Quit Kreds."""
+    import pystray
+    menu = pystray.Menu(
+        pystray.MenuItem("Open Kreds", lambda: api.show_window(), default=True),
+        pystray.MenuItem("Quit Kreds", lambda: api.quit()),
+    )
+    return pystray.Icon("Kreds", _tray_icon_image(), "Kreds", menu)
 
 
 # --------------------------------------------------------------------------
@@ -333,6 +417,17 @@ def launch(data_dir=None):
             "Kreds", url=f"http://127.0.0.1:{port}", frameless=True, js_api=api,
             width=1100, height=760, min_size=(900, 600))
         api.window = window
+        api._data_dir = data_dir
+        # Tray failures degrade, never block: without a tray the app still
+        # runs and hide_to_tray falls back to minimize.
+        try:
+            tray = _create_tray(api)
+            t_tray = threading.Thread(target=tray.run, name="kreds-tray", daemon=True)
+            t_tray.start()
+            api._tray = tray
+            api._tray_thread = t_tray
+        except Exception as e:
+            _log_error(data_dir, "tray unavailable: " + repr(e))
         # DevTools opt-in: set KREDS_DEVTOOLS=1 to enable right-click -> Inspect
         # in the WebView2 window (for diagnosing rendering). Off by default.
         webview.start(debug=os.environ.get("KREDS_DEVTOOLS") == "1")
