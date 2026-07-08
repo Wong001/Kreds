@@ -98,6 +98,10 @@ def main(argv=None):
                     help="directory holding manifest.json/.sig + bundles "
                          "(default: release/)")
     sp.add_argument("--repo", default="wong001/kreds_updater")
+    sp.add_argument("--installer", default=None,
+                    help="path to KredsSetup.exe to attach - the website's "
+                         "stable /releases/latest/download/KredsSetup.exe "
+                         "link only stays alive if every release carries it")
     sp.add_argument("--dry-run", action="store_true",
                     help="print the gh command instead of running it")
 
@@ -215,6 +219,8 @@ def main(argv=None):
         assets = [rel_dir / "manifest.json", rel_dir / "manifest.sig",
                  rel_dir / ("web-" + version + ".zip"),
                  rel_dir / ("core-" + version + ".zip")]
+        if args.installer:
+            assets.append(Path(args.installer))
         missing = [str(a) for a in assets if not a.exists()]
         if missing:
             raise SystemExit("release-publish: missing asset(s), run "

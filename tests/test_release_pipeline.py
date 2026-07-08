@@ -260,3 +260,29 @@ def test_release_publish_refuses_when_assets_missing(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["release-publish", "--version", "1.2.3", "--dir", str(out_dir),
                  "--dry-run"])
+
+def test_release_publish_includes_installer_when_passed(tmp_path, capsys):
+    # The website's stable download URL (…/releases/latest/download/
+    # KredsSetup.exe) only stays alive if every release uploads the
+    # installer - release-publish takes --installer and includes it in the
+    # gh command; a bad path fails fast instead of silently publishing a
+    # release that breaks the download page.
+    out_dir = _run_release_build(tmp_path, version="1.2.3")
+    priv, pub = _throwaway_key()
+    key_path = tmp_path / "release_private_key.hex"
+    key_path.write_text(priv)
+    cli.main(["release-sign", "--manifest", str(out_dir / "manifest.json"),
+             "--key", str(key_path)])
+
+    setup = tmp_path / "KredsSetup.exe"
+    setup.write_bytes(b"not a real installer")
+    cli.main(["release-publish", "--version", "1.2.3", "--dir", str(out_dir),
+             "--installer", str(setup), "--dry-run"])
+    out = capsys.readouterr().out
+    assert "KredsSetup.exe" in out
+
+    with pytest.raises(SystemExit) as e:
+        cli.main(["release-publish", "--version", "1.2.3",
+                 "--dir", str(out_dir),
+                 "--installer", str(tmp_path / "missing.exe"), "--dry-run"])
+    assert "missing" in str(e.value)

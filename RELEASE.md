@@ -131,8 +131,19 @@ print('signature verifies:', update.verify_manifest(m, s))
 ## 5. Publish (`release-publish` / `gh`)
 
 ```powershell
-.venv\Scripts\python.exe -m hearth release-publish --version <CORE_VERSION> --dir release
+.venv\Scripts\python.exe -m hearth release-publish --version <CORE_VERSION> --dir release `
+  --installer dist\KredsSetup.exe
 ```
+
+`--installer` attaches the Inno Setup installer to the same release. This
+is what keeps the website's stable download link
+(`.../releases/latest/download/KredsSetup.exe`) alive — every release must
+carry it or the kreds.eu download page 404s on the next "latest".
+
+The kreds.eu download page (Kreds_website repo,
+`src/pages/download.astro`) pins a VERSIONED installer URL + its SHA-256,
+so it never desyncs from what it hashes. When publishing a release, update
+that page's version, URL, and `sha256sum dist\KredsSetup.exe` alongside.
 
 This is a thin wrapper around:
 
