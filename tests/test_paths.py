@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 import hearth.paths as paths
@@ -42,4 +43,4 @@ def test_pystray_declared_and_bundled():
     root = Path(__file__).resolve().parents[1]
     assert "pystray" in (root / "requirements.txt").read_text()
     spec = (root / "packaging" / "kreds.spec").read_text()
-    assert '"packaging"' in spec           # kreds.ico datas destination
+    assert re.search(r'kreds\.ico"?\)\s*,\s*"packaging"', spec)  # kreds.ico datas destination

@@ -100,7 +100,11 @@ class Api:
         if not self.window: return
         try:
             self.window.show()
-            self.window.restore()
+            if not self._maximized:
+                self.window.restore()   # un-minimize if needed; a MAXIMIZED
+                                        # window must not be forced Normal
+                                        # (would clobber the layout and desync
+                                        # the titlebar maximize toggle)
         except Exception:
             pass                        # window mid-teardown; nothing to do
 
@@ -125,6 +129,9 @@ class Api:
         try:
             flag = self._data_dir / TRAY_NOTIFIED_FLAG
             if flag.exists(): return
+            # Written BEFORE notify() deliberately: a one-off balloon failure
+            # must permanently consume the one-time balloon, never retry a
+            # persistently failing balloon on every subsequent hide.
             flag.write_text("1")
             if self._tray is not None:
                 self._tray.notify("Kreds keeps running in the background. "
@@ -432,7 +439,16 @@ def launch(data_dir=None):
         # runs and hide_to_tray falls back to minimize.
         try:
             tray = _create_tray(api)
-            t_tray = threading.Thread(target=tray.run, name="kreds-tray", daemon=True)
+            def _run_tray():
+                try:
+                    tray.run()
+                except Exception as e:
+                    # In-thread death would otherwise vanish (pystray logs to a
+                    # handlerless logger; a frozen app has no console). The app
+                    # keeps working - hide_to_tray sees the dead thread and
+                    # falls back to minimize.
+                    _log_error(data_dir, "tray died: " + repr(e))
+            t_tray = threading.Thread(target=_run_tray, name="kreds-tray", daemon=True)
             t_tray.start()
             api._tray = tray
             api._tray_thread = t_tray

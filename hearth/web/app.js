@@ -3006,7 +3006,7 @@ async function renderOnboardingWizard() {
     stepDesktop.append(el("h2", "wiz-title", "When you close the window"));
     stepDesktop.append(el("p", "hint",
       "Quit stops Kreds entirely. Keep running in the background lets it keep "
-      + "syncing with your kreds while the window is minimized."));
+      + "syncing with your kreds while the window is hidden in the system tray."));
     const pickClose = async (v) => {
       await fetch("/api/settings", {method: "POST",
         headers: {"Content-Type": "application/json"},

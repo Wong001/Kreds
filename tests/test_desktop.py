@@ -513,6 +513,18 @@ def test_show_window_shows_and_restores(tmp_path):
     assert api.window.shown and api.window.restored
 
 
+def test_show_window_preserves_maximized_state(tmp_path):
+    # Reopening from the tray must not force a maximized window to Normal
+    # (whole-branch review, Important: restore() desyncs _maximized).
+    api = _tray_api(tmp_path, tray=_FakeTray())
+    api._maximized = True
+    api.show_window()
+    assert api.window.shown and not api.window.restored
+    api2 = _tray_api(tmp_path, tray=_FakeTray())
+    api2.show_window()
+    assert api2.window.shown and api2.window.restored
+
+
 def test_pystray_import_is_lazy():
     # import hearth.desktop must never require pystray (mirror of the lazy
     # `import webview` rule): the only `import pystray` sits inside

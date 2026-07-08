@@ -273,9 +273,11 @@ update on its own fresh start.
 **Honest, stated plainly.** This build is currently **unsigned** - no
 Authenticode code-signing certificate yet - so Windows SmartScreen shows
 an "unknown publisher" warning on first run; that's expected for the
-friend test, not a bug. **Authenticode signing, a real installer (Inno
-Setup - Start Menu entry, uninstaller, auto-start), and macOS packaging
-are public-release follow-ups**, not built yet. The system-tray icon
+friend test, not a bug. **The Inno Setup installer is built** (`dist/
+KredsSetup.exe` via `build.ps1` - Start Menu entry, uninstaller,
+auto-start); **Authenticode signing is in progress** (certificate
+identity validation underway as of 2026-07-08); **macOS packaging
+remains a follow-up**. The system-tray icon
 (see "Windows desktop app" above, "Quit vs. Keep-running") is bundled
 into this build too: `pystray` ships compiled into `Kreds.exe` itself
 (PyInstaller only extracts non-Python assets like DLLs into
