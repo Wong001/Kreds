@@ -149,12 +149,22 @@ class Api:
                 pass                                # loop already closed (node died/raced us)
         if self._tray is not None:
             try:
-                self._tray.stop()
+                self._tray.stop()       # safe from any thread incl. the tray's own menu
+                                        # callback: pystray 0.19.x _win32 stop() is a
+                                        # non-blocking PostMessage (verified from source)
             except Exception:
                 pass                    # a wedged tray must never block shutdown
-        if self.window: self.window.destroy()      # ALWAYS runs, even if the signal above failed --
-                                                     # otherwise a dead node loop leaves the frameless
-                                                     # (no OS close button) window unclosable
+        if self.window:
+            try:
+                self.window.destroy()   # ALWAYS attempted, even if the signal above
+                                        # failed -- otherwise a dead node loop leaves the
+                                        # frameless (no OS close button) window unclosable.
+            except Exception:
+                pass    # quit() is reachable from the tray thread too: destroy can
+                        # raise on a not-yet-shown window (pre-webview.start race) or
+                        # a double-quit (tray Quit racing titlebar close) - a raising
+                        # destroy must never leave shutdown half-done or spill an
+                        # unraisable out of a tray callback.
 
     def restart(self):
         """The shell's "restart to finish" action, offered after a staged

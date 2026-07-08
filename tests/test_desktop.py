@@ -492,6 +492,21 @@ def test_quit_stops_tray_best_effort_and_always_destroys(tmp_path):
     assert api2._tray.stopped and api2.window.destroyed
 
 
+def test_quit_survives_a_raising_window_destroy(tmp_path):
+    # quit() is reachable from the tray thread: a pre-start race or a
+    # double-quit can make destroy() raise - shutdown must complete
+    # (tray stopped) and nothing may propagate out of a tray callback.
+    api = _tray_api(tmp_path, tray=_FakeTray())
+
+    class _ExplodingWindow(_FakeWindow):
+        def destroy(self):
+            raise RuntimeError("window already disposed")
+
+    api.window = _ExplodingWindow()
+    api.quit()                          # must not raise
+    assert api._tray.stopped
+
+
 def test_show_window_shows_and_restores(tmp_path):
     api = _tray_api(tmp_path, tray=_FakeTray())
     api.show_window()
