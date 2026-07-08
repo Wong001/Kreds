@@ -115,6 +115,12 @@ Carried from implementation reviews; each is accepted for the current demo but s
 
 ---
 
+## Queued for a near session (flagged 2026-07-09, real-users milestone)
+
+- **Protocol compatibility policy** — v0.1→v0.2 was a hard break while user count was zero; real installs now exist and the repo is public. Decide and document BEFORE the next breaking slice: version negotiation vs in-place store migration vs coordinated flag-days; what `hearth/vX.Y` promises to third-party nodes/clients.
+- **Single-device backup honesty + recovery** — a single-device user's disk death loses content (identity recovers via paper seed; there is no re-entitlement pull-back of your own history from friends' copies). Near-term: state it plainly on the site + nudge a second device in-app. Long-term: circle-assisted recovery may share machinery with the sharded-guardians design (see 2026-07-09 sketch).
+- **Permanent behavioral test suite** — promote the throwaway Playwright smokes into a small gated suite (TOR_E2E-style, ~6 tests vs a demo node): the week's only two critical UI bugs were caught by live smokes, never by the static text asserts, and three review findings showed the static pattern passes on comment text alone.
+
 ## Polish & tech-debt backlog
 
 Minor items logged during reviews — none blocking, triaged for later:
