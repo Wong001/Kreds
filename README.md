@@ -1,5 +1,7 @@
 # Kreds
 
+[![tests](https://github.com/Wong001/Kreds/actions/workflows/ci.yml/badge.svg)](https://github.com/Wong001/Kreds/actions/workflows/ci.yml)
+
 **A private social space for people you've actually met.**
 
 Kreds is a peer-to-peer, end-to-end-encrypted social app. Your data lives
