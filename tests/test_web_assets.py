@@ -1014,6 +1014,14 @@ def test_circle_gestures_and_labels():
     assert "if (!pts.has(ev.pointerId)) return;" in g
     assert "if (pts.size === 0) CIRCLE_DRAGGED = false;" in g
     assert "!multi" in g
+    # tap path must stay uncaptured: capture is deferred to pan/pinch
+    # (capture at pointerdown retargets the click to the svg - dead taps,
+    # found by live smoke)
+    assert "const capture = ()" in g
+    down_block = g.split('addEventListener("pointerdown"')[1]
+    down_block = down_block[:down_block.index('});')]
+    assert "setPointerCapture" not in down_block
+    assert 'window.addEventListener("pointerup", gone)' in g
     # drag must not fire the node click that follows pointerup
     assert "CIRCLE_DRAGGED" in js
     click_handler = js.split('document.getElementById("circle-overlay-svg").addEventListener("click"')[1][:400]

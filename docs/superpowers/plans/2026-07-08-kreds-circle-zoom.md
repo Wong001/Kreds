@@ -429,6 +429,18 @@ function wireCircleGestures(svg) {
   let pinchDist = 0;
   let lastTap = 0;             // for double-tap reset (touch)
 
+  // Capture is DEFERRED until the gesture is definitely a pan/pinch: with
+  // capture taken at pointerdown, the browser retargets the eventual click
+  // to the svg itself, so a plain tap's click never reaches the person node
+  // (found by the Task 5 live smoke - taps were silently dead). Capturing
+  // only after the 6px threshold (or on a second pointer) leaves clean taps
+  // uncaptured -> their click flows to the node as before.
+  const capture = () => {
+    for (const id of pts.keys()) {
+      try { svg.setPointerCapture(id); } catch (e) { /* pointer already gone */ }
+    }
+  };
+
   const gone = (ev) => {
     // pointerup AND lostpointercapture both fire for a captured pointer -
     // process each pointer's release exactly once, or the second pass
@@ -445,11 +457,11 @@ function wireCircleGestures(svg) {
     // previous gesture would swallow this gesture's tap - clear it at the
     // start of every fresh gesture (task review, Important).
     if (pts.size === 0) CIRCLE_DRAGGED = false;
-    svg.setPointerCapture(ev.pointerId);
     pts.set(ev.pointerId, {x: ev.clientX, y: ev.clientY,
                            sx: ev.clientX, sy: ev.clientY});
     if (pts.size === 2) {
       multi = true;
+      capture();               // a second pointer = definitely a pinch, never a tap
       const [a, b] = [...pts.values()];
       pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
     }
@@ -460,7 +472,10 @@ function wireCircleGestures(svg) {
     if (!p) return;
     const prevX = p.x, prevY = p.y;
     p.x = ev.clientX; p.y = ev.clientY;
-    if (!moved && Math.hypot(p.x - p.sx, p.y - p.sy) > 6) moved = true;
+    if (!moved && Math.hypot(p.x - p.sx, p.y - p.sy) > 6) {
+      moved = true;
+      capture();               // definitely a pan now, never a tap
+    }
     if (!moved) return;
     if (pts.size === 1) {
       circleCamera.panBy(p.x - prevX, p.y - prevY);
@@ -485,6 +500,11 @@ function wireCircleGestures(svg) {
   });
   svg.addEventListener("pointercancel", gone);
   svg.addEventListener("lostpointercapture", gone);
+  // Sub-threshold releases can land off-svg without capture (a down at the
+  // very edge that exits before crossing 6px) - window-level teardown covers
+  // them; gone()'s pts.has guard makes stray pointerups elsewhere a no-op.
+  window.addEventListener("pointerup", gone);
+  window.addEventListener("pointercancel", gone);
 }
 ```
 
