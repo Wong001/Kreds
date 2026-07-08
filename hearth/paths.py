@@ -36,3 +36,12 @@ def seed_web_dir(dst: Path) -> None:
     shutil.copytree(src, tmp)
     if dst.exists(): shutil.rmtree(dst)
     tmp.rename(dst)
+
+def tray_icon_path() -> Path:
+    """packaging/kreds.ico for the system tray - bundled at
+    <resource_dir>/packaging/kreds.ico when frozen (kreds.spec datas must
+    match), the repo's packaging/ dir from source. Callers handle a
+    missing file (dev fallback draws a placeholder)."""
+    if is_frozen():
+        return resource_dir() / "packaging" / "kreds.ico"
+    return Path(__file__).parent.parent / "packaging" / "kreds.ico"
