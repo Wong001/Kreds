@@ -1043,3 +1043,16 @@ def test_circle_gestures_and_labels():
     html = (WEB / "index.html").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert "hint-ext" in html and ".overlayhint .hint-ext" in css
+
+
+def test_desktop_keep_close_hides_to_tray_with_fallback():
+    # Spec 2026-07-08-kreds-tray-icon: close with "keep" hides to the tray;
+    # an OLDER frozen shell (web payload ahead of core - the skew the
+    # updater allows) lacks hide_to_tray, so the handler falls back to
+    # minimize. The titlebar minimize button itself stays minimize.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    chrome = _js_fn_body(js, "wireDesktopChrome")
+    assert "hide_to_tray" in chrome
+    assert "api.minimize()" in chrome
+    # user-facing copy names the tray (wizard step + Settings label)
+    assert js.count("in the system tray") >= 2

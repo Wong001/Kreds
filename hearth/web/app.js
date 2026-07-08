@@ -2140,7 +2140,7 @@ async function renderDesktopSettings() {
   const sel = document.createElement("select");
   sel.setAttribute("aria-label", "When you close the window");
   for (const [v, label] of [["quit", "Quit the app"],
-                            ["keep", "Keep running in the background"]]) {
+                            ["keep", "Keep running in the background (in the system tray)"]]) {
     const o = document.createElement("option"); o.value = v; o.textContent = label;
     if (v === cur) o.selected = true;
     sel.append(o);
@@ -2850,8 +2850,13 @@ function wireDesktopChrome() {
     let closeBehavior = "quit";
     try { closeBehavior = (await j("/api/settings")).close_behavior; }
     catch (e) { /* unreadable pref - fail safe to quit, never trap the app open */ }
-    if (closeBehavior === "keep") api.minimize();
-    else api.quit();
+    if (closeBehavior === "keep") {
+      // Newer shells hide to the system tray; an older frozen shell (web
+      // payload ahead of core - allowed update skew) has no hide_to_tray,
+      // so degrade to the old taskbar-minimize.
+      if (api.hide_to_tray) api.hide_to_tray();
+      else api.minimize();
+    } else api.quit();
   };
 }
 window.addEventListener("pywebviewready", wireDesktopChrome);
@@ -3010,7 +3015,7 @@ async function renderOnboardingWizard() {
     };
     const quitBtn = el("button", "btn-accent", "Quit the app"); quitBtn.type = "button";
     quitBtn.onclick = () => pickClose("quit");
-    const keepBtn = el("button", "", "Keep running in the background"); keepBtn.type = "button";
+    const keepBtn = el("button", "", "Keep running in the background (in the system tray)"); keepBtn.type = "button";
     keepBtn.onclick = () => pickClose("keep");
     const row = el("div", "wiz-actions");
     row.append(quitBtn, keepBtn);
