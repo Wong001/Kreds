@@ -243,6 +243,7 @@ body.desktop .desktop-only-panel { display: block; }
   background: var(--surface); color: var(--ink); width: 32px; height: 32px; border-radius: 50%;
   font-size: 14px; }
 .overlayhint { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; }
+@media (max-width: 560px) { .overlayhint .hint-ext { display: none; } }
 
 /* filter chips: the circle's everyday form */
 .chipbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }

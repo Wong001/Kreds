@@ -1019,7 +1019,7 @@ def test_circle_gestures_and_labels():
     # found by live smoke)
     assert "const capture = ()" in g
     down_block = g.split('addEventListener("pointerdown"')[1]
-    down_block = down_block[:down_block.index('});')]
+    down_block = down_block[:down_block.index('addEventListener("pointermove"')]
     assert "setPointerCapture" not in down_block
     assert 'window.addEventListener("pointerup", gone)' in g
     # drag must not fire the node click that follows pointerup
@@ -1034,3 +1034,12 @@ def test_circle_gestures_and_labels():
     assert "CIRCLE_SPACING" in labels_fn and "classList.toggle" in labels_fn
     # no native DnD anywhere in the gesture code
     assert "dragstart" not in g and 'draggable="true"' not in g
+    # labels compare the ACTUAL node pitch published by buildCircle, not the
+    # SPACING floor (small circles keep labels at fit on small screens)
+    assert "dataset.nodePitch" in js
+    # a11y: focusing an off-camera node pans it into view
+    assert '"focusin"' in js and "ensureVisible" in js
+    # narrow screens shorten the gesture hint
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "hint-ext" in html and ".overlayhint .hint-ext" in css

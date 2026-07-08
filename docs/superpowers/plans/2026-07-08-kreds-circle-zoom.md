@@ -95,6 +95,18 @@ function buildCircle(svg, kreds, opts) {
   }
   svg.dataset.worldSize = size;
   svg.setAttribute("viewBox", "0 0 " + size + " " + size);
+  // ... (ring guides, ring labels, you-node - unchanged) ...
+  const inner = kreds.filter(k => k.ring === "inner");
+  const outer = kreds.filter(k => k.ring !== "inner");
+  // Actual minimum node pitch (world units of arc between adjacent nodes on
+  // the fullest ring). updateCircleLabels compares THIS, not the SPACING
+  // floor: a small circle's real pitch is far above the floor, so its labels
+  // stay visible at fit even on phone-sized viewports (whole-branch review,
+  // Important #1).
+  const pitches = [];
+  if (inner.length) pitches.push(2 * Math.PI * innerR / inner.length);
+  if (outer.length) pitches.push(2 * Math.PI * outerR / outer.length);
+  svg.dataset.nodePitch = pitches.length ? Math.min(...pitches) : CIRCLE_SPACING;
 ```
 
 And in `openCircleOverlay()` change the call to:
@@ -179,6 +191,9 @@ with:
   background: var(--surface); color: var(--ink-2); border-radius: 999px;
   padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
 .fitbtn:hover { color: var(--ink); border-color: var(--ink-2); }
+/* Whole-branch review fix: narrow screens drop the gesture clause from the
+   hint (directly after the existing .overlayhint rule). */
+@media (max-width: 560px) { .overlayhint .hint-ext { display: none; } }
 ```
 
 - [ ] **Step 4: Implement markup.** In `hearth/web/index.html` change the overlay block to:
@@ -189,12 +204,14 @@ with:
     <button class="fitbtn" id="circle-fit" aria-label="Zoom to fit">Fit</button>
     <div class="bigmapwrap">
       <svg id="circle-overlay-svg" viewBox="0 0 440 440"></svg>
-      <div class="overlayhint">Click a person to open their profile &middot;
-        scroll or pinch to zoom &middot; drag to move &middot;
-        double-click to reset &middot; Esc to close</div>
+      <div class="overlayhint">Click a person to open their profile<span class="hint-ext"> &middot; scroll or pinch to zoom &middot; drag to move &middot; double-click to reset</span> &middot; Esc to close</div>
     </div>
   </div>
 ```
+
+Whole-branch review fix: on narrow screens the hint's gesture clause is
+noise (no wheel/pinch/drag context on a small screen), so it's wrapped in
+`<span class="hint-ext">` and hidden below 560px (see the CSS block below).
 
 - [ ] **Step 5: Run tests**
 
@@ -403,16 +420,24 @@ Expected: FAIL (`wireCircleGestures` not found)
 
 ```js
 // Labels show only when nodes are far enough apart on SCREEN to carry
-// them (spec: node pitch >= 56 css px). Pitch = world spacing * px/world.
+// them (spec: node pitch >= 56 css px). Pitch comes from dataset.nodePitch,
+// the ACTUAL minimum world arc between adjacent nodes published by
+// buildCircle - not the SPACING floor (a small circle's real pitch is far
+// above that floor, so its labels stay visible on small viewports too).
 function updateCircleLabels() {
   const svg = circleCamera.svg;
   if (!svg) return;
   const r = svg.getBoundingClientRect();
   if (!r.width) return;
-  const pitchPx = CIRCLE_SPACING * (r.width / circleCamera.w);
+  const pitchWorld = +svg.dataset.nodePitch || CIRCLE_SPACING;
+  const pitchPx = pitchWorld * (r.width / circleCamera.w);
   svg.classList.toggle("labels-off", pitchPx < 56);
 }
 ```
+
+(Whole-branch review fix: the pitch used to be the SPACING floor, which
+undersells a small circle's real, wider spacing on small viewports; it now
+reads the actual pitch buildCircle publishes.)
 
 (b) Add above the `{ const svg = ... }` wiring block:
 
@@ -448,7 +473,9 @@ function wireCircleGestures(svg) {
     // before the browser's click event consumes it (task review, Critical).
     if (!pts.has(ev.pointerId)) return;
     pts.delete(ev.pointerId);
-    if (pts.size < 2) pinchDist = 0;
+    // dropping to exactly 2 must also re-seed (a 3rd finger lifting mid-pinch
+    // left a stale pair distance)
+    if (pts.size <= 2) pinchDist = 0;
     if (pts.size === 0) { CIRCLE_DRAGGED = moved; moved = false; multi = false; }
   };
 
@@ -470,6 +497,10 @@ function wireCircleGestures(svg) {
   svg.addEventListener("pointermove", (ev) => {
     const p = pts.get(ev.pointerId);
     if (!p) return;
+    // A swallowed right-button pointerup (context-menu flows on some
+    // platforms) can leave a stale entry - a mouse moving with no buttons
+    // held is not a gesture, tear it down.
+    if (ev.pointerType === "mouse" && !ev.buttons) { gone(ev); return; }
     const prevX = p.x, prevY = p.y;
     p.x = ev.clientX; p.y = ev.clientY;
     if (!moved && Math.hypot(p.x - p.sx, p.y - p.sy) > 6) {
@@ -507,6 +538,13 @@ function wireCircleGestures(svg) {
   window.addEventListener("pointercancel", gone);
 }
 ```
+
+(Whole-branch review fixes backported into the block above: `gone()` now
+re-seeds `pinchDist` on dropping to exactly 2 pointers, not just below 2 -
+a 3rd finger lifting mid-pinch used to leave a stale pair distance; and
+`pointermove` tears down via `gone()` when a mouse pointer moves with no
+buttons held, covering a swallowed right-button pointerup on platforms
+where a context-menu flow eats it.)
 
 (c) Inside the existing `{ const svg = ... }` wiring block, add one line after `circleCamera.init(svg);`:
 

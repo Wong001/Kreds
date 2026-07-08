@@ -781,6 +781,15 @@ function buildCircle(svg, kreds, opts) {
   }
   const inner = kreds.filter(k => k.ring === "inner");
   const outer = kreds.filter(k => k.ring !== "inner");
+  // Actual minimum node pitch (world units of arc between adjacent nodes on
+  // the fullest ring). updateCircleLabels compares THIS, not the SPACING
+  // floor: a small circle's real pitch is far above the floor, so its labels
+  // stay visible at fit even on phone-sized viewports (whole-branch review,
+  // Important #1).
+  const pitches = [];
+  if (inner.length) pitches.push(2 * Math.PI * innerR / inner.length);
+  if (outer.length) pitches.push(2 * Math.PI * outerR / outer.length);
+  svg.dataset.nodePitch = pitches.length ? Math.min(...pitches) : CIRCLE_SPACING;
   const placed = placeRing(inner, cx, cy, innerR).concat(placeRing(outer, cx, cy, outerR));
   for (const {k, x, y} of placed) {
     const color = identityColor(k.identity_pub);
@@ -874,13 +883,17 @@ function closeCircleOverlay() {
 // (x, y) and width w (the viewport is square, height mirrors width).
 // ---------------------------------------------------------------------
 // Labels show only when nodes are far enough apart on SCREEN to carry
-// them (spec: node pitch >= 56 css px). Pitch = world spacing * px/world.
+// them (spec: node pitch >= 56 css px). Pitch comes from dataset.nodePitch,
+// the ACTUAL minimum world arc between adjacent nodes published by
+// buildCircle - not the SPACING floor (a small circle's real pitch is far
+// above that floor, so its labels stay visible on small viewports too).
 function updateCircleLabels() {
   const svg = circleCamera.svg;
   if (!svg) return;
   const r = svg.getBoundingClientRect();
   if (!r.width) return;
-  const pitchPx = CIRCLE_SPACING * (r.width / circleCamera.w);
+  const pitchWorld = +svg.dataset.nodePitch || CIRCLE_SPACING;
+  const pitchPx = pitchWorld * (r.width / circleCamera.w);
   svg.classList.toggle("labels-off", pitchPx < 56);
 }
 
@@ -972,7 +985,9 @@ function wireCircleGestures(svg) {
     // before the browser's click event consumes it (task review, Critical).
     if (!pts.has(ev.pointerId)) return;
     pts.delete(ev.pointerId);
-    if (pts.size < 2) pinchDist = 0;
+    // dropping to exactly 2 must also re-seed (a 3rd finger lifting mid-pinch
+    // left a stale pair distance)
+    if (pts.size <= 2) pinchDist = 0;
     if (pts.size === 0) { CIRCLE_DRAGGED = moved; moved = false; multi = false; }
   };
 
@@ -994,6 +1009,10 @@ function wireCircleGestures(svg) {
   svg.addEventListener("pointermove", (ev) => {
     const p = pts.get(ev.pointerId);
     if (!p) return;
+    // A swallowed right-button pointerup (context-menu flows on some
+    // platforms) can leave a stale entry - a mouse moving with no buttons
+    // held is not a gesture, tear it down.
+    if (ev.pointerType === "mouse" && !ev.buttons) { gone(ev); return; }
     const prevX = p.x, prevY = p.y;
     p.x = ev.clientX; p.y = ev.clientY;
     if (!moved && Math.hypot(p.x - p.sx, p.y - p.sy) > 6) {
