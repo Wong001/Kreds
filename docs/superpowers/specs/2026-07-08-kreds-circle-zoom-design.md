@@ -75,8 +75,10 @@ is square, see CSS):
 - **Pan:** single-pointer drag on the SVG background (not on a node —
   a drag starting on a node still pans if it moves past the same ~6px
   tap-vs-drag threshold the profile canvas uses, so node clicks stay
-  clicks). Clamped so at least 20% of the world stays on-screen in each
-  axis (cannot fling the circle away).
+  clicks). Clamped so world content always covers at least 20% of the
+  viewport in each axis (cannot fling the circle away). (Erratum: an
+  earlier wording said 20% of the world, which is unsatisfiable at 8x
+  zoom.)
 - Pointer Events only (`pointerdown/move/up/cancel` +
   `lostpointercapture`, the lesson from the profile drag work), with
   `touch-action: none` on the overlay SVG while it is open.
@@ -89,7 +91,10 @@ is square, see CSS):
   driven by effective magnification `m = fitW / w`:
   below `m = LABEL_AT` (chosen so labels don't collide at the fit view of
   a large circle; computed as: show labels when on-screen node pitch
-  >= 56 CSS px) the SVG root carries class `labels-off`; CSS fades
+  >= 56 CSS px — pitch is the ACTUAL minimum arc between adjacent nodes,
+  published by the builder (`dataset.nodePitch`); small circles have
+  pitch far above the spacing floor, so their labels stay visible even
+  on small viewports) the SVG root carries class `labels-off`; CSS fades
   labels via opacity transition (respecting `prefers-reduced-motion`:
   no transition, just show/hide).
 - With few friends (today's realistic case) the fit view already passes
@@ -140,8 +145,10 @@ builder.
 - Pinch while a drag is in progress: second pointer upgrades the gesture
   from pan to pinch (standard two-pointer bookkeeping keyed by
   pointerId, as in the profile drag).
-- Overlay closed mid-gesture (Esc): listeners are removed with the
-  overlay's close path; `lostpointercapture` guarantees cleanup.
+- Overlay closed mid-gesture (Esc): listeners stay permanently wired with
+  idempotent guards - a closed overlay's zero-size rect makes camera ops
+  no-op, and window-level pointerup/pointercancel drain pointer state.
+  (Shipped design; supersedes the earlier remove-on-close wording.)
 
 ## Testing
 

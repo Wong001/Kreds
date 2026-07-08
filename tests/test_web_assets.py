@@ -939,3 +939,107 @@ def test_friend_add_css_present():
     for sel in (".friendadd-tabs", ".friendadd-tab", ".friendadd-body",
                 ".friendadd-code", ".friendadd-countdown", ".ceremony-manual"):
         assert sel in css
+
+
+def test_circle_world_scales_with_count():
+    # Spec 2026-07-08-kreds-circle-zoom: the overlay circle gets BIGGER
+    # with friend count, never denser - ring radius derives from occupancy
+    # (constant node spacing), and the world size is published on the svg
+    # for the camera. The rail's call must NOT opt in.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "CIRCLE_SPACING = 64" in js
+    assert "CIRCLE_RING_GAP = 78" in js
+    assert "CIRCLE_MARGIN = 60" in js
+    assert "function ringRadius(" in js
+    assert "scaleWithCount" in js
+    assert "dataset.worldSize" in js
+    # overlay call opts in; rail call does not
+    overlay_call = js.split("function openCircleOverlay")[1][:400]
+    assert "scaleWithCount: true" in overlay_call
+    rail_fn = js.split("function renderCircleRail")[1][:900]
+    assert "scaleWithCount" not in rail_fn
+
+
+def test_circle_overlay_fills_screen_and_label_css():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    # the fixed 470px cap is gone; vmin-square viewport instead
+    assert "min(76%, 470px)" not in css
+    assert "94vmin" in css
+    assert "touch-action: none" in _css_rule(css, ".bigmapwrap svg")
+    # label visibility contract + reduced-motion opt-out
+    assert ".labels-off" in css
+    assert re.search(r"prefers-reduced-motion[^}]*\.nlabel", css, re.S)
+    # Fit reset is a real, labeled <button>; hint teaches the gestures
+    assert re.search(r'<button[^>]*id="circle-fit"', html)
+    assert "pinch to zoom" in html and "drag to move" in html
+
+
+def test_circle_camera_core():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "const circleCamera" in js
+    cam = js.split("const circleCamera")[1].split("\nfunction wireCircleGestures")[0] \
+        if "wireCircleGestures" in js else js.split("const circleCamera")[1][:4000]
+    # zoom clamp: never past fit, never tighter than fit/8 (8x magnification)
+    assert "fitW / 8" in cam
+    # pan clamp: at least 20% of the world stays on-screen per axis
+    assert "0.2" in cam and "0.8" in cam
+    # anchored zoom + fit entry points
+    assert "zoomAt(" in js and ".fit()" in js
+    # wheel wired non-passively (preventDefault must work), dblclick + Fit reset
+    assert '"wheel"' in js and "passive: false" in js
+    assert '"dblclick"' in js
+    assert '"circle-fit"' in js
+    # opening the overlay initializes the camera at fit
+    overlay_fn = js.split("function openCircleOverlay")[1][:600]
+    assert "circleCamera" in overlay_fn
+
+
+def test_circle_gestures_and_labels():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "function wireCircleGestures" in js
+    g = js.split("function wireCircleGestures")[1].split("\nconst circleCamera")[0] \
+        if js.index("function wireCircleGestures") < js.index("const circleCamera") \
+        else js.split("function wireCircleGestures")[1][:5000]
+    # pointer-events discipline (profile-drag lessons): cancel + capture-loss
+    # both tear down; per-pointer bookkeeping for pinch; 6px tap threshold
+    for token in ("pointerdown", "pointermove", "pointerup",
+                  "pointercancel", "lostpointercapture",
+                  "setPointerCapture", "Math.hypot"):
+        assert token in g, token
+    assert "> 6" in g
+    # review fixes: gone() idempotent (pointerup + lostpointercapture both
+    # fire); stale pinch flag cleared at gesture start; pinch never counts
+    # toward double-tap
+    assert "if (!pts.has(ev.pointerId)) return;" in g
+    assert "if (pts.size === 0) CIRCLE_DRAGGED = false;" in g
+    assert "!multi" in g
+    # tap path must stay uncaptured: capture is deferred to pan/pinch
+    # (capture at pointerdown retargets the click to the svg - dead taps,
+    # found by live smoke)
+    assert "const capture = ()" in g
+    down_block = g.split('addEventListener("pointerdown"')[1]
+    down_block = down_block[:down_block.index('addEventListener("pointermove"')]
+    assert "setPointerCapture" not in down_block
+    assert 'window.addEventListener("pointerup", gone)' in g
+    # drag must not fire the node click that follows pointerup
+    assert "CIRCLE_DRAGGED" in js
+    click_handler = js.split('document.getElementById("circle-overlay-svg").addEventListener("click"')[1][:400]
+    assert "CIRCLE_DRAGGED" in click_handler
+    # double-tap reset for touch
+    assert "300" in g
+    # label threshold: on-screen node pitch vs 56px, toggling labels-off
+    assert "labels-off" in js and "56" in js
+    labels_fn = js.split("function updateCircleLabels")[-1][:600]
+    assert "CIRCLE_SPACING" in labels_fn and "classList.toggle" in labels_fn
+    # no native DnD anywhere in the gesture code
+    assert "dragstart" not in g and 'draggable="true"' not in g
+    # labels compare the ACTUAL node pitch published by buildCircle, not the
+    # SPACING floor (small circles keep labels at fit on small screens)
+    assert "dataset.nodePitch" in js
+    # a11y: focusing an off-camera node pans it into view
+    assert '"focusin"' in js and "ensureVisible" in js
+    # narrow screens shorten the gesture hint
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "hint-ext" in html and ".overlayhint .hint-ext" in css

@@ -14,7 +14,18 @@ Concept: `hearth_concept_capture_v0_4.md`
 Kreds is journal-first: a day-grouped feed of what your circle shared,
 with the circle itself doubling as navigation (a compact rail that
 expands into a radial map of who's Inner and who's Kreds; click anyone
-to open their profile). It installs as a PWA - "Install" on desktop,
+to open their profile).
+The expanded circle fills the screen and is a camera, not a fixed
+picture: ring radii grow with friend count (constant node spacing -
+the circle gets bigger, never denser), the wheel or a two-finger pinch
+zooms anchored under the pointer, dragging pans (same Pointer Events
+plumbing as the profile canvas: pointercancel + lostpointercapture
+teardown, 6px tap-vs-drag threshold so node clicks stay clicks), and
+double-click/double-tap or the Fit button resets to the full view.
+Name labels hide when nodes are tighter than ~56px on screen and fade
+back in as you zoom (instant, no fade, under prefers-reduced-motion).
+The compact rail minimap is unchanged.
+It installs as a PWA - "Install" on desktop,
 "Add to Home Screen" on Android - and is served entirely by your own
 node: there is no shared kreds.eu server in this picture. The web client
 you load *is* your node's UI; the app shell caches for offline load, but

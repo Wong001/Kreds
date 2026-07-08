@@ -725,12 +725,34 @@ function placeRing(items, cx, cy, r) {
   });
 }
 
+// World-scaling constants (spec 2026-07-08-kreds-circle-zoom): the circle
+// grows with friend count instead of packing nodes tighter. SPACING is the
+// world-unit distance between adjacent node centers on a ring; RING_GAP the
+// minimum inner->outer separation; MARGIN clears ring/name labels at the rim.
+const CIRCLE_SPACING = 64;
+const CIRCLE_RING_GAP = 78;
+const CIRCLE_MARGIN = 60;
+
+// Radius that gives `count` nodes CIRCLE_SPACING of arc each, never below
+// the ring's cosmetic base radius (small circles keep today's proportions).
+function ringRadius(count, baseR) {
+  return Math.max(baseR, (count * CIRCLE_SPACING) / (2 * Math.PI));
+}
+
 // Renders the radial map into `svg` (an <svg> element, cleared first).
 // `big` selects the full-overlay markup (.node/.younode/.ringlabel, with
 // name labels and keyboard-focusable nodes) vs the compact rail's
 // .mm-node/.mm-you markup (smaller, no labels).
 function buildCircle(svg, kreds, opts) {
-  const {size, innerR, outerR, youR, nodeR, big} = opts;
+  let {size, innerR, outerR, youR, nodeR, big} = opts;
+  if (opts.scaleWithCount) {
+    const nInner = kreds.filter(k => k.ring === "inner").length;
+    innerR = ringRadius(nInner, innerR);
+    outerR = Math.max(ringRadius(kreds.length - nInner, outerR),
+                      innerR + CIRCLE_RING_GAP);
+    size = 2 * (outerR + CIRCLE_MARGIN);
+  }
+  svg.dataset.worldSize = size;
   svg.setAttribute("viewBox", "0 0 " + size + " " + size);
   svg.replaceChildren();
   const cx = size / 2, cy = size / 2;
@@ -759,6 +781,15 @@ function buildCircle(svg, kreds, opts) {
   }
   const inner = kreds.filter(k => k.ring === "inner");
   const outer = kreds.filter(k => k.ring !== "inner");
+  // Actual minimum node pitch (world units of arc between adjacent nodes on
+  // the fullest ring). updateCircleLabels compares THIS, not the SPACING
+  // floor: a small circle's real pitch is far above the floor, so its labels
+  // stay visible at fit even on phone-sized viewports (whole-branch review,
+  // Important #1).
+  const pitches = [];
+  if (inner.length) pitches.push(2 * Math.PI * innerR / inner.length);
+  if (outer.length) pitches.push(2 * Math.PI * outerR / outer.length);
+  svg.dataset.nodePitch = pitches.length ? Math.min(...pitches) : CIRCLE_SPACING;
   const placed = placeRing(inner, cx, cy, innerR).concat(placeRing(outer, cx, cy, outerR));
   for (const {k, x, y} of placed) {
     const color = identityColor(k.identity_pub);
@@ -836,14 +867,207 @@ function renderCircleRail() {
 
 function openCircleOverlay() {
   const svg = document.getElementById("circle-overlay-svg");
-  buildCircle(svg, KREDS, {size: 440, innerR: 92, outerR: 170, youR: 24, nodeR: 21, big: true});
+  buildCircle(svg, KREDS, {size: 440, innerR: 92, outerR: 170, youR: 24,
+                           nodeR: 21, big: true, scaleWithCount: true});
   document.getElementById("circle-overlay").classList.add("open");
+  circleCamera.fit();
 }
 function closeCircleOverlay() {
   document.getElementById("circle-overlay").classList.remove("open");
 }
 
+// ---------------------------------------------------------------------
+// Circle camera (spec 2026-07-08-kreds-circle-zoom): zoom/pan by rewriting
+// the overlay svg's viewBox - the drawn nodes never carry transforms, so
+// click/keyboard/hover behavior is untouched. State is the viewBox origin
+// (x, y) and width w (the viewport is square, height mirrors width).
+// ---------------------------------------------------------------------
+// Labels show only when nodes are far enough apart on SCREEN to carry
+// them (spec: node pitch >= 56 css px). Pitch comes from dataset.nodePitch,
+// the ACTUAL minimum world arc between adjacent nodes published by
+// buildCircle - not the SPACING floor (a small circle's real pitch is far
+// above that floor, so its labels stay visible on small viewports too).
+function updateCircleLabels() {
+  const svg = circleCamera.svg;
+  if (!svg) return;
+  const r = svg.getBoundingClientRect();
+  if (!r.width) return;
+  const pitchWorld = +svg.dataset.nodePitch || CIRCLE_SPACING;
+  const pitchPx = pitchWorld * (r.width / circleCamera.w);
+  svg.classList.toggle("labels-off", pitchPx < 56);
+}
+
+const circleCamera = {
+  svg: null, x: 0, y: 0, w: 440, fitW: 440,
+  init(svg) { this.svg = svg; },
+  fit() {
+    this.fitW = +this.svg.dataset.worldSize || 440;
+    this.x = 0; this.y = 0; this.w = this.fitW;
+    this.apply();
+  },
+  apply() {
+    this.svg.setAttribute("viewBox",
+      this.x + " " + this.y + " " + this.w + " " + this.w);
+    updateCircleLabels();
+  },
+  clamp() {
+    // zoom: between fit (whole world) and 8x magnification
+    this.w = Math.min(this.fitW, Math.max(this.fitW / 8, this.w));
+    // pan: keep >= 20% of the viewport showing world on each axis
+    const lo = -0.8 * this.w, hi = this.fitW - 0.2 * this.w;
+    this.x = Math.min(hi, Math.max(lo, this.x));
+    this.y = Math.min(hi, Math.max(lo, this.y));
+  },
+  // Zoom by `factor` keeping the world point under (clientX, clientY) fixed.
+  zoomAt(clientX, clientY, factor) {
+    const r = this.svg.getBoundingClientRect();
+    if (!r.width) return;
+    const fx = (clientX - r.left) / r.width, fy = (clientY - r.top) / r.height;
+    const wx = this.x + fx * this.w, wy = this.y + fy * this.w;
+    this.w /= factor;
+    this.clamp();
+    this.x = wx - fx * this.w;
+    this.y = wy - fy * this.w;
+    this.clamp();
+    this.apply();
+  },
+  panBy(dxPx, dyPx) {
+    const r = this.svg.getBoundingClientRect();
+    if (!r.width) return;
+    this.x -= (dxPx / r.width) * this.w;
+    this.y -= (dyPx / r.height) * this.w;
+    this.clamp();
+    this.apply();
+  },
+  // Pan (no zoom change) so a focused node sits inside a 10% margin.
+  ensureVisible(nodeG) {
+    const c = nodeG.querySelector("circle");
+    if (!c) return;
+    const nx = +c.getAttribute("cx"), ny = +c.getAttribute("cy");
+    const pad = this.w * 0.1;
+    if (nx < this.x + pad) this.x = nx - pad;
+    if (nx > this.x + this.w - pad) this.x = nx - this.w + pad;
+    if (ny < this.y + pad) this.y = ny - pad;
+    if (ny > this.y + this.w - pad) this.y = ny - this.w + pad;
+    this.clamp();
+    this.apply();
+  },
+};
+
+// One-shot flag: a pan/pinch gesture ends in a browser-generated click on
+// whatever is under the pointer - swallow exactly that one click so a drag
+// that started on a person node doesn't ALSO open their profile.
+let CIRCLE_DRAGGED = false;
+
+function wireCircleGestures(svg) {
+  const pts = new Map();       // pointerId -> {x, y, sx, sy} (current + start)
+  let moved = false;           // past the 6px tap threshold this gesture?
+  let multi = false;           // did this gesture ever have two pointers?
+  let pinchDist = 0;
+  let lastTap = 0;             // for double-tap reset (touch)
+
+  // Capture is DEFERRED until the gesture is definitely a pan/pinch: with
+  // capture taken at pointerdown, the browser retargets the eventual click
+  // to the svg itself, so a plain tap's click never reaches the person node
+  // (found by the Task 5 live smoke - taps were silently dead). Capturing
+  // only after the 6px threshold (or on a second pointer) leaves clean taps
+  // uncaptured -> their click flows to the node as before.
+  const capture = () => {
+    for (const id of pts.keys()) {
+      try { svg.setPointerCapture(id); } catch (e) { /* pointer already gone */ }
+    }
+  };
+
+  const gone = (ev) => {
+    // pointerup AND lostpointercapture both fire for a captured pointer -
+    // process each pointer's release exactly once, or the second pass
+    // re-runs the size-0 branch and clobbers CIRCLE_DRAGGED back to false
+    // before the browser's click event consumes it (task review, Critical).
+    if (!pts.has(ev.pointerId)) return;
+    pts.delete(ev.pointerId);
+    // dropping to exactly 2 must also re-seed (a 3rd finger lifting mid-pinch
+    // left a stale pair distance)
+    if (pts.size <= 2) pinchDist = 0;
+    if (pts.size === 0) { CIRCLE_DRAGGED = moved; moved = false; multi = false; }
+  };
+
+  svg.addEventListener("pointerdown", (ev) => {
+    // A pinch generates no click, so a stale CIRCLE_DRAGGED=true from the
+    // previous gesture would swallow this gesture's tap - clear it at the
+    // start of every fresh gesture (task review, Important).
+    if (pts.size === 0) CIRCLE_DRAGGED = false;
+    pts.set(ev.pointerId, {x: ev.clientX, y: ev.clientY,
+                           sx: ev.clientX, sy: ev.clientY});
+    if (pts.size === 2) {
+      multi = true;
+      capture();               // a second pointer = definitely a pinch, never a tap
+      const [a, b] = [...pts.values()];
+      pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+    }
+  });
+
+  svg.addEventListener("pointermove", (ev) => {
+    const p = pts.get(ev.pointerId);
+    if (!p) return;
+    // A swallowed right-button pointerup (context-menu flows on some
+    // platforms) can leave a stale entry - a mouse moving with no buttons
+    // held is not a gesture, tear it down.
+    if (ev.pointerType === "mouse" && !ev.buttons) { gone(ev); return; }
+    const prevX = p.x, prevY = p.y;
+    p.x = ev.clientX; p.y = ev.clientY;
+    if (!moved && Math.hypot(p.x - p.sx, p.y - p.sy) > 6) {
+      moved = true;
+      capture();               // definitely a pan now, never a tap
+    }
+    if (!moved) return;
+    if (pts.size === 1) {
+      circleCamera.panBy(p.x - prevX, p.y - prevY);
+    } else if (pts.size === 2) {
+      const [a, b] = [...pts.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (pinchDist > 0 && dist > 0) {
+        circleCamera.zoomAt((a.x + b.x) / 2, (a.y + b.y) / 2, dist / pinchDist);
+      }
+      pinchDist = dist;
+    }
+  });
+
+  svg.addEventListener("pointerup", (ev) => {
+    // double-tap (touch) resets to fit - two clean taps within 300ms
+    if (!moved && !multi && ev.pointerType === "touch" && pts.size === 1) {
+      const now = performance.now();
+      if (now - lastTap < 300) { circleCamera.fit(); lastTap = 0; }
+      else lastTap = now;
+    }
+    gone(ev);
+  });
+  svg.addEventListener("pointercancel", gone);
+  svg.addEventListener("lostpointercapture", gone);
+  // Sub-threshold releases can land off-svg without capture (a down at the
+  // very edge that exits before crossing 6px) - window-level teardown covers
+  // them; gone()'s pts.has guard makes stray pointerups elsewhere a no-op.
+  window.addEventListener("pointerup", gone);
+  window.addEventListener("pointercancel", gone);
+}
+
+{
+  const svg = document.getElementById("circle-overlay-svg");
+  circleCamera.init(svg);
+  wireCircleGestures(svg);
+  svg.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    circleCamera.zoomAt(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.15 : 1 / 1.15);
+  }, {passive: false});
+  svg.addEventListener("dblclick", () => circleCamera.fit());
+  document.getElementById("circle-fit").onclick = () => circleCamera.fit();
+  svg.addEventListener("focusin", (ev) => {
+    const node = ev.target.closest("[data-open]");
+    if (node) circleCamera.ensureVisible(node);
+  });
+}
+
 document.getElementById("circle-overlay-svg").addEventListener("click", (ev) => {
+  if (CIRCLE_DRAGGED) { CIRCLE_DRAGGED = false; return; }   // that "click" was a drag ending
   const node = ev.target.closest("[data-open]");
   if (node) openProfile(node.getAttribute("data-open"));
 });
