@@ -1008,6 +1008,12 @@ def test_circle_gestures_and_labels():
                   "setPointerCapture", "Math.hypot"):
         assert token in g, token
     assert "> 6" in g
+    # review fixes: gone() idempotent (pointerup + lostpointercapture both
+    # fire); stale pinch flag cleared at gesture start; pinch never counts
+    # toward double-tap
+    assert "if (!pts.has(ev.pointerId)) return;" in g
+    assert "if (pts.size === 0) CIRCLE_DRAGGED = false;" in g
+    assert "!multi" in g
     # drag must not fire the node click that follows pointerup
     assert "CIRCLE_DRAGGED" in js
     click_handler = js.split('document.getElementById("circle-overlay-svg").addEventListener("click"')[1][:400]

@@ -949,20 +949,31 @@ let CIRCLE_DRAGGED = false;
 function wireCircleGestures(svg) {
   const pts = new Map();       // pointerId -> {x, y, sx, sy} (current + start)
   let moved = false;           // past the 6px tap threshold this gesture?
+  let multi = false;           // did this gesture ever have two pointers?
   let pinchDist = 0;
   let lastTap = 0;             // for double-tap reset (touch)
 
   const gone = (ev) => {
+    // pointerup AND lostpointercapture both fire for a captured pointer -
+    // process each pointer's release exactly once, or the second pass
+    // re-runs the size-0 branch and clobbers CIRCLE_DRAGGED back to false
+    // before the browser's click event consumes it (task review, Critical).
+    if (!pts.has(ev.pointerId)) return;
     pts.delete(ev.pointerId);
     if (pts.size < 2) pinchDist = 0;
-    if (pts.size === 0) { CIRCLE_DRAGGED = moved; moved = false; }
+    if (pts.size === 0) { CIRCLE_DRAGGED = moved; moved = false; multi = false; }
   };
 
   svg.addEventListener("pointerdown", (ev) => {
+    // A pinch generates no click, so a stale CIRCLE_DRAGGED=true from the
+    // previous gesture would swallow this gesture's tap - clear it at the
+    // start of every fresh gesture (task review, Important).
+    if (pts.size === 0) CIRCLE_DRAGGED = false;
     svg.setPointerCapture(ev.pointerId);
     pts.set(ev.pointerId, {x: ev.clientX, y: ev.clientY,
                            sx: ev.clientX, sy: ev.clientY});
     if (pts.size === 2) {
+      multi = true;
       const [a, b] = [...pts.values()];
       pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
     }
@@ -989,7 +1000,7 @@ function wireCircleGestures(svg) {
 
   svg.addEventListener("pointerup", (ev) => {
     // double-tap (touch) resets to fit - two clean taps within 300ms
-    if (!moved && ev.pointerType === "touch" && pts.size === 1) {
+    if (!moved && !multi && ev.pointerType === "touch" && pts.size === 1) {
       const now = performance.now();
       if (now - lastTap < 300) { circleCamera.fit(); lastTap = 0; }
       else lastTap = now;
