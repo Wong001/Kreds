@@ -861,9 +861,90 @@ function openCircleOverlay() {
   buildCircle(svg, KREDS, {size: 440, innerR: 92, outerR: 170, youR: 24,
                            nodeR: 21, big: true, scaleWithCount: true});
   document.getElementById("circle-overlay").classList.add("open");
+  circleCamera.fit();
 }
 function closeCircleOverlay() {
   document.getElementById("circle-overlay").classList.remove("open");
+}
+
+// ---------------------------------------------------------------------
+// Circle camera (spec 2026-07-08-kreds-circle-zoom): zoom/pan by rewriting
+// the overlay svg's viewBox - the drawn nodes never carry transforms, so
+// click/keyboard/hover behavior is untouched. State is the viewBox origin
+// (x, y) and width w (the viewport is square, height mirrors width).
+// ---------------------------------------------------------------------
+function updateCircleLabels() {}   // filled in by the gesture/labels pass
+
+const circleCamera = {
+  svg: null, x: 0, y: 0, w: 440, fitW: 440,
+  init(svg) { this.svg = svg; },
+  fit() {
+    this.fitW = +this.svg.dataset.worldSize || 440;
+    this.x = 0; this.y = 0; this.w = this.fitW;
+    this.apply();
+  },
+  apply() {
+    this.svg.setAttribute("viewBox",
+      this.x + " " + this.y + " " + this.w + " " + this.w);
+    updateCircleLabels();
+  },
+  clamp() {
+    // zoom: between fit (whole world) and 8x magnification
+    this.w = Math.min(this.fitW, Math.max(this.fitW / 8, this.w));
+    // pan: keep >= 20% of the viewport showing world on each axis
+    const lo = -0.8 * this.w, hi = this.fitW - 0.2 * this.w;
+    this.x = Math.min(hi, Math.max(lo, this.x));
+    this.y = Math.min(hi, Math.max(lo, this.y));
+  },
+  // Zoom by `factor` keeping the world point under (clientX, clientY) fixed.
+  zoomAt(clientX, clientY, factor) {
+    const r = this.svg.getBoundingClientRect();
+    if (!r.width) return;
+    const fx = (clientX - r.left) / r.width, fy = (clientY - r.top) / r.height;
+    const wx = this.x + fx * this.w, wy = this.y + fy * this.w;
+    this.w /= factor;
+    this.clamp();
+    this.x = wx - fx * this.w;
+    this.y = wy - fy * this.w;
+    this.clamp();
+    this.apply();
+  },
+  panBy(dxPx, dyPx) {
+    const r = this.svg.getBoundingClientRect();
+    if (!r.width) return;
+    this.x -= (dxPx / r.width) * this.w;
+    this.y -= (dyPx / r.height) * this.w;
+    this.clamp();
+    this.apply();
+  },
+  // Pan (no zoom change) so a focused node sits inside a 10% margin.
+  ensureVisible(nodeG) {
+    const c = nodeG.querySelector("circle");
+    if (!c) return;
+    const nx = +c.getAttribute("cx"), ny = +c.getAttribute("cy");
+    const pad = this.w * 0.1;
+    if (nx < this.x + pad) this.x = nx - pad;
+    if (nx > this.x + this.w - pad) this.x = nx - this.w + pad;
+    if (ny < this.y + pad) this.y = ny - pad;
+    if (ny > this.y + this.w - pad) this.y = ny - this.w + pad;
+    this.clamp();
+    this.apply();
+  },
+};
+
+{
+  const svg = document.getElementById("circle-overlay-svg");
+  circleCamera.init(svg);
+  svg.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    circleCamera.zoomAt(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.15 : 1 / 1.15);
+  }, {passive: false});
+  svg.addEventListener("dblclick", () => circleCamera.fit());
+  document.getElementById("circle-fit").onclick = () => circleCamera.fit();
+  svg.addEventListener("focusin", (ev) => {
+    const node = ev.target.closest("[data-open]");
+    if (node) circleCamera.ensureVisible(node);
+  });
 }
 
 document.getElementById("circle-overlay-svg").addEventListener("click", (ev) => {

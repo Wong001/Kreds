@@ -973,3 +973,23 @@ def test_circle_overlay_fills_screen_and_label_css():
     # Fit reset is a real, labeled <button>; hint teaches the gestures
     assert re.search(r'<button[^>]*id="circle-fit"', html)
     assert "pinch to zoom" in html and "drag to move" in html
+
+
+def test_circle_camera_core():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "const circleCamera" in js
+    cam = js.split("const circleCamera")[1].split("\nfunction wireCircleGestures")[0] \
+        if "wireCircleGestures" in js else js.split("const circleCamera")[1][:4000]
+    # zoom clamp: never past fit, never tighter than fit/8 (8x magnification)
+    assert "fitW / 8" in cam
+    # pan clamp: at least 20% of the world stays on-screen per axis
+    assert "0.2" in cam and "0.8" in cam
+    # anchored zoom + fit entry points
+    assert "zoomAt(" in js and ".fit()" in js
+    # wheel wired non-passively (preventDefault must work), dblclick + Fit reset
+    assert '"wheel"' in js and "passive: false" in js
+    assert '"dblclick"' in js
+    assert '"circle-fit"' in js
+    # opening the overlay initializes the camera at fit
+    overlay_fn = js.split("function openCircleOverlay")[1][:600]
+    assert "circleCamera" in overlay_fn
