@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS defriend_outbox(
   expires_at REAL NOT NULL, next_attempt_at REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS disconnected(
   identity_pub TEXT PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS undecryptable(
+  msg_id TEXT PRIMARY KEY, since REAL NOT NULL);
 """
 
 
@@ -230,11 +232,21 @@ class Store:
                 "SELECT 1 FROM tombstones WHERE msg_id=?",
                 (msg_id,)).fetchone() is not None
 
+    def message_kind(self, msg_id: str):
+        """Kind of a held message row, or None if not held (tombstoned or
+        never seen). Used by the delete-creation guard and tests."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT kind FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+            return row[0] if row else None
+
     def _tombstone(self, msg_id: str, reason: str):
         self._db.execute("INSERT OR IGNORE INTO tombstones VALUES(?,?,?)",
                          (msg_id, reason, time.time()))
         self._db.execute("DELETE FROM messages WHERE msg_id=?", (msg_id,))
         self._db.execute("DELETE FROM dm_keys WHERE msg_id=?", (msg_id,))
+        self._db.execute("DELETE FROM undecryptable WHERE msg_id=?",
+                         (msg_id,))
 
     # -- ingest ---------------------------------------------------------------------
 
@@ -269,9 +281,18 @@ class Store:
             deleted_target = None
             if kind == KIND_DELETE:
                 row = self._db.execute(
-                    "SELECT identity_pub FROM messages WHERE msg_id=?",
+                    "SELECT identity_pub, kind FROM messages WHERE msg_id=?",
                     (target,)).fetchone()
                 if row is not None:
+                    if row[1] == KIND_DELETE:
+                        # Wart 1: delete tags are immune to deletion.
+                        # Tombstones are permanent (no undelete), so a
+                        # delete-of-a-delete can only halt the tag's
+                        # propagation -> permanent divergence.
+                        self._db.commit()
+                        return IngestResult(
+                            False, "delete tag cannot target a delete tag",
+                            mid)
                     if row[0] != identity:
                         self._db.commit()
                         return IngestResult(False, "delete not authorized",
@@ -299,6 +320,15 @@ class Store:
                  recipient, json.dumps(msg.to_dict()),
                  msg.payload.get("created_at", now),
                  msg.payload.get("expires_at")))
+            if kind == KIND_DELETE:
+                # Hygiene: any held meta-delete targeting THIS tag is now
+                # provably invalid - tombstone it (reason 'invalid') so it
+                # stops gossiping. Tombstone, not DELETE: a bare row-delete
+                # would be re-fetched from peers on the next summary diff.
+                for (bad,) in self._db.execute(
+                        "SELECT msg_id FROM messages WHERE kind=?"
+                        " AND target_id=?", (KIND_DELETE, mid)).fetchall():
+                    self._tombstone(bad, "invalid")
             self._db.commit()
             if deleted_target:
                 self.gc_blobs()
@@ -339,6 +369,37 @@ class Store:
             if swept:
                 self.gc_blobs()
             return swept
+
+    def prune_superseded_enckeys(self) -> int:
+        """Tombstone (reason 'superseded') every enckey row that is not the
+        latest for its (identity_pub, device_pub), by the same
+        (created_at, seq) tie-break enckey_records resolves with. Rotation
+        is daily (maintain_enckey), so without this the table grows one row
+        per device per day forever, replicated to every friend. Tombstone,
+        never DELETE: a bare row-delete reads as "missing" to the next
+        summary diff and peers re-send it forever; a tombstone stops both
+        the holding and the offering, so superseded rows evaporate
+        network-wide as each node prunes independently. Safe: nothing reads
+        superseded rows (senders wrap to latest; recipients decrypt with
+        retired PRIVATE keys, client-side, untouched here)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT msg_id, identity_pub, device_pub, created_at, seq "
+                "FROM messages WHERE kind=?", (KIND_ENCKEY,)).fetchall()
+            latest = {}
+            for mid, ident, dpub, created, seq in rows:
+                cur = latest.get((ident, dpub))
+                if cur is None or (created, seq) > cur[1]:
+                    latest[(ident, dpub)] = (mid, (created, seq))
+            keep = {v[0] for v in latest.values()}
+            pruned = 0
+            for mid, *_rest in rows:
+                if mid not in keep:
+                    self._tombstone(mid, "superseded")
+                    pruned += 1
+            if pruned:
+                self._db.commit()
+            return pruned
 
     # -- reads -----------------------------------------------------------------------
 
@@ -502,6 +563,8 @@ class Store:
                 return          # a delete may have landed in the meantime
             self._db.execute("INSERT OR IGNORE INTO dm_keys VALUES(?,?)",
                              (msg_id, sealed_hex))
+            self._db.execute("DELETE FROM undecryptable WHERE msg_id=?",
+                             (msg_id,))
             self._db.commit()
 
     def replace_message_key(self, msg_id: str, sealed_hex: str):
@@ -513,6 +576,8 @@ class Store:
                 return          # a delete may have landed in the meantime
             self._db.execute("INSERT OR REPLACE INTO dm_keys VALUES(?,?)",
                              (msg_id, sealed_hex))
+            self._db.execute("DELETE FROM undecryptable WHERE msg_id=?",
+                             (msg_id,))
             self._db.commit()
 
     def cached_message_key(self, msg_id: str) -> Optional[str]:
@@ -521,6 +586,31 @@ class Store:
                 "SELECT sealed_key FROM dm_keys WHERE msg_id=?",
                 (msg_id,)).fetchone()
             return row[0] if row else None
+
+    def mark_undecryptable(self, msg_id: str, now=None) -> None:
+        """Wart 3: background-sweep negative cache. LOCAL ONLY - never
+        synced. Only the gossip-round sweep writes here (and only while the
+        node is unlocked - see node.cache_message_keys); per-view reads in
+        dm_thread stay correct-first and ignore this table."""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO undecryptable VALUES(?,?)",
+                (msg_id, time.time() if now is None else now))
+            self._db.commit()
+
+    def clear_undecryptable(self, msg_id=None) -> None:
+        with self._lock:
+            if msg_id is None:
+                self._db.execute("DELETE FROM undecryptable")
+            else:
+                self._db.execute(
+                    "DELETE FROM undecryptable WHERE msg_id=?", (msg_id,))
+            self._db.commit()
+
+    def undecryptable_ids(self) -> set:
+        with self._lock:
+            return {r[0] for r in self._db.execute(
+                "SELECT msg_id FROM undecryptable")}
 
     def uncached_message_ids(self, self_identity: str) -> List[str]:
         """msg_id list, kind-agnostic: DM rows where self is a party, plus
@@ -531,7 +621,8 @@ class Store:
             for mid, kind, ipub, rcpt, mj in self._db.execute(
                     "SELECT msg_id, kind, identity_pub, recipient, msg_json"
                     " FROM messages WHERE kind IN (?,?)"
-                    " AND msg_id NOT IN (SELECT msg_id FROM dm_keys)",
+                    " AND msg_id NOT IN (SELECT msg_id FROM dm_keys)"
+                    " AND msg_id NOT IN (SELECT msg_id FROM undecryptable)",
                     (KIND_DM, KIND_POST)):
                 if kind == KIND_DM:
                     if self_identity in (ipub, rcpt):
@@ -615,6 +706,9 @@ class Store:
                 self._db.executemany(
                     "DELETE FROM dm_keys WHERE msg_id=?",
                     [(mid,) for mid in ids])
+                self._db.executemany(
+                    "DELETE FROM undecryptable WHERE msg_id=?",
+                    [(mid,) for mid in ids])
             cur = self._db.execute(
                 "DELETE FROM messages WHERE identity_pub=?", (identity_pub,))
             self._db.commit()
@@ -658,6 +752,9 @@ class Store:
             if ids:
                 self._db.executemany(
                     "DELETE FROM dm_keys WHERE msg_id=?",
+                    [(mid,) for mid in ids])
+                self._db.executemany(
+                    "DELETE FROM undecryptable WHERE msg_id=?",
                     [(mid,) for mid in ids])
             self._db.execute("DELETE FROM messages WHERE identity_pub=?",
                              (other,))
@@ -731,7 +828,7 @@ class Store:
         with self._lock:
             for table in ("meta", "identities", "device_views", "messages",
                           "tombstones", "blobs", "peers", "dm_keys",
-                          "defriend_outbox", "disconnected"):
+                          "defriend_outbox", "disconnected", "undecryptable"):
                 self._db.execute(f"DELETE FROM {table}")
             self._db.commit()
 

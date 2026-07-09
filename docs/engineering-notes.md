@@ -540,6 +540,17 @@ Revoking a device logs it out on compliant clients
 (wipes its keys and store) and structurally cuts it off from anything
 new; a modified client cannot be forced to wipe.
 
+Superseded daily-rotation enckey announcements are tombstone-pruned from
+storage on each sweep, a growth fix; retired PRIVATE keys and the
+seven-day grace window are untouched, so forward secrecy is unchanged.
+
+Permanently-undecryptable envelopes — messages encrypted to keys
+permanently deleted — are negative-cached by the background sweep only
+(retries skipped on future sweeps); views still attempt decryption every
+time a message is displayed so a materializing key is never stale. The
+cache is never persisted while locked and clears entirely on unlock or
+the moment a matching key materializes.
+
 ## Posts and scopes
 
 Posts are encrypted to a ring, exactly like DMs - there is no plaintext
@@ -948,6 +959,13 @@ DRM. A modified client can keep what it already received, and a
 screenshot survives everything. Only the author of a message can
 delete it - a friend's delete tag for someone else's content is
 rejected.
+
+Delete tags are structurally immune to deletion: a delete tag naming
+another delete tag is refused at creation and refused again on ingest.
+A lurking meta-delete is tombstoned as invalid once its target is
+confirmed to be a tag, closing a divergence path where deleting a delete
+tag halted its propagation — some nodes would apply it before the
+meta-delete arrived, others would never apply it.
 
 ## Unfriend
 

@@ -17,11 +17,11 @@ from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        canonical, _sig_ok)
 from .imagegate import AVATAR_MAX, BANNER_MAX, transcode
 from .videogate import STORY_IMAGE_MAX, transcode_video
-from .messages import (DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS, KIND_DM,
-                       KIND_POST, MAX_CAPTION, MAX_LAYOUT, SIZE_LAYOUTS,
-                       make_delete, make_dm, make_enckey, make_post,
-                       make_profile, make_profile_layout, make_ring,
-                       make_story)
+from .messages import (DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
+                       KIND_DELETE, KIND_DM, KIND_POST, MAX_CAPTION,
+                       MAX_LAYOUT, SIZE_LAYOUTS, make_delete, make_dm,
+                       make_enckey, make_post, make_profile,
+                       make_profile_layout, make_ring, make_story)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -262,6 +262,10 @@ class HearthNode:
                 self.enter_revoked_state()
         if not self.revoked and "storage_key" not in merged:
             self._save_keys()          # legacy secret bundle: pin one now
+        # Wart 3: restored key material (current + retired enc keys) may
+        # make previously-marked messages decryptable again -- drop the
+        # whole negative cache rather than risk stale permanent misses.
+        self.store.clear_undecryptable()
         self._touch()
         self.notify()
 
@@ -684,6 +688,8 @@ class HearthNode:
                 "journal": self.posts_by(identity_pub, "journal")}
 
     def delete_post(self, target_msg_id: str) -> str:
+        if self.store.message_kind(target_msg_id) == KIND_DELETE:
+            raise ValueError("cannot delete a delete tag")
         return self._publish(make_delete(self.device, target_msg_id))
 
     def _decrypt_post_row(self, msg, names, now):
@@ -1179,14 +1185,25 @@ class HearthNode:
 
     def cache_message_keys(self):
         """Eagerly cache content keys for DMs/posts that arrived via sync,
-        so history survives rotation even on nodes that never display."""
-        if (self.revoked or self.device.identity_pub is None
+        so history survives rotation even on nodes that never display.
+
+        Wart 3: also negative-caches messages that fail to decrypt, so a
+        permanently-undecryptable message (e.g. wrapped to a device key we
+        never held) isn't retried every gossip round forever. Locked (or
+        storage key absent): EVERYTHING fails to decrypt - recording now
+        would mass-poison the negative cache, so skip entirely rather than
+        guard the mark_undecryptable call alone (revoked nodes already
+        clear storage_key, so that guard covers both cases).
+        Guard mirrors maintain_enckey's (revoked/locked/unenrolled) plus storage_key (needed to seal cache rows)."""
+        if (self.revoked or self.locked or self.device.identity_pub is None
                 or self.device.storage_key is None):
             return
         for mid in self.store.uncached_message_ids(self.identity_pub):
             msg = self.store.get_message(mid)
             if msg is not None:
-                self._content_key(msg)
+                key, _ = self._content_key(msg)
+                if key is None:
+                    self.store.mark_undecryptable(mid)
 
     def dm_thread(self, other_identity: str):
         out = []

@@ -204,6 +204,7 @@ class SyncService:
         await self.node.deliver_defriends()
         if self.node.store.sweep_expired():
             self.node.notify()
+        self.node.store.prune_superseded_enckeys()
         self.node.cache_message_keys()
         # Auto-lock (Kreds security slice): node-side idle/sleep check,
         # ticked once per round with THIS loop's real interval so a
