@@ -151,3 +151,42 @@ def test_enckeys_tiebreak_same_created_at_higher_seq_wins(tmp_path):
     assert s2.ingest_message(e1).accepted
     assert s2.enckeys(phone.identity_pub)[phone.device_pub] \
         == phone.enc_pub
+
+
+def test_wipe_all_clears_undecryptable(tmp_path):
+    """Whole-branch review Fix 1: wipe_all must clear the undecryptable
+    table, leaving no metadata remnant."""
+    s, phone = wong(tmp_path)
+    freja = friend_of(s)
+    d1 = dm_to(phone, freja.identity_pub)
+    assert s.ingest_message(d1).accepted
+    s.mark_undecryptable(d1.msg_id)
+    assert s.undecryptable_ids() == {d1.msg_id}
+
+    s.wipe_all()
+
+    assert s.undecryptable_ids() == set()
+
+
+def test_unfriend_teardown_clears_undecryptable_for_purged_ids(tmp_path):
+    """Whole-branch review Fix 3: unfriend_teardown must also delete
+    undecryptable rows for messages about to be purged, mirroring its
+    dm_keys deletion pattern."""
+    from hearth.messages import make_post
+    phone = DeviceKeys.create("phone")
+    IdentityCeremony().enroll_first_device(phone)
+    freja = DeviceKeys.create("freja-phone")
+    IdentityCeremony().enroll_first_device(freja)
+    s = Store(tmp_path / "teardown_undec.db")
+    s.add_identity(phone.identity_pub, is_self=True)
+    s.add_identity(freja.identity_pub)
+    # A message authored by freja that will be marked undecryptable
+    post = make_post(freja, "kreds", body_nonce="ab" * 12, body_ct="deadbeef",
+                     wraps={})
+    assert s.ingest_message(post).accepted
+    s.mark_undecryptable(post.msg_id)
+    assert s.undecryptable_ids() == {post.msg_id}
+
+    s.unfriend_teardown(phone.identity_pub, freja.identity_pub)
+
+    assert s.undecryptable_ids() == set()

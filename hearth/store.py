@@ -235,9 +235,10 @@ class Store:
     def message_kind(self, msg_id: str):
         """Kind of a held message row, or None if not held (tombstoned or
         never seen). Used by the delete-creation guard and tests."""
-        row = self._db.execute(
-            "SELECT kind FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
-        return row[0] if row else None
+        with self._lock:
+            row = self._db.execute(
+                "SELECT kind FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+            return row[0] if row else None
 
     def _tombstone(self, msg_id: str, reason: str):
         self._db.execute("INSERT OR IGNORE INTO tombstones VALUES(?,?,?)",
@@ -705,6 +706,9 @@ class Store:
                 self._db.executemany(
                     "DELETE FROM dm_keys WHERE msg_id=?",
                     [(mid,) for mid in ids])
+                self._db.executemany(
+                    "DELETE FROM undecryptable WHERE msg_id=?",
+                    [(mid,) for mid in ids])
             cur = self._db.execute(
                 "DELETE FROM messages WHERE identity_pub=?", (identity_pub,))
             self._db.commit()
@@ -748,6 +752,9 @@ class Store:
             if ids:
                 self._db.executemany(
                     "DELETE FROM dm_keys WHERE msg_id=?",
+                    [(mid,) for mid in ids])
+                self._db.executemany(
+                    "DELETE FROM undecryptable WHERE msg_id=?",
                     [(mid,) for mid in ids])
             self._db.execute("DELETE FROM messages WHERE identity_pub=?",
                              (other,))
@@ -821,7 +828,7 @@ class Store:
         with self._lock:
             for table in ("meta", "identities", "device_views", "messages",
                           "tombstones", "blobs", "peers", "dm_keys",
-                          "defriend_outbox", "disconnected"):
+                          "defriend_outbox", "disconnected", "undecryptable"):
                 self._db.execute(f"DELETE FROM {table}")
             self._db.commit()
 
