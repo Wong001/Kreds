@@ -82,6 +82,17 @@ Sybil-able open membership; the pool operator is a provider). The
 - The sender: B's guardian-set contact points (see open question 3).
 - Nobody else: transport is onion-to-onion throughout.
 
+## Refinement note (2026-07-09 daylight pass)
+
+Plain Shamir over the whole envelope costs n× storage (every guardian
+holds a full-envelope-sized share). The standard efficient construction:
+encrypt the envelope under a fresh per-envelope key, **Shamir only the
+key** (tiny, k-of-n), and **erasure-code the ciphertext** (Reed-Solomon,
+k-of-n) so each guardian stores ~1/k of the bytes (~(n/k)× total instead
+of n×). Same collusion threshold — k guardians reconstruct ciphertext
+AND key, fewer reconstruct neither — same trust story. Default guardian
+pool: the recipient's Inner circle (August, 2026-07-09).
+
 ## Open questions for the real brainstorm
 
 1. **Guardian-set discovery**: how does A learn B's guardians + get
