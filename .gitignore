@@ -14,3 +14,4 @@ dist/
 release/
 packaging/tor/
 dist.zip
+launch-notes.md
