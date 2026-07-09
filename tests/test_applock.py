@@ -25,7 +25,10 @@ def test_wrong_credential_fails():
 def test_tampered_ct_fails():
     seal, unseal = _seal_pair()
     rec, _ = applock.enable(SECRETS, "1234", "pin", seal)
-    rec = {**rec, "ct_hex": ("00" + rec["ct_hex"][2:])}
+    # XOR, don't set: a constant "00" is a no-op tamper 1-in-256 runs
+    # (same flake class CI hit in test_unfriend_node, 2026-07-09).
+    rec = {**rec, "ct_hex": format(int(rec["ct_hex"][:2], 16) ^ 0xFF, "02x")
+                           + rec["ct_hex"][2:]}
     with pytest.raises(applock.BadCredential):
         applock.unlock(rec, "1234", unseal)
 

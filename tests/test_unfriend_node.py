@@ -54,8 +54,12 @@ def test_apply_defriend_notice_purges_and_marks(two_friend_nodes):
 def test_apply_ignores_bad_or_misdirected_notice(two_friend_nodes):
     a, b = two_friend_nodes
     good = a.device.make_defriend(b.identity_pub)
+    # XOR the first byte instead of setting a constant: a fixed "00" is a
+    # NO-OP forgery whenever the real signature already starts with 0x00 -
+    # a 1-in-256 flake that CI actually hit (2026-07-09).
+    flipped = format(int(good.signature[:2], 16) ^ 0xFF, "02x")
     forged = DefriendNotice(a.identity_pub, b.identity_pub, good.created_at,
-                            "00" + good.signature[2:])
+                            flipped + good.signature[2:])
     assert b.apply_defriend_notice(forged) is False          # bad signature
     not_for_b = a.device.make_defriend("f" * 64)
     assert b.apply_defriend_notice(not_for_b) is False       # not targeting b
