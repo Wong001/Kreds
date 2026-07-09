@@ -381,23 +381,24 @@ class Store:
         network-wide as each node prunes independently. Safe: nothing reads
         superseded rows (senders wrap to latest; recipients decrypt with
         retired PRIVATE keys, client-side, untouched here)."""
-        rows = self._db.execute(
-            "SELECT msg_id, identity_pub, device_pub, created_at, seq "
-            "FROM messages WHERE kind=?", (KIND_ENCKEY,)).fetchall()
-        latest = {}
-        for mid, ident, dpub, created, seq in rows:
-            cur = latest.get((ident, dpub))
-            if cur is None or (created, seq) > cur[1]:
-                latest[(ident, dpub)] = (mid, (created, seq))
-        keep = {v[0] for v in latest.values()}
-        pruned = 0
-        for mid, *_rest in rows:
-            if mid not in keep:
-                self._tombstone(mid, "superseded")
-                pruned += 1
-        if pruned:
-            self._db.commit()
-        return pruned
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT msg_id, identity_pub, device_pub, created_at, seq "
+                "FROM messages WHERE kind=?", (KIND_ENCKEY,)).fetchall()
+            latest = {}
+            for mid, ident, dpub, created, seq in rows:
+                cur = latest.get((ident, dpub))
+                if cur is None or (created, seq) > cur[1]:
+                    latest[(ident, dpub)] = (mid, (created, seq))
+            keep = {v[0] for v in latest.values()}
+            pruned = 0
+            for mid, *_rest in rows:
+                if mid not in keep:
+                    self._tombstone(mid, "superseded")
+                    pruned += 1
+            if pruned:
+                self._db.commit()
+            return pruned
 
     # -- reads -----------------------------------------------------------------------
 

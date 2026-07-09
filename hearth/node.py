@@ -1193,8 +1193,10 @@ class HearthNode:
         storage key absent): EVERYTHING fails to decrypt - recording now
         would mass-poison the negative cache, so skip entirely rather than
         guard the mark_undecryptable call alone (revoked nodes already
-        clear storage_key, so that guard covers both cases)."""
-        if self.locked or self.device.storage_key is None:
+        clear storage_key, so that guard covers both cases).
+        Guard mirrors maintain_enckey's (revoked/locked/unenrolled) plus storage_key (needed to seal cache rows)."""
+        if (self.revoked or self.locked or self.device.identity_pub is None
+                or self.device.storage_key is None):
             return
         for mid in self.store.uncached_message_ids(self.identity_pub):
             msg = self.store.get_message(mid)
