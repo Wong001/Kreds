@@ -177,6 +177,103 @@ def test_cache_dm_keys_sweep_caches_without_a_read(tmp_path):
     assert freja.store.cached_message_key(mid) is not None
 
 
+def _forge_alien_wrapped_dm(wong, freja, alien_device, text="alien wrap"):
+    """A DM addressed to freja whose only wrap key belongs to a device she
+    has never owned -- her enc_privs() will never open it, no matter how
+    many times a sweep retries: permanently undecryptable."""
+    from hearth.dmcrypt import dm_aad, encrypt_body, new_content_key, wrap_key
+    from hearth.messages import make_dm
+    created_at = 100.0
+    aad = dm_aad(wong.identity_pub, freja.identity_pub, created_at)
+    key = new_content_key()
+    nonce, ct = encrypt_body(key, {"text": text, "blobs": []}, aad)
+    wraps = wrap_key(key, {alien_device.device_pub: alien_device.enc_pub},
+                     aad)
+    return make_dm(wong.device, freja.identity_pub, nonce, ct, wraps,
+                   created_at)
+
+
+def test_sweep_negative_caches_undecryptable_and_skips_next_round(
+        tmp_path, monkeypatch):
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    mads = HearthNode.create(tmp_path / "m", "Mads", "mads-phone")
+    befriend_with_enckeys(wong, freja)
+    alien = _forge_alien_wrapped_dm(wong, freja, mads.device)
+    assert freja.store.ingest_message(alien).accepted
+    mid = alien.msg_id
+    assert mid in freja.store.uncached_message_ids(freja.identity_pub)
+
+    freja.cache_message_keys()                       # first sweep: marks it
+    assert freja.store.undecryptable_ids() == {mid}
+    assert mid not in freja.store.uncached_message_ids(freja.identity_pub)
+
+    calls = []
+    real_content_key = freja._content_key
+    def spy(msg):
+        calls.append(msg.msg_id)
+        return real_content_key(msg)
+    monkeypatch.setattr(freja, "_content_key", spy)
+    freja.cache_message_keys()                        # second sweep
+    assert calls == []                                # zero attempts
+
+
+def test_locked_node_records_nothing(tmp_path):
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    befriend_with_enckeys(wong, freja)
+    wong.compose_dm(freja.identity_pub, "arrives before lock")
+    for m in wong.store.messages_not_in({}, {wong.identity_pub},
+                                        freja.identity_pub):
+        freja.store.ingest_message(m)
+    freja.enable_applock("1234", "pin")
+    freja2 = HearthNode(freja.data_dir)               # reboot: boots locked
+    assert freja2.locked is True
+    freja2.cache_message_keys()          # locked: must record NOTHING
+    assert freja2.store.undecryptable_ids() == set()
+
+
+def test_unlock_clears_negative_cache(tmp_path):
+    n = HearthNode.create(tmp_path / "n", "Wong", "phone")
+    n.enable_applock("1234", "pin")
+    n.store.mark_undecryptable("aa" * 32)
+    assert n.store.undecryptable_ids() == {"aa" * 32}
+    n2 = HearthNode(n.data_dir)                       # reboot: locked
+    n2.unlock("1234")
+    assert n2.store.undecryptable_ids() == set()
+
+
+def test_dm_thread_view_still_attempts_decryption(tmp_path):
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    mads = HearthNode.create(tmp_path / "m", "Mads", "mads-phone")
+    befriend_with_enckeys(wong, freja)
+
+    # A genuinely undecryptable DM, marked by the sweep: dm_thread still
+    # attempts it fresh and reports undecryptable=True from the real
+    # crypto result -- it does not shortcut on the negative cache.
+    alien = _forge_alien_wrapped_dm(wong, freja, mads.device)
+    assert freja.store.ingest_message(alien).accepted
+    freja.store.mark_undecryptable(alien.msg_id)
+    thread = freja.dm_thread(wong.identity_pub)
+    marked = next(t for t in thread if t["msg_id"] == alien.msg_id)
+    assert marked["undecryptable"] is True
+
+    # A message the negative cache holds a STALE mark for (simulating a
+    # sweep that ran before a retired key was available): dm_thread
+    # ignores the table and decrypts it anyway via the retired key.
+    mid = wong.compose_dm(freja.identity_pub, "husk stadig")
+    for m in wong.store.messages_not_in({}, {wong.identity_pub},
+                                        freja.identity_pub):
+        freja.store.ingest_message(m)
+    freja.device.rotate_enc(now=1000.0)     # BEFORE any read: no cache yet
+    freja.store.mark_undecryptable(mid)     # stale/erroneous mark
+    thread = freja.dm_thread(wong.identity_pub)
+    fixed = next(t for t in thread if t["msg_id"] == mid)
+    assert fixed["text"] == "husk stadig"
+    assert fixed["undecryptable"] is False
+
+
 def test_revoked_wipe_clears_rotation_material(tmp_path):
     d = tmp_path / "n"
     n = HearthNode.create(d, "Wong", "phone")

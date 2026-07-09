@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS defriend_outbox(
   expires_at REAL NOT NULL, next_attempt_at REAL NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS disconnected(
   identity_pub TEXT PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS undecryptable(
+  msg_id TEXT PRIMARY KEY, since REAL NOT NULL);
 """
 
 
@@ -242,6 +244,8 @@ class Store:
                          (msg_id, reason, time.time()))
         self._db.execute("DELETE FROM messages WHERE msg_id=?", (msg_id,))
         self._db.execute("DELETE FROM dm_keys WHERE msg_id=?", (msg_id,))
+        self._db.execute("DELETE FROM undecryptable WHERE msg_id=?",
+                         (msg_id,))
 
     # -- ingest ---------------------------------------------------------------------
 
@@ -557,6 +561,8 @@ class Store:
                 return          # a delete may have landed in the meantime
             self._db.execute("INSERT OR IGNORE INTO dm_keys VALUES(?,?)",
                              (msg_id, sealed_hex))
+            self._db.execute("DELETE FROM undecryptable WHERE msg_id=?",
+                             (msg_id,))
             self._db.commit()
 
     def replace_message_key(self, msg_id: str, sealed_hex: str):
@@ -568,6 +574,8 @@ class Store:
                 return          # a delete may have landed in the meantime
             self._db.execute("INSERT OR REPLACE INTO dm_keys VALUES(?,?)",
                              (msg_id, sealed_hex))
+            self._db.execute("DELETE FROM undecryptable WHERE msg_id=?",
+                             (msg_id,))
             self._db.commit()
 
     def cached_message_key(self, msg_id: str) -> Optional[str]:
@@ -576,6 +584,31 @@ class Store:
                 "SELECT sealed_key FROM dm_keys WHERE msg_id=?",
                 (msg_id,)).fetchone()
             return row[0] if row else None
+
+    def mark_undecryptable(self, msg_id: str, now=None) -> None:
+        """Wart 3: background-sweep negative cache. LOCAL ONLY - never
+        synced. Only the gossip-round sweep writes here (and only while the
+        node is unlocked - see node.cache_message_keys); per-view reads in
+        dm_thread stay correct-first and ignore this table."""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO undecryptable VALUES(?,?)",
+                (msg_id, time.time() if now is None else now))
+            self._db.commit()
+
+    def clear_undecryptable(self, msg_id=None) -> None:
+        with self._lock:
+            if msg_id is None:
+                self._db.execute("DELETE FROM undecryptable")
+            else:
+                self._db.execute(
+                    "DELETE FROM undecryptable WHERE msg_id=?", (msg_id,))
+            self._db.commit()
+
+    def undecryptable_ids(self) -> set:
+        with self._lock:
+            return {r[0] for r in self._db.execute(
+                "SELECT msg_id FROM undecryptable")}
 
     def uncached_message_ids(self, self_identity: str) -> List[str]:
         """msg_id list, kind-agnostic: DM rows where self is a party, plus
@@ -586,7 +619,8 @@ class Store:
             for mid, kind, ipub, rcpt, mj in self._db.execute(
                     "SELECT msg_id, kind, identity_pub, recipient, msg_json"
                     " FROM messages WHERE kind IN (?,?)"
-                    " AND msg_id NOT IN (SELECT msg_id FROM dm_keys)",
+                    " AND msg_id NOT IN (SELECT msg_id FROM dm_keys)"
+                    " AND msg_id NOT IN (SELECT msg_id FROM undecryptable)",
                     (KIND_DM, KIND_POST)):
                 if kind == KIND_DM:
                     if self_identity in (ipub, rcpt):

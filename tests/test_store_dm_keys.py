@@ -86,6 +86,54 @@ def test_replace_message_key_refuses_tombstoned_msg_id(tmp_path):
     assert s.cached_message_key(d1.msg_id) is None
 
 
+def test_caching_a_key_removes_the_entry(tmp_path):
+    s, phone = wong(tmp_path)
+    freja = friend_of(s)
+    d1 = dm_to(phone, freja.identity_pub)
+    assert s.ingest_message(d1).accepted
+    s.mark_undecryptable(d1.msg_id)
+    assert s.undecryptable_ids() == {d1.msg_id}
+    s.cache_message_key(d1.msg_id, "cafe01")
+    assert s.undecryptable_ids() == set()
+
+
+def test_replacing_a_key_removes_the_entry(tmp_path):
+    s, phone = wong(tmp_path)
+    freja = friend_of(s)
+    d1 = dm_to(phone, freja.identity_pub)
+    assert s.ingest_message(d1).accepted
+    s.mark_undecryptable(d1.msg_id)
+    s.replace_message_key(d1.msg_id, "beef02")
+    assert s.undecryptable_ids() == set()
+
+
+def test_tombstone_removes_the_entry(tmp_path):
+    s, phone = wong(tmp_path)
+    freja = friend_of(s)
+    d1 = dm_to(phone, freja.identity_pub)
+    assert s.ingest_message(d1).accepted
+    s.mark_undecryptable(d1.msg_id)
+    assert s.ingest_message(make_delete(phone, d1.msg_id)).accepted
+    assert s.undecryptable_ids() == set()
+
+
+def test_uncached_message_ids_excludes_marked_undecryptable(tmp_path):
+    s, phone = wong(tmp_path)
+    freja = friend_of(s)
+    d1 = dm_to(phone, freja.identity_pub)
+    assert s.ingest_message(d1).accepted
+    s.mark_undecryptable(d1.msg_id)
+    assert s.uncached_message_ids(phone.identity_pub) == []
+
+
+def test_clear_undecryptable_with_no_id_clears_everything(tmp_path):
+    s, phone = wong(tmp_path)
+    s.mark_undecryptable("aa" * 32)
+    s.mark_undecryptable("bb" * 32)
+    s.clear_undecryptable()
+    assert s.undecryptable_ids() == set()
+
+
 def test_enckeys_tiebreak_same_created_at_higher_seq_wins(tmp_path):
     s, phone = wong(tmp_path)
     e1 = make_enckey(phone, now=100.0)
