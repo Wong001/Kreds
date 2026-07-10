@@ -121,6 +121,17 @@ Carried from implementation reviews; each is accepted for the current demo but s
 - **Single-device backup honesty + recovery** — a single-device user's disk death loses content (identity recovers via paper seed; there is no re-entitlement pull-back of your own history from friends' copies). Near-term: state it plainly on the site + nudge a second device in-app. Long-term: circle-assisted recovery may share machinery with the sharded-guardians design (see 2026-07-09 sketch).
 - **Permanent behavioral test suite** — promote the throwaway Playwright smokes into a small gated suite (TOR_E2E-style, ~6 tests vs a demo node): the week's only two critical UI bugs were caught by live smokes, never by the static text asserts, and three review findings showed the static pattern passes on comment text alone.
 
+## Live-test findings (2026-07-10, first two-machine Tor test — the milestone)
+
+The real two-machine Tor test PASSED (friend-add over `.onion`, posts + DMs both ways). Surfaced:
+
+- **Compact invite encoding** — IN PROGRESS (own spec/plan). The invite code was ~600 chars of JSON; nearly killed the test (hand-typing). Shrink to ~80-char base58 (cert moves to the Tor handshake), display truncated (`kreds·invite·K7QX…R2M9`), 4-char identity fingerprint for a casual out-of-band verify.
+- **FOLLOW-UP: full-identity verification screen** — the 4-char fingerprint is a *casual* check (grindable by a real-time MITM). Add an option to view/compare the FULL identity string (Signal-safety-number style) for users who want real MITM proof. Deferred behind the compact-encoding work.
+- **BUG (elevated — silent failure + orphan): composer clears scope on photo-attach.** Journal composer: writing text then clicking Photo deselects the Kreds/Inner audience, so Post silently no-ops. The attempted post appears to go *somewhere* undeletable and never syncs (likely encrypted to an empty ring → readable by nobody incl. author). Fix: don't clear scope on photo-attach; investigate + clean the orphan path (empty-ring post should be refused, not silently created). Slot right after compact-encoding, ahead of the unread badge.
+- **Unread badge** — queued (top-bar red count for unread DMs; local knowledge, honest; masks Tor sync latency).
+- **Sticky top bar + composer on scroll** — the nav (logo/Journal/Messages/Me) and the compose box should stay fixed; only the journal list scrolls. `position: sticky` CSS, pure polish.
+- **Website hero/images stale** — hero mockup doesn't match shipped UI (circle-rail side, missing kreds circle). Update the Astro CSS mockup from current screenshots before the launch push.
+
 ## Polish & tech-debt backlog
 
 Minor items logged during reviews — none blocking, triaged for later:
