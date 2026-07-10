@@ -134,6 +134,8 @@ The real two-machine Tor test PASSED (friend-add over `.onion`, posts + DMs both
 
 ## Polish & tech-debt backlog
 
+- **release-build --web-only flag** - web-only hot-updates (e.g. 0.3.9) still build+publish an inert ~77MB core-<ver>.zip (pointed at the prior core payload, never fetched since core_version is unchanged). A --web-only mode would emit a manifest with no core entry, saving the wasteful upload. Workaround today: --core-version <prior> + --core <prior payload dir>.
+
 Minor items logged during reviews — none blocking, triaged for later:
 
 - **UI:** logo tweak (the floating "oo"s — revisit); focus ring is low-contrast on very pale custom accents; conversation list shows initials, not friends' avatars; no active-selection affordance on the custom color swatch.
