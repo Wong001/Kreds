@@ -214,9 +214,33 @@ if (-not $Iscc) {
 }
 if ($Iscc) {
     $IsccPath = if ($Iscc -is [string]) { $Iscc } else { $Iscc.Source }
-    & $IsccPath "/DAppVersion=$CoreVersion" $Iss
+    $IsccArgs = @("/DAppVersion=$CoreVersion")
+    if ($Sign) {
+        # Inno signs the installer AND the embedded uninstaller via a named
+        # SignTool (the uninstaller can't be post-signed - it isn't a file
+        # until install time). $f is Inno's filename placeholder. Use
+        # signtool's 8.3 short path so the command carries no spaces/quotes
+        # through PowerShell's native-arg quoting.
+        $stShort = $SignToolExe
+        try {
+            $stShort = (New-Object -ComObject Scripting.FileSystemObject).GetFile($SignToolExe).ShortPath
+        } catch { }
+        if ($stShort -match '\s') { $stShort = "`"$stShort`"" }   # fallback if 8.3 is disabled
+        $signCmd = "$stShort sign /sha1 $SignThumbprint /tr $SignTimestampUrl /td sha256 /fd sha256 `$f"
+        $IsccArgs += "/DSignSetup=1"
+        $IsccArgs += "/Skredssign=$signCmd"
+    }
+    & $IsccPath @IsccArgs $Iss
     if ($LASTEXITCODE -eq 0) {
-        Invoke-CodeSign (Join-Path $RepoRoot "dist\KredsSetup.exe")
+        if ($Sign) {
+            # Inno already signed the installer (and uninstaller) - just verify.
+            $prevEap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+            & $SignToolExe verify /pa /q (Join-Path $RepoRoot "dist\KredsSetup.exe") | Out-Null
+            $vExit = $LASTEXITCODE
+            $ErrorActionPreference = $prevEap
+            if ($vExit -ne 0) { Write-Error "installer signature verify failed (exit $vExit)"; exit 1 }
+            Write-Host "  signed:   installer + uninstaller (via Inno SignedUninstaller)"
+        }
         Write-Host "  installer -> $(Join-Path $RepoRoot 'dist\KredsSetup.exe')"
     } else {
         Write-Warning "ISCC failed (exit $LASTEXITCODE) -- portable dist\Kreds is still usable."

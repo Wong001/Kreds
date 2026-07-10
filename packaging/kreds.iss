@@ -14,8 +14,12 @@
 ; install/uninstall.
 ;
 ; BUILD: ISCC.exe /DAppVersion=<ver> packaging\kreds.iss  (build.ps1 does this
-; automatically when Inno Setup is installed). Unsigned for now (SmartScreen
-; warns on the installer -> "More info" -> "Run anyway"); Authenticode later.
+; automatically when Inno Setup is installed). Release builds pass
+; /DSignSetup=1 + a /Skredssign=<signtool cmd> (build.ps1 -Sign), which makes
+; Inno Authenticode-sign the installer AND the embedded uninstaller - the
+; uninstaller can ONLY be signed here (it never exists as a standalone file
+; on disk; Inno signs its stub before embedding it). Dev builds omit both and
+; are unsigned (SmartScreen warns -> "More info" -> "Run anyway").
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -36,6 +40,13 @@ SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=kreds.ico
 UninstallDisplayIcon={app}\Kreds.exe
+; Signed release only (guarded so dev builds don't require the sign tool).
+; SignedUninstaller extends the signature to the uninstaller stub; the
+; kredssign command is registered by build.ps1 via ISCC's /Skredssign=.
+#ifdef SignSetup
+SignTool=kredssign
+SignedUninstaller=yes
+#endif
 ; The installed launcher; auto-update maintains versions\ underneath.
 AppId={{9F4C2E7A-3B21-4D8E-9C5F-KREDS0AUTOUPD}}
 
