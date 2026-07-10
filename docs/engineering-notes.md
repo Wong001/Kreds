@@ -466,24 +466,46 @@ unit-tested offline; the live re-confirmation is pending.
 
 ## Adding a friend
 
-Shipped as **0.3.0**. Becoming friends still starts with someone you
-already know - there is no server-side discovery or lookup, so a stranger
-has no way in - and it now takes one code instead of a two-way paste. The
-code is deliberately safe to send over an existing channel: single-use,
-single-active, and expired after ten minutes, so sharing it means trusting
-that channel for ten minutes at most (in person removes even that
-dependency - share it like a house key, not a flyer).
+Shipped as **0.3.0**; the code itself was compacted in a follow-up slice
+(spec `2026-07-10-compact-invite`). Becoming friends still starts with
+someone you already know - there is no server-side discovery or lookup, so
+a stranger has no way in - and it takes one code instead of a two-way
+paste. The code is deliberately safe to send over an existing channel:
+single-use, single-active, and expired after ten minutes, so sharing it
+means trusting that channel for ten minutes at most (in person removes
+even that dependency - share it like a house key, not a flyer).
+
+**The code is compact**: ~80 characters of base58, not the ~600-char JSON
+blob the first cut of this shipped with (full cert + onion + nonce +
+expiry, all hex) - hand-typing that between two clipboard-isolated PCs
+nearly killed the first real two-machine Tor test. The shrink comes mostly
+from moving A's enrollment cert out of the invite: the cert never actually
+defended the invite (anyone who can rewrite the code in transit can swap
+the cert too, and B has no prior knowledge of A's identity to catch it) -
+what authenticates the handshake is the one-time nonce inside the code,
+which only A and whoever A shared it with know. So the cert now travels
+one message later, in the **final** handshake frame that B's node delivers
+back to A over Tor, after the nonce/signature proof has already run. The
+UI shows the code truncated as `kreds·invite·<FP>…<last four chars>`
+with a Copy button that copies the full string; `<FP>` is a 4-character
+fingerprint derived from the first 4 bytes of A's identity key.
 
 **A** opens Add Friend and shares **one code** - read aloud, AirDropped,
-texted, whatever's convenient. **B** pastes that single code
-in and hits Add. From there B's node dials A directly over Tor and
-delivers its half of the handshake automatically: A verifies it, both
-sides add each other, and B sees "Connected" - **A never pastes anything
-back**. The code carries A's onion address and a one-time nonce, so the
-auto-connect only works while both devices are online and reachable over
-Tor; the underlying cryptographic ceremony (mutual device-key proof,
+texted, whatever's convenient. **B** pastes that single code in and hits
+Add; B's screen shows "Connecting to someone whose ID starts with `<FP>`" -
+the same 4 characters visible on A's card, so B can glance across and
+confirm before anything completes. From there B's node dials A directly
+over Tor and delivers its half of the handshake automatically: A verifies
+it, both sides add each other, and B sees "Connected" - **A never pastes
+anything back**. The code carries A's onion address and a one-time nonce,
+so the auto-connect only works while both devices are online and reachable
+over Tor; the underlying cryptographic ceremony (mutual device-key proof,
 signed by both sides) is unchanged from the original four-box flow, only
-the second copy-paste round trip is gone.
+the second copy-paste round trip is gone. `complete_invite` also enforces
+a binding check now that the cert arrives later than the fingerprint:
+whoever's cert shows up in the final must match the invite's carried
+`id_prefix`, or the add is refused outright - so the 4-char fingerprint
+isn't just cosmetic, it's mechanically enforced too, not merely displayed.
 
 **The code is deliberately short-lived and single-shot**: single-use
 (consumed the moment a valid response lands), single-active (generating a
@@ -496,14 +518,28 @@ replayed old one, a forged signature) is refused outright and nothing is
 added to A's friend list; that inbound path is also rate-limited so it
 can't be hammered.
 
+**Honest limit of the 4-char fingerprint, stated plainly**: it is a
+*casual* integrity check, nothing more. It catches accidents - a mis-pasted
+code, a cross-wired share, an unsophisticated attempt to swap the code for
+a different one - because a wrong or tampered code shows a fingerprint that
+doesn't match what the sender is holding up. It is **not proof against a
+determined attacker**: someone who intercepts the trusted channel the code
+travels over and grinds a look-alike identity key matching those same 4
+characters (a 32-bit space - feasible in seconds on a GPU) can substitute
+their own identity and the fingerprint will still read as correct. Real
+MITM proof needs comparing the *full* identity, not 4 characters of it -
+that's a named, deferred follow-up (see ROADMAP: "full-identity
+verification screen"), not something this slice claims to provide.
+
 **Offline falls back to the original copy-paste flow, unchanged.** If B's
 auto-connect attempt can't reach A (A's node is offline, or not reachable
 over Tor at that moment), B's node still produces its response payload and
 shows it for manual copy-paste - the same "hand your device to the other
 person, they paste it into their Add Friend screen, then hand back the
 result" ceremony this app has always used, and the same underlying
-`respond_to_invite` / `finalize_invite` / `complete_invite` calls, now just
-reached as a fallback instead of the only path.
+`respond_to_invite` / `finalize_invite` / `complete_invite` calls (now
+carrying the same compact codec as the invite), reached as a fallback
+instead of the only path.
 
 Honest limits, stated plainly: this is still **copy-paste**, not a camera
 scan - a real QR flow (scan A's code with B's camera) is deferred to the
