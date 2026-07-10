@@ -2367,21 +2367,18 @@ function buildShareTab(container) {
   const getBtn = el("button", "btn-accent", "Get my code");
   getBtn.type = "button";
   const result = el("div", "friendadd-share-result hidden");
-  // Truncated chip is the primary display (shortInvite); the full code
-  // still lives in the textarea below it for Copy / manual selection.
+  // The truncated chip is the ONLY code shown - a pretty, readable label
+  // (kreds·invite·<fingerprint>…<suffix>). The full ~80-char code never
+  // appears on screen; Copy (or clicking the chip itself) puts it on the
+  // clipboard so you paste it straight into a chat. Showing the raw code
+  // alongside just confused people - it looked like a second, different code.
+  let fullCode = "";
   const chip = el("div", "friendadd-chip");
-  const codeLabel = document.createElement("label");
-  codeLabel.htmlFor = "friendadd-share-code";
-  codeLabel.className = "hint";
-  codeLabel.textContent = "Your code";
-  const code = document.createElement("textarea");
-  code.id = "friendadd-share-code";
-  code.className = "friendadd-code";
-  code.readOnly = true;
-  code.rows = 4;
+  chip.title = "Click to copy";
   const copyBtn = el("button", "", "Copy code");
   copyBtn.type = "button";
-  wireCopyButton(copyBtn, () => code.value);
+  wireCopyButton(copyBtn, () => fullCode);
+  chip.onclick = () => copyBtn.click();     // clicking the code copies it too
   const countdown = el("div", "hint friendadd-countdown");
   countdown.setAttribute("aria-live", "polite");
   const regenBtn = el("button", "hidden", "Regenerate");
@@ -2408,7 +2405,7 @@ function buildShareTab(container) {
     regenBtn.disabled = true;
     try {
       const r = await j("/api/friend/invite", {method: "POST"});
-      code.value = r.payload;
+      fullCode = r.payload;
       chip.textContent = shortInvite(r.payload, r.fp);
       copyBtn.disabled = false;
       regenBtn.classList.add("hidden");
@@ -2426,7 +2423,7 @@ function buildShareTab(container) {
   getBtn.onclick = getCode;
   regenBtn.onclick = getCode;
 
-  result.append(chip, codeLabel, code, copyBtn, countdown, regenBtn);
+  result.append(chip, copyBtn, countdown, regenBtn);
   container.append(hint, getBtn, result);
   container.friendaddFocus = () => getBtn.focus();
 }

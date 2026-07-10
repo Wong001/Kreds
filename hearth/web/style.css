@@ -611,12 +611,16 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
 .friendadd-tab.active { border-color: var(--ink); background: var(--line-2);
   color: var(--ink); font-weight: 650; }
 .friendadd-body { margin-top: 10px; }
-/* Truncated kreds·invite·<FP>…<code tail> chip (Task 3): the primary,
-   readable display -- the full ~80-char code stays in .friendadd-code
-   below it for Copy / manual selection. */
+/* Truncated kreds·invite·<FP>…<code tail> chip: the ONLY code shown - a
+   pretty readable label; clicking it (or Copy) puts the full ~80-char code
+   on the clipboard. The raw code is never displayed (it looked like a
+   second, different code and confused people). */
 .friendadd-chip { display: inline-block; margin-bottom: 8px; padding: 6px 10px;
   border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
-  font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: .01em; }
+  font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: .01em;
+  cursor: pointer; }
+.friendadd-chip:hover { border-color: var(--ink-2); }
+/* Retained for the manual-fallback code boxes (buildManualCeremony). */
 .friendadd-code { width: 100%; box-sizing: border-box; font-size: 11px; }
 .friendadd-code[readonly] { background: var(--line-2); }
 .friendadd-countdown { font-weight: 600; }
