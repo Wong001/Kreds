@@ -18,8 +18,24 @@
 #   6. Print the resulting dist\Kreds path.
 #
 # Run from anywhere; paths are resolved relative to this script.
+#
+# -Sign (release builds): Authenticode-sign the launcher exe, the payload
+# exe, and the installer with the Certum code-signing cert via SimplySign
+# Desktop (must be connected -- the cert appears in CurrentUser\My only
+# while the virtual card is mounted). Signing MUST happen here, inside the
+# build, because `release-build` hashes the payload bytes into the signed
+# update manifest -- signing after would break every client's update
+# verification. Dev builds omit -Sign and are unchanged.
+
+param(
+    [switch]$Sign,
+    # Thumbprint of the Certum "Open Source Developer August Wong" cert
+    # (public identifier, not a secret). Changes only on cert reissue.
+    [string]$SignThumbprint = "39909BFD9370EC3B6B959E3FADAB0FD0B73463FA"
+)
 
 $ErrorActionPreference = "Stop"
+$SignTimestampUrl = "http://time.certum.pl"
 
 $PackagingDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $PackagingDir
@@ -30,6 +46,56 @@ $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $Python)) {
     Write-Error "venv python not found at $Python -- create/activate .venv first."
     exit 1
+}
+
+$SignToolExe = $null
+if ($Sign) {
+    # Fail early (before the slow PyInstaller builds) if signing can't work.
+    $stCmd = Get-Command signtool -ErrorAction SilentlyContinue
+    if ($stCmd) {
+        $SignToolExe = $stCmd.Source
+    } else {
+        $kitRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+        $kitDirs = Get-ChildItem $kitRoot -Directory -Filter "10.*" -ErrorAction SilentlyContinue |
+                   Sort-Object Name -Descending
+        foreach ($k in $kitDirs) {
+            $p = Join-Path $k.FullName "x64\signtool.exe"
+            if (Test-Path $p) { $SignToolExe = $p; break }
+        }
+    }
+    if (-not $SignToolExe) {
+        Write-Error "-Sign given but signtool.exe not found (install the Windows 10/11 SDK signing tools)."
+        exit 1
+    }
+    $cert = Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
+            Where-Object { $_.Thumbprint -eq $SignThumbprint }
+    if (-not $cert) {
+        Write-Error "-Sign given but cert $SignThumbprint is not in CurrentUser\My. Connect SimplySign Desktop (tray icon -> Connect) and retry."
+        exit 1
+    }
+    Write-Host "== Signing enabled: $($cert.Subject) =="
+}
+
+function Invoke-CodeSign {
+    param($Path)
+    if (-not $Sign) { return }
+    # Like Invoke-PyInstaller below: signtool logs benign lines to stderr
+    # (e.g. timestamp retries), which EAP=Stop would promote to a fatal
+    # error. Relax and check the exit code instead.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $SignToolExe sign /sha1 $SignThumbprint /tr $SignTimestampUrl /td sha256 /fd sha256 $Path
+    $signExit = $LASTEXITCODE
+    if ($signExit -eq 0) {
+        & $SignToolExe verify /pa /q $Path | Out-Null
+        $signExit = $LASTEXITCODE
+    }
+    $ErrorActionPreference = $prevEap
+    if ($signExit -ne 0) {
+        Write-Error "code signing failed (exit $signExit) for $Path"
+        exit 1
+    }
+    Write-Host "  signed:   $Path"
 }
 
 Write-Host "== Staging tor.exe into packaging/tor/ =="
@@ -87,9 +153,11 @@ Push-Location $RepoRoot
 try {
     Write-Host "== Running PyInstaller (payload: kreds.spec) =="
     Invoke-PyInstaller (Join-Path $PackagingDir "kreds.spec") $CoreDistDir (Join-Path $RepoRoot "build\core")
+    Invoke-CodeSign (Join-Path $CoreDistDir "Kreds\Kreds.exe")
 
     Write-Host "== Running PyInstaller (launcher: launcher.spec) =="
     Invoke-PyInstaller (Join-Path $PackagingDir "launcher.spec") $LauncherDistDir (Join-Path $RepoRoot "build\launcher")
+    Invoke-CodeSign (Join-Path $LauncherDistDir "Kreds.exe")
 } finally {
     Pop-Location
 }
@@ -148,6 +216,7 @@ if ($Iscc) {
     $IsccPath = if ($Iscc -is [string]) { $Iscc } else { $Iscc.Source }
     & $IsccPath "/DAppVersion=$CoreVersion" $Iss
     if ($LASTEXITCODE -eq 0) {
+        Invoke-CodeSign (Join-Path $RepoRoot "dist\KredsSetup.exe")
         Write-Host "  installer -> $(Join-Path $RepoRoot 'dist\KredsSetup.exe')"
     } else {
         Write-Warning "ISCC failed (exit $LASTEXITCODE) -- portable dist\Kreds is still usable."

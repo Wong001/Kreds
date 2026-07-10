@@ -49,13 +49,32 @@ print(pub)
 *before* building -- the `.exe`, the bundles, and the manifest all derive
 their version from this one place.
 
-## 2. Build the `.exe`
+## 2. Build the `.exe` (signed)
+
+Release builds are Authenticode-signed with the Certum code-signing
+certificate ("Open Source Developer August Wong", via SimplySign cloud).
+First connect **SimplySign Desktop** (tray icon -> Connect to SimplySign,
+log in with the SimplySign ID + the 6-digit token from the mobile app) --
+the cert is only visible to Windows while that session is connected. Then:
 
 ```powershell
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt -r requirements-dev.txt
-.\packaging\build.ps1
+.\packaging\build.ps1 -Sign
 ```
+
+`-Sign` signs the launcher exe, the payload exe, and `KredsSetup.exe`,
+each with a Certum timestamp (signatures stay valid after the cert
+expires). It must happen in THIS step, not after: step 3's manifest hashes
+the payload bytes, so signing later would break client update
+verification. Plain `.\packaging\build.ps1` (dev build) is unchanged and
+produces unsigned exes.
+
+The cert thumbprint is a default parameter in `packaging/build.ps1`
+(`-SignThumbprint`); it's a public identifier, not a secret, and only
+changes if the certificate is ever reissued. The SimplySign credentials
+follow the same hygiene as the release key: never in a script, never in
+an agent session.
 
 Produces `dist\Kreds\` (see `packaging/README.md`), including the payload
 at `dist\Kreds\versions\<CORE_VERSION>\` -- that payload directory is the
