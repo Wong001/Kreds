@@ -611,10 +611,17 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
 .friendadd-tab.active { border-color: var(--ink); background: var(--line-2);
   color: var(--ink); font-weight: 650; }
 .friendadd-body { margin-top: 10px; }
+/* Truncated kreds·invite·<FP>…<code tail> chip (Task 3): the primary,
+   readable display -- the full ~80-char code stays in .friendadd-code
+   below it for Copy / manual selection. */
+.friendadd-chip { display: inline-block; margin-bottom: 8px; padding: 6px 10px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+  font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: .01em; }
 .friendadd-code { width: 100%; box-sizing: border-box; font-size: 11px; }
 .friendadd-code[readonly] { background: var(--line-2); }
 .friendadd-countdown { font-weight: 600; }
 .friendadd-fallback { margin-top: 10px; }
+.friendadd-fp { font-weight: 600; }
 .ceremony-manual { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line-2); }
 .linklike { display: block; margin-top: 10px; padding: 0; border: none; background: none;
   color: var(--ink-2); text-decoration: underline; cursor: pointer; font-size: 12px; }

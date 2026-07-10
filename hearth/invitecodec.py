@@ -52,6 +52,13 @@ def fingerprint(identity_pub_hex: str) -> str:
     pre = bytes.fromhex(identity_pub_hex)[:4]
     return base64.b32encode(pre).decode().rstrip("=")[:4]
 
+def fp_from_prefix(id_prefix_hex: str) -> str:
+    """Same base32 derivation as fingerprint(), but from an already-carried
+    4-byte id_prefix (e.g. an invite's id_prefix field) instead of a full
+    identity pubkey -- lets /api/friend/add show the peer's fingerprint
+    without needing their full identity_pub."""
+    return base64.b32encode(bytes.fromhex(id_prefix_hex)).decode().rstrip("=")[:4]
+
 def pack_addr(addr) -> bytes:
     """Pack a gossip address. A real Tor v3 onion address (the production
     case - run_node's tor=True path in hearth/runner.py) reconstructs from
