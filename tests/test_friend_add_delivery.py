@@ -14,6 +14,7 @@ import asyncio
 import time
 
 import hearth.sync as sync_mod
+from hearth import invitecodec
 from hearth.node import HearthNode
 from hearth.sync import SyncService
 from hearth.transport import read_frame
@@ -62,6 +63,21 @@ def test_offline_falls_back_to_manual(tmp_path):
         finally:
             await svc_b.stop()
     asyncio.run(scenario())
+
+
+def test_second_respond_to_invite_with_a_live_pending_entry(tmp_path):
+    # Regression (whole-branch review, CRITICAL): the pending-response purge
+    # must read the expiry (index 2), not the invite nonce (index 3). With a
+    # prior pending entry still live (e.g. an offline peer left it after a
+    # manual fallback), a SECOND respond_to_invite used to crash comparing a
+    # str nonce '>' a float time. Two sequential responds on one node must
+    # both succeed.
+    b = HearthNode.create(tmp_path / "b", "B", "b-dev")
+    a1 = HearthNode.create(tmp_path / "a1", "A1", "a1-dev")
+    a2 = HearthNode.create(tmp_path / "a2", "A2", "a2-dev")
+    b.respond_to_invite(a1.create_invite())        # leaves a live pending entry
+    b.respond_to_invite(a2.create_invite())        # must NOT raise (was TypeError)
+    assert len(b._pending_responses) == 2          # both entries retained (unexpired)
 
 
 def test_friend_add_frame_without_valid_nonce_refused(tmp_path):
@@ -148,8 +164,8 @@ def test_finalize_invite_locked_mutates_nothing(tmp_path):
         assert a.store.is_known(b.identity_pub) is False
         # the invite is still pending -- nothing was consumed by the failed attempt
         assert resp
-        import json as _json
-        nonce = _json.loads(resp)["nonce"]
+        _, resp_d = invitecodec.decode(resp)
+        nonce = resp_d["nonce"]
         assert nonce in a._pending_invites
     asyncio.run(scenario())
 

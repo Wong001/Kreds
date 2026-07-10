@@ -1061,3 +1061,15 @@ def test_desktop_keep_close_hides_to_tray_with_fallback():
     assert "else api.minimize();" in keep_branch
     # user-facing copy names the tray (wizard step + Settings label)
     assert js.count("in the system tray") >= 2
+
+
+def test_invite_display_is_truncated_and_copies_full():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    # a short-display helper renders kreds·invite·<FP>…<suffix>; Copy copies raw
+    assert "kreds·invite·" in js
+    assert "shortInvite" in js
+    # the enter path names the fingerprint the user should confirm
+    assert "starts with" in js
+    # copy uses the full code, not the truncated display (grep the copy wiring)
+    share = _js_fn_body(js, "buildShareTab")
+    assert "shortInvite" in share

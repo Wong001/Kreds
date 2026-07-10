@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from . import applock
+from . import applock, invitecodec
 from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
                       encrypt_body, new_content_key, open_content_key,
                       post_aad, seal_content_key, unwrap_key, wrap_key)
@@ -875,44 +875,41 @@ class HearthNode:
         nonce = os.urandom(16).hex()
         expiry = time.time() + ttl_seconds
         self._pending_invites[nonce] = expiry
-        return json.dumps({
-            "t": "hearth-invite", "protocol": PROTOCOL,
-            "cert": self.device.cert.to_dict(),
-            "addr": self.store.get_meta("gossip_addr"),
-            "nonce": nonce, "expires_at": expiry,
-        })
+        return invitecodec.encode_invite(
+            self.device.cert.identity_pub[:8], self.store.get_meta("gossip_addr"),
+            nonce, expiry)
 
     def respond_to_invite(self, invite_json: str) -> str:
         try:
-            inv = json.loads(invite_json)
-        except json.JSONDecodeError:
-            raise ValueError("invite is not valid JSON")
-        if inv.get("t") != "hearth-invite":
+            typ, inv = invitecodec.decode(invite_json)
+        except ValueError:
             raise ValueError("not an invite")
-        cert = EnrollmentCert.from_dict(inv["cert"])
-        if not cert.verify():
-            raise ValueError("invalid cert in invite")
+        if typ != "invite":
+            raise ValueError("not an invite")
+        # no cert to verify here anymore (it arrives in the final); keep the
+        # id_prefix so complete_invite can bind it.
         my_nonce = os.urandom(16).hex()
         self._pending_responses = {k: v for k, v in self._pending_responses.items()
-                                   if v[2] > time.time()}          # purge expired
-        self._pending_responses[my_nonce] = (cert, inv.get("addr"), time.time() + 600)
-        return json.dumps({
-            "t": "hearth-response", "protocol": PROTOCOL,
-            "cert": self.device.cert.to_dict(),
-            "addr": self.store.get_meta("gossip_addr"),
-            "nonce": inv["nonce"],
-            "sig": self.device.sign_raw(_friend_add_body(inv["nonce"])),
-            "peer_nonce": my_nonce,
-        })
+                                   if v[2] > time.time()}          # purge expired (v[2]=expiry)
+        # store (id_prefix, addr, expiry, invite_nonce) - expiry is index 2,
+        # which is what the purge above and complete_invite's unpack both read.
+        self._pending_responses[my_nonce] = (
+            inv["id_prefix"], inv["addr"], time.time() + 600, inv["nonce"])
+        return invitecodec.encode_response(
+            self.store.get_meta("gossip_addr"), inv["nonce"], my_nonce,
+            self.device.sign_raw(_friend_add_body(inv["nonce"])),
+            self.device.cert.to_dict())
 
     def finalize_invite(self, response_json: str) -> str:
         try:
-            resp = json.loads(response_json)
-        except json.JSONDecodeError:
-            raise ValueError("response is not valid JSON")
-        nonce = resp.get("nonce")
+            typ, resp = invitecodec.decode(response_json)
+        except ValueError:
+            raise ValueError("no matching invite")
+        if typ != "response":
+            raise ValueError("no matching invite")
+        nonce = resp["nonce"]
         exp = self._pending_invites.get(nonce)
-        if resp.get("t") != "hearth-response" or exp is None:
+        if exp is None:
             raise ValueError("no matching invite")
         if time.time() >= exp:
             del self._pending_invites[nonce]
@@ -942,28 +939,33 @@ class HearthNode:
         # del nonce keeps every step ordered from "detectable failure,
         # nothing consumed" to "fully applied, then consumed".
         sig = self.device.sign_raw(_friend_add_body(resp["peer_nonce"]))
-        self._add_friend(cert, resp.get("addr"))
+        self._add_friend(cert, resp["addr"])
         del self._pending_invites[nonce]
-        return json.dumps({
-            "t": "hearth-final", "protocol": PROTOCOL,
-            "nonce": resp["peer_nonce"],
-            "sig": sig,
-        })
+        # final now carries A's cert (moved out of the invite)
+        return invitecodec.encode_final(resp["peer_nonce"], sig, self.device.cert.to_dict())
 
     def complete_invite(self, final_json: str):
         try:
-            fin = json.loads(final_json)
-        except json.JSONDecodeError:
-            raise ValueError("final is not valid JSON")
-        entry = self._pending_responses.get(fin.get("nonce"))
-        if fin.get("t") != "hearth-final" or entry is None:
+            typ, fin = invitecodec.decode(final_json)
+        except ValueError:
             raise ValueError("no matching response")
-        cert, addr, exp = entry
+        if typ != "final":
+            raise ValueError("no matching response")
+        entry = self._pending_responses.get(fin["nonce"])
+        if entry is None:
+            raise ValueError("no matching response")
+        id_prefix, addr, exp, _a_nonce = entry
         if time.time() >= exp:
             del self._pending_responses[fin["nonce"]]
             raise ValueError("response expired")
-        if not _sig_ok(cert.device_pub, fin["sig"],
-                       _friend_add_body(fin["nonce"])):
+        cert = EnrollmentCert.from_dict(fin["cert"])
+        # binding check: the identity that completed must match the invite's
+        # fingerprint (spec 2026-07-10-compact-invite; forces full
+        # substitution, makes the human 4-char check meaningful).
+        if cert.identity_pub[:8] != id_prefix:
+            raise ValueError("identity does not match invite fingerprint")
+        if not cert.verify() or not _sig_ok(cert.device_pub, fin["sig"],
+                                            _friend_add_body(fin["nonce"])):
             raise ValueError("invalid final signature")
         del self._pending_responses[fin["nonce"]]
         self._add_friend(cert, addr)
@@ -973,19 +975,24 @@ class HearthNode:
         the add automatically. Falls back to returning the response for manual
         copy-paste when A is unreachable (or _friend_dial isn't wired -- e.g.
         no SyncService). respond_to_invite is the only validation of A's
-        invite here (bad cert/JSON/etc raises before any dial is attempted);
-        the auto-delivered response is authenticated on A's end solely by
-        finalize_invite (nonce must match a live, non-expired pending invite
-        + valid sig) -- this method adds no friend-auth of its own."""
+        invite here (bad invite/malformed code/etc raises before any dial is
+        attempted); the auto-delivered response is authenticated on A's end
+        solely by finalize_invite (nonce must match a live, non-expired
+        pending invite + valid sig) -- this method adds no friend-auth of its
+        own. A's cert no longer travels in the invite (spec
+        2026-07-10-compact-invite -- it moved to the final), so the display
+        name below is read from the FINAL's cert, decoded again after
+        complete_invite has already verified it (cert + sig + binding
+        check) -- not from the invite."""
         resp = self.respond_to_invite(invite_json)      # validates A's invite (raises on bad)
-        inv = json.loads(invite_json)
+        typ, inv = invitecodec.decode(invite_json)
         addr = inv.get("addr")
         final = None
         if self._friend_dial and addr:
             final = await self._friend_dial(addr, resp)
         if final:
             try:
-                self.complete_invite(final)             # adds A (verifies A's sig)
+                self.complete_invite(final)             # adds A (verifies A's cert + sig + binding)
             except (ValueError, KeyError, TypeError):
                 # A malformed/bogus friend-final (protocol error, tampered
                 # relay, buggy peer) -- complete_invite verifies A's sig
@@ -994,7 +1001,8 @@ class HearthNode:
                 # unreachable: B still holds its own response to hand
                 # over by hand instead of raising out of this method.
                 return {"status": "manual", "response": resp}
-            cert = EnrollmentCert.from_dict(inv["cert"])
+            _, fin = invitecodec.decode(final)          # already verified above; cert lives here now
+            cert = EnrollmentCert.from_dict(fin["cert"])
             return {"status": "connected",
                     "friend": self.store.profiles().get(
                         cert.identity_pub, cert.identity_pub[:8])}

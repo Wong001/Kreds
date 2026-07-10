@@ -2319,6 +2319,15 @@ function profileEditor(p) {
 // "manual" branch's response code above walks the user through.
 // ---------------------------------------------------------------------
 
+// Display the ~80-char invite compactly: kreds·invite·<FP>…<last4>. `fp`
+// is the server-derived 4-char fingerprint (r.fp from /api/friend/invite);
+// falls back to the code's own first 4 chars if a caller ever omits it.
+// The Copy button always copies the RAW code (code.value / r.payload),
+// never this truncated form.
+function shortInvite(code, fp) {
+  return "kreds·invite·" + (fp || code.slice(0, 4)) + "…" + code.slice(-4);
+}
+
 function wireCopyButton(btn, getValue) {
   const label = btn.textContent;
   btn.onclick = async () => {
@@ -2358,6 +2367,9 @@ function buildShareTab(container) {
   const getBtn = el("button", "btn-accent", "Get my code");
   getBtn.type = "button";
   const result = el("div", "friendadd-share-result hidden");
+  // Truncated chip is the primary display (shortInvite); the full code
+  // still lives in the textarea below it for Copy / manual selection.
+  const chip = el("div", "friendadd-chip");
   const codeLabel = document.createElement("label");
   codeLabel.htmlFor = "friendadd-share-code";
   codeLabel.className = "hint";
@@ -2397,6 +2409,7 @@ function buildShareTab(container) {
     try {
       const r = await j("/api/friend/invite", {method: "POST"});
       code.value = r.payload;
+      chip.textContent = shortInvite(r.payload, r.fp);
       copyBtn.disabled = false;
       regenBtn.classList.add("hidden");
       result.classList.remove("hidden");
@@ -2413,7 +2426,7 @@ function buildShareTab(container) {
   getBtn.onclick = getCode;
   regenBtn.onclick = getCode;
 
-  result.append(codeLabel, code, copyBtn, countdown, regenBtn);
+  result.append(chip, codeLabel, code, copyBtn, countdown, regenBtn);
   container.append(hint, getBtn, result);
   container.friendaddFocus = () => getBtn.focus();
 }
@@ -2447,6 +2460,11 @@ function buildEnterTab(container) {
   });
   const submitBtn = el("button", "btn-accent", "Connect");
   submitBtn.type = "submit";
+  // Names the peer's fingerprint (server-derived from the pasted invite's
+  // id_prefix) so there's a human check even on the auto-connect path --
+  // filled right before the connected/manual result below.
+  const fpLine = el("div", "hint friendadd-fp");
+  fpLine.setAttribute("aria-live", "polite");
   const status = el("div", "hint");
   status.setAttribute("aria-live", "polite");
   const fallback = el("div", "friendadd-fallback hidden");
@@ -2464,17 +2482,21 @@ function buildEnterTab(container) {
   wireCopyButton(fbCopy, () => fbCode.value);
   fallback.append(fbLabel, fbCode, fbCopy);
 
-  form.append(label, ta, submitBtn, status);
+  form.append(label, ta, submitBtn, fpLine, status);
   form.onsubmit = async (ev) => {
     ev.preventDefault();
     if (!ta.value.trim()) { status.textContent = "Paste a code first."; return; }
     submitBtn.disabled = true;
     fallback.classList.add("hidden");
+    fpLine.textContent = "";
     status.textContent = "Connecting...";
     try {
       const r = await j("/api/friend/add", {method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({payload: ta.value})});
+      if (r.fp) {
+        fpLine.textContent = "Connecting to someone whose ID starts with " + r.fp;
+      }
       if (r.status === "connected") {
         status.textContent = "You're now friends with " + r.friend;
         ta.value = "";

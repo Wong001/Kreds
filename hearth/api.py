@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 import time
 import zipfile
 from pathlib import Path
@@ -15,7 +14,7 @@ from fastapi import (Body, FastAPI, File, HTTPException, Form, Request,
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import applock, update
+from . import applock, invitecodec, update
 from .messages import (_is_hex_color, AVATAR_ALIGNS, AVATAR_SHAPES,
                        AVATAR_SIZES, MAX_BIO, MAX_BLOB_BYTES,
                        MAX_VIDEO_UPLOAD)
@@ -462,7 +461,15 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
     @app.post("/api/friend/invite")
     async def friend_invite():
         payload = node.create_invite()
-        return {"payload": payload, "expires_at": json.loads(payload)["expires_at"]}
+        # create_invite now returns a compact base58 code (spec
+        # 2026-07-10-compact-invite), not JSON -- decode it to read back
+        # the expiry the client's countdown UI needs.
+        _, d = invitecodec.decode(payload)
+        # fp: this node's own 4-char fingerprint, so the Share tab can show
+        # a short "kreds.invite.<FP>...<code tail>" chip instead of the raw
+        # ~80-char code (task 3, compact-invite web display).
+        return {"payload": payload, "expires_at": d["expiry"],
+                "fp": invitecodec.fingerprint(node.identity_pub)}
 
     @app.post("/api/friend/respond")
     async def friend_respond(body: dict = Body(...)):
@@ -487,7 +494,15 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
     @app.post("/api/friend/add")
     async def friend_add(body: dict = Body(...)):
         try:
-            return await node.add_friend_via_invite(body["payload"])
+            result = await node.add_friend_via_invite(body["payload"])
+            # fp: the PEER's 4-char fingerprint, derived from the pasted
+            # invite's own id_prefix (not the connected friend's full
+            # identity_pub, which the "manual" branch doesn't have yet) --
+            # the Enter tab shows "Connecting to someone whose ID starts
+            # with <fp>" so the human check stays meaningful either way.
+            _, inv = invitecodec.decode(body["payload"])
+            result["fp"] = invitecodec.fp_from_prefix(inv["id_prefix"])
+            return result
         except (ValueError, KeyError, TypeError) as e:
             raise HTTPException(400, str(e))
 

@@ -8,6 +8,7 @@ import json
 
 from fastapi.testclient import TestClient
 
+from hearth import invitecodec
 from hearth.api import build_app
 from hearth.node import HearthNode
 
@@ -40,7 +41,10 @@ def test_friend_add_connected_when_dial_returns_valid_final(tmp_path):
     # No profile message has been exchanged yet (that's a separate gossip
     # step) -- add_friend_via_invite's "friend" name falls back to A's
     # identity-pub prefix, same as node.py's own fallback.
-    assert body == {"status": "connected", "friend": a.identity_pub[:8]}
+    # fp (Task 3, compact-invite web display) is derived from the pasted
+    # invite's own id_prefix -- A's identity_pub[:8], same bytes.
+    assert body == {"status": "connected", "friend": a.identity_pub[:8],
+                     "fp": invitecodec.fp_from_prefix(a.identity_pub[:8])}
     assert b.store.is_known(a.identity_pub)
     assert a.store.is_known(b.identity_pub)
 
@@ -107,8 +111,9 @@ def test_friend_add_malformed_json_400(tmp_path):
 
 
 def test_friend_add_missing_cert_key_400(tmp_path):
-    # Valid JSON, right "t", but missing the "cert" key -> KeyError inside
-    # respond_to_invite's EnrollmentCert.from_dict -- must 400, not 500.
+    # A JSON string is not a valid compact invite code at all (spec
+    # 2026-07-10-compact-invite -- invites are base58, not JSON) -> raises
+    # inside invitecodec.decode via respond_to_invite -- must 400, not 500.
     b = HearthNode.create(tmp_path / "b", "B", "b-dev")
     c = TestClient(build_app(b))
     bad = json.dumps({"t": "hearth-invite", "nonce": "x"})
