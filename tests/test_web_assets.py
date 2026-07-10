@@ -1073,3 +1073,20 @@ def test_invite_display_is_truncated_and_copies_full():
     # copy uses the full code, not the truncated display (grep the copy wiring)
     share = _js_fn_body(js, "buildShareTab")
     assert "shortInvite" in share
+
+
+def test_journal_composer_photo_button_not_a_scope_and_post_fails_loud():
+    # Bug (first two-machine test, 2026-07-10): the Photo button is
+    # <label class="keep"> (for pill styling), so the scope handler
+    # (#composer .keep) caught it, moved .active onto Photo and set scope to
+    # undefined -> server 400 -> the post silently vanished (inputs cleared
+    # with NO error, looking like an undeletable orphan; nothing was actually
+    # created). Scope logic must target .keep[data-scope] so the Photo label
+    # is excluded, AND the submit must check response.ok and keep the user's
+    # text/photo on failure (matching the Wall composer's pattern).
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "#composer .keep[data-scope]" in js
+    submit = js.split('document.getElementById("composer").onsubmit')[1].split("\n};")[0]
+    assert "r.ok" in submit and "Post failed" in submit
+    # the input-clearing must come AFTER the ok-guard (a failed post keeps text)
+    assert submit.index("Post failed") < submit.index('"post-text").value = ""')

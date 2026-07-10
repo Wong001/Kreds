@@ -2714,9 +2714,13 @@ document.getElementById("dm-compose").onsubmit = async (ev) => {
 // Composer (keeps -> hidden #scope, submit -> /api/post)
 // ---------------------------------------------------------------------
 
-document.querySelectorAll("#composer .keep").forEach(btn => {
+// Scope buttons only: the Photo button is a <label class="keep"> for pill
+// styling but carries NO data-scope, so restrict the scope handler to
+// .keep[data-scope] - otherwise clicking Photo set scope to undefined
+// (bug found in the first two-machine test).
+document.querySelectorAll("#composer .keep[data-scope]").forEach(btn => {
   btn.addEventListener("click", () => {
-    document.querySelectorAll("#composer .keep").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll("#composer .keep[data-scope]").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     document.getElementById("scope").value = btn.dataset.scope;
   });
@@ -2730,7 +2734,10 @@ document.getElementById("composer").onsubmit = async (ev) => {
   fd.append("expires_seconds", document.getElementById("post-expiry").value);
   for (const f of document.getElementById("post-photos").files)
     fd.append("photos", f);
-  await fetch("/api/post", {method: "POST", body: fd});
+  const r = await fetch("/api/post", {method: "POST", body: fd});
+  // Fail loud, keep the user's work: a swallowed 400 silently discarded the
+  // post (looked like a vanished orphan). Match the Wall composer's pattern.
+  if (!r.ok) { alert("Post failed: " + await r.text()); return; }
   document.getElementById("post-text").value = "";
   document.getElementById("post-photos").value = "";
   refresh();
