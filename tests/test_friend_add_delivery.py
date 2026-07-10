@@ -14,6 +14,7 @@ import asyncio
 import time
 
 import hearth.sync as sync_mod
+from hearth import invitecodec
 from hearth.node import HearthNode
 from hearth.sync import SyncService
 from hearth.transport import read_frame
@@ -148,8 +149,8 @@ def test_finalize_invite_locked_mutates_nothing(tmp_path):
         assert a.store.is_known(b.identity_pub) is False
         # the invite is still pending -- nothing was consumed by the failed attempt
         assert resp
-        import json as _json
-        nonce = _json.loads(resp)["nonce"]
+        _, resp_d = invitecodec.decode(resp)
+        nonce = resp_d["nonce"]
         assert nonce in a._pending_invites
     asyncio.run(scenario())
 

@@ -1,5 +1,6 @@
-import json, time
+import time
 import pytest
+from hearth import invitecodec
 from hearth.node import HearthNode
 
 def _pair(tmp_path):
@@ -11,8 +12,8 @@ def _pair(tmp_path):
 
 def test_invite_carries_expiry(tmp_path):
     a, _ = _pair(tmp_path)
-    inv = json.loads(a.create_invite(ttl_seconds=600))
-    assert inv["expires_at"] > time.time()
+    typ, inv = invitecodec.decode(a.create_invite(ttl_seconds=600))
+    assert inv["expiry"] > time.time()
 
 def test_expired_invite_rejected_at_finalize(tmp_path):
     a, b = _pair(tmp_path)

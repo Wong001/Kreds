@@ -2,7 +2,14 @@
 The three ceremony messages (invite/response/final) pack to base58 instead
 of JSON. Nonces/certs cross this API as hex strings / dicts (the ceremony
 in node.py stays hex-and-EnrollmentCert internally); this module converts
-to raw bytes only on the wire. No dependency - base58 is hand-rolled."""
+to raw bytes only on the wire. No dependency - base58 is hand-rolled.
+
+Addresses cross this API as the plain "host:port" string the ceremony
+already uses (node.py never splits/joins onion pubkeys itself - see
+pack_addr/unpack_addr): a real onion address reconstructs from its 32-byte
+pubkey (the actual size win), a non-onion address (a first-class
+gossip_addr too - see hearth/runner.py's tor=False path and sync.py's
+_is_onion dual-stack handling) falls back to a length-prefixed string."""
 import base64
 import hashlib
 import struct
@@ -45,6 +52,49 @@ def fingerprint(identity_pub_hex: str) -> str:
     pre = bytes.fromhex(identity_pub_hex)[:4]
     return base64.b32encode(pre).decode().rstrip("=")[:4]
 
+def pack_addr(addr) -> bytes:
+    """Pack a gossip address. A real Tor v3 onion address (the production
+    case - run_node's tor=True path in hearth/runner.py) reconstructs from
+    its 32-byte pubkey; that's the actual size win this codec exists for.
+    A non-onion "host:port" address is ALSO a first-class gossip_addr in
+    this system (run_node's tor=False dev/LAN path, plus sync.py's
+    TcpTransport / _is_onion dual-stack handling) but has no fixed-size
+    form, so it's carried as a length-prefixed UTF-8 string instead. A
+    missing address (gossip_addr never set) packs to a single flag byte,
+    mirroring the old JSON encoding's `null`. A 1-byte flag selects which
+    of the three; all round-trip exactly via unpack_addr."""
+    if not addr:
+        return bytes([2])
+    host = addr.rsplit(":", 1)[0]
+    if host.endswith(".onion"):
+        pub, port = onion_split(addr)
+        return bytes([0]) + pub + struct.pack(">H", port)
+    raw = addr.encode("utf-8")
+    if len(raw) > 0xFFFF:
+        raise ValueError("address too long")
+    return bytes([1]) + struct.pack(">H", len(raw)) + raw
+
+def unpack_addr(b: bytes, off: int):
+    if len(b) - off < 1:
+        raise ValueError("truncated address")
+    flag = b[off]; off += 1
+    if flag == 0:
+        if len(b) - off < 34:
+            raise ValueError("truncated onion address")
+        pub = b[off:off+32]; off += 32
+        port = struct.unpack(">H", b[off:off+2])[0]; off += 2
+        return onion_join(pub, port), off
+    if flag == 1:
+        if len(b) - off < 2:
+            raise ValueError("truncated address length")
+        n = struct.unpack(">H", b[off:off+2])[0]; off += 2
+        if len(b) - off < n:
+            raise ValueError("truncated address")
+        return b[off:off+n].decode("utf-8"), off + n
+    if flag == 2:
+        return None, off
+    raise ValueError("unknown address encoding")
+
 def pack_cert(c: dict) -> bytes:
     name = c["device_name"].encode("utf-8")
     return (bytes.fromhex(c["identity_pub"]) + bytes.fromhex(c["device_pub"])
@@ -72,13 +122,13 @@ _VER = 0x01
 def _wrap(typ: int, body: bytes) -> str:
     return b58encode(bytes([_VER, typ]) + body)
 
-def encode_invite(id_prefix_hex, onion_pub, port, nonce_hex, expiry) -> str:
-    body = (bytes.fromhex(id_prefix_hex) + onion_pub + struct.pack(">H", port)
+def encode_invite(id_prefix_hex, addr, nonce_hex, expiry) -> str:
+    body = (bytes.fromhex(id_prefix_hex) + pack_addr(addr)
             + bytes.fromhex(nonce_hex) + struct.pack(">I", int(expiry)))
     return _wrap(1, body)
 
-def encode_response(onion_pub, port, nonce_hex, peer_nonce_hex, sig_hex, cert) -> str:
-    body = (onion_pub + struct.pack(">H", port) + bytes.fromhex(nonce_hex)
+def encode_response(addr, nonce_hex, peer_nonce_hex, sig_hex, cert) -> str:
+    body = (pack_addr(addr) + bytes.fromhex(nonce_hex)
             + bytes.fromhex(peer_nonce_hex) + bytes.fromhex(sig_hex) + pack_cert(cert))
     return _wrap(2, body)
 
@@ -93,20 +143,25 @@ def decode(code: str):
     typ, body = raw[1], raw[2:]
     try:
         if typ == 1:
-            if len(body) < 58:
+            if len(body) < 4:
                 raise ValueError("truncated invite")
-            return "invite", {
-                "id_prefix": body[0:4].hex(),
-                "addr": onion_join(body[4:36], struct.unpack(">H", body[36:38])[0]),
-                "nonce": body[38:54].hex(),
-                "expiry": struct.unpack(">I", body[54:58])[0]}
+            id_prefix = body[0:4].hex()
+            addr, off = unpack_addr(body, 4)
+            if len(body) - off < 20:            # nonce(16) + expiry(4)
+                raise ValueError("truncated invite")
+            nonce = body[off:off+16].hex(); off += 16
+            expiry = struct.unpack(">I", body[off:off+4])[0]
+            return "invite", {"id_prefix": id_prefix, "addr": addr,
+                              "nonce": nonce, "expiry": expiry}
         if typ == 2:
-            if len(body) < 268:
+            addr, off = unpack_addr(body, 0)
+            if len(body) - off < 96:            # nonce(16)+peer_nonce(16)+sig(64)
                 raise ValueError("truncated response")
-            pub = body[0:32]; port = struct.unpack(">H", body[32:34])[0]
-            nonce = body[34:50].hex(); peer = body[50:66].hex(); sig = body[66:130].hex()
-            cert, _ = unpack_cert(body, 130)
-            return "response", {"addr": onion_join(pub, port), "nonce": nonce,
+            nonce = body[off:off+16].hex(); off += 16
+            peer = body[off:off+16].hex(); off += 16
+            sig = body[off:off+64].hex(); off += 64
+            cert, _ = unpack_cert(body, off)
+            return "response", {"addr": addr, "nonce": nonce,
                                 "peer_nonce": peer, "sig": sig, "cert": cert}
         if typ == 3:
             if len(body) < 218:

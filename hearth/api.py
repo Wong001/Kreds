@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 import time
 import zipfile
 from pathlib import Path
@@ -15,7 +14,7 @@ from fastapi import (Body, FastAPI, File, HTTPException, Form, Request,
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import applock, update
+from . import applock, invitecodec, update
 from .messages import (_is_hex_color, AVATAR_ALIGNS, AVATAR_SHAPES,
                        AVATAR_SIZES, MAX_BIO, MAX_BLOB_BYTES,
                        MAX_VIDEO_UPLOAD)
@@ -462,7 +461,11 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
     @app.post("/api/friend/invite")
     async def friend_invite():
         payload = node.create_invite()
-        return {"payload": payload, "expires_at": json.loads(payload)["expires_at"]}
+        # create_invite now returns a compact base58 code (spec
+        # 2026-07-10-compact-invite), not JSON -- decode it to read back
+        # the expiry the client's countdown UI needs.
+        _, d = invitecodec.decode(payload)
+        return {"payload": payload, "expires_at": d["expiry"]}
 
     @app.post("/api/friend/respond")
     async def friend_respond(body: dict = Body(...)):

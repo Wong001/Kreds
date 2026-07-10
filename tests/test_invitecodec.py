@@ -24,10 +24,9 @@ def test_fingerprint_is_4_chars_and_stable():
 def test_invite_roundtrip_and_size():
     idhex = "ab" * 32
     addr = "otkspt5nohnwvmgir7obhcpeouqx4qkxchorw3ybhznjatdmwc7t5lad.onion:53799"
-    pub, port = ic.onion_split(addr)
     nonce = os.urandom(16).hex()
     expiry = int(time.time()) + 600
-    code = ic.encode_invite(idhex[:8], pub, port, nonce, expiry)  # id_prefix = first 4 bytes = 8 hex
+    code = ic.encode_invite(idhex[:8], addr, nonce, expiry)  # id_prefix = first 4 bytes = 8 hex
     assert len(code) < 100                                        # the whole point
     typ, d = ic.decode(code)
     assert typ == "invite"
@@ -39,8 +38,7 @@ def test_response_and_final_roundtrip_with_cert():
             "device_name": "desktop", "enrolled_at": 1783534958.87,
             "signature": "ef"*64}
     addr = "otkspt5nohnwvmgir7obhcpeouqx4qkxchorw3ybhznjatdmwc7t5lad.onion:53799"
-    pub, port = ic.onion_split(addr)
-    resp = ic.encode_response(pub, port, "aa"*16, "bb"*16, "cc"*64, cert)
+    resp = ic.encode_response(addr, "aa"*16, "bb"*16, "cc"*64, cert)
     typ, d = ic.decode(resp)
     assert typ == "response" and d["cert"] == cert and d["addr"] == addr
     assert d["nonce"] == "aa"*16 and d["peer_nonce"] == "bb"*16 and d["sig"] == "cc"*64
@@ -48,23 +46,50 @@ def test_response_and_final_roundtrip_with_cert():
     typ2, d2 = ic.decode(fin)
     assert typ2 == "final" and d2["cert"] == cert and d2["nonce"] == "bb"*16 and d2["sig"] == "dd"*64
 
+def test_pack_addr_roundtrips_onion_plain_and_none():
+    # onion (the compact-size win path)
+    onion_addr = "otkspt5nohnwvmgir7obhcpeouqx4qkxchorw3ybhznjatdmwc7t5lad.onion:53799"
+    packed = ic.pack_addr(onion_addr)
+    addr, off = ic.unpack_addr(packed, 0)
+    assert addr == onion_addr and off == len(packed)
+    # a non-onion "host:port" is a first-class gossip_addr too (runner.py's
+    # tor=False dev/LAN path, and every loopback-socket test in the suite)
+    plain_addr = "127.0.0.1:59999"
+    packed2 = ic.pack_addr(plain_addr)
+    addr2, off2 = ic.unpack_addr(packed2, 0)
+    assert addr2 == plain_addr and off2 == len(packed2)
+    # gossip_addr never set (fresh node, no listener bound yet)
+    packed3 = ic.pack_addr(None)
+    addr3, off3 = ic.unpack_addr(packed3, 0)
+    assert addr3 is None and off3 == len(packed3)
+
 def test_decode_rejects_bad_version_and_garbage():
     import pytest
+    addr = "otkspt5nohnwvmgir7obhcpeouqx4qkxchorw3ybhznjatdmwc7t5lad.onion:53799"
     with pytest.raises(ValueError):
-        ic.decode("z" + ic.encode_invite("ab"*4, os.urandom(32), 1, "aa"*16, 1)[1:])  # corrupt
+        ic.decode("z" + ic.encode_invite("ab"*4, addr, "aa"*16, 1)[1:])  # corrupt
     with pytest.raises(ValueError):
         ic.decode("!!!!not base58!!!!")
 
 def test_decode_rejects_truncated_bodies_as_valueerror():
     import pytest
-    # A valid header (version+type) with a too-short invite body
-    short_invite = ic.b58encode(bytes([0x01, 0x01]) + b"\x00" * 10)
+    import struct as _struct
+    # A valid header (version+type) with a too-short invite body (not even
+    # a full id_prefix + address flag)
+    short_invite = ic.b58encode(bytes([0x01, 0x01]) + b"\x00" * 3)
     with pytest.raises(ValueError, match="truncated invite"):
         ic.decode(short_invite)
-    # A response with body shorter than 268 bytes
+    # A response with body shorter than the address+nonce+peer+sig minimum
     short_response = ic.b58encode(bytes([0x01, 0x02]) + b"\x00" * 100)
     with pytest.raises(ValueError, match="truncated response"):
         ic.decode(short_response)
+    # A response whose plain-address (flag=1) length prefix claims more
+    # bytes than actually follow it -- untrusted pasted input, not just an
+    # honest short message.
+    bad_addr_len_response = ic.b58encode(
+        bytes([0x01, 0x02]) + bytes([1]) + _struct.pack(">H", 500) + b"\x00" * 5)
+    with pytest.raises(ValueError, match="truncated address"):
+        ic.decode(bad_addr_len_response)
     # A final with body shorter than 218 bytes
     short_final = ic.b58encode(bytes([0x01, 0x03]) + b"\x00" * 50)
     with pytest.raises(ValueError, match="truncated final"):

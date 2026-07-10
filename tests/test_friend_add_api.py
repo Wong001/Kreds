@@ -107,8 +107,9 @@ def test_friend_add_malformed_json_400(tmp_path):
 
 
 def test_friend_add_missing_cert_key_400(tmp_path):
-    # Valid JSON, right "t", but missing the "cert" key -> KeyError inside
-    # respond_to_invite's EnrollmentCert.from_dict -- must 400, not 500.
+    # A JSON string is not a valid compact invite code at all (spec
+    # 2026-07-10-compact-invite -- invites are base58, not JSON) -> raises
+    # inside invitecodec.decode via respond_to_invite -- must 400, not 500.
     b = HearthNode.create(tmp_path / "b", "B", "b-dev")
     c = TestClient(build_app(b))
     bad = json.dumps({"t": "hearth-invite", "nonce": "x"})
