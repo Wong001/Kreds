@@ -890,8 +890,9 @@ class HearthNode:
         # id_prefix so complete_invite can bind it.
         my_nonce = os.urandom(16).hex()
         self._pending_responses = {k: v for k, v in self._pending_responses.items()
-                                   if v[3] > time.time()}          # purge expired
-        # store id_prefix alongside (addr, my_nonce, expiry) for the binding check
+                                   if v[2] > time.time()}          # purge expired (v[2]=expiry)
+        # store (id_prefix, addr, expiry, invite_nonce) - expiry is index 2,
+        # which is what the purge above and complete_invite's unpack both read.
         self._pending_responses[my_nonce] = (
             inv["id_prefix"], inv["addr"], time.time() + 600, inv["nonce"])
         return invitecodec.encode_response(
