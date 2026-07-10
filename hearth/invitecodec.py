@@ -53,11 +53,17 @@ def pack_cert(c: dict) -> bytes:
             + struct.pack(">H", len(name)) + name)
 
 def unpack_cert(b: bytes, off: int):
+    # Check fixed-width portion exists: 32+32+8+64+2 = 138 bytes
+    if len(b) - off < 138:
+        raise ValueError("truncated cert")
     ident = b[off:off+32].hex();      off += 32
     dev = b[off:off+32].hex();        off += 32
     enrolled = struct.unpack(">d", b[off:off+8])[0]; off += 8
     sig = b[off:off+64].hex();        off += 64
     nl = struct.unpack(">H", b[off:off+2])[0]; off += 2
+    # Check name buffer exists
+    if off + nl > len(b):
+        raise ValueError("truncated cert name")
     name = b[off:off+nl].decode("utf-8"); off += nl
     return {"identity_pub": ident, "device_pub": dev, "device_name": name,
             "enrolled_at": enrolled, "signature": sig}, off
@@ -85,20 +91,29 @@ def decode(code: str):
     if len(raw) < 2 or raw[0] != _VER:
         raise ValueError("unrecognized invite")
     typ, body = raw[1], raw[2:]
-    if typ == 1:
-        return "invite", {
-            "id_prefix": body[0:4].hex(),
-            "addr": onion_join(body[4:36], struct.unpack(">H", body[36:38])[0]),
-            "nonce": body[38:54].hex(),
-            "expiry": struct.unpack(">I", body[54:58])[0]}
-    if typ == 2:
-        pub = body[0:32]; port = struct.unpack(">H", body[32:34])[0]
-        nonce = body[34:50].hex(); peer = body[50:66].hex(); sig = body[66:130].hex()
-        cert, _ = unpack_cert(body, 130)
-        return "response", {"addr": onion_join(pub, port), "nonce": nonce,
-                            "peer_nonce": peer, "sig": sig, "cert": cert}
-    if typ == 3:
-        nonce = body[0:16].hex(); sig = body[16:80].hex()
-        cert, _ = unpack_cert(body, 80)
-        return "final", {"nonce": nonce, "sig": sig, "cert": cert}
-    raise ValueError("unknown message type")
+    try:
+        if typ == 1:
+            if len(body) < 58:
+                raise ValueError("truncated invite")
+            return "invite", {
+                "id_prefix": body[0:4].hex(),
+                "addr": onion_join(body[4:36], struct.unpack(">H", body[36:38])[0]),
+                "nonce": body[38:54].hex(),
+                "expiry": struct.unpack(">I", body[54:58])[0]}
+        if typ == 2:
+            if len(body) < 268:
+                raise ValueError("truncated response")
+            pub = body[0:32]; port = struct.unpack(">H", body[32:34])[0]
+            nonce = body[34:50].hex(); peer = body[50:66].hex(); sig = body[66:130].hex()
+            cert, _ = unpack_cert(body, 130)
+            return "response", {"addr": onion_join(pub, port), "nonce": nonce,
+                                "peer_nonce": peer, "sig": sig, "cert": cert}
+        if typ == 3:
+            if len(body) < 218:
+                raise ValueError("truncated final")
+            nonce = body[0:16].hex(); sig = body[16:80].hex()
+            cert, _ = unpack_cert(body, 80)
+            return "final", {"nonce": nonce, "sig": sig, "cert": cert}
+        raise ValueError("unknown message type")
+    except (struct.error, IndexError) as e:
+        raise ValueError("malformed invite") from e

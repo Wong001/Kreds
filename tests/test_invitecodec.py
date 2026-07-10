@@ -54,3 +54,26 @@ def test_decode_rejects_bad_version_and_garbage():
         ic.decode("z" + ic.encode_invite("ab"*4, os.urandom(32), 1, "aa"*16, 1)[1:])  # corrupt
     with pytest.raises(ValueError):
         ic.decode("!!!!not base58!!!!")
+
+def test_decode_rejects_truncated_bodies_as_valueerror():
+    import pytest
+    # A valid header (version+type) with a too-short invite body
+    short_invite = ic.b58encode(bytes([0x01, 0x01]) + b"\x00" * 10)
+    with pytest.raises(ValueError, match="truncated invite"):
+        ic.decode(short_invite)
+    # A response with body shorter than 268 bytes
+    short_response = ic.b58encode(bytes([0x01, 0x02]) + b"\x00" * 100)
+    with pytest.raises(ValueError, match="truncated response"):
+        ic.decode(short_response)
+    # A final with body shorter than 218 bytes
+    short_final = ic.b58encode(bytes([0x01, 0x03]) + b"\x00" * 50)
+    with pytest.raises(ValueError, match="truncated final"):
+        ic.decode(short_final)
+    # A cert whose name_len claims more bytes than remain: construct a type-3 message
+    # with valid header through sig, but a cert that overruns
+    cert_overrun = (bytes([0x01, 0x03]) + b"\x00"*16 + b"\x00"*64  # nonce + sig
+                    + b"\x00"*32 + b"\x00"*32 + b"\x00"*8 + b"\x00"*64  # identity, device, enrolled, signature
+                    + b"\xff\xff")  # name_len = 65535, no following bytes
+    short_final_cert = ic.b58encode(cert_overrun)
+    with pytest.raises(ValueError, match="truncated cert name"):
+        ic.decode(short_final_cert)
