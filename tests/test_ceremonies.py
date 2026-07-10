@@ -1,7 +1,7 @@
 import pytest
 
 from hearth import invitecodec
-from hearth.node import HearthNode
+from hearth.node import HearthNode, _friend_add_body
 
 
 def test_friend_ceremony_full_flow(tmp_path):
@@ -151,7 +151,16 @@ def test_full_ceremony_roundtrip_compact(tmp_path):
 
 
 def test_binding_check_rejects_wrong_identity_in_final(tmp_path):
-    # A final whose cert identity[:4] != the invite's id_prefix is rejected.
+    # A final whose cert identity[:8] != the invite's id_prefix is rejected --
+    # even when the cert and signature in that final are BOTH otherwise
+    # perfectly valid. Mallory forges a final carrying HER OWN valid cert
+    # and HER OWN valid signature over the peer nonce (so it cleanly passes
+    # cert.verify() and _sig_ok); only the binding check itself
+    # (cert.identity_pub[:8] != id_prefix in complete_invite) can catch
+    # this substitution. A weaker forgery -- a foreign cert paired with
+    # someone else's signature -- would fail ordinary signature
+    # verification too, so the test would keep passing even if the binding
+    # check were deleted. This construction isolates the binding check.
     wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
     freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
     mallory = HearthNode.create(tmp_path / "m", "Mallory", "mal-phone")
@@ -162,6 +171,11 @@ def test_binding_check_rejects_wrong_identity_in_final(tmp_path):
     response = freja.respond_to_invite(invite)
     good_final = wong.finalize_invite(response)
     typ, d = invitecodec.decode(good_final)
-    forged = invitecodec.encode_final(d["nonce"], d["sig"], mallory.device.cert.to_dict())
-    with pytest.raises(ValueError):
-        freja.complete_invite(forged)             # fingerprint mismatch
+    peer_nonce = d["nonce"]                     # freja's nonce from respond_to_invite
+    mallory_sig = mallory.device.sign_raw(_friend_add_body(peer_nonce))
+    forged = invitecodec.encode_final(peer_nonce, mallory_sig,
+                                      mallory.device.cert.to_dict())
+    with pytest.raises(ValueError, match="fingerprint"):
+        freja.complete_invite(forged)            # binding check, not a sig failure
+    assert freja.store.is_known(mallory.identity_pub) is False
+    assert freja.store.is_known(wong.identity_pub) is False
