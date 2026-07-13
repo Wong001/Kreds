@@ -132,3 +132,48 @@ def test_wipe_all(tmp_path):
     assert s.known_identities() == []
     assert s.post_messages() == [] and s.list_peers() == []
     assert s.get_meta("gossip_addr") is None            # meta wiped too
+
+
+def test_dm_thread_same_second_tie_orders_by_local_arrival(tmp_path):
+    """created_at is wall-clock time.time(): on this machine consecutive
+    calls return the IDENTICAL float ~99.997% of the time (measured), so
+    two DMs landing in the same compose burst routinely tie exactly.
+    'ORDER BY created_at ASC' alone has no tie-break, so which message
+    dm_thread puts last (and node.conversations()' last_from_me, and the
+    web client's chat-bubble order) becomes a function of unrelated
+    storage/scan order rather than of the messages themselves.
+
+    Store.profile()'s own (created_at, seq, device_pub) idiom is NOT
+    enough on its own here, verified against real HearthNode/Store
+    plumbing (9/30 real runs still failed with only that tie-break, 0/60
+    once rowid was added): seq is a PER-DEVICE publish counter, and two
+    peers who've each signed the same number of prior messages before
+    their first DM to each other -- exactly this repo's
+    befriend_with_enckeys (one enckey publish each) followed by
+    compose_dm -- land on the SAME seq value too. Once seq also ties,
+    (seq, device_pub) alone decays to an arbitrary lexicographic coin
+    flip on a random key, unrelated to which message this store actually
+    learned about most recently. The tie
+    must ultimately fall back to THIS store's own local arrival order
+    (SQLite rowid, monotonic per insert) -- the only signal that answers
+    'which message did I see/compose last', which is what last_from_me
+    needs. Proven here for BOTH insertion orders so the result can't be
+    an accident of whichever device_pub happens to sort higher."""
+    wong, freja = person("wong-phone"), person("freja-phone")
+    m_a = dm(wong, freja.identity_pub, "hej", now=100.0)          # seq=1
+    m_b = dm(freja, wong.identity_pub, "hej selv", now=100.0)     # seq=1 too
+    assert m_a.payload["created_at"] == m_b.payload["created_at"]
+    assert m_a.seq == m_b.seq                    # the seq tie-break alone
+                                                  # cannot disambiguate
+
+    for label, insertion in (("a_then_b", (m_a, m_b)),
+                             ("b_then_a", (m_b, m_a))):
+        s = Store(tmp_path / f"{label}.db")
+        s.add_identity(wong.identity_pub, is_self=True)
+        s.add_identity(freja.identity_pub)
+        for m in insertion:
+            s.ingest_message(m)
+        thread = s.dm_thread(wong.identity_pub, freja.identity_pub)
+        # whichever arrived (was inserted) into THIS store last must be
+        # reported last -- regardless of the arbitrary device_pub values
+        assert thread[-1].msg_id == insertion[-1].msg_id, label

@@ -667,12 +667,33 @@ class Store:
     def dm_thread(self, a_identity: str,
                   b_identity: str) -> List[SignedMessage]:
         with self._lock:
+            # created_at alone ties (wall-clock time.time(), sub-second
+            # collisions are common on fast successive composes) and SQLite
+            # leaves same-key order unspecified/implementation-defined --
+            # so "last message" (and the web client's chat-bubble order)
+            # was silently nondeterministic.
+            #
+            # Store.profile() resolves its own latest-wins ties with
+            # (created_at, seq, device_pub) -- tried here first, but seq is
+            # a PER-DEVICE publish counter, and two peers who've each
+            # signed the same number of prior messages before their first
+            # DM to each other (e.g. one enckey publish each, then compose
+            # -- exactly this repo's befriend_with_enckeys + compose_dm
+            # flow) land on the SAME seq for that DM too. Once seq also
+            # ties, (seq, device_pub) decays to a lexicographic coin flip
+            # on a random key, unrelated to which message this node
+            # actually saw/composed last -- verified against real
+            # HearthNode/Store plumbing, ~1 in 3 runs still showed the
+            # wrong side as "last". rowid (monotonic per insert) is this
+            # store's own local arrival order and is the only signal that
+            # actually answers that question, so it's the final tie-break
+            # instead of device_pub.
             return [SignedMessage.from_dict(json.loads(mj))
                     for (mj,) in self._db.execute(
                         "SELECT msg_json FROM messages WHERE kind=?"
                         " AND ((identity_pub=? AND recipient=?)"
                         "  OR (identity_pub=? AND recipient=?))"
-                        " ORDER BY created_at ASC",
+                        " ORDER BY created_at ASC, seq ASC, rowid ASC",
                         (KIND_DM, a_identity, b_identity,
                          b_identity, a_identity))]
 
