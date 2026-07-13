@@ -78,9 +78,16 @@ class LiveNode:
         self._run(self.sync.sync_with(other.gossip_addr), timeout=30)
 
     def stop(self):
+        # Must survive a partially-failed start() (reviewer finding: an
+        # AttributeError here would leak the OTHER node's thread/socket
+        # via the shared finally).
         async def _stop():
-            self.server.should_exit = True
-            await self.sync.stop()
+            server = getattr(self, "server", None)
+            if server is not None:
+                server.should_exit = True
+            sync = getattr(self, "sync", None)
+            if sync is not None:
+                await sync.stop()
         try:
             self._run(_stop(), timeout=10)
         finally:
@@ -175,5 +182,7 @@ def test_seen_dot_and_dm_badge_live(tmp_path):
             assert not errors, f"console pageerrors: {errors}"
             browser.close()
     finally:
-        a.stop()
-        b.stop()
+        try:
+            a.stop()
+        finally:
+            b.stop()
