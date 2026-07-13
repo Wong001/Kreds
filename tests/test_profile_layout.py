@@ -1,9 +1,16 @@
 """Tests for KIND_PROFILE_LAYOUT: a signed, latest-wins record (mirrors the
-profile record) holding an ordered list of block msg_ids that arranges the
-profile wall. `single_node` is defined here as a local pytest fixture (no
-such fixture exists in the repo); layout ordering is single-author render
-logic. The API endpoint's input handling is covered in
-test_api_profile_layout below."""
+profile record) holding an ordered list of block msg_ids. `single_node` is
+defined here as a local pytest fixture (no such fixture exists in the
+repo). The API endpoint's input handling is covered in
+test_api_profile_layout below.
+
+Retired (spec 2026-07-13, collage Slice A): `order` no longer arranges the
+profile wall -- profile_view renders newest-first always, geometry-ruled
+by pins/spans instead (proven single-node in tests/test_block_pins.py).
+`order` still rides the wire for back-compat, so the tests below that
+used to prove view-ordering now prove (a) the wall really is newest-first
+regardless of `order`, and (b) the order record itself is still
+latest-wins at the store layer."""
 import pytest
 
 from fastapi.testclient import TestClient
@@ -17,7 +24,7 @@ def single_node(tmp_path):
     return HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
 
 
-def test_layout_orders_wall(single_node, monkeypatch):
+def test_wall_stays_newest_first_despite_explicit_order(single_node, monkeypatch):
     """Regression: composing 3 posts back-to-back can land on the same
     time.time() value (fast hardware / coarse clock granularity), which
     made the created_at DESC ordering ties non-deterministic and flaked
@@ -25,7 +32,11 @@ def test_layout_orders_wall(single_node, monkeypatch):
     hearth.node, which calls it once per compose_post to stamp created_at)
     so each call returns a strictly increasing value -- A, B, C get
     unambiguous distinct timestamps and "newest-first" is deterministic,
-    without weakening the assertion below."""
+    without weakening the assertion below.
+
+    Retired (spec 2026-07-13): explicit order used to reshuffle the wall;
+    now it's wire-compat only (see module docstring) -- the wall is
+    newest-first before AND after set_profile_layout."""
     clock = iter(1_700_000_000.0 + i * 0.01 for i in range(10_000))
     monkeypatch.setattr("hearth.node.time.time", lambda: next(clock))
     n = single_node
@@ -34,34 +45,44 @@ def test_layout_orders_wall(single_node, monkeypatch):
     c = n.compose_post("C", scope="kreds", placement="profile")
     # default: newest-first (C, B, A)
     assert [p["text"] for p in n.profile_view(n.identity_pub)["wall"]] == ["C", "B", "A"]
-    n.set_profile_layout([a, c, b])            # explicit order A, C, B
-    assert [p["text"] for p in n.profile_view(n.identity_pub)["wall"]] == ["A", "C", "B"]
+    n.set_profile_layout([a, c, b])            # explicit order -- inert for rendering
+    assert [p["text"] for p in n.profile_view(n.identity_pub)["wall"]] == ["C", "B", "A"]
+    assert n.store.profile_layout(n.identity_pub)["order"] == [a, c, b]  # record still carries it
 
 
-def test_unlisted_block_prepended_newest_first(single_node):
+def test_wall_stays_newest_first_with_or_without_a_layout_record(single_node):
+    """Retired (spec 2026-07-13): a fresh post used to be prepended ahead
+    of an "arranged" set; now every post renders newest-first regardless
+    of whether a layout record exists at all."""
     n = single_node
     a = n.compose_post("A", scope="kreds", placement="profile")
     b = n.compose_post("B", scope="kreds", placement="profile")
-    n.set_profile_layout([a, b])               # A, B arranged
-    c = n.compose_post("C", scope="kreds", placement="profile")   # new, unlisted
-    # fresh post surfaces on top, then the arranged order
-    assert [p["text"] for p in n.profile_view(n.identity_pub)["wall"]] == ["C", "A", "B"]
+    n.set_profile_layout([a, b])               # wire-compat only, doesn't arrange
+    c = n.compose_post("C", scope="kreds", placement="profile")   # newest
+    assert [p["text"] for p in n.profile_view(n.identity_pub)["wall"]] == ["C", "B", "A"]
 
 
 def test_unknown_id_in_layout_skipped(single_node):
+    # A syntactically-valid but nonexistent id in `order` must not error --
+    # true before the retirement (it was skipped when shaping the wall) and
+    # still true now (order isn't read by profile_view at all any more).
     n = single_node
     a = n.compose_post("A", scope="kreds", placement="profile")
-    n.set_profile_layout(["f" * 64, a])        # unknown id skipped, no error
+    n.set_profile_layout(["f" * 64, a])        # no error
     assert [p["text"] for p in n.profile_view(n.identity_pub)["wall"]] == ["A"]
 
 
 def test_layout_latest_wins(single_node):
+    """Retired for view-shaping (order no longer changes wall order --
+    see test_wall_stays_newest_first_with_or_without_a_layout_record).
+    This proves latest-wins still holds at the record layer
+    (store.profile_layout), the wire-compat guarantee that survives."""
     n = single_node
     a = n.compose_post("A", scope="kreds", placement="profile")
     b = n.compose_post("B", scope="kreds", placement="profile")
     n.set_profile_layout([a, b])
     n.set_profile_layout([b, a])
-    assert [p["text"] for p in n.profile_view(n.identity_pub)["wall"]] == ["B", "A"]
+    assert n.store.profile_layout(n.identity_pub)["order"] == [b, a]
 
 
 def test_layout_validation():

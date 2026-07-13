@@ -1,12 +1,16 @@
-"""Two-node integration test for per-block bento sizes (the `sizes` map
-inside KIND_PROFILE_LAYOUT, Kreds profile bento Phase A). Mirrors
+"""Two-node integration test for the `sizes` map inside
+KIND_PROFILE_LAYOUT (Kreds profile bento Phase A). Mirrors
 tests/test_profile_grids_integration.py: real SyncService, the started()
-helper, store-level befriend(). tests/test_profile_sizes.py already proves
-size annotation + reorder/grid-preserves-size at the single-node/API level;
-this file proves the sizes map itself survives encrypt -> sync -> decrypt,
-that a friend sees the chosen sizes after sync, and that reordering the
-wall + restyling a block's photo grid (separate publishes) do not drop an
-already-set size on the friend's side."""
+helper, store-level befriend().
+
+Retired (spec 2026-07-13, collage Slice A): profile_view no longer
+annotates wall entries with `p["size"]`/`p["grid"]` -- legacy sizes now
+map to default spans instead (proven single-node in
+tests/test_block_pins.py). Bento sizes ride the wire for back-compat
+only. This file now asserts the record itself (sizes, then reorder +
+grid change) survives encrypt -> sync -> decrypt to a friend's store via
+store.profile_layout(...), keeping the wire-compat guarantee pinned
+without asserting retired view annotations."""
 import asyncio
 
 from hearth.node import HearthNode
@@ -25,7 +29,7 @@ async def started(node):
     return svc, f"127.0.0.1:{port}"
 
 
-def test_friend_sees_bento_sizes_and_they_survive_reorder_and_grid_change(tmp_path):
+def test_friend_gets_bento_size_records_surviving_reorder_and_grid_change(tmp_path):
     async def scenario():
         a = HearthNode.create(tmp_path / "a", "Anna", "anna-phone")
         b = HearthNode.create(tmp_path / "b", "Bo", "bo-phone")
@@ -45,23 +49,21 @@ def test_friend_sees_bento_sizes_and_they_survive_reorder_and_grid_change(tmp_pa
         a.set_block_size(three, "full")
         await sa.sync_with(ba)
 
-        view = b.profile_view(a.identity_pub)
-        wall = {p["msg_id"]: p for p in view["wall"]}
-        assert wall[one]["size"] == "wide"
-        assert wall[two]["size"] == "small"
-        assert wall[three]["size"] == "full"        # explicit full, same as default
+        sizes = b.store.profile_layout(a.identity_pub)["sizes"]
+        assert sizes[one] == "wide"
+        assert sizes[two] == "small"
+        assert three not in sizes                   # explicit full clears the entry
 
-        a.set_profile_layout([three, one, two])     # reorder A's wall
+        a.set_profile_layout([three, one, two])     # reorder A's wall (wire-compat only)
         a.set_block_grid(two, "cols3")               # change one block's grid
         await sa.sync_with(ba)
 
-        view2 = b.profile_view(a.identity_pub)
-        assert [p["msg_id"] for p in view2["wall"]] == [three, one, two]
-        wall2 = {p["msg_id"]: p for p in view2["wall"]}
-        assert wall2[one]["size"] == "wide"          # sizes survived the reorder...
-        assert wall2[two]["size"] == "small"         # ...and the grid change...
-        assert wall2[three]["size"] == "full"
-        assert wall2[two]["grid"] == "cols3"         # ...and the grid landed too
+        layout2 = b.store.profile_layout(a.identity_pub)
+        assert layout2["order"] == [three, one, two]
+        assert layout2["sizes"][one] == "wide"       # sizes survived the reorder...
+        assert layout2["sizes"][two] == "small"      # ...and the grid change...
+        assert three not in layout2["sizes"]
+        assert layout2["grids"][two] == "cols3"      # ...and the grid landed too
 
         for s in (sa, sb):
             await s.stop()

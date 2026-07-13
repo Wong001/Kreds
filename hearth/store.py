@@ -443,7 +443,8 @@ class Store:
 
     def profile_layout(self, identity_pub: str) -> dict:
         """Latest-wins {order: [...], grids: {msg_id: layout},
-        sizes: {msg_id: size}} for this author's wall. Empty when never
+        sizes: {msg_id: size}, pins: {msg_id: {x,y,w,h}},
+        spans: {msg_id: {w,h}}} for this author's wall. Empty when never
         arranged."""
         with self._lock:
             best, best_key = None, None
@@ -456,9 +457,12 @@ class Store:
                 if best is None or key > best_key:
                     best = {"order": p.get("order", []),
                             "grids": p.get("grids", {}),
-                            "sizes": p.get("sizes", {})}
+                            "sizes": p.get("sizes", {}),
+                            "pins": p.get("pins", {}),
+                            "spans": p.get("spans", {})}
                     best_key = key
-            return best or {"order": [], "grids": {}, "sizes": {}}
+            return best or {"order": [], "grids": {}, "sizes": {},
+                            "pins": {}, "spans": {}}
 
     def messages_not_in(self, summaries: dict, entitled: Set[str],
                         peer_identity: str) -> List[SignedMessage]:

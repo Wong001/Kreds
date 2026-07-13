@@ -1,13 +1,15 @@
-"""Two-node integration test for per-block grid styling (the `grids` map
-inside KIND_PROFILE_LAYOUT, Slice 3b), proven over real sync sockets.
-Mirrors tests/test_profile_arrange_integration.py: real SyncService,
-started() helper, store-level befriend(). tests/test_profile_grids.py
-already proves grid annotation + reorder-preserves-grids at the
-single-node/API level; this file proves the grids map itself survives
-encrypt -> sync -> decrypt, that restyling republishes and a friend sees
-the new style after a further sync, and that reordering the wall (a
-separate publish) does not drop an already-set grid on the friend's
-side."""
+"""Two-node integration test for the `grids` map inside
+KIND_PROFILE_LAYOUT (Slice 3b), proven over real sync sockets. Mirrors
+tests/test_profile_arrange_integration.py: real SyncService, started()
+helper, store-level befriend().
+
+Retired (spec 2026-07-13, collage Slice A): profile_view no longer
+annotates wall entries with `p["grid"]` -- the client stops reading it
+(Task 5, same bundle). Grid styling rides the wire for back-compat only.
+This file now asserts the record itself (restyle, then reorder) survives
+encrypt -> sync -> decrypt to a friend's store via
+store.profile_layout(...)["grids"], keeping the wire-compat guarantee
+pinned without asserting retired view annotations."""
 import asyncio
 
 from hearth.node import HearthNode
@@ -26,7 +28,7 @@ async def started(node):
     return svc, f"127.0.0.1:{port}"
 
 
-def test_friend_sees_restyled_grid_and_it_survives_reorder(tmp_path):
+def test_friend_gets_grid_record_and_it_survives_reorder(tmp_path):
     async def scenario():
         a = HearthNode.create(tmp_path / "a", "Anna", "anna-phone")
         b = HearthNode.create(tmp_path / "b", "Bo", "bo-phone")
@@ -43,21 +45,18 @@ def test_friend_sees_restyled_grid_and_it_survives_reorder(tmp_path):
         a.set_block_grid(multi, "cols3")
         await sa.sync_with(ba)
 
-        view = b.profile_view(a.identity_pub)
-        wall = {p["msg_id"]: p for p in view["wall"]}
-        assert wall[multi]["grid"] == "cols3"       # B can decrypt it, sees the style
+        # B can decrypt it and the record carries the style (wire-compat).
+        assert b.store.profile_layout(a.identity_pub)["grids"][multi] == "cols3"
 
         a.set_block_grid(multi, "hero")             # restyle in place
         await sa.sync_with(ba)
-        view2 = b.profile_view(a.identity_pub)
-        assert {p["msg_id"]: p for p in view2["wall"]}[multi]["grid"] == "hero"
+        assert b.store.profile_layout(a.identity_pub)["grids"][multi] == "hero"
 
-        a.set_profile_layout([other, multi])        # reorder A's wall
+        a.set_profile_layout([other, multi])        # reorder A's wall (wire-compat only)
         await sa.sync_with(ba)
-        view3 = b.profile_view(a.identity_pub)
-        assert [p["msg_id"] for p in view3["wall"]] == [other, multi]
-        wall3 = {p["msg_id"]: p for p in view3["wall"]}
-        assert wall3[multi]["grid"] == "hero"        # grid survived the reorder, on B's side
+        layout = b.store.profile_layout(a.identity_pub)
+        assert layout["order"] == [other, multi]
+        assert layout["grids"][multi] == "hero"      # grid survived the reorder, on B's side
 
         for s in (sa, sb):
             await s.stop()

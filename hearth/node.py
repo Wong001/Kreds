@@ -18,10 +18,11 @@ from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
 from .imagegate import AVATAR_MAX, BANNER_MAX, transcode
 from .videogate import STORY_IMAGE_MAX, transcode_video
 from .messages import (DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
-                       KIND_DELETE, KIND_DM, KIND_POST, MAX_CAPTION,
-                       MAX_LAYOUT, SIZE_LAYOUTS, make_delete, make_dm,
-                       make_enckey, make_post, make_profile,
-                       make_profile_layout, make_ring, make_story)
+                       KIND_DELETE, KIND_DM, KIND_POST, MAX_BLOCK_H,
+                       MAX_CAPTION, MAX_LAYOUT, SIZE_LAYOUTS, WALL_COLS,
+                       make_delete, make_dm, make_enckey, make_post,
+                       make_profile, make_profile_layout, make_ring,
+                       make_story)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -609,11 +610,13 @@ class HearthNode:
         if not all(isinstance(x, str) and len(x) == 64
                    and all(c in "0123456789abcdef" for c in x) for x in order):
             raise ValueError("bad layout id")
-        # Reorder must never drop per-block grid/size styles: carry forward
-        # the current record's grids + sizes maps into the republished layout.
+        # Reorder must never drop per-block grid/size styles, nor the
+        # collage pins/spans maps: carry every one of them forward into
+        # the republished layout.
         cur = self.store.profile_layout(self.identity_pub)
-        return self._publish(make_profile_layout(self.device, order,
-                                                 grids=cur["grids"], sizes=cur["sizes"]))
+        return self._publish(make_profile_layout(
+            self.device, order, grids=cur["grids"], sizes=cur["sizes"],
+            pins=cur["pins"], spans=cur["spans"]))
 
     def set_block_grid(self, msg_id: str, grid: str) -> str:
         if grid not in GRID_LAYOUTS:
@@ -629,8 +632,9 @@ class HearthNode:
             grids[msg_id] = grid
         if len(grids) > MAX_LAYOUT:           # pre-check -> 400, not a 500 from _publish
             raise ValueError("too many styled blocks")
-        return self._publish(make_profile_layout(self.device, cur["order"],
-                                                 grids=grids, sizes=cur["sizes"]))
+        return self._publish(make_profile_layout(
+            self.device, cur["order"], grids=grids, sizes=cur["sizes"],
+            pins=cur["pins"], spans=cur["spans"]))
 
     def set_block_size(self, msg_id: str, size: str) -> str:
         if size not in SIZE_LAYOUTS:
@@ -646,8 +650,67 @@ class HearthNode:
             sizes[msg_id] = size
         if len(sizes) > MAX_LAYOUT:          # pre-check -> 400, not a 500 from _publish
             raise ValueError("too many sized blocks")
-        return self._publish(make_profile_layout(self.device, cur["order"],
-                                                 grids=cur["grids"], sizes=sizes))
+        return self._publish(make_profile_layout(
+            self.device, cur["order"], grids=cur["grids"], sizes=sizes,
+            pins=cur["pins"], spans=cur["spans"]))
+
+    def _check_block_id(self, msg_id):
+        if not (isinstance(msg_id, str) and len(msg_id) == 64
+                and all(c in "0123456789abcdef" for c in msg_id)):
+            raise ValueError("bad msg_id")
+
+    def set_block_pin(self, msg_id: str, x: int, y: int, w: int, h: int) -> str:
+        """Place (or move/resize) a block at explicit cell coordinates.
+        Shape-checked here for a clean 400; overlap is the client's job."""
+        self._check_block_id(msg_id)
+        for v in (x, y, w, h):
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError("bad pin geometry")
+        if not (1 <= w <= WALL_COLS and 1 <= h <= MAX_BLOCK_H
+                and 0 <= x and x + w <= WALL_COLS and 0 <= y <= MAX_LAYOUT):
+            raise ValueError("bad pin geometry")
+        cur = self.store.profile_layout(self.identity_pub)
+        pins = dict(cur["pins"])
+        pins[msg_id] = {"x": x, "y": y, "w": w, "h": h}
+        spans = dict(cur["spans"])
+        spans.pop(msg_id, None)          # geometry lives in the pin now
+        if len(pins) > MAX_LAYOUT:
+            raise ValueError("too many pinned blocks")
+        return self._publish(make_profile_layout(
+            self.device, cur["order"], grids=cur["grids"],
+            sizes=cur["sizes"], pins=pins, spans=spans))
+
+    def unpin_block(self, msg_id: str) -> str:
+        """Send a block back to the unplaced tray, keeping its size."""
+        self._check_block_id(msg_id)
+        cur = self.store.profile_layout(self.identity_pub)
+        pins = dict(cur["pins"])
+        geom = pins.pop(msg_id, None)
+        spans = dict(cur["spans"])
+        if geom is not None:
+            spans[msg_id] = {"w": geom["w"], "h": geom["h"]}
+        return self._publish(make_profile_layout(
+            self.device, cur["order"], grids=cur["grids"],
+            sizes=cur["sizes"], pins=pins, spans=spans))
+
+    def set_block_span(self, msg_id: str, w: int, h: int) -> str:
+        """Size an UNPLACED block. A pinned block's geometry lives in its
+        pin (set_block_pin) - one source of truth, so this refuses."""
+        self._check_block_id(msg_id)
+        if not (isinstance(w, int) and isinstance(h, int)
+                and not isinstance(w, bool) and not isinstance(h, bool)
+                and 1 <= w <= WALL_COLS and 1 <= h <= MAX_BLOCK_H):
+            raise ValueError("bad span")
+        cur = self.store.profile_layout(self.identity_pub)
+        if msg_id in cur["pins"]:
+            raise ValueError("block is pinned - move/resize via block-pin")
+        spans = dict(cur["spans"])
+        spans[msg_id] = {"w": w, "h": h}
+        if len(spans) > MAX_LAYOUT:
+            raise ValueError("too many sized blocks")
+        return self._publish(make_profile_layout(
+            self.device, cur["order"], grids=cur["grids"],
+            sizes=cur["sizes"], pins=cur["pins"], spans=spans))
 
     def profile_view(self, identity_pub: str):
         if identity_pub != self.identity_pub \
@@ -664,27 +727,35 @@ class HearthNode:
                    "avatar_align": "left", "banner": None}
         ring, since = (("kreds", None) if identity_pub == self.identity_pub
                        else self._ring_and_since(identity_pub))
-        # Order the wall by the author's latest-wins layout record: listed
-        # blocks in layout order, any unlisted block prepended newest-first
-        # (fresh posts surface on top until arranged). Unknown/undecryptable
-        # ids in the layout are simply absent from `wall` already (posts_by
-        # only returns what this viewer could decrypt) -- skipped here, no
-        # new confidentiality surface from being named in the order.
-        wall = self.posts_by(identity_pub, "profile")
+        # The collage is geometry-ruled (spec 2026-07-13): pins say where a
+        # block sits; unpinned blocks flow newest-first (posts_by's order).
+        # The legacy order/grids maps ride the wire untouched but no longer
+        # shape rendering; legacy sizes map to default spans so a
+        # never-arranged wall still has sane geometry.
+        wall = self.posts_by(identity_pub, "profile")   # newest-first
         layout = self.store.profile_layout(identity_pub)
-        order, grids, sizes = layout["order"], layout["grids"], layout["sizes"]
-        pos = {mid: i for i, mid in enumerate(order)}
-        listed = [p for p in wall if p["msg_id"] in pos]
-        listed.sort(key=lambda p: pos[p["msg_id"]])
-        unlisted = [p for p in wall if p["msg_id"] not in pos]  # newest-first already
-        ordered_wall = unlisted + listed
-        for p in ordered_wall:
-            p["grid"] = grids.get(p["msg_id"], "auto")
-            p["size"] = sizes.get(p["msg_id"], "full")
+        pins, spans, sizes = layout["pins"], layout["spans"], layout["sizes"]
+
+        def _default_span(p):
+            size = sizes.get(p["msg_id"], "full")
+            if size == "small":
+                return {"w": 1, "h": 1}
+            if size == "wide":
+                return {"w": 2, "h": 2}
+            has_media = bool(p.get("blobs")) or p.get("media") == "video"
+            return {"w": 4, "h": 2} if has_media else {"w": 4, "h": 1}
+
+        for p in wall:
+            pin = pins.get(p["msg_id"])
+            p["pin"] = pin
+            if pin is not None:
+                p["span"] = {"w": pin["w"], "h": pin["h"]}
+            else:
+                p["span"] = spans.get(p["msg_id"]) or _default_span(p)
         return {**rec, "identity_pub": identity_pub,
                 "mine": identity_pub == self.identity_pub,
                 "ring": ring, "since": since,
-                "wall": ordered_wall,
+                "wall": wall,
                 "journal": self.posts_by(identity_pub, "journal")}
 
     def delete_post(self, target_msg_id: str) -> str:
