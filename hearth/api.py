@@ -388,6 +388,22 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         _400(lambda: node.set_block_size(body["msg_id"], body["size"]))
         return {"ok": True}
 
+    @app.post("/api/block-pin")
+    async def block_pin(body: dict = Body(...)):
+        _400(lambda: node.set_block_pin(body["msg_id"], body["x"],
+                                        body["y"], body["w"], body["h"]))
+        return {"ok": True}
+
+    @app.post("/api/block-unpin")
+    async def block_unpin(body: dict = Body(...)):
+        _400(lambda: node.unpin_block(body["msg_id"]))
+        return {"ok": True}
+
+    @app.post("/api/block-span")
+    async def block_span(body: dict = Body(...)):
+        _400(lambda: node.set_block_span(body["msg_id"], body["w"], body["h"]))
+        return {"ok": True}
+
     @app.post("/api/unfriend")
     async def unfriend(body: dict = Body(...)):
         _400(lambda: node.unfriend(body["identity_pub"]))
