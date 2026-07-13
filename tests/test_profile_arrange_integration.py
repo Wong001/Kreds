@@ -51,6 +51,8 @@ def test_friend_gets_order_record_but_wall_stays_newest_first(tmp_path):
         # ...but it no longer shapes B's view of the wall: newest-first always.
         view = b.profile_view(a.identity_pub)
         wall_texts = [p["text"] for p in view["wall"]]
+        # deterministic even on a created_at tie: post_messages' rowid
+        # DESC tie-break orders same-second posts by local arrival.
         assert wall_texts == ["three", "two", "one"]
 
         # A posts a 4th block after "arranging"; newest-first means it's on

@@ -58,6 +58,38 @@ def test_post_messages_accessor(tmp_path):
     assert ids == [b.msg_id, a.msg_id]                   # newest first
 
 
+def test_post_messages_same_second_tie_orders_by_local_arrival(tmp_path):
+    """created_at is wall-clock time.time(): on this machine consecutive
+    calls return the IDENTICAL float ~99.997% of the time (measured, see
+    test_store_dm.py's sibling test for dm_thread), so two posts composed
+    in the same second routinely tie exactly. 'ORDER BY created_at DESC'
+    alone has no tie-break, so which post lands on top of the wall/feed
+    (this is the query behind posts_by/feed/profile_view) becomes a
+    function of unrelated storage/scan order rather than of the posts
+    themselves -- this is the flake test_profile_layout.py's docstrings
+    document (~1-in-5..30 real runs).
+
+    The tie must fall back to THIS store's own local arrival order
+    (SQLite rowid, monotonic per insert) -- mirroring dm_thread's fix.
+    Proven here for BOTH insertion orders so the result can't be an
+    accident of whichever msg_id happens to sort higher."""
+    s, phone = wong(tmp_path)
+    a = _post(phone, "kreds", {}, created_at=100.0)
+    b = _post(phone, "kreds", {}, created_at=100.0)
+    assert a.payload["created_at"] == b.payload["created_at"]
+
+    for label, insertion in (("a_then_b", (a, b)), ("b_then_a", (b, a))):
+        s = Store(tmp_path / f"{label}.db")
+        s.add_identity(phone.identity_pub, is_self=True)
+        for m in insertion:
+            s.ingest_message(m)
+        posts = s.post_messages()
+        # newest-first, and on a created_at tie the LAST-inserted (most
+        # recently arrived locally) post must sort FIRST
+        assert posts[0].msg_id == insertion[-1].msg_id, label
+        assert posts[1].msg_id == insertion[0].msg_id, label
+
+
 def test_uncached_message_ids_includes_own_posts(tmp_path):
     s, phone = wong(tmp_path)
     p = _post(phone, "kreds", {}, created_at=1.0)      # authored by self

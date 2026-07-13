@@ -57,6 +57,8 @@ def test_pins_survive_sync_and_legacy_flows(tmp_path):
         await sb.sync_with(aa)
         view = a.profile_view(b.identity_pub)
         ids = [p["msg_id"] for p in view["wall"]]
+        # deterministic even on a created_at tie: post_messages' rowid
+        # DESC tie-break puts q2 (composed/arrived after q1) first.
         assert ids.index(q2) < ids.index(q1)
         assert all(p["pin"] is None for p in view["wall"])
         assert all(p["span"] == {"w": 4, "h": 1} for p in view["wall"])

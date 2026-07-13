@@ -641,15 +641,34 @@ class Store:
 
     def post_messages(
             self, identity_pub: Optional[str] = None) -> List[SignedMessage]:
+        # created_at alone ties (wall-clock time.time(), sub-second
+        # collisions are common on fast successive composes) and SQLite
+        # leaves same-key order unspecified/implementation-defined -- so
+        # wall/feed/profile_view order (this is the query behind all of
+        # them) was silently nondeterministic on a tie.
+        #
+        # rowid (monotonic per insert) is this store's own local arrival
+        # order -- the ONLY tie-break signal that answers "which post did
+        # I see/compose last", mirroring dm_thread's fix (see that
+        # method's comment for why per-device seq and device_pub are
+        # WRONG tie-breaks here too: seq is a per-device publish counter,
+        # meaningless to compare across different identities' devices, and
+        # equal/skewed seqs both decay the tie to something unrelated to
+        # arrival order). DESC here (vs dm_thread's ASC) because this
+        # query is newest-first: among same-second posts, the latest
+        # local arrival sorts first. Sync stays consistent with this: a
+        # peer ingests one author's posts in seq order
+        # (messages_not_in ORDER BY seq ASC), so arrival order there
+        # matches compose order too.
         with self._lock:
             if identity_pub is None:
                 rows = self._db.execute(
                     "SELECT msg_json FROM messages WHERE kind=?"
-                    " ORDER BY created_at DESC", (KIND_POST,))
+                    " ORDER BY created_at DESC, rowid DESC", (KIND_POST,))
             else:
                 rows = self._db.execute(
                     "SELECT msg_json FROM messages WHERE kind=?"
-                    " AND identity_pub=? ORDER BY created_at DESC",
+                    " AND identity_pub=? ORDER BY created_at DESC, rowid DESC",
                     (KIND_POST, identity_pub))
             return [SignedMessage.from_dict(json.loads(mj)) for (mj,) in rows]
 
