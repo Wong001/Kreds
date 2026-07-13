@@ -1109,3 +1109,26 @@ def test_seen_state_observer_wired():
     assert "markOpenedNow" in prof              # profile visit clears the dot
     be = _js_fn_body(js, "buildEntry")
     assert "dataset.created" in be              # observer needs the post time
+
+
+def test_dm_unread_badge_wired():
+    # Unread badge (live-test follow-up): count of conversations whose
+    # last message is from the other side and newer than the per-device
+    # kreds_dm_opened watermark. Desktop nav only (mobile has no Messages
+    # tab - a named follow-up, not silently included).
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert 'id="nav-msg-badge"' in html
+    assert "kreds_dm_opened:" in js               # own prefix, not kreds_opened
+    unread = _js_fn_body(js, "convUnread")
+    assert "last_from_me" in unread
+    assert "over-badge" in unread                 # skew degrade documented
+    badge = _js_fn_body(js, "renderDmBadge")
+    assert "hidden" in badge                      # hidden at zero
+    thread = _js_fn_body(js, "openThread")
+    assert "markDmOpenedNow" in thread            # opening clears
+    assert "await j(\"/api/conversations\")" not in _js_fn_body(js, "openThread")
+    _css_rule(css, ".navbadge")                   # style exists
+    # the old double-fetch is gone: exactly ONE fetch site remains
+    assert js.count('j("/api/conversations")') == 1

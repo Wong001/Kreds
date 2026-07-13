@@ -16,6 +16,7 @@
 let STATE = null;
 let KREDS = [];       // /api/kreds rows: {identity_pub, name, ring, since}
 let FEED = [];        // /api/feed rows
+let CONVS = [];   // latest /api/conversations - fetched every refresh() for the nav badge
 let ACTIVE_FILTER = "all";   // "all" | "inner" | an identity_pub
 let CURRENT_DM = null;
 let CURRENT_DM_NAME = "";
@@ -113,6 +114,40 @@ function scheduleFreshDotRerender() {
     renderChipbar();
     renderCircleRail();
   }, 200);
+}
+
+// -- DM unread watermark: same per-device localStorage boundary as the
+// post watermark above (never synced, never sent to the server), with
+// its OWN prefix - a chip click marking posts read must not mark a DM
+// thread read, and vice versa.
+function dmOpened(identity) {
+  return Number(localStorage.getItem("kreds_dm_opened:" + identity) || 0);
+}
+function markDmOpenedNow(identity) {
+  localStorage.setItem("kreds_dm_opened:" + identity, String(Date.now() / 1000));
+}
+
+// A conversation is unread when the other side wrote last and it's newer
+// than this device's watermark.
+function convUnread(c) {
+  if (!c.last_at) return false;
+  if (c.last_from_me === true) return false;
+  // Update-skew degrade (web payload ahead of core, allowed skew): an
+  // older core omits last_from_me entirely - fall back to "any activity
+  // since I opened", which can over-badge a thread my own OTHER device
+  // answered last, but never silently under-badges.
+  return c.last_at > dmOpened(c.identity_pub);
+}
+
+// Red count pill on the desktop Messages nav button: number of unread
+// CONVERSATIONS (people, not messages), hidden at zero. Mobile has no
+// Messages tab to badge - named follow-up, not silently included.
+function renderDmBadge() {
+  const badge = document.getElementById("nav-msg-badge");
+  if (!badge) return;
+  const n = CONVS.filter(convUnread).length;
+  badge.textContent = String(n);
+  badge.classList.toggle("hidden", n === 0);
 }
 
 const SUN = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" '
@@ -2687,9 +2722,15 @@ function ceremonyUI() {
 // ---------------------------------------------------------------------
 
 async function loadConversations() {
-  const convs = await j("/api/conversations");
+  CONVS = await j("/api/conversations");
+  renderConversations();
+  renderDmBadge();
+}
+
+function renderConversations() {
   const root = document.getElementById("conversations");
   root.replaceChildren();
+  const convs = CONVS.slice();
   const friends = (STATE ? STATE.friends : []);
   const seen = new Set(convs.map(c => c.identity_pub));
   for (const f of friends)
@@ -2700,13 +2741,16 @@ async function loadConversations() {
     return;
   }
   for (const c of convs) {
-    const row = el("div", "conv" + (c.identity_pub === CURRENT_DM ? " active" : ""));
+    const row = el("div", "conv"
+      + (c.identity_pub === CURRENT_DM ? " active" : "")
+      + (convUnread(c) ? " unread" : ""));
     const av = el("div", "conv-avatar");
     av.textContent = (c.name || "?").slice(0, 1).toUpperCase();
     const txt = el("div");
     txt.append(el("div", "name", c.name),
                el("div", "preview", c.last_text || "no messages yet"));
     row.append(av, txt);
+    if (convUnread(c)) row.append(el("span", "cdot"));
     row.onclick = () => openThread(c.identity_pub, c.name);
     root.append(row);
   }
@@ -2749,7 +2793,12 @@ async function openThread(identity, name, keepScroll) {
     const e = el("div", "dm-empty", "No messages yet - say hi.");
     root.append(e);
   }
-  loadConversations();   // refresh the active highlight
+  // Opening the thread is what "read" means for the badge: mark this
+  // device's watermark, then re-render list + badge from the CONVS we
+  // already hold (the old refetch here was the backlog's double-fetch).
+  markDmOpenedNow(identity);
+  renderConversations();
+  renderDmBadge();
   // Auto-scroll to newest on an explicit open, or on a live update only when
   // the reader was already at the bottom (don't yank them up mid-scroll).
   if (!keepScroll || atBottom) root.scrollTop = root.scrollHeight;
@@ -2768,6 +2817,9 @@ document.getElementById("dm-compose").onsubmit = async (ev) => {
   if (r.ok) {
     document.getElementById("dm-text").value = "";
     document.getElementById("dm-photos").value = "";
+    // Replying obviously means the thread is read - matters on the skew
+    // path (no last_from_me), where the fallback is time-based.
+    if (CURRENT_DM) markDmOpenedNow(CURRENT_DM);
     openThread(CURRENT_DM, CURRENT_DM_NAME);
   } else { alert("Send failed: " + await r.text()); }
 };
@@ -2882,8 +2934,11 @@ async function refresh() {
   renderCircleRail();
   renderMeStrip();
   renderStories();
+  // Conversations are fetched EVERY cycle now (not just with Messages
+  // open): the nav badge lives outside that view. One fetch feeds both
+  // the badge and the list.
+  await loadConversations();
   if (!document.getElementById("view-messages").classList.contains("hidden")) {
-    loadConversations();
     // Keep the open conversation live: a WS "changed" (e.g. an incoming DM
     // arriving over gossip) re-renders the thread in place, preserving the
     // reader's scroll position unless they're already at the bottom.
