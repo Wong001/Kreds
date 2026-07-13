@@ -265,17 +265,20 @@ body.desktop .desktop-only-panel { display: block; }
 /* Sticky journal header: chips + composer pin as ONE wrapper under the
    nav (per-element sticky offsets would break when the chipbar wraps to
    a second row as friends grow). Negative margins/padding make it span
-   .journal's 20px/24px padding so entries scroll fully under it, on the
-   journal column's own --surface. --nav-h is measured at runtime in
-   app.js (nav height depends on content), --chrome-h is the desktop
-   titlebar (0 in a browser). <=760px - the journal's existing mobile
-   breakpoint - keeps only the nav pinned: three stacked bars would eat
-   a phone viewport. */
+   .journal's 24px side padding so entries scroll fully under it, on the
+   journal column's own --surface. The wrapper is NOT .journal's first
+   child at runtime - renderStories() (app.js) inserts the #stories strip
+   above it on every render - so the negative top margin must only
+   overlap the strip's own 14px bottom padding (empty space), never its
+   rings/labels. --nav-h is measured at runtime in app.js (nav height
+   depends on content), --chrome-h is the desktop titlebar (0 in a
+   browser). <=760px - the journal's existing mobile breakpoint - keeps
+   only the nav pinned: three stacked bars would eat a phone viewport. */
 @media (min-width: 761px) {
   .journal-sticky { position: sticky;
     top: calc(var(--chrome-h, 0px) + var(--nav-h, 51px)); z-index: 14;
     background: var(--surface); border-bottom: 1px solid var(--line);
-    margin: -20px -24px 14px; padding: 20px 24px 10px; }
+    margin: -14px -24px 14px; padding: 14px 24px 10px; }
 }
 
 /* composer */
