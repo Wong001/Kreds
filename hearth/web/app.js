@@ -123,8 +123,15 @@ function scheduleFreshDotRerender() {
 function dmOpened(identity) {
   return Number(localStorage.getItem("kreds_dm_opened:" + identity) || 0);
 }
-function markDmOpenedNow(identity) {
-  localStorage.setItem("kreds_dm_opened:" + identity, String(Date.now() / 1000));
+// `floor`: optional lower bound for the watermark, in epoch seconds. The
+// journal watermark dodges sender clock skew by bumping to the post's own
+// created_at rather than "now"; this is the DM-side equivalent - mirror
+// the sender's clock forward, never lag behind it. openThread passes the
+// newest message's created_at; the send-path call below stays floor-less
+// (replying is always "now" - there's no older event to mirror).
+function markDmOpenedNow(identity, floor) {
+  localStorage.setItem("kreds_dm_opened:" + identity,
+    String(Math.max(Date.now() / 1000, floor || 0)));
 }
 
 // A conversation is unread when the other side wrote last and it's newer
@@ -148,6 +155,14 @@ function renderDmBadge() {
   const n = CONVS.filter(convUnread).length;
   badge.textContent = String(n);
   badge.classList.toggle("hidden", n === 0);
+  // The count is the only thing assistive tech should hear - a static
+  // "Unread conversations" label would override the number entirely.
+  badge.setAttribute("aria-label", n + " unread conversation" + (n === 1 ? "" : "s"));
+  // The badge appearing/disappearing changes .appnav's height with no
+  // resize event of its own - re-measure --nav-h so .journal-sticky's
+  // offset never goes stale (a stale offset opens a see-through slit
+  // between the pinned nav and the sticky header-group below it).
+  measureNavHeight();
 }
 
 const SUN = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" '
@@ -2793,10 +2808,20 @@ async function openThread(identity, name, keepScroll) {
     const e = el("div", "dm-empty", "No messages yet - say hi.");
     root.append(e);
   }
-  // Opening the thread is what "read" means for the badge: mark this
-  // device's watermark, then re-render list + badge from the CONVS we
-  // already hold (the old refetch here was the backlog's double-fetch).
-  markDmOpenedNow(identity);
+  // Opening the thread is what "read" means for the badge - but ONLY when
+  // the user could actually have seen it. refresh() re-invokes openThread
+  // on every WS push while Messages is the active view, and that reaches
+  // hidden windows too (a background tab, or the desktop app minimized to
+  // tray): document.hidden guards against silently marking a friend's DM
+  // read before anyone looked at it. Same standard as the journal's
+  // IntersectionObserver, which gets this for free - browsers pause IO
+  // callbacks in hidden tabs, so it never fires unseen.
+  // The watermark itself is clamped to the newest message's own
+  // created_at (mirroring the journal watermark's created_at-not-now
+  // trick): local Date.now() alone would let a sender's fast clock keep
+  // the thread "unread" forever after it's been opened.
+  const newest = msgs.length ? msgs[msgs.length - 1].created_at : 0;
+  if (!document.hidden) markDmOpenedNow(identity, newest);
   renderConversations();
   renderDmBadge();
   // Auto-scroll to newest on an explicit open, or on a live update only when
@@ -2989,6 +3014,10 @@ function measureNavHeight() {
 }
 window.addEventListener("resize", measureNavHeight);
 measureNavHeight();
+// Nav height depends on font metrics, which can still settle after first
+// paint (webfont swap) - re-measure once they're ready rather than only
+// on boot + resize.
+document.fonts.ready.then(measureNavHeight);
 
 function wireDesktopChrome() {
   if (!window.pywebview) return;

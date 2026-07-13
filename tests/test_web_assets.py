@@ -1126,9 +1126,14 @@ def test_dm_unread_badge_wired():
     assert "over-badge" in unread                 # skew degrade documented
     badge = _js_fn_body(js, "renderDmBadge")
     assert "hidden" in badge                      # hidden at zero
+    assert "measureNavHeight" in badge            # badge toggle can resize .appnav
+    assert "aria-label" in badge                  # count is exposed to AT, not static
     thread = _js_fn_body(js, "openThread")
     assert "markDmOpenedNow" in thread            # opening clears
+    assert "document.hidden" in thread            # never mark read behind a hidden window
     assert "await j(\"/api/conversations\")" not in _js_fn_body(js, "openThread")
+    mark = _js_fn_body(js, "markDmOpenedNow")
+    assert "floor" in mark                        # clamped against sender clock skew
     _css_rule(css, ".navbadge")                   # style exists
     # the old double-fetch is gone: exactly ONE fetch site remains
     assert js.count('j("/api/conversations")') == 1
