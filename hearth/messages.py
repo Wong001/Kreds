@@ -18,6 +18,8 @@ KIND_PROFILE_LAYOUT = "profile_layout"
 MAX_LAYOUT = 500
 GRID_LAYOUTS = ("auto", "cols2", "cols3", "hero", "masonry")
 SIZE_LAYOUTS = ("small", "wide", "full")
+WALL_COLS = 4      # collage canvas width in cells (spec 2026-07-13)
+MAX_BLOCK_H = 8    # tallest block in row-units
 RINGS = ("inner", "kreds")
 MAX_CAPTION = 200
 STORY_TTL = 86400
@@ -124,10 +126,12 @@ def make_story(device: DeviceKeys, media_kind: str, media: str,
 
 def make_profile_layout(device: DeviceKeys, order: Sequence[str],
                         grids: Optional[dict] = None, sizes: Optional[dict] = None,
+                        pins: Optional[dict] = None, spans: Optional[dict] = None,
                         now: Optional[float] = None) -> SignedMessage:
     return device.sign_message({
         "kind": KIND_PROFILE_LAYOUT, "order": list(order),
         "grids": dict(grids or {}), "sizes": dict(sizes or {}),
+        "pins": dict(pins or {}), "spans": dict(spans or {}),
         "created_at": _now(now),
     })
 
@@ -287,6 +291,37 @@ def validate_payload(p: dict) -> Tuple[bool, str]:
         for k, v in sizes.items():
             if not _is_hex64(k) or v not in SIZE_LAYOUTS:
                 return False, "bad layout size"
+
+        # Collage geometry (Slice A). Shape-only, like every other record
+        # check here: overlapping pins are the CLIENT's job to prevent -
+        # a hostile record just renders as stacked blocks, no crash.
+        def _ok_geom(v, need_xy):
+            keys = {"x", "y", "w", "h"} if need_xy else {"w", "h"}
+            if not isinstance(v, dict) or set(v) != keys:
+                return False
+            if not all(isinstance(v[k], int) and not isinstance(v[k], bool)
+                       for k in keys):
+                return False
+            if not (1 <= v["w"] <= WALL_COLS and 1 <= v["h"] <= MAX_BLOCK_H):
+                return False
+            if need_xy and not (0 <= v["x"] and v["x"] + v["w"] <= WALL_COLS
+                                and 0 <= v["y"] <= MAX_LAYOUT):
+                return False
+            return True
+
+        pins = p.get("pins", {})
+        if not isinstance(pins, dict) or len(pins) > MAX_LAYOUT:
+            return False, "bad layout pins"
+        for k, v in pins.items():
+            if not _is_hex64(k) or not _ok_geom(v, True):
+                return False, "bad layout pin"
+        spans = p.get("spans", {})
+        if not isinstance(spans, dict) or len(spans) > MAX_LAYOUT:
+            return False, "bad layout spans"
+        for k, v in spans.items():
+            if not _is_hex64(k) or not _ok_geom(v, False):
+                return False, "bad layout span"
+
         return True, "ok"
     return False, "unknown kind"
 
