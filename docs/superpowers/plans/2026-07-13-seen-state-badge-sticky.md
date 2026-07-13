@@ -571,9 +571,14 @@ body.desktop { padding-top: 40px; --chrome-h: 40px; }
   .journal-sticky { position: sticky;
     top: calc(var(--chrome-h, 0px) + var(--nav-h, 51px)); z-index: 14;
     background: var(--surface); border-bottom: 1px solid var(--line);
-    margin: -20px -24px 14px; padding: 20px 24px 10px; }
+    margin: -14px -24px 14px; padding: 14px 24px 10px; }
 }
 ```
+
+*(Amended during execution — Task 4 review finding: the original -20px/20px pair
+assumed the wrapper is `.journal`'s first child, but `renderStories()` inserts
+the `#stories` strip above it at runtime, so -20px covered the story-name
+labels. -14px/14px overlaps only the strip's own 14px empty bottom padding.)*
 
 - [ ] **Step 5: app.js — measure the nav height**
 
