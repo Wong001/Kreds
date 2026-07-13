@@ -1241,6 +1241,7 @@ class HearthNode:
                 "identity_pub": other,
                 "name": names.get(other, other[:8]),
                 "last_text": last["text"] if last else None,
+                "last_from_me": last["from_me"] if last else None,
                 "last_at": last["created_at"] if last else None,
                 "count": len(thread),
             })

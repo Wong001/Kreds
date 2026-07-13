@@ -351,3 +351,21 @@ def test_maintain_enckey_prunes_past_grace_and_persists(tmp_path):
     n.close()
     raw = json.loads((d / "keys.json").read_text())
     assert all(r["retired_at"] > 0.0 for r in raw["retired_enc"])
+
+
+def test_conversations_last_from_me(tmp_path):
+    # Direction of the newest message, per side: the unread badge (web
+    # client) needs "did the other person write last", which last_at
+    # alone cannot answer.
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    befriend_with_enckeys(wong, freja)
+    wong.compose_dm(freja.identity_pub, "hej")
+    assert wong.conversations()[0]["last_from_me"] is True
+    # carry the DM to freja (same hand-carry as the roundtrip test above)
+    for m in wong.store.messages_not_in({}, {wong.identity_pub},
+                                        freja.identity_pub):
+        freja.store.ingest_message(m)
+    assert freja.conversations()[0]["last_from_me"] is False
+    freja.compose_dm(wong.identity_pub, "hej selv")
+    assert freja.conversations()[0]["last_from_me"] is True
