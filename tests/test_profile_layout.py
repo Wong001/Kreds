@@ -50,10 +50,17 @@ def test_wall_stays_newest_first_despite_explicit_order(single_node, monkeypatch
     assert n.store.profile_layout(n.identity_pub)["order"] == [a, c, b]  # record still carries it
 
 
-def test_wall_stays_newest_first_with_or_without_a_layout_record(single_node):
+def test_wall_stays_newest_first_with_or_without_a_layout_record(single_node, monkeypatch):
     """Retired (spec 2026-07-13): a fresh post used to be prepended ahead
     of an "arranged" set; now every post renders newest-first regardless
-    of whether a layout record exists at all."""
+    of whether a layout record exists at all.
+
+    Same monkeypatched clock as the sibling test above: back-to-back
+    composes can share a time.time() value and created_at DESC has no
+    secondary tie-break, so strict ["C","B","A"] needs distinct,
+    strictly increasing timestamps to be deterministic."""
+    clock = iter(1_700_000_000.0 + i * 0.01 for i in range(10_000))
+    monkeypatch.setattr("hearth.node.time.time", lambda: next(clock))
     n = single_node
     a = n.compose_post("A", scope="kreds", placement="profile")
     b = n.compose_post("B", scope="kreds", placement="profile")
