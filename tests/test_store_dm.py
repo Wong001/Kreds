@@ -177,3 +177,33 @@ def test_dm_thread_same_second_tie_orders_by_local_arrival(tmp_path):
         # whichever arrived (was inserted) into THIS store last must be
         # reported last -- regardless of the arbitrary device_pub values
         assert thread[-1].msg_id == insertion[-1].msg_id, label
+
+
+def test_dm_thread_cross_identity_seq_skew_cannot_override_arrival(tmp_path):
+    """Review counterexample for the first version of the fix, which used
+    ORDER BY (created_at, seq, rowid): seq is a PER-DEVICE publish
+    counter, so comparing it across two different identities' devices is
+    meaningless -- a chatty device (many prior signed messages, high seq)
+    vs a fresh one (low seq) is the same class of wrongness as the
+    device_pub coin flip, just relocated one column left. If the
+    higher-seq message arrives FIRST locally and the lower-seq one
+    arrives LAST on the same created_at, a seq term in the ORDER BY
+    would flip them, contradicting local arrival order. Only rowid
+    (this store's own monotonic arrival order) answers 'which arrived
+    last here'."""
+    wong, freja = person("wong-phone"), person("freja-phone")
+    for _ in range(19):                    # wong's device is chatty:
+        make_enckey(wong)                  # bump its per-device seq
+    m_high = dm(wong, freja.identity_pub, "hej", now=100.0)       # seq=20
+    m_low = dm(freja, wong.identity_pub, "hej selv", now=100.0)   # seq=1
+    assert m_high.payload["created_at"] == m_low.payload["created_at"]
+    assert m_high.seq > m_low.seq
+
+    s = Store(tmp_path / "s.db")
+    s.add_identity(wong.identity_pub, is_self=True)
+    s.add_identity(freja.identity_pub)
+    s.ingest_message(m_high)               # high-seq message arrives first
+    s.ingest_message(m_low)                # low-seq message arrives LAST
+    thread = s.dm_thread(wong.identity_pub, freja.identity_pub)
+    # arrival order wins: the last-arrived (low-seq) message is last
+    assert thread[-1].msg_id == m_low.msg_id
