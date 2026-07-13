@@ -139,7 +139,7 @@ The real two-machine Tor test PASSED (friend-add over `.onion`, posts + DMs both
 
 Minor items logged during reviews — none blocking, triaged for later:
 
-- **UI:** logo tweak (the floating "oo"s — revisit); focus ring is low-contrast on very pale custom accents; conversation list shows initials, not friends' avatars; no active-selection affordance on the custom color swatch.
+- **UI:** logo tweak (the floating "oo"s — revisit); focus ring is low-contrast on very pale custom accents; conversation list shows initials, not friends' avatars; no active-selection affordance on the custom color swatch; tall journal entries (large photos) can exceed the seen-observer's 60%-visibility ceiling so their author's dot only clears via profile/chip (honest direction; pixel-based fallback candidate).
 - **Media/tests:** rewrite the weak odd-height video test to assert output dimensions; test-temp-dir cleanup on Windows; image-gate JPEG-path test.
 - **Data/perf:** add SQL indexes on message scans (delete-guard index landed 2026-07-03; feed/thread scan indexes still open); share a post-row helper between `feed` and `posts_by`; `enckeys()` latest-wins tiebreak (same class as the profile fix, narrower); prune superseded enckey messages (rotation accumulates one per device per day).
 - **Robustness:** log gossip-loop exceptions; rollback-on-exception in ingest; negative-cache permanently-undecryptable DMs so the gossip-loop sweep stops retrying them every round.

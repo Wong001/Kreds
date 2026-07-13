@@ -176,3 +176,18 @@ untouched), no store migration, no crypto change.
 - Mobile Messages tab / mobile badge placement.
 - Synced (cross-device) read-state — roadmap item, unchanged.
 - Home-feed photo lightbox and other deferred UI polish.
+
+## Amendments (2026-07-13 final review)
+
+Two accuracy corrections against what actually shipped, recorded here
+rather than edited into the sections above:
+
+- **Sticky wrapper background:** shipped as `--surface` (the journal
+  column's own background), not the `--paper` this spec's "Sticky top
+  bar + composer" section named. See `.journal-sticky` in
+  `hearth/web/style.css`.
+- **Circle overlay stacking:** the overlay (`.overlay` in
+  `hearth/web/style.css`) is `position: absolute` at `z-index: 20`, not
+  "fixed at z>=25" as this spec's z-index line implied. It is still
+  above the sticky pair (nav at 15, `.journal-sticky` at 14), which is
+  the property that line was actually asserting.
