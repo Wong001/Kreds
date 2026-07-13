@@ -110,7 +110,7 @@ textarea { width: 100%; resize: vertical; }
 .titlebar-close { font-size: 15px; }
 .titlebar-close:hover { background: var(--red); border-color: var(--red); color: #fff; }
 /* Content shifts down by the bar's height so nothing sits underneath it. */
-body.desktop { padding-top: 40px; }
+body.desktop { padding-top: 40px; --chrome-h: 40px; }
 /* The 999-z-index full-screen overlays (first-run, lock-screen, onboarding
    wizard) are position:fixed; inset:0 and don't inherit body.desktop's
    content padding, so on a short viewport their top edge can slide under
@@ -132,10 +132,15 @@ body.desktop .desktop-only-panel { display: block; }
 /* ---------- app chrome ---------- */
 .app { max-width: 1220px; margin: 22px auto; min-height: calc(100vh - 44px);
   background: var(--paper); border: 1px solid var(--line-2); border-radius: 18px;
-  overflow: hidden; box-shadow: var(--shadow); position: relative;
+  /* overflow: clip (NOT hidden) - identical rounded-corner clipping, but
+     hidden would make .app a scroll container and silently kill the
+     position:sticky nav/journal-header below (sticky pins to the nearest
+     scrollport; .app itself never scrolls - the page does). */
+  overflow: clip; box-shadow: var(--shadow); position: relative;
   display: flex; flex-direction: column; }
 .appnav { display: flex; align-items: center; gap: 10px; padding: 12px 20px;
-  background: var(--surface); border-bottom: 1px solid var(--line); }
+  background: var(--surface); border-bottom: 1px solid var(--line);
+  position: sticky; top: var(--chrome-h, 0px); z-index: 15; }
 .appnav .mark { width: 26px; height: 26px; }
 .appnav .mark .arc { stroke-width: 9; }
 .navword { font-family: var(--disp); font-weight: 700; font-size: 19px; letter-spacing: -.02em; }
@@ -256,6 +261,22 @@ body.desktop .desktop-only-panel { display: block; }
 .fchip.active { color: var(--red); border-color: var(--red); background: var(--red-soft); }
 .fchip.plain { padding: 5px 12px; }
 .fchip .fdot { width: 6px; height: 6px; border-radius: 50%; background: var(--red); }
+
+/* Sticky journal header: chips + composer pin as ONE wrapper under the
+   nav (per-element sticky offsets would break when the chipbar wraps to
+   a second row as friends grow). Negative margins/padding make it span
+   .journal's 20px/24px padding so entries scroll fully under it, on the
+   journal column's own --surface. --nav-h is measured at runtime in
+   app.js (nav height depends on content), --chrome-h is the desktop
+   titlebar (0 in a browser). <=760px - the journal's existing mobile
+   breakpoint - keeps only the nav pinned: three stacked bars would eat
+   a phone viewport. */
+@media (min-width: 761px) {
+  .journal-sticky { position: sticky;
+    top: calc(var(--chrome-h, 0px) + var(--nav-h, 51px)); z-index: 14;
+    background: var(--surface); border-bottom: 1px solid var(--line);
+    margin: -20px -24px 14px; padding: 20px 24px 10px; }
+}
 
 /* composer */
 .composer { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px 10px;

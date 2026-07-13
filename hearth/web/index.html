@@ -56,33 +56,35 @@
 
     <div id="view-journal">
       <section class="journal">
-        <div class="chipbar" id="chipbar" role="group" aria-label="Filter journal"></div>
+        <div class="journal-sticky" id="journal-sticky">
+          <div class="chipbar" id="chipbar" role="group" aria-label="Filter journal"></div>
 
-        <form class="composer" id="composer">
-          <input type="text" id="post-text" autocomplete="off"
-            placeholder="Say something to your kreds&hellip;" aria-label="Write a post">
-          <input type="hidden" id="scope" value="kreds">
-          <div class="composerbar">
-            <span class="keeps-label">keeps</span>
-            <button type="button" class="keep" data-scope="inner">
-              <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/></svg>Inner
-            </button>
-            <button type="button" class="keep active" data-scope="kreds">
-              <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/><circle class="r" cx="10" cy="10" r="7"/></svg>Kreds
-            </button>
-            <label class="keep" id="post-photo-btn" title="Add a photo">
-              <svg viewBox="0 0 20 20"><rect class="r" x="3" y="4" width="14" height="12" rx="2"/><circle class="r" cx="7.5" cy="8.5" r="1.6"/><path class="r" d="M4 15l4-4 3 3 3-3 2 2" fill="none"/></svg>Photo
-              <input type="file" id="post-photos" accept="image/*" multiple class="visually-hidden">
-            </label>
-            <select id="post-expiry" class="keep-select" aria-label="Auto-delete after">
-              <option value="">keep</option>
-              <option value="3600">1 hour</option>
-              <option value="86400">1 day</option>
-              <option value="604800">7 days</option>
-            </select>
-            <button type="submit" class="postbtn">Post</button>
-          </div>
-        </form>
+          <form class="composer" id="composer">
+            <input type="text" id="post-text" autocomplete="off"
+              placeholder="Say something to your kreds&hellip;" aria-label="Write a post">
+            <input type="hidden" id="scope" value="kreds">
+            <div class="composerbar">
+              <span class="keeps-label">keeps</span>
+              <button type="button" class="keep" data-scope="inner">
+                <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/></svg>Inner
+              </button>
+              <button type="button" class="keep active" data-scope="kreds">
+                <svg viewBox="0 0 20 20"><circle class="rf" cx="10" cy="10" r="3.4"/><circle class="r" cx="10" cy="10" r="7"/></svg>Kreds
+              </button>
+              <label class="keep" id="post-photo-btn" title="Add a photo">
+                <svg viewBox="0 0 20 20"><rect class="r" x="3" y="4" width="14" height="12" rx="2"/><circle class="r" cx="7.5" cy="8.5" r="1.6"/><path class="r" d="M4 15l4-4 3 3 3-3 2 2" fill="none"/></svg>Photo
+                <input type="file" id="post-photos" accept="image/*" multiple class="visually-hidden">
+              </label>
+              <select id="post-expiry" class="keep-select" aria-label="Auto-delete after">
+                <option value="">keep</option>
+                <option value="3600">1 hour</option>
+                <option value="86400">1 day</option>
+                <option value="604800">7 days</option>
+              </select>
+              <button type="submit" class="postbtn">Post</button>
+            </div>
+          </form>
+        </div>
 
         <div id="journal"></div>
       </section>

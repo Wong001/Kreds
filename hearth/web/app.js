@@ -2979,6 +2979,17 @@ if (dmBtn) dmBtn.innerHTML = ICONS.send + "<span>Send</span>";
 // it's already there.
 // ---------------------------------------------------------------------
 
+// --nav-h feeds .journal-sticky's sticky offset (style.css): measured,
+// not hardcoded - the nav's real height depends on font metrics and can
+// change if it ever wraps.
+function measureNavHeight() {
+  const nav = document.querySelector(".appnav");
+  if (nav) document.documentElement.style.setProperty(
+    "--nav-h", nav.offsetHeight + "px");
+}
+window.addEventListener("resize", measureNavHeight);
+measureNavHeight();
+
 function wireDesktopChrome() {
   if (!window.pywebview) return;
   document.body.classList.add("desktop");

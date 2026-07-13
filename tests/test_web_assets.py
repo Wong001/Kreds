@@ -1132,3 +1132,22 @@ def test_dm_unread_badge_wired():
     _css_rule(css, ".navbadge")                   # style exists
     # the old double-fetch is gone: exactly ONE fetch site remains
     assert js.count('j("/api/conversations")') == 1
+
+
+def test_sticky_journal_header():
+    # Sticky nav + chips/composer (live-test follow-up). The load-bearing
+    # detail: .app must be overflow:clip, NOT hidden - a hidden ancestor
+    # creates a scroll container and silently kills position:sticky
+    # against the page scroll.
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    app_rule = _css_rule(css, ".app")
+    assert "overflow: clip" in app_rule
+    assert "overflow: hidden" not in app_rule
+    nav_rule = _css_rule(css, ".appnav")
+    assert "position: sticky" in nav_rule
+    assert "--chrome-h" in nav_rule               # desktop titlebar offset
+    assert 'id="journal-sticky"' in html
+    assert ".journal-sticky" in css
+    assert "--nav-h" in js and "offsetHeight" in js   # measured, not hardcoded
