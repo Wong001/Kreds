@@ -92,6 +92,29 @@ function markOpenedNow(key) {
   localStorage.setItem("kreds_opened:" + key, String(Date.now() / 1000));
 }
 
+// Bump a person's watermark to a specific post's created_at - never to
+// "now", never backwards. Seeing Tuesday's post must NOT mark Thursday's
+// unseen post below the fold as read: isFresh() compares against the
+// person's LATEST post, so a created_at watermark honestly keeps the dot.
+function bumpOpenedTo(key, t) {
+  if (!key || !(t > lastOpened(key))) return;
+  localStorage.setItem("kreds_opened:" + key, String(t));
+  scheduleFreshDotRerender();
+}
+
+// Debounced dot refresh: one scroll can mark several posts seen; collapse
+// into one chipbar+rail re-render. Deliberately NEVER re-renders the
+// journal itself - that would rebuild the entries mid-scroll and
+// re-trigger the seen observer.
+let FRESH_RERENDER_TIMER = null;
+function scheduleFreshDotRerender() {
+  clearTimeout(FRESH_RERENDER_TIMER);
+  FRESH_RERENDER_TIMER = setTimeout(() => {
+    renderChipbar();
+    renderCircleRail();
+  }, 200);
+}
+
 const SUN = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" '
   + 'stroke="currentColor" stroke-width="2" stroke-linecap="round">'
   + '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2'
@@ -207,6 +230,7 @@ function buildEntry(p) {
     ? STATE.accent : identityColor(p.identity_pub);
   const article = el("article", "entry");
   article.dataset.author = p.identity_pub;
+  article.dataset.created = p.created_at;
 
   const avatar = el("button", "eavatar", (p.author_name || "?").slice(0, 1).toUpperCase());
   avatar.style.background = color;
@@ -635,12 +659,49 @@ function filteredFeed() {
   return FEED.filter(p => p.identity_pub === ACTIVE_FILTER);
 }
 
+// -- seen-state observer: a journal entry that has genuinely been on
+// screen (>= SEEN_RATIO visible for SEEN_DWELL_MS) marks its author's
+// watermark at that post's created_at. The dwell means a fast fling past
+// a post does not count as reading it. localStorage-only - same honesty
+// boundary as lastOpened above; no seen-data ever leaves this device.
+const SEEN_RATIO = 0.6;
+const SEEN_DWELL_MS = 700;
+const SEEN_TIMERS = new Map();   // entry element -> pending dwell timer
+function clearSeenTimers() {
+  for (const t of SEEN_TIMERS.values()) clearTimeout(t);
+  SEEN_TIMERS.clear();
+}
+const journalSeenObserver = new IntersectionObserver((entries) => {
+  for (const en of entries) {
+    const node = en.target;
+    if (en.isIntersecting && en.intersectionRatio >= SEEN_RATIO) {
+      if (!SEEN_TIMERS.has(node)) SEEN_TIMERS.set(node, setTimeout(() => {
+        SEEN_TIMERS.delete(node);
+        journalSeenObserver.unobserve(node);
+        bumpOpenedTo(node.dataset.author, Number(node.dataset.created));
+      }, SEEN_DWELL_MS));
+    } else {
+      clearTimeout(SEEN_TIMERS.get(node));
+      SEEN_TIMERS.delete(node);
+    }
+  }
+}, {threshold: SEEN_RATIO});
+
 function renderJournal() {
   const root = document.getElementById("journal");
+  // Entries are about to be rebuilt: drop observations AND pending dwell
+  // timers (a timer surviving a re-render would mark a post the user may
+  // have already scrolled away from).
+  journalSeenObserver.disconnect();
+  clearSeenTimers();
   root.replaceChildren();
   for (const day of groupByDay(filteredFeed())) {
     root.append(el("div", "dayhead", dayLabel(day.date)));
-    for (const p of day.rows) root.append(buildEntry(p));
+    for (const p of day.rows) {
+      const entry = buildEntry(p);
+      root.append(entry);
+      if (!p.mine) journalSeenObserver.observe(entry);
+    }
   }
   root.append(endState());
 }
@@ -1128,6 +1189,10 @@ async function openProfile(identityPub) {
     // instead of leaving the click silently do nothing.
     p = fallbackProfile(identityPub);
   }
+  // Opening someone's profile is a deliberate visit: clear their new-post
+  // dot outright (watermark to now - unlike the journal observer's
+  // per-post bump, a visit means "caught up on this person").
+  if (!p.mine) { markOpenedNow(identityPub); scheduleFreshDotRerender(); }
   renderProfilePage(p);
   setView("profile");
   applyProfileNav(p.mine);   // runs on BOTH the loaded and fallback paths

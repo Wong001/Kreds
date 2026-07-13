@@ -1090,3 +1090,22 @@ def test_journal_composer_photo_button_not_a_scope_and_post_fails_loud():
     assert "r.ok" in submit and "Post failed" in submit
     # the input-clearing must come AFTER the ok-guard (a failed post keeps text)
     assert submit.index("Post failed") < submit.index('"post-text").value = ""')
+
+
+def test_seen_state_observer_wired():
+    # The 2026-07-13 seen-state fix: a post genuinely on screen (or a
+    # profile visit) clears the person's new-post dot - not just the
+    # chip click. Static wiring asserts; the live behavior is pinned by
+    # tests/test_ui_smoke_seen_badge.py (UI_E2E=1).
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "IntersectionObserver" in js
+    assert "SEEN_DWELL_MS" in js and "SEEN_RATIO" in js
+    rj = _js_fn_body(js, "renderJournal")
+    assert "journalSeenObserver" in rj          # entries observed on render
+    assert "disconnect" in rj                   # re-attached, never leaked
+    bump = _js_fn_body(js, "bumpOpenedTo")
+    assert "lastOpened" in bump                 # never moves backwards
+    prof = _js_fn_body(js, "openProfile")
+    assert "markOpenedNow" in prof              # profile visit clears the dot
+    be = _js_fn_body(js, "buildEntry")
+    assert "dataset.created" in be              # observer needs the post time
