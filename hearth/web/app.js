@@ -450,6 +450,12 @@ async function addPhotosToBlock(p, files) {
 // hand if messages.py's ACCENTS ever changes.
 const TEXT_COLORS = ["#2743d6", "#c0563b", "#3e7c55", "#8a5cd0", "#17191e",
   "#1f8a8a", "#c79a2e", "#c0567e", "#4a5568", "#7a4e8a"];
+// Cosmetic labels for AT only (positional, matching TEXT_COLORS order) -
+// a screen reader announcing "Text color #17191e" names nothing a sighted
+// user would recognize; these are just human-friendly names for the same
+// swatches, not a new source of truth (messages.py's ACCENTS still is).
+const TEXT_COLOR_NAMES = ["Blue", "Rust", "Green", "Purple", "Ink", "Teal",
+  "Gold", "Rose", "Slate", "Plum"];
 
 // Applies a wall text block's style (spec 2026-07-14) to `wrap` (the
 // .block-text-wrap flex container around .block-text-body): h/v alignment
@@ -460,7 +466,7 @@ const TEXT_COLORS = ["#2743d6", "#c0563b", "#3e7c55", "#8a5cd0", "#17191e",
 // own accent, like the profile banner; a raw hex is set as-is; "default"
 // sets nothing, so .block-text-wrap's var(--text-color, inherit) falls
 // through to theme ink - the dark-mode-honest monochrome default).
-function applyTextStyle(block, wrap, ts, authorAccent) {
+function applyTextStyle(wrap, ts, authorAccent) {
   const JUSTIFY = {left: "flex-start", center: "center", right: "flex-end"};
   const ALIGN = {top: "flex-start", middle: "center", bottom: "flex-end"};
   wrap.style.setProperty("justify-content", JUSTIFY[ts.h] || "flex-start");
@@ -537,7 +543,7 @@ function renderBlock(p) {
     const wrap = el("div", "block-text-wrap");
     wrap.append(el("p", "block-text-body", p.text));
     block.append(wrap);
-    if (p.text_style) applyTextStyle(block, wrap, p.text_style, CURRENT_PROFILE_ACCENT);
+    if (p.text_style) applyTextStyle(wrap, p.text_style, CURRENT_PROFILE_ACCENT);
   }
   if (p.mine) {
     // Album pseudo-blocks fold members at possibly-different scopes, so a
@@ -985,6 +991,7 @@ function openBlockSettings(p, block, opener, focusSel) {
     text.append(el("div", "settings-label", "Align"), hrow);
 
     const vrow = el("div", "settings-row");
+    vrow.setAttribute("aria-label", "Vertical align");   // mirrors hrow's visible "Align" label - vrow has no preceding label div of its own
     for (const [label, val] of [["Top", "top"], ["Middle", "middle"], ["Bottom", "bottom"]]) {
       const btn = el("button", "settings-opt", label);
       btn.type = "button";
@@ -1018,11 +1025,13 @@ function openBlockSettings(p, block, opener, focusSel) {
     const bold = el("button", "settings-opt", "B");
     bold.type = "button";
     bold.dataset.sel = "text-weight";
+    bold.setAttribute("aria-label", "Bold");
     if (ts.weight === "bold") bold.classList.add("active");
     bold.onclick = () => postStyle({weight: ts.weight === "bold" ? "normal" : "bold"}, "text-weight");
     const italic = el("button", "settings-opt", "I");
     italic.type = "button";
     italic.dataset.sel = "text-style";
+    italic.setAttribute("aria-label", "Italic");
     if (ts.style === "italic") italic.classList.add("active");
     italic.onclick = () => postStyle({style: ts.style === "italic" ? "normal" : "italic"}, "text-style");
     frow.append(bold, italic);
@@ -1043,7 +1052,7 @@ function openBlockSettings(p, block, opener, focusSel) {
       const sw = el("button", "sw", "");
       sw.type = "button";
       sw.dataset.sel = "text-color-" + i;
-      sw.setAttribute("aria-label", "Text color " + hex);
+      sw.setAttribute("aria-label", "Text color " + TEXT_COLOR_NAMES[i]);
       sw.style.background = hex;
       if (ts.color === hex) sw.classList.add("on");
       sw.onclick = () => postStyle({color: hex}, "text-color-" + i);

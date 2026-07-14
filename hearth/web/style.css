@@ -537,6 +537,13 @@ body.desktop .desktop-only-panel { display: block; }
    height here rather than hiding the element outright, so the box still
    exists (e.g. for any future affordance) but nothing paints or spills. */
 .block.has-deck .block-text-body { max-height: 0; overflow: hidden; }
+/* The wrap (not just the body above) can escape has-deck's overflow:visible
+   too - .block-text-wrap is a second 100%-height flowed sibling below the
+   deck, and with no cap of its own it would paint the same distance past
+   the card as an invisible click/tap target sitting over whatever block is
+   next in the grid (confirmed via elementFromPoint - review-probed, not
+   theoretical). Cap the wrap itself the same way as its child. */
+.block.has-deck .block-text-wrap { max-height: 0; overflow: hidden; }
 .block.text-w1 .block-text-body { font-size: 12.5px; }
 .block.text-w2 .block-text-body { font-size: 15px; }
 .block.text-w3 .block-text-body { font-size: 19px; }
@@ -550,8 +557,14 @@ body.desktop .desktop-only-panel { display: block; }
    "default" never sets the var, so theme ink flows through untouched
    (dark-mode-honest monochrome, per August's note); "accent"/a palette hex
    set it explicitly. Size/font/weight/style are independent axes from H/V
-   and from each other, applied as their own classes by applyTextStyle. */
-.block-text-wrap { display: flex; height: 100%; color: var(--text-color, inherit); }
+   and from each other, applied as their own classes by applyTextStyle.
+   align-items: flex-start is a belt-and-braces default - applyTextStyle
+   always sets align-items explicitly today, but flex's own default
+   (stretch) would otherwise stretch an unstyled .block-text-body to fill
+   the wrap, painting a clipped 7th line below the line-clamp's ellipsis
+   the moment that call is ever skipped. */
+.block-text-wrap { display: flex; height: 100%; align-items: flex-start;
+  color: var(--text-color, inherit); }
 .text-size-s .block-text-body { font-size: 12.5px; }
 .text-size-m .block-text-body { font-size: 15px; }
 .text-size-l .block-text-body { font-size: 19px; }

@@ -1317,3 +1317,17 @@ def test_text_styling_wired():
     modal = _js_fn_body(js, "openBlockSettings")
     assert '"/api/block-text"' in modal and "TEXT_COLORS" in modal
     assert ".block-text-wrap" in css
+    # final-review Fix 1: the wrap is capped the same way as its body, or a
+    # captioned deck's wrap escapes has-deck's overflow:visible as an
+    # invisible click-stealer below the card (review-probed via
+    # elementFromPoint).
+    assert ".block.has-deck .block-text-wrap" in css
+    # final-review Fix 2: belt-and-braces default so an unstyled body can't
+    # flex-stretch a clipped line past the clamp's ellipsis if applyTextStyle
+    # is ever skipped. Anchored to line-start (not _css_rule's plain substring
+    # search) so it targets the base .block-text-wrap rule itself, not the
+    # ".block.has-deck .block-text-wrap" override rule that also contains
+    # ".block-text-wrap" as a substring and sits earlier in the file.
+    wrap_rule = re.search(r"(?m)^\.block-text-wrap\s*\{([^}]*)\}", css)
+    assert wrap_rule, "no base .block-text-wrap rule found"
+    assert "align-items: flex-start" in wrap_rule.group(1)
