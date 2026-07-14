@@ -688,23 +688,6 @@ function cellFromPoint(px, py, w) {
   const y = Math.max(0, Math.round((py - r.top) / step));
   return {x, y};
 }
-function pinsOverlap(a, b) {
-  return a.x < b.x + b.w && b.x < a.x + a.w
-      && a.y < b.y + b.h && b.y < a.y + a.h;
-}
-function pinFree(geom, exceptId) {
-  for (const [id, pin] of Object.entries(WALL_PINS))
-    if (id !== exceptId && pinsOverlap(geom, pin)) return false;
-  return true;
-}
-// First free {x, y} that fits a w x h block: scan rows top-down, columns
-// left-to-right - the keyboard path's "Place on canvas".
-function firstFreeSpot(w, h, exceptId) {
-  for (let y = 0; y <= 500; y++)
-    for (let x = 0; x + w <= 4; x++)
-      if (pinFree({x, y, w, h}, exceptId)) return {x, y};
-  return null;   // unreachable in practice (canvas grows downward)
-}
 function ghostAt(geom, ok) {
   let g = document.getElementById("pin-ghost");
   if (!g) {
@@ -723,59 +706,35 @@ function clearGhost() {
 
 // Hand-rolled pointer drag (mouse + touch + pen), collage edition: the
 // gesture no longer reorders siblings - it carries the block's w x h
-// footprint to a cell target. The ghost previews the drop (accent = free,
-// red = overlap/out of bounds); release on valid pins via /api/block-pin;
-// release over the tray/off-canvas unpins; invalid or cancelled drops
-// change nothing (no auto-push - blocks never displace each other, spec
-// 2026-07-13 section 3). Capture stays on the WALL (a reparented captured
-// element loses capture in Chromium - found live in Slice 3a); finish()
-// is idempotent and also wired to lostpointercapture (the autoscroll
-// dropped-event fix from Slice 3a still applies).
+// footprint to a cell target. Dynamic placement (spec 2026-07-14): the
+// ghost is invalid ONLY out-of-bounds - cellFromPoint always clamps its
+// result into bounds, so once the pointer is over the canvas the target
+// is always valid; the client's overlap veto is gone (the server pushes
+// whatever's in the way on drop, see set_block_pin). A drop off-canvas is
+// a snap-back no-op (the tray/unpin drop zone died with the tray itself -
+// /api/block-unpin has no UI caller left). Capture stays on the WALL (a
+// reparented captured element loses capture in Chromium - found live in
+// Slice 3a); finish() is idempotent and also wired to lostpointercapture
+// (the autoscroll dropped-event fix from Slice 3a still applies).
 function startBlockDrag(block, ev, p) {
   if ((ev.button != null && ev.button !== 0) || !ev.isPrimary) return;
   ev.preventDefault();
   const wall = document.getElementById("profile-wall");
-  const trayEl = document.getElementById("profile-tray");
-  const trayWrap = document.getElementById("profile-tray-wrap");
-  const wasPinned = !!p.pin;
   const w = p.span.w, h = p.span.h;
   try { wall.setPointerCapture(ev.pointerId); } catch (e) { return; }
   block.classList.add("dragging");
-  let target = null, ok = false, overTray = false;
-
-  // Fix 3: the Unplaced tray is an explicit, discoverable unpin drop zone
-  // (additive to the off-canvas-unpin path below, which stays as a
-  // fallback for a drag that just leaves the canvas without reaching the
-  // tray). .tray-target gives it the same hover affordance as the ghost.
-  const setOverTray = (v) => {
-    if (overTray === v) return;
-    overTray = v;
-    trayEl.classList.toggle("tray-target", v);
-  };
+  let target = null;
 
   const onMove = (e) => {
     if (e.pointerId !== ev.pointerId) return;
-    const trayVisible = !trayWrap.classList.contains("hidden");
-    if (trayVisible) {
-      const tr = trayWrap.getBoundingClientRect();
-      const overTrayNow = e.clientX >= tr.left && e.clientX <= tr.right
-                        && e.clientY >= tr.top && e.clientY <= tr.bottom;
-      if (overTrayNow) {
-        setOverTray(true);
-        clearGhost(); target = null; ok = false;   // tray hit takes priority over the wall test below
-        return;
-      }
-    }
-    setOverTray(false);
     const {r} = wallMetrics();
     const over = e.clientX >= r.left && e.clientX <= r.right
               && e.clientY >= r.top - 40;   // small grace above row 0
-    if (!over) { clearGhost(); target = null; ok = false; }   // no #pin-ghost while off-canvas
+    if (!over) { clearGhost(); target = null; }   // no #pin-ghost while off-canvas (out of bounds)
     else {
       const c = cellFromPoint(e.clientX, e.clientY, w);
       target = {x: c.x, y: c.y, w, h};
-      ok = pinFree(target, p.msg_id);
-      ghostAt(target, ok);   // paints/updates #pin-ghost at the target cell
+      ghostAt(target, true);   // paints/updates #pin-ghost at the target cell - always valid in-bounds
     }
     const M = 70;
     if (e.clientY < M) window.scrollBy(0, -12);
@@ -791,21 +750,10 @@ function startBlockDrag(block, ev, p) {
     wall.removeEventListener("lostpointercapture", onLost);
     try { wall.releasePointerCapture(ev.pointerId); } catch (e) { /* released */ }
     block.classList.remove("dragging");
-    clearGhost();   // #pin-ghost never survives past the gesture, valid or not
-    setOverTray(false);
-    if (commit && overTray) {
-      // Dropped explicitly on the tray: unpin a pinned block; a block
-      // that was already unplaced has nothing to change.
-      if (wasPinned) await postJSON("/api/block-unpin", {msg_id: p.msg_id});
-      else return;
-    } else if (commit && target && ok) {
+    clearGhost();   // #pin-ghost never survives past the gesture
+    if (commit && target)
       await postJSON("/api/block-pin", {msg_id: p.msg_id, ...target});
-    } else if (commit && !target && wasPinned) {
-      // dragged clean off the canvas (not via the tray zone): back to the tray
-      await postJSON("/api/block-unpin", {msg_id: p.msg_id});
-    } else if (!commit || !target) {
-      return void (CURRENT_PROFILE && openProfile(CURRENT_PROFILE));
-    }
+    // else: cancelled, or dropped out of bounds - snap-back no-op, nothing to post
     if (CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
   };
   const onUp = (e) => { if (e.pointerId === ev.pointerId) finish(true); };
@@ -832,7 +780,7 @@ function startBlockResize(block, ev, p) {
   try { wall.setPointerCapture(ev.pointerId); } catch (e) { return; }
   block.classList.add("dragging");
   const pin = p.pin;
-  let target = null, ok = false;
+  let target = null;
   const onMove = (e) => {
     if (e.pointerId !== ev.pointerId) return;
     const {r, cell} = wallMetrics();
@@ -842,8 +790,9 @@ function startBlockResize(block, ev, p) {
     const h = Math.max(1, Math.min(8,
       Math.round((e.clientY - (r.top + pin.y * step)) / step)));
     target = {x: pin.x, y: pin.y, w, h};
-    ok = pinFree(target, p.msg_id);
-    ghostAt(target, ok);
+    // Dynamic placement (spec 2026-07-14): w/h are clamped into bounds
+    // above, so the ghost is always valid - the server pushes on collision.
+    ghostAt(target, true);
   };
   let done = false;
   const finish = async (commit) => {
@@ -856,7 +805,7 @@ function startBlockResize(block, ev, p) {
     try { wall.releasePointerCapture(ev.pointerId); } catch (e) { /* released */ }
     block.classList.remove("dragging");
     clearGhost();
-    if (commit && target && ok)
+    if (commit && target)
       await postJSON("/api/block-pin", {msg_id: p.msg_id, ...target});
     if (CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
   };
@@ -880,8 +829,13 @@ function startBlockResize(block, ev, p) {
 // drag handle button, Up/Down arrows, and grid-<select> on the block face
 // itself. The Phase-A Size picker, Slice-3b Photo-layout picker, and the
 // reorder-era Move Up/Down pair are all retired (spec 2026-07-13, collage
-// redesign) - Task 7 rebuilds the controls around pin/span geometry: Size
-// presets, one-cell Nudge, Send to tray (pinned), Place on canvas (unpinned).
+// redesign) - Task 7 rebuilt the controls around pin/span geometry: Size
+// presets and one-cell Nudge for a pinned block. The pinned/unpinned pair
+// of actions that used to live below Nudge (send-to-holding-area / place-
+// on-canvas) died with the holding area itself (spec 2026-07-14, dynamic
+// placement) - a block is always on the canvas now; an unplaced one can
+// still be sized here (/api/block-span) and gets placed by a direct drag
+// or by /api/wall-autoplace's migration.
 function closeBlockSettings() {
   document.getElementById("block-settings").classList.add("hidden");
   // IMPORTANT #5(e): return focus to whatever opened the modal (the gear
@@ -915,7 +869,7 @@ function openBlockSettings(p, block, opener, focusSel) {
   // openProfile), relocates THIS block by its data-msg-id in the freshly
   // rendered DOM, and reopens the modal on it with focusSel (falling back
   // to the close button when focusSel doesn't resolve, same as any fresh
-  // open - #5d below). If the block is no longer on the canvas/tray at all
+  // open - #5d below). If the block is no longer on the canvas at all
   // (deleted meanwhile), close the modal instead of reopening on nothing.
   // The re-render detaches EVERY node, including whatever opened the modal -
   // BLOCK_SETTINGS_OPENER would go stale, and #5(e)'s isConnected guard
@@ -949,9 +903,10 @@ function openBlockSettings(p, block, opener, focusSel) {
     if (!p.pin && p.span && p.span.w === w && p.span.h === h) btn.classList.add("active");
     btn.onclick = async () => {
       if (p.pin) {
+        // x-clamp keeps a resized block on the canvas; the overlap veto is
+        // gone (spec 2026-07-14) - the server pushes whatever's in the way.
         const x = Math.min(p.pin.x, 4 - w);
         const g = {x, y: p.pin.y, w, h};
-        if (!pinFree(g, p.msg_id)) { alert("No room there - move it first."); return; }
         await postJSON("/api/block-pin", {msg_id: p.msg_id, ...g});
       } else {
         await postJSON("/api/block-span", {msg_id: p.msg_id, w, h});
@@ -1064,7 +1019,9 @@ function openBlockSettings(p, block, opener, focusSel) {
   }
 
   if (p.pin) {
-    // Nudge - one cell per press, refused (disabled feel) when blocked.
+    // Nudge - one cell per press, disabled only at a canvas edge (spec
+    // 2026-07-14: the overlap veto is gone, the server pushes on collision -
+    // there's no bottom edge since the canvas grows downward).
     const move = el("div", "settings-group");
     move.append(el("div", "settings-label", "Move"));
     const mrow = el("div", "settings-row");
@@ -1074,8 +1031,7 @@ function openBlockSettings(p, block, opener, focusSel) {
       btn.type = "button";
       btn.dataset.sel = "nudge-" + label;
       const g = {x: p.pin.x + dx, y: p.pin.y + dy, w: p.pin.w, h: p.pin.h};
-      btn.disabled = g.x < 0 || g.x + g.w > 4 || g.y < 0
-                     || !pinFree(g, p.msg_id);
+      btn.disabled = g.x < 0 || g.x + g.w > 4 || g.y < 0;
       btn.onclick = async () => {
         await postJSON("/api/block-pin", {msg_id: p.msg_id, ...g});
         await reopenAfterAction('[data-sel="nudge-' + label + '"]');
@@ -1083,25 +1039,6 @@ function openBlockSettings(p, block, opener, focusSel) {
       mrow.append(btn);
     }
     move.append(mrow); body.append(move);
-
-    const tray = el("button", "settings-opt", "Send to tray");
-    tray.type = "button";
-    tray.onclick = async () => {
-      await postJSON("/api/block-unpin", {msg_id: p.msg_id});
-      await reopenAfterAction(null);   // block left the canvas; focus close btn
-    };
-    body.append(tray);
-  } else {
-    const place = el("button", "settings-opt", "Place on canvas");
-    place.type = "button";
-    place.onclick = async () => {
-      const spot = firstFreeSpot(p.span.w, p.span.h, p.msg_id);
-      if (!spot) { alert("No free spot fits this block."); return; }
-      await postJSON("/api/block-pin",
-        {msg_id: p.msg_id, ...spot, w: p.span.w, h: p.span.h});
-      await reopenAfterAction(null);
-    };
-    body.append(place);
   }
 
   if (p.album) {
@@ -1747,30 +1684,31 @@ function fallbackProfile(identityPub) {
 
 // The collage: pinned blocks at explicit coordinates on #profile-wall
 // (holes stay empty - a block this viewer can't decrypt leaves its gap);
-// unplaced blocks flow newest-first below (#profile-wall-flow), or sit in
-// the Unplaced tray when the owner is arranging. WALL_PINS mirrors the
-// rendered pins map for Task-6 overlap checks.
-let WALL_PINS = {};
+// unplaced blocks flow newest-first below (#profile-wall-flow). The tray
+// died with dynamic placement (spec 2026-07-14) - a legacy wall's unplaced
+// blocks self-migrate below instead: opening YOUR OWN profile with any
+// unplaced block fires one /api/wall-autoplace (a single layout write
+// pinning them all at the top, push rule applied), then re-renders - but
+// only when the response reports placed > 0, so a fully-migrated wall (or
+// a visitor's, who never calls this at all) doesn't re-enter the loop.
 function renderWall(p) {
   const wall = document.getElementById("profile-wall");
   const flow = document.getElementById("profile-wall-flow");
-  const tray = document.getElementById("profile-tray");
-  const trayWrap = document.getElementById("profile-tray-wrap");
-  wall.replaceChildren(); flow.replaceChildren(); tray.replaceChildren();
-  WALL_PINS = {};
+  wall.replaceChildren(); flow.replaceChildren();
   const pinned = p.wall.filter(b => b.pin);
   const unpinned = p.wall.filter(b => !b.pin);
-  for (const post of pinned) {
-    WALL_PINS[post.msg_id] = post.pin;
-    wall.append(renderBlock(post));
-  }
-  const trayMode = ARRANGING && p.mine;
-  trayWrap.classList.toggle("hidden", !trayMode);
-  for (const post of unpinned)
-    (trayMode ? tray : flow).append(renderBlock(post));
+  for (const post of pinned) wall.append(renderBlock(post));
+  for (const post of unpinned) flow.append(renderBlock(post));
   if (!p.wall.length) flow.append(el("div", "hint",
     p.mine ? "Your profile is a blank canvas - post something above." : "Nothing here yet."));
   measureWallCell();
+  if (p.mine && unpinned.length) {
+    fetch("/api/wall-autoplace", {method: "POST"}).then(async (r) => {
+      if (!r.ok) return;
+      const {placed} = await r.json();
+      if (placed > 0 && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
+    });
+  }
 }
 
 // --cell drives grid-auto-rows: CSS can't express "row height = column
@@ -1971,8 +1909,9 @@ function profilePostComposer() {
   // -- size chips: the block's starting w x h, previewed at true canvas
   // proportions via --cell (measureWallCell keeps it fresh on the
   // profile page, where this composer exclusively lives). Media defaults
-  // to 2x2; text-only posts show no chips and send no seed (the server's
-  // 4x1 text default applies).
+  // to 2x2 and rides the chosen chip as w/h fields on /api/post; text-only
+  // posts show no chips and send neither field (the server's 4x1 text
+  // default applies).
   const chips = el("div", "size-chips");
   chips.setAttribute("role", "group");
   chips.setAttribute("aria-label", "Block size");
@@ -2076,18 +2015,13 @@ function profilePostComposer() {
     const hasMedia = !!videoFile || photoInput.files.length > 0;
     if (videoFile) fd.append("video", videoFile);
     else for (const f of photoInput.files) fd.append("photos", f);
+    // The chosen size rides straight on /api/post now (spec 2026-07-14 -
+    // the separate span-seed call is gone): a new post auto-places at the
+    // top at these proportions, push-place applied. Text-only posts send
+    // no chips (none shown) - the server's 4x1 text default applies.
+    if (hasMedia) { fd.append("w", span.w); fd.append("h", span.h); }
     const r = await fetch("/api/post", {method: "POST", body: fd});
     if (!r.ok) { alert("Post failed: " + await r.text()); return; }
-    const { msg_id } = await r.json();
-    // Seed the chosen size so the block waits in the Unplaced tray at the
-    // proportions the preview showed. Text-only posts skip the seed - the
-    // server's 4x1 text default already matches what was previewed (none).
-    if (hasMedia) {
-      const sr = await fetch("/api/block-span", {method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({msg_id, w: span.w, h: span.h})});
-      if (!sr.ok) alert("Posted, but couldn't set the size: " + await sr.text());
-    }
     input.value = "";
     photoInput.value = "";
     videoInput.value = "";
@@ -2107,8 +2041,8 @@ document.getElementById("profile-back").onclick = () => goView(PRIOR_VIEW);
 // Arrange/Done toggle (self-only Wall canvas): wired once here, like the
 // other topbar handlers - it reads CURRENT_PROFILE to know which profile to
 // re-render against. Collage edition (Task 6): every pin/resize/nudge POSTs
-// itself the moment it happens (/api/block-pin, /api/block-unpin), so Done
-// has nothing left to publish - it just exits arrange mode and re-renders.
+// itself (/api/block-pin) the moment it happens, so Done has nothing left
+// to publish - it just exits arrange mode and re-renders.
 async function toggleArrange() {
   if (ARRANGING) {
     ARRANGING = false;

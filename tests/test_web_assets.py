@@ -337,12 +337,14 @@ def test_bento_grid_render():
     # Retired by the collage redesign, spec 2026-07-13: Phase-A's p.size /
     # size-small|wide|full bento span classes are gone from both render and
     # CSS - renderBlock now reads p.pin/p.span onto inline grid-column/
-    # grid-row (see test_collage_canvas_wired); #profile-wall-flow/#profile-
-    # tray still pack with grid-auto-flow, just not via size-* classes.
+    # grid-row (see test_collage_canvas_wired); #profile-wall-flow still
+    # packs unplaced blocks with grid-auto-flow, just not via size-*
+    # classes (the tray it once shared this rule with is retired, spec
+    # 2026-07-14 dynamic placement).
     js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert "p.size" not in js
-    assert "grid-auto-flow" in css                         # unplaced flow/tray packing
+    assert "grid-auto-flow" in css                         # unplaced flow packing
     for k in ("size-small", "size-wide", "size-full"):
         assert k not in css
         assert k not in js
@@ -353,8 +355,9 @@ def test_block_settings_modal():
     # Phase-A Size (/api/block-size) and Slice-3b Photo-layout groups are
     # gone. Task 7 then retired the reorder-era Move Up/Down pair too and
     # rebuilt the modal around pin/span geometry (Size presets, Nudge,
-    # Send to tray, Place on canvas - see test_block_settings_modal_
-    # collage_groups).
+    # Send to tray, Place on canvas). Dynamic placement (spec 2026-07-14)
+    # then retired Send to tray / Place on canvas themselves - see
+    # test_block_settings_modal_collage_groups.
     html = (WEB / "index.html").read_text(encoding="utf-8")
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert 'id="block-settings"' in html                 # modal markup
@@ -1192,19 +1195,24 @@ def test_sticky_journal_header():
 
 def test_collage_canvas_wired():
     # Slice A pin engine: 4-col canvas with measured square-ish cells,
-    # pinned blocks at explicit coordinates, unplaced flow + tray,
-    # legacy size-*/grid-* rendering retired.
+    # pinned blocks at explicit coordinates, unplaced flow below (the tray
+    # died with dynamic placement, spec 2026-07-14), legacy size-*/grid-*
+    # rendering retired.
     html = (WEB / "index.html").read_text(encoding="utf-8")
     js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert 'id="profile-wall-flow"' in html
-    assert 'id="profile-tray"' in html
+    assert 'id="profile-tray"' not in html
     wall_rule = _css_rule(css, "#profile-wall")
     assert "repeat(4, 1fr)" in wall_rule
     assert "var(--cell" in wall_rule
     assert "measureWallCell" in js and "clientWidth" in js
     rw = _js_fn_body(js, "renderWall")
-    assert "pin" in rw and "profile-tray" in rw
+    assert "pin" in rw
+    # Migration (spec 2026-07-14): own profile, any unplaced block ->
+    # one /api/wall-autoplace call, re-render only when placed > 0.
+    assert "/api/wall-autoplace" in rw
+    assert "placed" in rw
     rb = _js_fn_body(js, "renderBlock")
     assert "gridColumn" in rb and "gridRow" in rb
     assert "size-full" not in js          # Phase-A width classes retired
@@ -1214,35 +1222,76 @@ def test_collage_canvas_wired():
 def test_drag_to_pin_wired():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
-    html = (WEB / "index.html").read_text(encoding="utf-8")
     drag = _js_fn_body(js, "startBlockDrag")
     assert "cellFromPoint" in drag and "pin-ghost" in drag
     assert "/api/block-pin" in drag
-    assert "/api/block-unpin" in drag        # dropping off-canvas unpins
     assert "insertBefore" not in drag        # reorder semantics are gone
-    assert "tray-target" in drag             # Fix 3: tray is a real, explicit unpin drop zone
-    ov = _js_fn_body(js, "pinsOverlap")
-    assert "w" in ov and "h" in ov
+    # Dynamic placement (spec 2026-07-14): the tray/unpin drop zone and the
+    # client's overlap veto are both retired - a drop pushes server-side
+    # instead of being refused, and dragging off-canvas is a snap-back
+    # no-op (no more /api/block-unpin from a drag gesture).
+    assert "tray-target" not in drag
+    assert "/api/block-unpin" not in drag
+    assert "pinFree" not in drag
     assert "block-resize" in js              # corner handle exists
     _css_rule(css, ".pin-ghost")
     assert ".pin-ghost.invalid" in css
     done = _js_fn_body(js, "toggleArrange") if "function toggleArrange" in js \
         else _js_fn_body(js, "renderProfilePage")
     assert '"/api/profile-layout"' not in done   # Done no longer posts order
-    # Fix 3(a): the Unplaced tray sits ABOVE the canvas per spec
-    # (2026-07-13-wall-collage-redesign-design.md sec 2), not below it.
-    assert html.index('id="profile-tray-wrap"') < html.index('id="profile-wall"')
+
+
+def test_tray_retired():
+    # Dynamic placement (spec 2026-07-14): the Unplaced tray - its markup,
+    # CSS, and every JS branch (renderWall's tray/flow split, the drag
+    # gesture's tray hit-test, the modal's Send to tray) - is gone
+    # entirely. Blocks are always on the canvas: unplaced ones flow below
+    # until a drag places them or /api/wall-autoplace migrates them.
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "profile-tray" not in html
+    assert "profile-tray" not in js
+    assert "profile-tray" not in css
+    assert "tray-target" not in css
+    assert "Send to tray" not in js
+    assert "Place on canvas" not in js
+    # The client's overlap veto (pinFree/WALL_PINS) is retired along with
+    # its only remaining caller (firstFreeSpot, "Place on canvas"'s
+    # keyboard path) - the server pushes on collision instead.
+    assert "pinFree" not in js
+    assert "WALL_PINS" not in js
+    assert "firstFreeSpot" not in js
+
+
+def test_nudge_and_preset_push_aware():
+    # Dynamic placement (spec 2026-07-14): nudge buttons disable only at
+    # canvas edges (no more overlap veto); the size preset keeps its
+    # x-clamp but its "No room" alert is gone - both just POST
+    # /api/block-pin and let the server push whatever's in the way.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    body = _js_fn_body(js, "openBlockSettings")
+    assert "No room" not in body
+    assert "Math.min(p.pin.x, 4 - w)" in body    # x-clamp survives
+    nudge_block = body[body.index('el("div", "settings-label", "Move")'):]
+    assert "g.x < 0 || g.x + g.w > 4 || g.y < 0" in nudge_block
 
 
 def test_block_settings_modal_collage_groups():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     body = _js_fn_body(js, "openBlockSettings")
-    for needle in ("firstFreeSpot", "/api/block-unpin", "/api/block-span",
-                   "/api/block-pin", "Send to tray", "Place on canvas"):
+    for needle in ("/api/block-span", "/api/block-pin"):
         assert needle in body, needle
     assert "previousElementSibling" not in body   # Up/Down reorder retired
-    ff = _js_fn_body(js, "firstFreeSpot")
-    assert "pinFree" in ff
+    # Dynamic placement (spec 2026-07-14): Send to tray / Place on canvas
+    # are retired (blocks are always on the canvas now); firstFreeSpot lost
+    # its only caller with Place on canvas and is gone too.
+    assert "Send to tray" not in body
+    assert "Place on canvas" not in body
+    assert "/api/block-unpin" not in body
+    assert "firstFreeSpot" not in js
+    assert "pinFree" not in js
+    assert "WALL_PINS" not in js
 
 
 def test_composer_preview_wired():
@@ -1255,13 +1304,18 @@ def test_composer_preview_wired():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     body = _js_fn_body(js, "profilePostComposer")
     for needle in ("compose-preview", "size-chips", "createObjectURL",
-                   "revokeObjectURL", "/api/block-span", "preview-deck",
+                   "revokeObjectURL", "preview-deck",
                    "deck-count", "aria-pressed"):
         assert needle in body, needle
     assert '"2x2"' in body                     # media default chip
     assert "layout-pick" not in js             # dropdown fully retired
     assert "Masonry" not in js and "cols3" not in js
     assert "/api/block-grid" not in js         # zero client callers left
+    # Dynamic placement (spec 2026-07-14): the size chips now ride w/h
+    # fields straight on /api/post - the separate span-seed call is gone.
+    assert 'fd.append("w"' in body
+    assert 'fd.append("h"' in body
+    assert "/api/block-span" not in body
     _css_rule(css, ".compose-preview")
     assert ".preview-deck" in css and ".deck-count" in css
     assert "layout-pick" not in css
