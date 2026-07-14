@@ -444,6 +444,8 @@ body.desktop .desktop-only-panel { display: block; }
   place-items: center; }
 .preview-note { font-size: 11.5px; color: var(--ink-2); margin-top: 6px; }
 .size-chips { display: flex; gap: 6px; margin: 8px 0 2px; }
+/* author display:flex beats the UA's [hidden]{display:none} - restore it */
+.size-chips[hidden] { display: none; }
 .size-chip { border: 1px solid var(--line-2); background: transparent;
   color: var(--ink-2); font-size: 12px; font-weight: 550; padding: 4px 10px;
   border-radius: 99px; transition: .15s; }

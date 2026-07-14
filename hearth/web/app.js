@@ -1666,7 +1666,6 @@ function profilePostComposer() {
   // on post; previewing is not acceptance.
   const preview = el("div", "compose-preview");
   preview.hidden = true;
-  form.insertBefore(preview, bar);
 
   // -- size chips: the block's starting w x h, previewed at true canvas
   // proportions via --cell (measureWallCell keeps it fresh on the
@@ -1696,7 +1695,6 @@ function profilePostComposer() {
     chipBtns.push(c);
     chips.append(c);
   }
-  form.insertBefore(chips, bar);
 
   let objectUrls = [];
   const dropUrls = () => {
@@ -1755,7 +1753,9 @@ function profilePostComposer() {
 
   const btn = el("button", "postbtn", "Post to profile"); btn.type = "submit";
   bar.append(btn);
-  form.append(bar);
+  // preview/chips must be appended WITH bar, not inserted before a bar that
+  // isn't in the form yet (unconditional NotFoundError - live-smoke crash).
+  form.append(preview, chips, bar);
 
   form.onsubmit = async (ev) => {
     ev.preventDefault();
