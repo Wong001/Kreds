@@ -444,7 +444,8 @@ class Store:
     def profile_layout(self, identity_pub: str) -> dict:
         """Latest-wins {order: [...], grids: {msg_id: layout},
         sizes: {msg_id: size}, pins: {msg_id: {x,y,w,h}},
-        spans: {msg_id: {w,h}}} for this author's wall. Empty when never
+        spans: {msg_id: {w,h}}, texts: {msg_id: {h,v,size,font,weight,
+        style,color}}} for this author's wall. Empty when never
         arranged."""
         with self._lock:
             best, best_key = None, None
@@ -459,10 +460,11 @@ class Store:
                             "grids": p.get("grids", {}),
                             "sizes": p.get("sizes", {}),
                             "pins": p.get("pins", {}),
-                            "spans": p.get("spans", {})}
+                            "spans": p.get("spans", {}),
+                            "texts": p.get("texts", {})}
                     best_key = key
             return best or {"order": [], "grids": {}, "sizes": {},
-                            "pins": {}, "spans": {}}
+                            "pins": {}, "spans": {}, "texts": {}}
 
     def albums(self, identity_pub: str) -> dict:
         """Latest-wins {album_id: members} for this author (collage Slice

@@ -3,6 +3,7 @@ GROWS across the wire, an Inner-scoped member stays out of a Kreds-only
 viewer's deck AND stays suppressed standalone, ungroup restores."""
 import asyncio
 
+from hearth.messages import ACCENTS
 from hearth.node import HearthNode
 from hearth.sync import SyncService
 
@@ -62,6 +63,36 @@ def test_album_grows_and_scopes_over_sync(tmp_path):
         assert not any(p.get("album") for p in view["wall"])
         ids = [p["msg_id"] for p in view["wall"]]
         assert p1 in ids and p3 in ids and p2 not in ids     # p2 inner: still invisible
+
+        for s in (sa, sb):
+            await s.stop()
+    asyncio.run(scenario())
+
+
+def test_text_style_survives_sync(tmp_path):
+    """A styled wall text block (spec 2026-07-14) reaches a friend's
+    profile_view with the same text_style - the texts map rides the same
+    profile_layout record as pins/spans/albums, so this is the album
+    suite's sibling: real sync sockets, no shortcuts."""
+    async def scenario():
+        a = HearthNode.create(tmp_path / "a", "Anna", "anna-pc")
+        b = HearthNode.create(tmp_path / "b", "Bo", "bo-pc")
+        befriend(a, b)
+        for n in (a, b):
+            n.ensure_enckey()
+        sa, aa = await started(a)
+        sb, ba = await started(b)
+        await sa.sync_with(ba)
+
+        t = a.compose_post("styled", scope="kreds", placement="profile")
+        a.set_block_text(t, h="center", size="xl", color=ACCENTS[0])
+        await sa.sync_with(ba)
+
+        view = b.profile_view(a.identity_pub)
+        blk = next(p for p in view["wall"] if p["msg_id"] == t)
+        assert blk["text_style"] == {"h": "center", "v": "top", "size": "xl",
+                                     "font": "sans", "weight": "normal",
+                                     "style": "normal", "color": ACCENTS[0]}
 
         for s in (sa, sb):
             await s.stop()

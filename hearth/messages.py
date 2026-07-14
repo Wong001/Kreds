@@ -19,6 +19,17 @@ KIND_ALBUM = "album"
 MAX_LAYOUT = 500
 GRID_LAYOUTS = ("auto", "cols2", "cols3", "hero", "masonry")
 SIZE_LAYOUTS = ("small", "wide", "full")
+# Text block styling (spec 2026-07-14): each tuple's FIRST value is the
+# default, dropped from storage by set_block_text. `color` is validated
+# separately (not an enum tuple): "default" / "accent" / one of ACCENTS.
+TEXT_STYLE_ENUMS = {
+    "h": ("left", "center", "right"),
+    "v": ("top", "middle", "bottom"),
+    "size": ("auto", "s", "m", "l", "xl"),
+    "font": ("sans", "disp"),
+    "weight": ("normal", "bold"),
+    "style": ("normal", "italic"),
+}
 WALL_COLS = 4      # collage canvas width in cells (spec 2026-07-13)
 MAX_BLOCK_H = 8    # tallest block in row-units
 RINGS = ("inner", "kreds")
@@ -128,11 +139,13 @@ def make_story(device: DeviceKeys, media_kind: str, media: str,
 def make_profile_layout(device: DeviceKeys, order: Sequence[str],
                         grids: Optional[dict] = None, sizes: Optional[dict] = None,
                         pins: Optional[dict] = None, spans: Optional[dict] = None,
+                        texts: Optional[dict] = None,
                         now: Optional[float] = None) -> SignedMessage:
     return device.sign_message({
         "kind": KIND_PROFILE_LAYOUT, "order": list(order),
         "grids": dict(grids or {}), "sizes": dict(sizes or {}),
         "pins": dict(pins or {}), "spans": dict(spans or {}),
+        "texts": dict(texts or {}),
         "created_at": _now(now),
     })
 
@@ -330,6 +343,26 @@ def validate_payload(p: dict) -> Tuple[bool, str]:
         for k, v in spans.items():
             if not _is_hex64(k) or not _ok_geom(v, False):
                 return False, "bad layout span"
+
+        # Text block styling (spec 2026-07-14): same idiom as the retired
+        # grids map. Values are dicts whose keys are a subset of the seven
+        # style fields, each enum-checked; an empty dict is refused (that
+        # state is expressed by the key being ABSENT, per set_block_text).
+        texts = p.get("texts", {})
+        if not isinstance(texts, dict) or len(texts) > MAX_LAYOUT:
+            return False, "bad layout texts"
+        text_fields = set(TEXT_STYLE_ENUMS) | {"color"}
+        for k, v in texts.items():
+            if not _is_hex64(k):
+                return False, "bad layout text id"
+            if not isinstance(v, dict) or not v or not set(v) <= text_fields:
+                return False, "bad layout text"
+            for field, val in v.items():
+                if field == "color":
+                    if val not in ("default", "accent") and val not in ACCENTS:
+                        return False, "bad layout text color"
+                elif val not in TEXT_STYLE_ENUMS[field]:
+                    return False, "bad layout text"
 
         return True, "ok"
     if kind == KIND_ALBUM:

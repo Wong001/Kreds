@@ -18,11 +18,11 @@ from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        canonical, _sig_ok)
 from .imagegate import AVATAR_MAX, BANNER_MAX, transcode
 from .videogate import STORY_IMAGE_MAX, transcode_video
-from .messages import (DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
+from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_POST,
                        MAX_BLOCK_H, MAX_CAPTION, MAX_LAYOUT, SIZE_LAYOUTS,
-                       WALL_COLS, make_album, make_delete, make_dm,
-                       make_enckey, make_post, make_profile,
+                       TEXT_STYLE_ENUMS, WALL_COLS, make_album, make_delete,
+                       make_dm, make_enckey, make_post, make_profile,
                        make_profile_layout, make_ring, make_story)
 from .store import IngestResult, Store
 
@@ -617,7 +617,7 @@ class HearthNode:
         cur = self.store.profile_layout(self.identity_pub)
         return self._publish(make_profile_layout(
             self.device, order, grids=cur["grids"], sizes=cur["sizes"],
-            pins=cur["pins"], spans=cur["spans"]))
+            pins=cur["pins"], spans=cur["spans"], texts=cur["texts"]))
 
     def set_block_grid(self, msg_id: str, grid: str) -> str:
         if grid not in GRID_LAYOUTS:
@@ -635,7 +635,7 @@ class HearthNode:
             raise ValueError("too many styled blocks")
         return self._publish(make_profile_layout(
             self.device, cur["order"], grids=grids, sizes=cur["sizes"],
-            pins=cur["pins"], spans=cur["spans"]))
+            pins=cur["pins"], spans=cur["spans"], texts=cur["texts"]))
 
     def set_block_size(self, msg_id: str, size: str) -> str:
         if size not in SIZE_LAYOUTS:
@@ -653,7 +653,7 @@ class HearthNode:
             raise ValueError("too many sized blocks")
         return self._publish(make_profile_layout(
             self.device, cur["order"], grids=cur["grids"], sizes=sizes,
-            pins=cur["pins"], spans=cur["spans"]))
+            pins=cur["pins"], spans=cur["spans"], texts=cur["texts"]))
 
     def _check_block_id(self, msg_id):
         if not (isinstance(msg_id, str) and len(msg_id) == 64
@@ -679,7 +679,7 @@ class HearthNode:
             raise ValueError("too many pinned blocks")
         return self._publish(make_profile_layout(
             self.device, cur["order"], grids=cur["grids"],
-            sizes=cur["sizes"], pins=pins, spans=spans))
+            sizes=cur["sizes"], pins=pins, spans=spans, texts=cur["texts"]))
 
     def unpin_block(self, msg_id: str) -> str:
         """Send a block back to the unplaced tray, keeping its size."""
@@ -694,7 +694,7 @@ class HearthNode:
             raise ValueError("too many sized blocks")
         return self._publish(make_profile_layout(
             self.device, cur["order"], grids=cur["grids"],
-            sizes=cur["sizes"], pins=pins, spans=spans))
+            sizes=cur["sizes"], pins=pins, spans=spans, texts=cur["texts"]))
 
     def set_block_span(self, msg_id: str, w: int, h: int) -> str:
         """Size an UNPLACED block. A pinned block's geometry lives in its
@@ -713,7 +713,49 @@ class HearthNode:
             raise ValueError("too many sized blocks")
         return self._publish(make_profile_layout(
             self.device, cur["order"], grids=cur["grids"],
-            sizes=cur["sizes"], pins=cur["pins"], spans=spans))
+            sizes=cur["sizes"], pins=cur["pins"], spans=spans,
+            texts=cur["texts"]))
+
+    def set_block_text(self, msg_id: str, **style) -> str:
+        """Style a wall TEXT block in place (spec 2026-07-14): the texts
+        map is presentation, not content - same idiom as the retired
+        grids map. REPLACES the block's whole style each call (the modal
+        always posts the complete current selection). Defaults are
+        dropped so the map stays minimal; an all-default style removes
+        the entry."""
+        self._check_block_id(msg_id)
+        msg = self.store.get_message(msg_id)
+        if msg is None or msg.cert.identity_pub != self.identity_pub:
+            raise ValueError("not your block")
+        pl = msg.payload
+        if pl.get("kind") != KIND_POST or pl.get("placement") != "profile" \
+                or pl.get("blobs") or pl.get("media") == "video":
+            raise ValueError("text styling applies to text blocks only")
+        cleaned = {}
+        for k, v in style.items():
+            if k == "color":
+                if v not in ("default", "accent") and v not in ACCENTS:
+                    raise ValueError("bad text color")
+                if v != "default":
+                    cleaned[k] = v
+                continue
+            enum = TEXT_STYLE_ENUMS.get(k)
+            if enum is None or v not in enum:
+                raise ValueError("bad text style")
+            if v != enum[0]:                      # enum[0] is the default
+                cleaned[k] = v
+        cur = self.store.profile_layout(self.identity_pub)
+        texts = dict(cur["texts"])
+        if cleaned:
+            texts[msg_id] = cleaned
+        else:
+            texts.pop(msg_id, None)
+        if len(texts) > MAX_LAYOUT:
+            raise ValueError("too many styled blocks")
+        return self._publish(make_profile_layout(
+            self.device, cur["order"], grids=cur["grids"],
+            sizes=cur["sizes"], pins=cur["pins"], spans=cur["spans"],
+            texts=texts))
 
     def set_album(self, members, album_id: str | None = None) -> str:
         """Group own profile photo posts into a growable album (collage
@@ -772,7 +814,8 @@ class HearthNode:
                 raise ValueError("too many sized blocks")
             self._publish(make_profile_layout(
                 self.device, cur["order"], grids=cur["grids"],
-                sizes=cur["sizes"], pins=pins, spans=spans))
+                sizes=cur["sizes"], pins=pins, spans=spans,
+                texts=cur["texts"]))
         self._publish(make_album(self.device, album_id, members))
         return album_id
 
@@ -799,6 +842,12 @@ class HearthNode:
         wall = self.posts_by(identity_pub, "profile")   # newest-first
         layout = self.store.profile_layout(identity_pub)
         pins, spans, sizes = layout["pins"], layout["spans"], layout["sizes"]
+        texts = layout["texts"]
+        # Fully-defaulted so the client never guesses (spec 2026-07-14):
+        # enum defaults are each tuple's FIRST value; color's default is
+        # "default" (theme ink), not part of TEXT_STYLE_ENUMS.
+        text_style_defaults = {k: v[0] for k, v in TEXT_STYLE_ENUMS.items()}
+        text_style_defaults["color"] = "default"
 
         def _default_span(p):
             size = sizes.get(p["msg_id"], "full")
@@ -816,6 +865,13 @@ class HearthNode:
                 p["span"] = {"w": pin["w"], "h": pin["h"]}
             else:
                 p["span"] = spans.get(p["msg_id"]) or _default_span(p)
+            # Text styling annotation (spec 2026-07-14): plain text blocks
+            # only - never blobs (photos), never video. Album pseudo-blocks
+            # are synthesized below, after this loop, so they never pass
+            # through here.
+            if not p.get("blobs") and p.get("media") != "video":
+                p["text_style"] = {**text_style_defaults,
+                                   **texts.get(p["msg_id"], {})}
 
         # Album folding (Slice C): members render inside their album's
         # deck, never standalone; the album pseudo-block borrows the
