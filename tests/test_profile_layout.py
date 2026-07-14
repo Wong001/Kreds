@@ -34,6 +34,11 @@ def test_wall_stays_newest_first_despite_explicit_order(single_node, monkeypatch
     unambiguous distinct timestamps and "newest-first" is deterministic,
     without weakening the assertion below.
 
+    Stale-docstring correction (final Slice A review): post_messages now
+    tie-breaks a created_at collision by rowid DESC (arrival order, see
+    hearth/store.py) -- the monkeypatched clock here is belt-and-braces,
+    not load-bearing for determinism anymore.
+
     Retired (spec 2026-07-13): explicit order used to reshuffle the wall;
     now it's wire-compat only (see module docstring) -- the wall is
     newest-first before AND after set_profile_layout."""
@@ -56,9 +61,12 @@ def test_wall_stays_newest_first_with_or_without_a_layout_record(single_node, mo
     of whether a layout record exists at all.
 
     Same monkeypatched clock as the sibling test above: back-to-back
-    composes can share a time.time() value and created_at DESC has no
-    secondary tie-break, so strict ["C","B","A"] needs distinct,
-    strictly increasing timestamps to be deterministic."""
+    composes can share a time.time() value. Stale-docstring correction
+    (final Slice A review): post_messages now tie-breaks a created_at
+    collision by rowid DESC (see hearth/store.py), so the strict
+    ["C","B","A"] ordering no longer strictly needs distinct timestamps to
+    be deterministic -- the monkeypatched clock is kept here as
+    belt-and-braces, not because the tie-break is missing."""
     clock = iter(1_700_000_000.0 + i * 0.01 for i in range(10_000))
     monkeypatch.setattr("hearth.node.time.time", lambda: next(clock))
     n = single_node
