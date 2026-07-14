@@ -544,7 +544,7 @@ function clearGhost() {
 
 // Hand-rolled pointer drag (mouse + touch + pen), collage edition: the
 // gesture no longer reorders siblings - it carries the block's w x h
-// footprint to a cell target. The ghost previews the drop (green = free,
+// footprint to a cell target. The ghost previews the drop (accent = free,
 // red = overlap/out of bounds); release on valid pins via /api/block-pin;
 // release over the tray/off-canvas unpins; invalid or cancelled drops
 // change nothing (no auto-push - blocks never displace each other, spec
@@ -556,14 +556,38 @@ function startBlockDrag(block, ev, p) {
   if ((ev.button != null && ev.button !== 0) || !ev.isPrimary) return;
   ev.preventDefault();
   const wall = document.getElementById("profile-wall");
+  const trayEl = document.getElementById("profile-tray");
+  const trayWrap = document.getElementById("profile-tray-wrap");
   const wasPinned = !!p.pin;
   const w = p.span.w, h = p.span.h;
   try { wall.setPointerCapture(ev.pointerId); } catch (e) { return; }
   block.classList.add("dragging");
-  let target = null, ok = false;
+  let target = null, ok = false, overTray = false;
+
+  // Fix 3: the Unplaced tray is an explicit, discoverable unpin drop zone
+  // (additive to the off-canvas-unpin path below, which stays as a
+  // fallback for a drag that just leaves the canvas without reaching the
+  // tray). .tray-target gives it the same hover affordance as the ghost.
+  const setOverTray = (v) => {
+    if (overTray === v) return;
+    overTray = v;
+    trayEl.classList.toggle("tray-target", v);
+  };
 
   const onMove = (e) => {
     if (e.pointerId !== ev.pointerId) return;
+    const trayVisible = !trayWrap.classList.contains("hidden");
+    if (trayVisible) {
+      const tr = trayWrap.getBoundingClientRect();
+      const overTrayNow = e.clientX >= tr.left && e.clientX <= tr.right
+                        && e.clientY >= tr.top && e.clientY <= tr.bottom;
+      if (overTrayNow) {
+        setOverTray(true);
+        clearGhost(); target = null; ok = false;   // tray hit takes priority over the wall test below
+        return;
+      }
+    }
+    setOverTray(false);
     const {r} = wallMetrics();
     const over = e.clientX >= r.left && e.clientX <= r.right
               && e.clientY >= r.top - 40;   // small grace above row 0
@@ -589,10 +613,16 @@ function startBlockDrag(block, ev, p) {
     try { wall.releasePointerCapture(ev.pointerId); } catch (e) { /* released */ }
     block.classList.remove("dragging");
     clearGhost();   // #pin-ghost never survives past the gesture, valid or not
-    if (commit && target && ok) {
+    setOverTray(false);
+    if (commit && overTray) {
+      // Dropped explicitly on the tray: unpin a pinned block; a block
+      // that was already unplaced has nothing to change.
+      if (wasPinned) await postJSON("/api/block-unpin", {msg_id: p.msg_id});
+      else return;
+    } else if (commit && target && ok) {
       await postJSON("/api/block-pin", {msg_id: p.msg_id, ...target});
     } else if (commit && !target && wasPinned) {
-      // dragged clean off the canvas: back to the tray
+      // dragged clean off the canvas (not via the tray zone): back to the tray
       await postJSON("/api/block-unpin", {msg_id: p.msg_id});
     } else if (!commit || !target) {
       return void (CURRENT_PROFILE && openProfile(CURRENT_PROFILE));
@@ -1381,9 +1411,15 @@ async function openProfile(identityPub) {
   // dot outright (watermark to now - unlike the journal observer's
   // per-post bump, a visit means "caught up on this person").
   if (!p.mine) { markOpenedNow(identityPub); scheduleFreshDotRerender(); }
-  renderProfilePage(p);
+  // Final-review fix: setView BEFORE renderProfilePage - #view-profile still
+  // carries .hidden (display:none !important) until setView clears it, and
+  // renderProfilePage's renderWall/measureWallCell reads wall.clientWidth
+  // synchronously; a display:none wall always measures 0, squashing --cell
+  // on every profile visit (Journal/Messages -> profile is the most common
+  // one). The view must be visible before anything inside it gets measured.
   setView("profile");
-  applyProfileNav(p.mine);   // runs on BOTH the loaded and fallback paths
+  renderProfilePage(p);
+  applyProfileNav(p.mine);   // runs on BOTH the loaded and fallback paths, after setView per its own comment
 }
 
 // Your own profile keeps the "Me" nav context (desktop nav + mobile tab);
@@ -1450,7 +1486,12 @@ function renderWall(p) {
 // width" for spanning rows, so measure it (same idiom as --nav-h).
 function measureWallCell() {
   const wall = document.getElementById("profile-wall");
-  if (!wall) return;
+  // Skip, don't clamp, when unmeasurable: a display:none wall (e.g.
+  // #view-profile hidden mid-navigation) reads clientWidth 0 - leave --cell
+  // at whatever it already was rather than poisoning it down to the 40px
+  // floor. The floor below still applies to a genuinely tiny but VISIBLE
+  // wall (real narrow-viewport case).
+  if (!wall || !wall.clientWidth) return;
   const cell = Math.max(40, (wall.clientWidth - 3 * 12) / 4);
   document.documentElement.style.setProperty("--cell", cell.toFixed(2) + "px");
 }

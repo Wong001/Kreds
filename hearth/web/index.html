@@ -135,12 +135,16 @@
           <div class="profile-actions" id="profile-actions"></div>
           <div class="profile-body" id="profile-body">
             <div id="profile-wall-compose"></div>
-            <h4 class="profile-section-h">Wall</h4>
-            <div id="profile-wall"></div>
+            <!-- Unplaced tray sits ABOVE the canvas (spec 2026-07-13
+                 wall-collage-redesign-design.md sec 2) - self-only Arrange
+                 mode's staging area for not-yet-placed blocks. Visitors'
+                 flow (#profile-wall-flow) stays below the canvas. -->
             <div id="profile-tray-wrap" class="hidden">
               <h4 class="profile-section-h">Unplaced</h4>
               <div id="profile-tray"></div>
             </div>
+            <h4 class="profile-section-h">Wall</h4>
+            <div id="profile-wall"></div>
             <div id="profile-wall-flow"></div>
           </div>
         </div>

@@ -55,10 +55,33 @@ def test_pin_drag_resize_and_synced_view(tmp_path):
             page.click("text=Place on canvas")
             page.wait_for_selector("#profile-wall .block")
 
-            # modal preset resize: 2x2. openBlockSettings's reopenAfterAction
-            # (app.js) keeps the modal open on the block after EVERY action
-            # (focus-return, #5a-e) - "Place on canvas" already left it open
-            # on the now-pinned block, so no extra gear click here.
+            # Final-review Fix 1 regression guard: navigating away from the
+            # profile and back must not leave --cell squashed to the 40px
+            # floor. openProfile used to call renderProfilePage (which
+            # measures the wall) BEFORE setView("profile") unhid the view -
+            # a display:none wall always reads clientWidth 0, clamping
+            # --cell every time on the most common profile entry
+            # (Journal/Messages -> profile). Close the still-open modal
+            # first (it's a fixed full-viewport overlay that would eat the
+            # nav clicks below).
+            page.keyboard.press("Escape")
+            page.click("#nav-journal")
+            page.wait_for_selector("#journal")
+            page.click('.navlinks button[data-view="me"]')
+            page.wait_for_selector("#profile-wall .block")
+            cell = page.evaluate(
+                "parseFloat(getComputedStyle(document.documentElement)"
+                ".getPropertyValue('--cell'))")
+            assert cell > 100, f"--cell squashed to {cell}px after journal->profile nav"
+
+            # Leaving the profile view exits Arrange mode (setView's own
+            # reset, so the nav round-trip above dropped it) - re-enter
+            # before the modal-driven steps below.
+            page.click("#profile-arrange")
+            page.wait_for_selector("#profile-wall .block .block-settings-btn")
+
+            # modal preset resize: 2x2.
+            page.click("#profile-wall .block .block-settings-btn")
             page.click('[data-sel="size-2x2"]')
             page.wait_for_timeout(400)
             page.keyboard.press("Escape")

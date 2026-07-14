@@ -689,6 +689,8 @@ class HearthNode:
         spans = dict(cur["spans"])
         if geom is not None:
             spans[msg_id] = {"w": geom["w"], "h": geom["h"]}
+        if len(spans) > MAX_LAYOUT:           # pre-check -> 400, not a 500 from _publish
+            raise ValueError("too many sized blocks")
         return self._publish(make_profile_layout(
             self.device, cur["order"], grids=cur["grids"],
             sizes=cur["sizes"], pins=pins, spans=spans))

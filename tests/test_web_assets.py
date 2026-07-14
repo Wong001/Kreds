@@ -1207,11 +1207,13 @@ def test_collage_canvas_wired():
 def test_drag_to_pin_wired():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
     drag = _js_fn_body(js, "startBlockDrag")
     assert "cellFromPoint" in drag and "pin-ghost" in drag
     assert "/api/block-pin" in drag
     assert "/api/block-unpin" in drag        # dropping off-canvas unpins
     assert "insertBefore" not in drag        # reorder semantics are gone
+    assert "tray-target" in drag             # Fix 3: tray is a real, explicit unpin drop zone
     ov = _js_fn_body(js, "pinsOverlap")
     assert "w" in ov and "h" in ov
     assert "block-resize" in js              # corner handle exists
@@ -1220,6 +1222,9 @@ def test_drag_to_pin_wired():
     done = _js_fn_body(js, "toggleArrange") if "function toggleArrange" in js \
         else _js_fn_body(js, "renderProfilePage")
     assert '"/api/profile-layout"' not in done   # Done no longer posts order
+    # Fix 3(a): the Unplaced tray sits ABOVE the canvas per spec
+    # (2026-07-13-wall-collage-redesign-design.md sec 2), not below it.
+    assert html.index('id="profile-tray-wrap"') < html.index('id="profile-wall"')
 
 
 def test_block_settings_modal_collage_groups():

@@ -442,6 +442,11 @@ body.desktop .desktop-only-panel { display: block; }
   grid-auto-rows: var(--cell, 120px); grid-auto-flow: row dense;
   gap: 12px; padding: 10px; border: 1px dashed var(--line-2);
   border-radius: 12px; background: var(--paper); }
+/* Fix 3: hovered-as-unpin-target state while dragging a pinned block over
+   the tray (startBlockDrag's setOverTray) - the tray already has a dashed
+   border, so this just accents it, same token family as .pin-ghost. */
+.tray-target { border-color: var(--me);
+  background: color-mix(in srgb, var(--me) 8%, transparent); }
 #profile-wall-flow > .hint { grid-column: 1 / -1; }
 .block { min-width: 0; position: relative; overflow: hidden;
   border-radius: 12px; }
@@ -454,8 +459,13 @@ body.desktop .desktop-only-panel { display: block; }
   gap: 8px; height: 100%; }
 .block-gallery img { width: 100%; height: 100%; object-fit: cover;
   border-radius: 10px; }
-/* text scales to its width-span: 4-wide is a headliner, 1x1 a note */
+/* text scales to its width-span: 4-wide is a headliner, 1x1 a note.
+   Overflow ellipsis rather than cell growth (spec 2026-07-13): a long post
+   in a fixed-height pinned block clips with a fading/ellipsis cutoff
+   instead of pushing the block taller than its pin. One sensible clamp
+   (6 lines) across every span - per-span overrides aren't needed. */
 .block-text-body { font-size: 15px; line-height: 1.5; white-space: pre-wrap;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6;
   overflow: hidden; }
 .block.text-w1 .block-text-body { font-size: 12.5px; }
 .block.text-w2 .block-text-body { font-size: 15px; }
@@ -496,11 +506,11 @@ body.desktop .desktop-only-panel { display: block; }
 /* Arrange-mode collage affordances (Task 6): the dragged block stays put in
    the DOM (no more reorder-by-reparenting) and just dims - the ghost below
    previews the cell target instead. */
-.pin-ghost { border: 2px dashed var(--red); border-radius: 12px;
-  background: color-mix(in srgb, var(--red) 12%, transparent);
+.pin-ghost { border: 2px dashed var(--me); border-radius: 12px;
+  background: color-mix(in srgb, var(--me) 12%, transparent);
   pointer-events: none; z-index: 3; }
-.pin-ghost.invalid { border-color: var(--ink-2); border-style: dotted;
-  background: color-mix(in srgb, var(--ink-2) 14%, transparent); }
+.pin-ghost.invalid { border-color: var(--red);
+  background: color-mix(in srgb, var(--red) 14%, transparent); }
 .block.dragging { opacity: .45; }
 .block-resize { position: absolute; right: 2px; bottom: 2px; width: 18px;
   height: 18px; cursor: nwse-resize; z-index: 3; border-right: 3px solid
