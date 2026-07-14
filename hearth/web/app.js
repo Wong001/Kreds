@@ -518,6 +518,14 @@ function pinFree(geom, exceptId) {
     if (id !== exceptId && pinsOverlap(geom, pin)) return false;
   return true;
 }
+// First free {x, y} that fits a w x h block: scan rows top-down, columns
+// left-to-right - the keyboard path's "Place on canvas".
+function firstFreeSpot(w, h, exceptId) {
+  for (let y = 0; y <= 500; y++)
+    for (let x = 0; x + w <= 4; x++)
+      if (pinFree({x, y, w, h}, exceptId)) return {x, y};
+  return null;   // unreachable in practice (canvas grows downward)
+}
 function ghostAt(geom, ok) {
   let g = document.getElementById("pin-ghost");
   if (!g) {
@@ -648,9 +656,10 @@ function startBlockResize(block, ev, p) {
 // Per-block settings modal (self+Arrange-only): opened by a TAP on a block
 // (see the pointerdown handler in renderBlock) - replaces the old inline
 // drag handle button, Up/Down arrows, and grid-<select> on the block face
-// itself. The Phase-A Size picker and Slice-3b Photo-layout picker are
-// retired (spec 2026-07-13, collage redesign) - Move is what's left here
-// until Task 7 rebuilds this modal around the pin/span geometry.
+// itself. The Phase-A Size picker, Slice-3b Photo-layout picker, and the
+// reorder-era Move Up/Down pair are all retired (spec 2026-07-13, collage
+// redesign) - Task 7 rebuilds the controls around pin/span geometry: Size
+// presets, one-cell Nudge, Send to tray (pinned), Place on canvas (unpinned).
 function closeBlockSettings() {
   document.getElementById("block-settings").classList.add("hidden");
   // IMPORTANT #5(e): return focus to whatever opened the modal (the gear
@@ -660,22 +669,6 @@ function closeBlockSettings() {
   const opener = BLOCK_SETTINGS_OPENER;
   BLOCK_SETTINGS_OPENER = null;
   if (opener && opener.isConnected) opener.focus();
-}
-// Build a labelled button group; onPick(value) fires on click. `groupKey`
-// (optional) tags the group with data-group so a rebuild can refocus the
-// specific option that was just picked (see openBlockSettings' focusSel).
-function settingsGroup(label, options, current, onPick, groupKey) {
-  const wrap = el("div", "settings-group");
-  if (groupKey) wrap.dataset.group = groupKey;
-  wrap.append(el("div", "settings-label", label));
-  const row = el("div", "settings-row");
-  for (const [v, text] of options) {
-    const b = el("button", "settings-opt" + (v === current ? " on" : ""), text);
-    b.type = "button";
-    b.onclick = () => onPick(v);
-    row.append(b);
-  }
-  wrap.append(row); return wrap;
 }
 async function postJSON(url, body) {
   const r = await fetch(url, {method: "POST",
@@ -692,36 +685,96 @@ function openBlockSettings(p, block, opener, focusSel) {
   if (opener) BLOCK_SETTINGS_OPENER = opener;
   const body = document.getElementById("block-settings-body");
   body.textContent = "";
-  // Size (Phase-A's per-block size field/size-* classes) and Photo layout
-  // (Slice-3b's per-block grid field) groups retired here - spec
-  // 2026-07-13's collage redesign replaces both with pin/span geometry
-  // (see renderBlock); Task 7 rebuilds this modal's controls around that.
-  // Move is what's left for this task.
-  // Move (keyboard/touch-accessible reorder; DOM-only until Done, like Up/Down
-  // was). The modal shows one block at a time, so end-of-list disabling is
-  // just this pair's own sibling check - refreshed after each move, no
-  // page-wide bookkeeping needed (the old updateArrowStates() this replaced
-  // queried per-block arrow-button elements that no longer exist).
-  const move = el("div", "settings-group");
-  move.append(el("div", "settings-label", "Move"));
-  const row = el("div", "settings-row");
-  const up = el("button", "settings-opt", "Up"); up.type = "button";
-  const down = el("button", "settings-opt", "Down"); down.type = "button";
-  const refreshMoveState = () => {
-    up.disabled = !block.previousElementSibling;
-    down.disabled = !block.nextElementSibling;
+
+  // Refresh-after-action: every control below POSTs immediately (the
+  // pin/span/unpin endpoints are the source of truth), then this re-fetches
+  // the profile, re-renders the page (the same fetch-with-fallback +
+  // renderProfilePage the rest of the app uses to reflect a POST - see
+  // openProfile), relocates THIS block by its data-msg-id in the freshly
+  // rendered DOM, and reopens the modal on it with focusSel (falling back
+  // to the close button when focusSel doesn't resolve, same as any fresh
+  // open - #5d below). If the block is no longer on the canvas/tray at all
+  // (deleted meanwhile), close the modal instead of reopening on nothing.
+  const reopenAfterAction = async (focusSel) => {
+    let np;
+    try {
+      np = await j("/api/profile/" + CURRENT_PROFILE);
+    } catch (e) {
+      np = fallbackProfile(CURRENT_PROFILE);
+    }
+    renderProfilePage(np);
+    const post = np.wall && np.wall.find(b => b.msg_id === p.msg_id);
+    const nextBlock = document.querySelector('[data-msg-id="' + p.msg_id + '"]');
+    if (!post || !nextBlock) { closeBlockSettings(); return; }
+    openBlockSettings(post, nextBlock, null, focusSel);
   };
-  // Disabling the focused button blurs it to <body> (outside the modal),
-  // silently breaking the Tab trap below - so if a move just disabled the
-  // button the user is on, hop focus to its still-enabled sibling.
-  up.onclick = () => { const prev = block.previousElementSibling;
-    if (prev) { block.parentNode.insertBefore(block, prev); refreshMoveState();
-      if (up.disabled) down.focus(); } };
-  down.onclick = () => { const next = block.nextElementSibling;
-    if (next) { block.parentNode.insertBefore(next, block); refreshMoveState();
-      if (down.disabled) up.focus(); } };
-  refreshMoveState();
-  row.append(up, down); move.append(row); body.append(move);
+
+  // Size presets - the keyboard path for what corner-drag does by pointer.
+  const sizes = el("div", "settings-group");
+  sizes.append(el("div", "settings-label", "Size"));
+  const srow = el("div", "settings-row");
+  for (const [w, h] of [[1, 1], [2, 1], [2, 2], [4, 2], [4, 3]]) {
+    const btn = el("button", "settings-opt", w + "x" + h);
+    btn.type = "button";
+    btn.dataset.sel = "size-" + w + "x" + h;
+    if (p.pin && p.pin.w === w && p.pin.h === h) btn.classList.add("active");
+    if (!p.pin && p.span && p.span.w === w && p.span.h === h) btn.classList.add("active");
+    btn.onclick = async () => {
+      if (p.pin) {
+        const x = Math.min(p.pin.x, 4 - w);
+        const g = {x, y: p.pin.y, w, h};
+        if (!pinFree(g, p.msg_id)) { alert("No room there - move it first."); return; }
+        await postJSON("/api/block-pin", {msg_id: p.msg_id, ...g});
+      } else {
+        await postJSON("/api/block-span", {msg_id: p.msg_id, w, h});
+      }
+      await reopenAfterAction('[data-sel="size-' + w + 'x' + h + '"]');
+    };
+    srow.append(btn);
+  }
+  sizes.append(srow); body.append(sizes);
+
+  if (p.pin) {
+    // Nudge - one cell per press, refused (disabled feel) when blocked.
+    const move = el("div", "settings-group");
+    move.append(el("div", "settings-label", "Move"));
+    const mrow = el("div", "settings-row");
+    for (const [label, dx, dy] of [["Left", -1, 0], ["Right", 1, 0],
+                                   ["Up", 0, -1], ["Down", 0, 1]]) {
+      const btn = el("button", "settings-opt", label);
+      btn.type = "button";
+      btn.dataset.sel = "nudge-" + label;
+      const g = {x: p.pin.x + dx, y: p.pin.y + dy, w: p.pin.w, h: p.pin.h};
+      btn.disabled = g.x < 0 || g.x + g.w > 4 || g.y < 0
+                     || !pinFree(g, p.msg_id);
+      btn.onclick = async () => {
+        await postJSON("/api/block-pin", {msg_id: p.msg_id, ...g});
+        await reopenAfterAction('[data-sel="nudge-' + label + '"]');
+      };
+      mrow.append(btn);
+    }
+    move.append(mrow); body.append(move);
+
+    const tray = el("button", "settings-opt", "Send to tray");
+    tray.type = "button";
+    tray.onclick = async () => {
+      await postJSON("/api/block-unpin", {msg_id: p.msg_id});
+      await reopenAfterAction(null);   // block left the canvas; focus close btn
+    };
+    body.append(tray);
+  } else {
+    const place = el("button", "settings-opt", "Place on canvas");
+    place.type = "button";
+    place.onclick = async () => {
+      const spot = firstFreeSpot(p.span.w, p.span.h, p.msg_id);
+      if (!spot) { alert("No free spot fits this block."); return; }
+      await postJSON("/api/block-pin",
+        {msg_id: p.msg_id, ...spot, w: p.span.w, h: p.span.h});
+      await reopenAfterAction(null);
+    };
+    body.append(place);
+  }
+
   document.getElementById("block-settings").classList.remove("hidden");
   // IMPORTANT #5(b)/(d): move focus into the dialog. A fresh open (no
   // focusSel) goes to the close button; a post-pick rebuild (focusSel set)

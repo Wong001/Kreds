@@ -344,9 +344,12 @@ def test_bento_grid_render():
 
 
 def test_block_settings_modal():
-    # Retired by the collage redesign, spec 2026-07-13: the modal's Size
-    # (/api/block-size) and Photo-layout groups are gone - Move is what's
-    # left until Task 7 rebuilds this modal around pin/span geometry.
+    # Retired by the collage redesign, spec 2026-07-13: the modal's old
+    # Phase-A Size (/api/block-size) and Slice-3b Photo-layout groups are
+    # gone. Task 7 then retired the reorder-era Move Up/Down pair too and
+    # rebuilt the modal around pin/span geometry (Size presets, Nudge,
+    # Send to tray, Place on canvas - see test_block_settings_modal_
+    # collage_groups).
     html = (WEB / "index.html").read_text(encoding="utf-8")
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert 'id="block-settings"' in html                 # modal markup
@@ -1217,3 +1220,14 @@ def test_drag_to_pin_wired():
     done = _js_fn_body(js, "toggleArrange") if "function toggleArrange" in js \
         else _js_fn_body(js, "renderProfilePage")
     assert '"/api/profile-layout"' not in done   # Done no longer posts order
+
+
+def test_block_settings_modal_collage_groups():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    body = _js_fn_body(js, "openBlockSettings")
+    for needle in ("firstFreeSpot", "/api/block-unpin", "/api/block-span",
+                   "/api/block-pin", "Send to tray", "Place on canvas"):
+        assert needle in body, needle
+    assert "previousElementSibling" not in body   # Up/Down reorder retired
+    ff = _js_fn_body(js, "firstFreeSpot")
+    assert "pinFree" in ff
