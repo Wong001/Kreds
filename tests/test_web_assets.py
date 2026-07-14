@@ -278,12 +278,19 @@ def test_journal_rail_and_self_only_friends():
 
 
 def test_photo_grid_layouts():
+    # Retired by the collage redesign, spec 2026-07-13: the Slice-3b
+    # cols2/cols3/hero/masonry photo-grid picker no longer drives rendering -
+    # photoGridClass is now a two-way big-vs-gallery split and renderBlock/
+    # renderWall never read p.grid (see test_collage_canvas_wired). The
+    # composer's own compose-time preselect still POSTs /api/block-grid
+    # (kept until Slice B; not a wall-post reader), so that endpoint string
+    # survives in js even though nothing reads the value back.
     js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
-    assert "p.grid" in js                                    # render reads the grid
-    assert "/api/block-grid" in js                           # picker persists it
+    assert "p.grid" not in js
+    assert "/api/block-grid" in js                           # composer's compose-time preselect only
     for k in ("block-grid-2", "block-grid-3", "block-hero", "block-masonry"):
-        assert k in css                                      # five layouts styled
+        assert k not in css                                  # five-layout styling retired
 
 
 def test_pointer_dnd_present():
@@ -317,21 +324,29 @@ def test_video_block_render_and_composer():
 
 
 def test_bento_grid_render():
+    # Retired by the collage redesign, spec 2026-07-13: Phase-A's p.size /
+    # size-small|wide|full bento span classes are gone from both render and
+    # CSS - renderBlock now reads p.pin/p.span onto inline grid-column/
+    # grid-row (see test_collage_canvas_wired); #profile-wall-flow/#profile-
+    # tray still pack with grid-auto-flow, just not via size-* classes.
     js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
-    assert "p.size" in js                                  # render reads the size
-    assert "size-" in js                                   # span class applied
-    assert "grid-auto-flow" in css                         # bento packing
+    assert "p.size" not in js
+    assert "grid-auto-flow" in css                         # unplaced flow/tray packing
     for k in ("size-small", "size-wide", "size-full"):
-        assert k in css
+        assert k not in css
+        assert k not in js
 
 
 def test_block_settings_modal():
+    # Retired by the collage redesign, spec 2026-07-13: the modal's Size
+    # (/api/block-size) and Photo-layout groups are gone - Move is what's
+    # left until Task 7 rebuilds this modal around pin/span geometry.
     html = (WEB / "index.html").read_text(encoding="utf-8")
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert 'id="block-settings"' in html                 # modal markup
     assert "openBlockSettings" in js                     # opener
-    assert "/api/block-size" in js                       # size action
+    assert "/api/block-size" not in js                   # size action retired
     assert "drag-handle" not in js                       # inline 3-line handle removed
     assert 'className = "grid-pick"' not in js and "grid-pick" not in js  # inline select removed
 
@@ -1156,3 +1171,24 @@ def test_sticky_journal_header():
     assert 'id="journal-sticky"' in html
     assert ".journal-sticky" in css
     assert "--nav-h" in js and "offsetHeight" in js   # measured, not hardcoded
+
+
+def test_collage_canvas_wired():
+    # Slice A pin engine: 4-col canvas with measured square-ish cells,
+    # pinned blocks at explicit coordinates, unplaced flow + tray,
+    # legacy size-*/grid-* rendering retired.
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert 'id="profile-wall-flow"' in html
+    assert 'id="profile-tray"' in html
+    wall_rule = _css_rule(css, "#profile-wall")
+    assert "repeat(4, 1fr)" in wall_rule
+    assert "var(--cell" in wall_rule
+    assert "measureWallCell" in js and "clientWidth" in js
+    rw = _js_fn_body(js, "renderWall")
+    assert "pin" in rw and "profile-tray" in rw
+    rb = _js_fn_body(js, "renderBlock")
+    assert "gridColumn" in rb and "gridRow" in rb
+    assert "size-full" not in js          # Phase-A width classes retired
+    assert "existence-disclosure" in js or "opaque ids" in js  # honesty note

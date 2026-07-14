@@ -344,24 +344,33 @@ function buildEntry(p) {
 // Profile canvas block: a profile post rendered by inferred type - text, or
 // photo (one big, several as a gallery). Distinct from the compact journal
 // buildEntry(). Delete-everywhere (self) routes through the shared helper.
-// Map a photo block's grid choice + photo count to its media-container CSS
-// class. Single photo always renders big regardless of grid. Shared by
-// renderBlock and the arrange-mode grid picker (which applies it in place).
-function photoGridClass(grid, count) {
-  if (count === 1) return "block-photo";
-  switch (grid) {
-    case "cols2": return "block-grid-2";
-    case "cols3": return "block-grid-3";
-    case "hero": return "block-hero";
-    case "masonry": return "block-masonry";
-    default: return "block-gallery";   // auto
-  }
+// Photo container class: one photo renders big, several as a cropped
+// 2-col gallery (interim until Slice C's album decks). The Slice-3b grid
+// layouts are retired - a synced record's grids map is deliberately
+// ignored (spec 2026-07-13 decision 4).
+function photoGridClass(count) {
+  return count === 1 ? "block-photo" : "block-gallery";
 }
 
 function renderBlock(p) {
   const block = el("article", "block");
   block.dataset.msgId = p.msg_id;   // read back by Arrange mode's Done handler
-  block.classList.add("size-" + (p.size || "full"));   // bento width span
+  // Collage geometry: a pinned block sits at explicit cells; an unplaced
+  // one spans its chosen size and flows. Pins/spans are plaintext geometry
+  // over opaque ids (existence-disclosure class, same as the old order
+  // list - see the spec's metadata honesty note).
+  block.classList.add("block-cells");
+  const geom = p.pin || null;
+  const span = p.span || {w: 4, h: 1};
+  if (geom) {
+    block.style.gridColumn = (geom.x + 1) + " / span " + geom.w;
+    block.style.gridRow = (geom.y + 1) + " / span " + geom.h;
+  } else {
+    block.style.gridColumn = "span " + span.w;
+    block.style.gridRow = "span " + span.h;
+  }
+  if (p.text && !(p.blobs && p.blobs.length))
+    block.classList.add("text-w" + span.w);
   if (p.media === "video" && p.blobs && p.blobs.length) {
     const wrap = el("div", "block-video");
     const v = document.createElement("video");
@@ -371,7 +380,7 @@ function renderBlock(p) {
     src.src = "/api/post-blob/" + p.msg_id + "/" + p.blobs[0];
     v.append(src); wrap.append(v); block.append(wrap);
   } else if (p.blobs && p.blobs.length) {
-    const media = el("div", photoGridClass(p.grid || "auto", p.blobs.length));
+    const media = el("div", photoGridClass(p.blobs.length));
     p.blobs.forEach((h, idx) => {
       const img = document.createElement("img");
       img.src = "/api/post-blob/" + p.msg_id + "/" + h;
@@ -559,9 +568,9 @@ function startBlockDrag(block, ev) {
 // Per-block settings modal (self+Arrange-only): opened by a TAP on a block
 // (see the pointerdown handler in renderBlock) - replaces the old inline
 // drag handle button, Up/Down arrows, and grid-<select> on the block face
-// itself. Size and grid apply in place (swap classes on the live DOM node)
-// so a pending, uncommitted reorder from this Arrange session survives,
-// matching the prior inline photo-layout picker's behavior (see dc49210).
+// itself. The Phase-A Size picker and Slice-3b Photo-layout picker are
+// retired (spec 2026-07-13, collage redesign) - Move is what's left here
+// until Task 7 rebuilds this modal around the pin/span geometry.
 function closeBlockSettings() {
   document.getElementById("block-settings").classList.add("hidden");
   // IMPORTANT #5(e): return focus to whatever opened the modal (the gear
@@ -603,34 +612,11 @@ function openBlockSettings(p, block, opener, focusSel) {
   if (opener) BLOCK_SETTINGS_OPENER = opener;
   const body = document.getElementById("block-settings-body");
   body.textContent = "";
-  // Size (all blocks)
-  body.append(settingsGroup("Size",
-    [["small","Small"],["wide","Wide"],["full","Full"]], p.size || "full",
-    async (v) => {
-      if (await postJSON("/api/block-size", {msg_id: p.msg_id, size: v})) {
-        p.size = v;
-        block.classList.remove("size-small","size-wide","size-full");
-        block.classList.add("size-" + v);            // apply in place (keep pending order)
-        // refresh the highlighted option, refocusing the picked size (#5d)
-        openBlockSettings(p, block, null, '[data-group="size"] .settings-opt.on');
-      }
-    }, "size"));
-  // Photo grid (multi-photo blocks only)
-  if (p.media !== "video" && p.blobs && p.blobs.length > 1) {
-    body.append(settingsGroup("Photo layout",
-      [["auto","Auto"],["cols2","2 cols"],["cols3","3 cols"],["hero","Hero"],["masonry","Masonry"]],
-      p.grid || "auto",
-      async (v) => {
-        if (await postJSON("/api/block-grid", {msg_id: p.msg_id, grid: v})) {
-          p.grid = v;
-          const media = block.querySelector(".block-photo,.block-gallery,"
-            + ".block-grid-2,.block-grid-3,.block-hero,.block-masonry");
-          if (media) media.className = photoGridClass(p.grid, p.blobs.length);
-          // refresh the highlighted option, refocusing the picked grid (#5d)
-          openBlockSettings(p, block, null, '[data-group="grid"] .settings-opt.on');
-        }
-      }, "grid"));
-  }
+  // Size (Phase-A's per-block size field/size-* classes) and Photo layout
+  // (Slice-3b's per-block grid field) groups retired here - spec
+  // 2026-07-13's collage redesign replaces both with pin/span geometry
+  // (see renderBlock); Task 7 rebuilds this modal's controls around that.
+  // Move is what's left for this task.
   // Move (keyboard/touch-accessible reorder; DOM-only until Done, like Up/Down
   // was). The modal shows one block at a time, so end-of-list disabling is
   // just this pair's own sibling check - refreshed after each move, no
@@ -1280,6 +1266,44 @@ function fallbackProfile(identityPub) {
           ring: null, since: null, wall: [], journal: [], unavailable: true};
 }
 
+// The collage: pinned blocks at explicit coordinates on #profile-wall
+// (holes stay empty - a block this viewer can't decrypt leaves its gap);
+// unplaced blocks flow newest-first below (#profile-wall-flow), or sit in
+// the Unplaced tray when the owner is arranging. WALL_PINS mirrors the
+// rendered pins map for Task-6 overlap checks.
+let WALL_PINS = {};
+function renderWall(p) {
+  const wall = document.getElementById("profile-wall");
+  const flow = document.getElementById("profile-wall-flow");
+  const tray = document.getElementById("profile-tray");
+  const trayWrap = document.getElementById("profile-tray-wrap");
+  wall.replaceChildren(); flow.replaceChildren(); tray.replaceChildren();
+  WALL_PINS = {};
+  const pinned = p.wall.filter(b => b.pin);
+  const unpinned = p.wall.filter(b => !b.pin);
+  for (const post of pinned) {
+    WALL_PINS[post.msg_id] = post.pin;
+    wall.append(renderBlock(post));
+  }
+  const trayMode = ARRANGING && p.mine;
+  trayWrap.classList.toggle("hidden", !trayMode);
+  for (const post of unpinned)
+    (trayMode ? tray : flow).append(renderBlock(post));
+  if (!p.wall.length) flow.append(el("div", "hint",
+    p.mine ? "Your profile is a blank canvas - post something above." : "Nothing here yet."));
+  measureWallCell();
+}
+
+// --cell drives grid-auto-rows: CSS can't express "row height = column
+// width" for spanning rows, so measure it (same idiom as --nav-h).
+function measureWallCell() {
+  const wall = document.getElementById("profile-wall");
+  if (!wall) return;
+  const cell = Math.max(40, (wall.clientWidth - 3 * 12) / 4);
+  document.documentElement.style.setProperty("--cell", cell.toFixed(2) + "px");
+}
+window.addEventListener("resize", measureWallCell);
+
 function renderProfilePage(p) {
   const color = p.accent || identityColor(p.identity_pub);   // owner's chosen accent for all viewers
   const page = document.getElementById("profile-page");
@@ -1371,11 +1395,7 @@ function renderProfilePage(p) {
   compose.replaceChildren();
   if (p.mine) compose.append(profilePostComposer());
 
-  const wall = document.getElementById("profile-wall");
-  wall.replaceChildren();
-  if (!p.wall.length) wall.append(el("div", "hint",
-    p.mine ? "Your profile is a blank canvas - post something above." : "Nothing here yet."));
-  for (const post of p.wall) wall.append(renderBlock(post));
+  renderWall(p);
 
   const rail = document.getElementById("profile-journal-rail");
   rail.replaceChildren();

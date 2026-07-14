@@ -426,45 +426,46 @@ body.desktop .desktop-only-panel { display: block; }
 .profile-body #profile-wall-compose:empty { display: none; }
 .profile-composer { margin-bottom: 4px; }
 
-/* Wall canvas blocks (renderBlock): text-only, one big photo, or a gallery
-   grid - distinct from the compact journal .entry rows above. Bento canvas
-   (Phase A): #profile-wall is a 3-col CSS grid, blocks span 1/2/3 columns by
-   p.size (small/wide/full, set in renderBlock) and pack densely so a small
-   block can backfill a gap left by a taller neighbor. */
-#profile-wall { display: grid; grid-template-columns: repeat(3, 1fr);
-  grid-auto-flow: row dense; gap: 12px; align-items: start; }
-#profile-wall > .hint { grid-column: 1 / -1; }  /* empty-wall placeholder spans full width */
-.block { min-width: 0; }                       /* let grid items shrink, no overflow */
-.block.size-small { grid-column: span 1; }
-.block.size-wide  { grid-column: span 2; }
-.block.size-full  { grid-column: span 3; }
-@media (max-width: 560px) {
-  #profile-wall { grid-template-columns: repeat(2, 1fr); }
-  .block.size-full, .block.size-wide { grid-column: span 2; }  /* clamp to 2 cols */
-  .block.size-small { grid-column: span 1; }
-}
-.block-photo img { width: 100%; border-radius: 12px; display: block; }
-.block-gallery { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-.block-gallery img { width: 100%; aspect-ratio: 1/1; object-fit: cover; border-radius: 10px; }
-/* Configurable grid layouts (Slice 3b): auto (.block-gallery, above) plus
-   four explicit picks, applied per p.grid in renderBlock. */
-.block-grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-.block-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-.block-grid-2 img, .block-grid-3 img { width: 100%; aspect-ratio: 1/1; object-fit: cover; border-radius: 10px; }
-.block-hero { display: flex; flex-wrap: wrap; gap: 8px; }
-.block-hero img:first-child { width: 100%; flex-basis: 100%; border-radius: 12px; margin-bottom: 8px; }
-.block-hero img:not(:first-child) { flex: 1 1 0; min-width: 80px; aspect-ratio: 1/1; object-fit: cover; border-radius: 8px; }
-.block-masonry { column-count: 3; column-gap: 8px; }
-.block-masonry img { width: 100%; margin-bottom: 8px; border-radius: 10px; break-inside: avoid; }
-/* Video block (Slice 3c): poster + controls, no autoplay - see renderBlock. */
-.block-video video { width: 100%; border-radius: 12px; display: block; }
-.layout-pick { margin-top: 6px; }   /* profilePostComposer's compose-time grid preselect */
-@media (max-width: 560px) {
-  .block-grid-3 { grid-template-columns: repeat(2, 1fr); }   /* grid layout */
-  .block-masonry { column-count: 2; }                        /* multicol layout */
-}
-.block-text-body { font-size: 15px; line-height: 1.5; white-space: pre-wrap; }
-.block .del { margin-top: 8px; }
+/* Collage canvas (Slice A): 4 columns of square-ish cells. --cell is
+   measured in JS (measureWallCell) - CSS cannot express "row height =
+   column width" when blocks span rows. Pinned blocks carry inline
+   grid-column/grid-row from their pin; empty cells are real (honest
+   holes). #profile-wall-flow packs unplaced blocks newest-first;
+   the collage SCALES on small screens (cells shrink), it never reflows -
+   the user composed a page. */
+#profile-wall { display: grid; grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: var(--cell, 120px); gap: 12px; }
+#profile-wall-flow { display: grid; grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: var(--cell, 120px); grid-auto-flow: row dense;
+  gap: 12px; margin-top: 12px; }
+#profile-tray { display: grid; grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: var(--cell, 120px); grid-auto-flow: row dense;
+  gap: 12px; padding: 10px; border: 1px dashed var(--line-2);
+  border-radius: 12px; background: var(--paper); }
+#profile-wall-flow > .hint { grid-column: 1 / -1; }
+.block { min-width: 0; position: relative; overflow: hidden;
+  border-radius: 12px; }
+/* media fills its cells, cropped (iOS-widget style) */
+.block-photo, .block-photo img, .block-video, .block-video video {
+  width: 100%; height: 100%; }
+.block-photo img, .block-video video { object-fit: cover; display: block;
+  border-radius: 12px; }
+.block-gallery { display: grid; grid-template-columns: repeat(2, 1fr);
+  gap: 8px; height: 100%; }
+.block-gallery img { width: 100%; height: 100%; object-fit: cover;
+  border-radius: 10px; }
+/* text scales to its width-span: 4-wide is a headliner, 1x1 a note */
+.block-text-body { font-size: 15px; line-height: 1.5; white-space: pre-wrap;
+  overflow: hidden; }
+.block.text-w1 .block-text-body { font-size: 12.5px; }
+.block.text-w2 .block-text-body { font-size: 15px; }
+.block.text-w3 .block-text-body { font-size: 19px; }
+.block.text-w4 .block-text-body { font-size: 24px; font-weight: 650;
+  font-family: var(--disp); line-height: 1.25; }
+/* self-only overlays sit on the cell, not under it (fixed block heights) */
+.block .block-scope { position: absolute; top: 6px; left: 6px; z-index: 2; }
+.block .del { position: absolute; bottom: 6px; right: 6px; z-index: 2; }
+.layout-pick { margin-top: 6px; }   /* profilePostComposer's compose-time grid preselect (Slice B) */
 /* Fix B: per-block audience badge (self-only - visible on your own wall so
    you can see at a glance what each block's scope is). */
 .block-scope { display: inline-block; font-family: var(--mono); font-size: 10px;
