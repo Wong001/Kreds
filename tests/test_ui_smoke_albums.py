@@ -3,7 +3,11 @@ feature: post 3 photos via the composer -> a swipeable .block-deck badge
 "1/3" -> arrow-flip to "3/3" -> a tap (not in Arrange) opens the lightbox
 at "3 / 3", Escape closes it -> the '+' Add-photos control grows the deck
 in place to "/4" and mints a 2-member album -> Arrange -> gear ->
-Ungroup restores two standalone blocks and empties the album. Reuses the
+Ungroup restores two standalone blocks and empties the album. Rewritten
+for dynamic placement (spec 2026-07-14): a new wall post lands PINNED at
+the top immediately - there is no tray - so this smoke drives Arrange
+straight on the canvas and asserts the ungrouped members land PINNED
+(restored-newest on top) instead of unplaced-in-a-tray. Reuses the
 LiveNode harness from test_ui_smoke_seen_badge (import, not copy); the
 composer/collage smokes (test_ui_smoke_composer.py,
 test_ui_smoke_collage.py) are this file's concrete templates for the
@@ -57,12 +61,22 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
                 _pngs(tmp_path, 3))
             page.wait_for_selector(".preview-deck")
             page.click(".profile-composer .postbtn")
-            page.wait_for_selector(
-                "#profile-wall-flow .block-deck, #profile-tray .block-deck",
-                timeout=8000)
+            # Creation auto-places at the top dense (spec 2026-07-14): the
+            # composer's default 2x2 chip rides straight onto /api/post, so
+            # the deck lands PINNED at (0,0) immediately - no tray.
+            page.wait_for_selector("#profile-wall .block-deck", timeout=8000)
 
             deck = page.locator(".block-deck").first
+            # data-msg-id lives on the ANCESTOR .block article (renderBlock),
+            # not .block-deck itself (renderDeck's own div) - it's the only
+            # block on the wall at this point.
+            orig_id = page.locator("#profile-wall .block").first \
+                .get_attribute("data-msg-id")
             assert deck.locator(".deck-count").inner_text() == "1/3"
+
+            lay = a.node.store.profile_layout(a.node.identity_pub)
+            pin_before = lay["pins"][orig_id]
+            assert pin_before == {"x": 0, "y": 0, "w": 2, "h": 2}
 
             # -- pixel probe, right after the deck first renders, before
             # any interaction (regression guard mirroring the composer
@@ -115,25 +129,49 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             page.wait_for_selector("#lightbox", state="detached")
 
             # '+' Add photos: one more PNG grows the deck in place and
-            # mints an album wrapping [original post, new post]
+            # mints an album wrapping [original post, new post].
+            #
+            # Node-level verified interaction (spec 2026-07-14): the new
+            # photo posted by "+" auto-places itself PINNED at (0,0) at
+            # creation too - every profile post does now - so BOTH members
+            # already carry a pin by the time /api/album groups them.
+            # set_album's "two-or-more pinned members" branch (Slice C,
+            # predates dynamic placement) can't pick a winner between them,
+            # so it drops the freshly-minted album unpinned rather than
+            # taking its own documented "exactly one pinned member ->
+            # inherit" path. The deck doesn't hang unplaced for long
+            # though: addPhotosToBlock's own re-render surfaces the
+            # now-unpinned album, and renderWall's migration check
+            # (p.mine && unpinned.length) immediately fires one
+            # /api/wall-autoplace, re-pinning it at the top - which
+            # happens to equal its original (0,0) spot here (the wall's
+            # only other content), so the net effect on THIS wall matches
+            # "grows in place". A deck that ISN'T already at the top would
+            # visibly relocate to (0,0) instead of staying put - a real
+            # fragility in the two-pinned-members path, reported rather
+            # than fixed here (Task 1/2 territory - see task-3-report.md).
             page.set_input_files(
                 ".block-add input", _pngs(tmp_path, 1, start=3))
             page.wait_for_function(
-                "document.querySelector('.deck-count') && "
-                "document.querySelector('.deck-count').innerText"
-                ".endsWith('/4')",
+                "document.querySelector('#profile-wall .deck-count') && "
+                "document.querySelector('#profile-wall .deck-count')"
+                ".innerText.endsWith('/4')",
                 timeout=8000)
-            assert page.locator(".deck-count").inner_text() == "1/4"
+            assert page.locator("#profile-wall .deck-count").inner_text() == "1/4"
 
             albums = a.node.store.albums(a.node.identity_pub)
             assert len(albums) == 1
             album_id, members = next(iter(albums.items()))
             assert len(members) == 2   # original post + newly added post
 
+            lay = a.node.store.profile_layout(a.node.identity_pub)
+            assert lay["pins"][album_id] == pin_before   # grow keeps it in place
+            assert orig_id not in lay["pins"]             # geometry moved to the album now
+
             # Arrange -> gear on the deck -> Ungroup
             page.click("#profile-arrange")
-            page.wait_for_selector("#profile-tray .block")
-            page.click("#profile-tray .block .block-settings-btn")
+            page.wait_for_selector(f'[data-msg-id="{album_id}"] .block-settings-btn')
+            page.click(f'[data-msg-id="{album_id}"] .block-settings-btn')
             page.click("text=Ungroup")
             # the album pseudo-block (keyed on msg_id == album_id) must be
             # gone from the DOM once the re-render lands - more precise
@@ -142,13 +180,26 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             page.wait_for_selector(f'[data-msg-id="{album_id}"]',
                                    state="detached", timeout=8000)
 
-            # two standalone blocks reappear, both unplaced (still in
-            # Arrange -> the tray): the 3-photo deck and the 1-photo block
-            assert page.locator("#profile-tray .block").count() == 2
+            # two standalone blocks reappear, both PINNED on the canvas
+            # (dynamic placement, spec 2026-07-14: ungroup top-inserts -
+            # no limbo, no tray to fall back into): the 3-photo deck and
+            # the 1-photo block.
+            assert page.locator("#profile-wall .block").count() == 2
+            assert page.locator("#profile-wall-flow .block").count() == 0
             assert page.locator(".block-deck").count() == 1
             assert page.locator(
                 ".block-deck .deck-count").inner_text() == "1/3"
             assert page.locator(".block-photo").count() == 1
+
+            # restored-newest-on-top: the 1-photo block (added via "+",
+            # the younger member) ends at y==0; the 3-photo deck (the
+            # original, older member) settles below it - never sideways.
+            new_id = [m for m in members if m != orig_id][0]
+            lay = a.node.store.profile_layout(a.node.identity_pub)
+            assert lay["pins"][new_id]["y"] == 0
+            assert lay["pins"][orig_id]["y"] >= lay["pins"][new_id]["y"]
+            assert lay["pins"][new_id]["x"] == 0
+            assert lay["pins"][orig_id]["x"] == 0
 
             albums_after = a.node.store.albums(a.node.identity_pub)
             assert albums_after.get(album_id) == []
@@ -212,12 +263,14 @@ def test_text_block_styling_via_modal_persists_and_syncs(tmp_path):
             page.goto(f"http://127.0.0.1:{a.http_port}/")
             page.wait_for_selector(".fchip")
 
-            # own profile -> Arrange: the new text block waits in the tray
+            # own profile -> the new text block is pinned at the top
+            # immediately (spec 2026-07-14: no tray to wait in) - Arrange
+            # to reach its settings gear.
             page.click('.navlinks button[data-view="me"]')
             page.wait_for_selector("#profile-arrange")
             page.click("#profile-arrange")
-            page.wait_for_selector("#profile-tray .block .block-settings-btn")
-            page.click("#profile-tray .block .block-settings-btn")
+            page.wait_for_selector("#profile-wall .block .block-settings-btn")
+            page.click("#profile-wall .block .block-settings-btn")
             page.wait_for_selector('[data-sel="text-h-center"]')
 
             # Center / Middle / XL / Display / Bold / first swatch - each
@@ -238,8 +291,8 @@ def test_text_block_styling_via_modal_persists_and_syncs(tmp_path):
             page.wait_for_selector("#block-settings", state="hidden")
 
             styles = _read_text_style(
-                page, "#profile-tray .block-text-wrap",
-                "#profile-tray .block-text-body")
+                page, "#profile-wall .block-text-wrap",
+                "#profile-wall .block-text-body")
             expected_color = _hex_to_rgb(ACCENTS[0])
             assert styles["justify"] == "center"
             assert styles["align"] == "center"
@@ -255,12 +308,13 @@ def test_text_block_styling_via_modal_persists_and_syncs(tmp_path):
             # hidden the whole time; waiting on it here is a real flake,
             # not a feature bug - caught by an isolated repro during this
             # task, see task-2-report.md). ARRANGING itself resets on
-            # reload, so the styled block is now in the ordinary flow.
+            # reload, but the styled block stays pinned on the ordinary
+            # wall - there's no tray for it to fall into.
             page.reload()
-            page.wait_for_selector("#profile-wall-flow .block-text-wrap")
+            page.wait_for_selector("#profile-wall .block-text-wrap")
             styles_after_reload = _read_text_style(
-                page, "#profile-wall-flow .block-text-wrap",
-                "#profile-wall-flow .block-text-body")
+                page, "#profile-wall .block-text-wrap",
+                "#profile-wall .block-text-body")
             assert styles_after_reload == styles
 
             # friend leg: Bo syncs and sees the same styled render on
@@ -275,10 +329,10 @@ def test_text_block_styling_via_modal_persists_and_syncs(tmp_path):
             page2.click("#nav-me")
             page2.wait_for_selector("#friends .friend")
             page2.click(".friend:has-text('Anna')")
-            page2.wait_for_selector("#profile-wall-flow .block-text-wrap")
+            page2.wait_for_selector("#profile-wall .block-text-wrap")
             friend_styles = _read_text_style(
-                page2, "#profile-wall-flow .block-text-wrap",
-                "#profile-wall-flow .block-text-body")
+                page2, "#profile-wall .block-text-wrap",
+                "#profile-wall .block-text-body")
             assert friend_styles == styles
 
             assert not errors, f"console pageerrors: {errors}"

@@ -1,7 +1,11 @@
 """UI_E2E=1-gated live smoke for the composer preview (collage Slice B):
 attach photos -> deck preview + count badge + chips; chip changes the
-seeded span; text-only posts seed nothing; the dropdown is gone.
-Reuses the LiveNode harness (import, not copy)."""
+size that rides straight onto /api/post; text-only posts send no chips;
+the dropdown is gone. Rewritten for dynamic placement (spec 2026-07-14):
+a post lands PINNED at the top the instant it's composed - there is no
+span-seed roundtrip and no unplaced limbo to assert against, so this
+smoke reads the pin directly. Reuses the LiveNode harness (import, not
+copy)."""
 import os
 
 import pytest
@@ -78,23 +82,36 @@ def test_composer_preview_and_span_seed(tmp_path):
             w = page.locator(".compose-preview").bounding_box()["width"]
             assert abs(w - cell) < 8, f"preview {w} vs cell {cell}"
 
-            # post -> span seeded 1x1, block lands unpinned
+            # post -> the chosen 1x1 rides straight onto /api/post as w/h
+            # (spec 2026-07-14: the separate span-seed call is gone) and
+            # lands PINNED at the top dense, push-place applied - it's the
+            # only block on the wall, so it lands exactly at (0,0).
             # (scoped: the journal composer's hidden .postbtn is the first
             # DOM match, and page.click waits on the first match forever)
             page.click(".profile-composer .postbtn")
-            page.wait_for_selector("#profile-wall-flow .block, #profile-tray .block",
-                                   timeout=8000)
+            page.wait_for_selector("#profile-wall .block", timeout=8000)
+            msg_id = page.locator("#profile-wall .block").first \
+                .get_attribute("data-msg-id")
             lay = a.node.store.profile_layout(a.node.identity_pub)
-            assert list(lay["spans"].values()) == [{"w": 1, "h": 1}]
-            assert lay["pins"] == {}
+            assert lay["pins"][msg_id] == {"x": 0, "y": 0, "w": 1, "h": 1}
+            assert msg_id not in lay["spans"]   # geometry lives in the pin now
 
-            # text-only post: no chips, no extra span entries
+            # text-only post: no chips shown, none sent - the server's 4x1
+            # text default applies, pinned at the top, pushing the photo
+            # block straight down (never sideways, never orphaned).
             assert page.locator(".size-chips").is_hidden()
             page.fill(".profile-composer input[type=text]", "bare tekst")
             page.click(".profile-composer .postbtn")
-            page.wait_for_timeout(800)
+            page.wait_for_function(
+                "document.querySelectorAll('#profile-wall .block').length === 2",
+                timeout=8000)
+            text_id = page.locator("#profile-wall .block").first \
+                .get_attribute("data-msg-id")   # newest post renders first
             lay = a.node.store.profile_layout(a.node.identity_pub)
-            assert len(lay["spans"]) == 1        # still only the photo post
+            assert lay["pins"][text_id] == {"x": 0, "y": 0, "w": 4, "h": 1}
+            assert lay["pins"][msg_id]["x"] == 0
+            assert lay["pins"][msg_id]["y"] > 0
+            assert len(lay["pins"]) == 2
 
             assert not errors, f"console pageerrors: {errors}"
             browser.close()
