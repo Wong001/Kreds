@@ -124,6 +124,37 @@ def test_auto_place_unplaced_single_publish(tmp_path):
     assert n.auto_place_unplaced() == 0      # idempotent, no extra publish
 
 
+def test_autoplace_skips_shadowed_album(tmp_path):
+    """Two own devices minting albums around the same post offline can
+    leave two albums sharing a member; profile_view folds the shared
+    member into the lexically-smallest album_id and never renders the
+    other album at all. auto_place_unplaced must gate candidacy on that
+    SAME fold - otherwise it can pin the shadowed album: a permanent
+    invisible hole in the grid, unreachable by any UI (review finding).
+    Mint order is deliberately the REVERSE of lexical order (larger id
+    first) so the test can't pass by accident on publish/ingest order."""
+    n = _node(tmp_path)
+    p1 = n.compose_post("shared", scope="kreds", placement="profile",
+                        photos=[b"\x89PNG fake"])
+    big_id = "b" * 64
+    small_id = "a" * 64
+    n.set_album([p1], album_id=big_id)              # minted first, larger id
+    n.set_album([p1], album_id=small_id)             # same sole member, smaller id
+    # simulate legacy: strip all pins via a raw layout write (established
+    # simulation, same idiom as test_auto_place_unplaced_single_publish).
+    cur = n.store.profile_layout(n.identity_pub)
+    from hearth.messages import make_profile_layout
+    n._publish(make_profile_layout(n.device, cur["order"],
+                                   grids=cur["grids"], sizes=cur["sizes"],
+                                   pins={}, spans={}, texts=cur["texts"]))
+    placed = n.auto_place_unplaced()
+    p = _pins(n)
+    assert placed == 1                    # only the winning album is a candidate
+    assert small_id in p                  # lexically-smallest wins the fold
+    assert big_id not in p                # shadowed album never gets pinned
+    assert p1 not in p                    # the member itself is not standalone
+
+
 def test_grow_pinned_album_leaves_wall_undisturbed(tmp_path):
     """Deck grow (smoke-caught fix): an album-bound photo post composed
     with auto_place=False is deck CONTENT, not a wall block - it must

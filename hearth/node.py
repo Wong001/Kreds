@@ -931,6 +931,25 @@ class HearthNode:
         self._publish(make_album(self.device, album_id, members))
         return album_id
 
+    @staticmethod
+    def _fold_album_members(albums: dict) -> dict:
+        """{member_msg_id: winning_album_id}. A member claimed by two
+        albums folds into the lexically-smallest album_id -
+        content-deterministic, so every device resolves the conflict
+        identically regardless of ingest order (dict order is SQL scan
+        order, which differs across devices). This is profile_view's
+        rendering rule; auto_place_unplaced shares it so migration
+        candidacy can never disagree with what profile_view actually
+        renders (review finding: auto_place_unplaced pinned an album
+        whose only member was shadowed elsewhere - a permanent invisible
+        hole in the grid, reachable via two own devices minting albums
+        around the same post offline)."""
+        member_of = {}
+        for aid, mids in sorted(albums.items()):
+            for mid in mids:
+                member_of.setdefault(mid, aid)     # smallest album_id wins a conflict
+        return member_of
+
     def auto_place_unplaced(self) -> int:
         """One-shot migration (spec 2026-07-14): pin every unplaced own
         wall block at the top, oldest first so the newest ends on top.
@@ -941,9 +960,8 @@ class HearthNode:
         posts = self.posts_by(self.identity_pub, "profile")
         by_id = {p["msg_id"]: p for p in posts}
         albums = self.store.albums(self.identity_pub)
-        album_members = set()
-        for mids in albums.values():
-            album_members.update(mids)
+        member_of = self._fold_album_members(albums)
+        album_members = set(member_of)
         candidates = []          # (msg_id, created_at, default_span)
         for p in posts:
             mid = p["msg_id"]
@@ -957,6 +975,10 @@ class HearthNode:
                 continue
             newest = None
             for mid in mids:
+                if member_of.get(mid) != aid:
+                    continue    # shadowed by a lexically-smaller album -
+                                # profile_view will never render this
+                                # member here, so aid can't be a candidate
                 m = by_id.get(mid)
                 if m is None or m.get("media") == "video" or not m.get("blobs"):
                     continue
@@ -1039,14 +1061,12 @@ class HearthNode:
         # simply absent (honest hole). Empty members = ungrouped.
         albums = self.store.albums(identity_pub)
         by_id = {p["msg_id"]: p for p in wall}
-        member_of = {}
-        # A member claimed by two albums folds into the lexically-smallest
-        # album_id -- content-deterministic, so every device resolves the
-        # conflict identically regardless of ingest order (review finding:
-        # dict order here is SQL scan order, which differs across devices).
-        for aid, mids in sorted(albums.items()):
-            for mid in mids:
-                member_of.setdefault(mid, aid)     # smallest album_id wins a conflict
+        # _fold_album_members resolves a member claimed by two albums into
+        # the lexically-smallest album_id -- content-deterministic, so
+        # every device resolves the conflict identically regardless of
+        # ingest order (dict order here is SQL scan order, which differs
+        # across devices). auto_place_unplaced shares this same fold.
+        member_of = self._fold_album_members(albums)
         folded = [p for p in wall if p["msg_id"] not in member_of]
         for aid, mids in sorted(albums.items()):
             photos, newest, scope_newest = [], None, "kreds"
