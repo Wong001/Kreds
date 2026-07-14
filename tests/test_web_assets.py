@@ -287,13 +287,14 @@ def test_photo_grid_layouts():
     # cols2/cols3/hero/masonry photo-grid picker no longer drives rendering -
     # photoGridClass is now a two-way big-vs-gallery split and renderBlock/
     # renderWall never read p.grid (see test_collage_canvas_wired). The
-    # composer's own compose-time preselect still POSTs /api/block-grid
-    # (kept until Slice B; not a wall-post reader), so that endpoint string
-    # survives in js even though nothing reads the value back.
+    # composer's own compose-time preselect (gridSelect / /api/block-grid)
+    # is itself retired by collage Slice B, spec 2026-07-13 SS4 (see
+    # test_composer_preview_wired): the live preview + size chips replace
+    # it, and /api/block-grid now has zero client callers.
     js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert "p.grid" not in js
-    assert "/api/block-grid" in js                           # composer's compose-time preselect only
+    assert "/api/block-grid" not in js                       # last client caller retired (Slice B)
     for k in ("block-grid-2", "block-grid-3", "block-hero", "block-masonry"):
         assert k not in css                                  # five-layout styling retired
 
@@ -1236,3 +1237,25 @@ def test_block_settings_modal_collage_groups():
     assert "previousElementSibling" not in body   # Up/Down reorder retired
     ff = _js_fn_body(js, "firstFreeSpot")
     assert "pinFree" in ff
+
+
+def test_composer_preview_wired():
+    # Collage Slice B: the wall composer previews attached media (photo /
+    # stacked deck / video first-frame) sized by chips at true canvas
+    # proportions; the dead Auto dropdown and the last /api/block-grid
+    # client caller are gone. Live behavior pinned by
+    # tests/test_ui_smoke_composer.py (UI_E2E=1).
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    body = _js_fn_body(js, "profilePostComposer")
+    for needle in ("compose-preview", "size-chips", "createObjectURL",
+                   "revokeObjectURL", "/api/block-span", "preview-deck",
+                   "deck-count", "aria-pressed"):
+        assert needle in body, needle
+    assert '"2x2"' in body                     # media default chip
+    assert "layout-pick" not in js             # dropdown fully retired
+    assert "Masonry" not in js and "cols3" not in js
+    assert "/api/block-grid" not in js         # zero client callers left
+    _css_rule(css, ".compose-preview")
+    assert ".preview-deck" in css and ".deck-count" in css
+    assert "layout-pick" not in css

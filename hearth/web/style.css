@@ -425,6 +425,30 @@ body.desktop .desktop-only-panel { display: block; }
   margin: 6px 0 8px; border-top: 1px solid var(--line); padding-top: 12px; }
 .profile-body #profile-wall-compose:empty { display: none; }
 .profile-composer { margin-bottom: 4px; }
+/* Composer live preview (Slice B): the post at its chosen w x h, using
+   the canvas's own --cell so proportions are true. The deck is the same
+   stacked-photos affordance Slice C's wall decks render. */
+.compose-preview { margin: 10px 0 4px; border-radius: 12px; overflow: visible;
+  position: relative; max-width: 100%; }
+.compose-preview img, .compose-preview video { width: 100%; height: 100%;
+  object-fit: cover; border-radius: 12px; display: block; }
+.preview-photo, .preview-deck { width: 100%; height: 100%; position: relative; }
+.preview-deck::before, .preview-deck::after { content: ""; position: absolute;
+  inset: 0; border-radius: 12px; background: var(--line-2);
+  border: 1px solid var(--line); z-index: -1; }
+.preview-deck::before { transform: rotate(2.5deg) translate(4px, 2px); }
+.preview-deck::after { transform: rotate(-2deg) translate(-3px, 4px); }
+.deck-count { position: absolute; top: 8px; right: 8px; min-width: 22px;
+  height: 22px; padding: 0 6px; border-radius: 99px; background: var(--ink);
+  color: var(--paper); font-size: 12px; font-weight: 650; display: grid;
+  place-items: center; }
+.preview-note { font-size: 11.5px; color: var(--ink-2); margin-top: 6px; }
+.size-chips { display: flex; gap: 6px; margin: 8px 0 2px; }
+.size-chip { border: 1px solid var(--line-2); background: transparent;
+  color: var(--ink-2); font-size: 12px; font-weight: 550; padding: 4px 10px;
+  border-radius: 99px; transition: .15s; }
+.size-chip:hover { color: var(--ink); border-color: var(--ink-2); }
+.size-chip.active { color: var(--me); border-color: var(--me); }
 
 /* Collage canvas (Slice A): 4 columns of square-ish cells. --cell is
    measured in JS (measureWallCell) - CSS cannot express "row height =
@@ -477,7 +501,6 @@ body.desktop .desktop-only-panel { display: block; }
 /* bottom-left, not bottom-right: Task 6's .block-resize corner handle
    claims bottom-right on pinned blocks and the two must not collide. */
 .block .del { position: absolute; bottom: 6px; left: 6px; right: auto; z-index: 2; }
-.layout-pick { margin-top: 6px; }   /* profilePostComposer's compose-time grid preselect (Slice B) */
 /* Fix B: per-block audience badge (self-only - visible on your own wall so
    you can see at a glance what each block's scope is). */
 .block-scope { display: inline-block; font-family: var(--mono); font-size: 10px;

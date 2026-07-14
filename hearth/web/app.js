@@ -1650,44 +1650,109 @@ function profilePostComposer() {
   photoInput.className = "visually-hidden";   // keyboard-reachable (not display:none)
   photoLabel.append(photoInput);
   bar.append(photoLabel);
-  // Layout picker: only meaningful once 2+ photos are attached, so it stays
-  // hidden until the photo input says so.
-  const gridSelect = document.createElement("select");
-  // Task 3 renamed this class: the old identifier is now specifically the
-  // removed arrange-mode inline picker's - this is the unrelated compose-time
-  // layout preselect, kept as its own distinct class.
-  gridSelect.className = "layout-pick"; gridSelect.setAttribute("aria-label", "Photo layout");
-  gridSelect.hidden = true;
-  for (const [v, label] of [["auto","Auto"],["cols2","2 columns"],
-      ["cols3","3 columns"],["hero","Hero"],["masonry","Masonry"]]) {
-    const o = document.createElement("option"); o.value = v; o.textContent = label;
-    gridSelect.append(o);
-  }
-  bar.append(gridSelect);
-  // Video attach: one medium per block, video wins. Picking a video clears
-  // any chosen photos (and hides the now-meaningless grid picker); picking
-  // photos clears a previously-chosen video. The cue makes the winner explicit.
   const videoLabel = el("label", "keep");
   videoLabel.textContent = "Video";
   const videoInput = document.createElement("input");
   videoInput.type = "file"; videoInput.accept="video/*";
-  videoInput.className = "visually-hidden";   // keyboard-reachable (not display:none)
+  videoInput.className = "visually-hidden";
   videoLabel.append(videoInput);
   bar.append(videoLabel);
-  const videoCue = el("span", "video-cue");
-  videoCue.hidden = true;
-  bar.append(videoCue);
+
+  // -- live preview (spec 2026-07-13 section 4): the post as it will
+  // render - one photo big, several as a stacked deck (the same
+  // affordance Slice C's wall decks use), video as its first frame via a
+  // local object URL. Honest boundary: the video preview is the RAW
+  // file's frame - the server gate still transcodes and can still reject
+  // on post; previewing is not acceptance.
+  const preview = el("div", "compose-preview");
+  preview.hidden = true;
+  form.insertBefore(preview, bar);
+
+  // -- size chips: the block's starting w x h, previewed at true canvas
+  // proportions via --cell (measureWallCell keeps it fresh on the
+  // profile page, where this composer exclusively lives). Media defaults
+  // to 2x2; text-only posts show no chips and send no seed (the server's
+  // 4x1 text default applies).
+  const chips = el("div", "size-chips");
+  chips.setAttribute("role", "group");
+  chips.setAttribute("aria-label", "Block size");
+  chips.hidden = true;
+  let span = {w: 2, h: 2};
+  const chipBtns = [];
+  for (const [w, h] of [[1, 1], [2, 2], [4, 2], [4, 3]]) {
+    const c = el("button", "size-chip", w + "x" + h);
+    c.type = "button";
+    c.dataset.span = w + "x" + h;
+    c.setAttribute("aria-pressed", String(w === 2 && h === 2));
+    if (w === 2 && h === 2) c.classList.add("active");   // "2x2" default
+    c.onclick = () => {
+      span = {w, h};
+      for (const x of chipBtns) {
+        x.classList.toggle("active", x === c);
+        x.setAttribute("aria-pressed", String(x === c));
+      }
+      sizePreview();
+    };
+    chipBtns.push(c);
+    chips.append(c);
+  }
+  form.insertBefore(chips, bar);
+
+  let objectUrls = [];
+  const dropUrls = () => {
+    for (const u of objectUrls) URL.revokeObjectURL(u);
+    objectUrls = [];
+  };
+  const sizePreview = () => {
+    // True proportions: the same cell math the canvas renders with.
+    preview.style.width = "calc(var(--cell, 120px) * " + span.w
+      + " + " + (12 * (span.w - 1)) + "px)";
+    preview.style.height = "calc(var(--cell, 120px) * " + span.h
+      + " + " + (12 * (span.h - 1)) + "px)";
+  };
+  const clearPreview = () => {
+    dropUrls();
+    preview.replaceChildren();
+    preview.hidden = true;
+    chips.hidden = true;
+  };
+  const showPreview = () => {
+    dropUrls();
+    preview.replaceChildren();
+    const files = [...photoInput.files];
+    const videoFile = videoInput.files[0];
+    if (videoFile) {
+      const v = document.createElement("video");
+      v.muted = true; v.playsInline = true; v.preload = "metadata";
+      const u = URL.createObjectURL(videoFile);
+      objectUrls.push(u);
+      v.src = u;
+      preview.append(v, el("div", "preview-note",
+        videoFile.name + " - will be trimmed to the story rules on post"));
+    } else if (files.length) {
+      const wrap = el("div", files.length > 1 ? "preview-deck" : "preview-photo");
+      const img = document.createElement("img");
+      const u = URL.createObjectURL(files[0]);
+      objectUrls.push(u);
+      img.src = u; img.alt = "";
+      wrap.append(img);
+      if (files.length > 1)
+        wrap.append(el("span", "deck-count", String(files.length)));
+      preview.append(wrap);
+    } else { clearPreview(); return; }
+    preview.hidden = false;
+    chips.hidden = false;
+    sizePreview();
+  };
   photoInput.onchange = () => {
-    gridSelect.hidden = photoInput.files.length < 2;
-    if (photoInput.files.length) { videoInput.value = ""; videoCue.hidden = true; }
+    if (photoInput.files.length) videoInput.value = "";   // one medium, photos win
+    showPreview();
   };
   videoInput.onchange = () => {
-    const f = videoInput.files[0];
-    if (!f) { videoCue.hidden = true; return; }
-    videoCue.textContent = "video attached: " + f.name;
-    videoCue.hidden = false;
-    photoInput.value = ""; gridSelect.hidden = true;
+    if (videoInput.files.length) photoInput.value = "";   // one medium, video wins
+    showPreview();
   };
+
   const btn = el("button", "postbtn", "Post to profile"); btn.type = "submit";
   bar.append(btn);
   form.append(bar);
@@ -1699,21 +1764,31 @@ function profilePostComposer() {
     fd.append("scope", scope);
     fd.append("placement", "profile");
     const videoFile = videoInput.files[0];
+    const hasMedia = !!videoFile || photoInput.files.length > 0;
     if (videoFile) fd.append("video", videoFile);
     else for (const f of photoInput.files) fd.append("photos", f);
     const r = await fetch("/api/post", {method: "POST", body: fd});
     if (!r.ok) { alert("Post failed: " + await r.text()); return; }
     const { msg_id } = await r.json();
-    if (!videoFile && gridSelect.value !== "auto") {   // grid seed only applies to photos
-      const gr = await fetch("/api/block-grid", {method: "POST",
+    // Seed the chosen size so the block waits in the Unplaced tray at the
+    // proportions the preview showed. Text-only posts skip the seed - the
+    // server's 4x1 text default already matches what was previewed (none).
+    if (hasMedia) {
+      const sr = await fetch("/api/block-span", {method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({msg_id, grid: gridSelect.value})});
-      if (!gr.ok) alert("Posted, but couldn't set the layout: " + await gr.text());
+        body: JSON.stringify({msg_id, w: span.w, h: span.h})});
+      if (!sr.ok) alert("Posted, but couldn't set the size: " + await sr.text());
     }
     input.value = "";
     photoInput.value = "";
-    videoInput.value = ""; videoCue.hidden = true;
-    gridSelect.value = "auto"; gridSelect.hidden = true;
+    videoInput.value = "";
+    clearPreview();
+    span = {w: 2, h: 2};
+    for (const x of chipBtns) {
+      const isDefault = x.dataset.span === "2x2";
+      x.classList.toggle("active", isDefault);
+      x.setAttribute("aria-pressed", String(isDefault));
+    }
     openProfile(STATE.identity_pub);                // re-render the wall
   };
   return form;
