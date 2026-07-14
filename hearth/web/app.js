@@ -1703,10 +1703,18 @@ function renderWall(p) {
     p.mine ? "Your profile is a blank canvas - post something above." : "Nothing here yet."));
   measureWallCell();
   if (p.mine && unpinned.length) {
+    const who = p.identity_pub;   // snapshot: whose wall this migration was fired for
     fetch("/api/wall-autoplace", {method: "POST"}).then(async (r) => {
       if (!r.ok) return;
       const {placed} = await r.json();
-      if (placed > 0 && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
+      // This trigger is silent (not click-initiated like the file's other
+      // unsnapshotted re-render sites), so the response must never yank a
+      // user who navigated away back to the profile view - openProfile
+      // unconditionally setView("profile")s. Re-render only if they're
+      // still looking at THIS profile; the migration itself persisted
+      // server-side either way (the next visit renders it placed).
+      if (placed > 0 && CURRENT_PROFILE === who
+          && currentView() === "profile") openProfile(who);
     });
   }
 }

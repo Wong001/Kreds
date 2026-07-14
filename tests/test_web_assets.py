@@ -1213,6 +1213,11 @@ def test_collage_canvas_wired():
     # one /api/wall-autoplace call, re-render only when placed > 0.
     assert "/api/wall-autoplace" in rw
     assert "placed" in rw
+    # The trigger is silent (not click-initiated), so the resolution must
+    # check the user is still on this profile's view before re-rendering -
+    # openProfile would otherwise setView("profile") and yank a
+    # navigated-away user back.
+    assert "currentView()" in rw
     rb = _js_fn_body(js, "renderBlock")
     assert "gridColumn" in rb and "gridRow" in rb
     assert "size-full" not in js          # Phase-A width classes retired
