@@ -488,11 +488,19 @@ class HearthNode:
 
     def compose_post(self, text: str, scope: str = "kreds",
                      photos=(), expires_seconds=None,
-                     placement: str = "journal", video=None) -> str:
+                     placement: str = "journal", video=None,
+                     span_w=None, span_h=None) -> str:
         if scope not in ("inner", "kreds"):
             raise ValueError("scope must be inner or kreds")
         if placement not in ("journal", "profile"):
             raise ValueError("placement must be journal or profile")
+        if (span_w is None) != (span_h is None):
+            raise ValueError("span_w and span_h must be given together")
+        if span_w is not None and not (
+                isinstance(span_w, int) and isinstance(span_h, int)
+                and not isinstance(span_w, bool) and not isinstance(span_h, bool)
+                and 1 <= span_w <= WALL_COLS and 1 <= span_h <= MAX_BLOCK_H):
+            raise ValueError("bad span")
         pubs = self._scope_device_pubs(scope)
         created_at = time.time()
         expires_at = (created_at + expires_seconds
@@ -509,14 +517,33 @@ class HearthNode:
                                           [vref], created_at, expires_at,
                                           placement=placement, media="video", poster=pref))
             self._cache_message_key(mid, key)
-            return mid
-        refs = [self.store.put_blob(encrypt_blob(key, p)) for p in photos]
-        nonce, ct = encrypt_body(key, {"text": text, "blobs": refs}, aad)
-        wraps = wrap_key(key, pubs, aad)
-        mid = self._publish(make_post(self.device, scope, nonce, ct, wraps,
-                                      refs, created_at, expires_at,
-                                      placement=placement))
-        self._cache_message_key(mid, key)
+            has_media = True
+        else:
+            refs = [self.store.put_blob(encrypt_blob(key, p)) for p in photos]
+            nonce, ct = encrypt_body(key, {"text": text, "blobs": refs}, aad)
+            wraps = wrap_key(key, pubs, aad)
+            mid = self._publish(make_post(self.device, scope, nonce, ct, wraps,
+                                          refs, created_at, expires_at,
+                                          placement=placement))
+            self._cache_message_key(mid, key)
+            has_media = bool(refs)
+        if placement == "profile":
+            # Creation auto-places at the top, dense (spec 2026-07-14): a
+            # new wall post is pinned at (0,0) with its composer-chosen
+            # size (or the media/text default), pushed-place applied so
+            # only whatever is actually in the way slides down - the
+            # separate span-seed call is gone. August 2026-07-14.
+            span = ({"w": span_w, "h": span_h} if span_w is not None
+                    else ({"w": 2, "h": 2} if has_media else {"w": 4, "h": 1}))
+            cur = self.store.profile_layout(self.identity_pub)
+            pins = self._push_place(cur["pins"], mid, {"x": 0, "y": 0, **span})
+            spans = dict(cur["spans"])
+            spans.pop(mid, None)
+            if len(pins) > MAX_LAYOUT:
+                raise ValueError("too many pinned blocks")
+            self._publish(make_profile_layout(
+                self.device, cur["order"], grids=cur["grids"],
+                sizes=cur["sizes"], pins=pins, spans=spans, texts=cur["texts"]))
         return mid
 
     def set_ring(self, member_identity: str, ring: str) -> str:
@@ -660,9 +687,39 @@ class HearthNode:
                 and all(c in "0123456789abcdef" for c in msg_id)):
             raise ValueError("bad msg_id")
 
+    def _push_place(self, pins: dict, msg_id: str, geom: dict) -> dict:
+        """One placement rule (spec 2026-07-14): the placed block anchors
+        exactly at its target; every other pinned block, processed in
+        (y, x, id) order, keeps its own (x, w, h) and settles just below
+        anything already settled that it overlaps. Non-colliding blocks
+        never move; chains cascade straight down, never sideways. The
+        published record carries the RESULT, so every peer renders the
+        same layout without re-running this."""
+        def overlaps(a, b):
+            return (a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"]
+                    and a["y"] < b["y"] + b["h"] and b["y"] < a["y"] + a["h"])
+        rest = sorted(((k, dict(v)) for k, v in pins.items() if k != msg_id),
+                      key=lambda kv: (kv[1]["y"], kv[1]["x"], kv[0]))
+        final = {msg_id: dict(geom)}
+        for oid, og in rest:
+            g = og
+            bumped = True
+            while bumped:
+                bumped = False
+                for fg in final.values():
+                    if overlaps(g, fg):
+                        g["y"] = fg["y"] + fg["h"]
+                        bumped = True
+            if g["y"] > MAX_LAYOUT:
+                raise ValueError("wall is full")
+            final[oid] = g
+        return final
+
     def set_block_pin(self, msg_id: str, x: int, y: int, w: int, h: int) -> str:
-        """Place (or move/resize) a block at explicit cell coordinates.
-        Shape-checked here for a clean 400; overlap is the client's job."""
+        """Place (or move/resize) a block at explicit cell coordinates:
+        pushes any block already in the way straight down (spec
+        2026-07-14 dynamic placement) - the client no longer vetoes
+        overlap. Shape-checked here for a clean 400."""
         self._check_block_id(msg_id)
         for v in (x, y, w, h):
             if not isinstance(v, int) or isinstance(v, bool):
@@ -671,8 +728,7 @@ class HearthNode:
                 and 0 <= x and x + w <= WALL_COLS and 0 <= y <= MAX_LAYOUT):
             raise ValueError("bad pin geometry")
         cur = self.store.profile_layout(self.identity_pub)
-        pins = dict(cur["pins"])
-        pins[msg_id] = {"x": x, "y": y, "w": w, "h": h}
+        pins = self._push_place(cur["pins"], msg_id, {"x": x, "y": y, "w": w, "h": h})
         spans = dict(cur["spans"])
         spans.pop(msg_id, None)          # geometry lives in the pin now
         if len(pins) > MAX_LAYOUT:
@@ -816,8 +872,87 @@ class HearthNode:
                 self.device, cur["order"], grids=cur["grids"],
                 sizes=cur["sizes"], pins=pins, spans=spans,
                 texts=cur["texts"]))
+        else:
+            # Ungroup (spec 2026-07-14): read the outgoing record's
+            # members from the store BEFORE publishing the empty one
+            # below (that publish IS what erases them). Fold in the
+            # album's own residual pin/span here too (review finding,
+            # folded in since this branch is being touched anyway), then
+            # top-insert each restored member oldest first so the newest
+            # ends on top - same push rule, no limbo.
+            prior_members = self.store.albums(self.identity_pub).get(album_id, [])
+            cur = self.store.profile_layout(self.identity_pub)
+            pins = dict(cur["pins"])
+            spans = dict(cur["spans"])
+            pins.pop(album_id, None)
+            spans.pop(album_id, None)
+            if prior_members:
+                def _created_at(mid):
+                    msg = self.store.get_message(mid)
+                    return msg.payload["created_at"] if msg else 0
+                for mid in sorted(prior_members, key=_created_at):
+                    span = spans.pop(mid, None)
+                    if span is None:
+                        msg = self.store.get_message(mid)
+                        pl = msg.payload if msg else {}
+                        has_media = (bool(pl.get("blobs"))
+                                    or pl.get("media") == "video")
+                        span = {"w": 2, "h": 2} if has_media else {"w": 4, "h": 1}
+                    pins = self._push_place(pins, mid, {"x": 0, "y": 0, **span})
+            if len(pins) > MAX_LAYOUT:
+                raise ValueError("too many pinned blocks")
+            self._publish(make_profile_layout(
+                self.device, cur["order"], grids=cur["grids"],
+                sizes=cur["sizes"], pins=pins, spans=spans,
+                texts=cur["texts"]))
         self._publish(make_album(self.device, album_id, members))
         return album_id
+
+    def auto_place_unplaced(self) -> int:
+        """One-shot migration (spec 2026-07-14): pin every unplaced own
+        wall block at the top, oldest first so the newest ends on top.
+        One layout publish; zero-publish no-op when nothing is unplaced."""
+        cur = self.store.profile_layout(self.identity_pub)
+        pins = dict(cur["pins"])
+        spans = dict(cur["spans"])
+        posts = self.posts_by(self.identity_pub, "profile")
+        by_id = {p["msg_id"]: p for p in posts}
+        albums = self.store.albums(self.identity_pub)
+        album_members = set()
+        for mids in albums.values():
+            album_members.update(mids)
+        candidates = []          # (msg_id, created_at, default_span)
+        for p in posts:
+            mid = p["msg_id"]
+            if mid in pins or mid in album_members:
+                continue        # already placed, or rendered inside its album
+            has_media = bool(p.get("blobs")) or p.get("media") == "video"
+            candidates.append((mid, p["created_at"],
+                               {"w": 2, "h": 2} if has_media else {"w": 4, "h": 1}))
+        for aid, mids in albums.items():
+            if aid in pins:
+                continue
+            newest = None
+            for mid in mids:
+                m = by_id.get(mid)
+                if m is None or m.get("media") == "video" or not m.get("blobs"):
+                    continue
+                if newest is None or m["created_at"] > newest:
+                    newest = m["created_at"]
+            if newest is not None:       # an unpinned album with photos counts
+                candidates.append((aid, newest, {"w": 2, "h": 2}))
+        if not candidates:
+            return 0
+        candidates.sort(key=lambda c: c[1])    # oldest first -> newest ends on top
+        for mid, _created_at, default_span in candidates:
+            span = spans.pop(mid, None) or default_span
+            pins = self._push_place(pins, mid, {"x": 0, "y": 0, **span})
+        if len(pins) > MAX_LAYOUT:
+            raise ValueError("too many pinned blocks")
+        self._publish(make_profile_layout(
+            self.device, cur["order"], grids=cur["grids"],
+            sizes=cur["sizes"], pins=pins, spans=spans, texts=cur["texts"]))
+        return len(candidates)
 
     def profile_view(self, identity_pub: str):
         if identity_pub != self.identity_pub \

@@ -133,5 +133,8 @@ def test_ungroup_after_pin_inheritance_restores_unplaced(tmp_path):
     n.set_album([], album_id=aid)                  # ungroup
     view = n.profile_view(n.identity_pub)
     member = next(p for p in view["wall"] if p["msg_id"] == a)
-    assert member["pin"] is None
-    assert member["span"] == {"w": 2, "h": 2}       # span preserved, no pin
+    # dynamic placement (spec 2026-07-14): ungroup top-inserts the
+    # restored member via the push rule now, instead of leaving it
+    # unplaced - no more limbo.
+    assert member["pin"] == {"x": 0, "y": 0, "w": 2, "h": 2}
+    assert member["span"] == {"w": 2, "h": 2}

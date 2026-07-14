@@ -70,6 +70,9 @@ def test_carry_forward_everywhere(tmp_path):
                         photos=[b"\x89PNG fake"])
     n.set_block_text(t, size="xl")
     n.set_block_pin(t, 0, 0, 2, 1)
+    # dynamic placement (spec 2026-07-14): creation auto-pins now, so
+    # reaching an unplaced/spanned block goes through an explicit unpin.
+    n.unpin_block(ph)
     n.set_block_span(ph, 1, 1)
     n.set_block_size(ph, "small")                 # legacy writer
     n.set_profile_layout([t, ph])

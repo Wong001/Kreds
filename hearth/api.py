@@ -6,7 +6,7 @@ import io
 import time
 import zipfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import qrcode
 from fastapi import (Body, FastAPI, File, HTTPException, Form, Request,
@@ -349,14 +349,17 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
                    expires_seconds: str = Form(""),
                    placement: str = Form("journal"),
                    photos: List[UploadFile] = File(default=[]),
-                   video: UploadFile = File(default=None)):
+                   video: UploadFile = File(default=None),
+                   w: Optional[int] = Form(default=None),
+                   h: Optional[int] = Form(default=None)):
         expiry = float(expires_seconds) if expires_seconds.strip() else None
         if video is not None:
             vbytes = await video.read()
             if len(vbytes) > MAX_VIDEO_UPLOAD:
                 raise HTTPException(413, "video exceeds upload cap")
             mid = _400(lambda: node.compose_post(text, scope, (), expiry,
-                                                 placement=placement, video=vbytes))
+                                                 placement=placement, video=vbytes,
+                                                 span_w=w, span_h=h))
             return {"msg_id": mid}
         blobs = []
         for up in photos:
@@ -365,7 +368,8 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
                 raise HTTPException(413, "photo exceeds 5 MB cap")
             blobs.append(data)
         mid = _400(lambda: node.compose_post(text, scope, blobs, expiry,
-                                             placement=placement))
+                                             placement=placement,
+                                             span_w=w, span_h=h))
         return {"msg_id": mid}
 
     @app.post("/api/ring")
@@ -416,6 +420,14 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         aid = _400(lambda: node.set_album(body["members"],
                                           body.get("album_id")))
         return {"ok": True, "album_id": aid}
+
+    @app.post("/api/wall-autoplace")
+    async def wall_autoplace():
+        """Migration (spec 2026-07-14): a client calls this once on
+        opening its OWN profile if any own wall block is unplaced. A
+        single layout write pins every one of them at the top, newest on
+        top, push rule applied."""
+        return {"ok": True, "placed": _400(lambda: node.auto_place_unplaced())}
 
     @app.post("/api/unfriend")
     async def unfriend(body: dict = Body(...)):

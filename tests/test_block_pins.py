@@ -13,6 +13,9 @@ def test_pin_roundtrip_and_carry_forward(tmp_path):
     a = n.compose_post("first", scope="kreds", placement="profile")
     b = n.compose_post("second", scope="kreds", placement="profile")
     n.set_block_pin(a, 0, 0, 2, 2)
+    # dynamic placement (spec 2026-07-14): creation auto-pins now, so
+    # reaching an unplaced/spanned block goes through an explicit unpin.
+    n.unpin_block(b)
     n.set_block_span(b, 4, 1)
     lay = n.store.profile_layout(n.identity_pub)
     assert lay["pins"][a] == {"x": 0, "y": 0, "w": 2, "h": 2}
@@ -27,6 +30,9 @@ def test_pin_roundtrip_and_carry_forward(tmp_path):
 def test_pin_moves_geometry_out_of_spans(tmp_path):
     n = _node(tmp_path)
     a = n.compose_post("x", scope="kreds", placement="profile")
+    # dynamic placement (spec 2026-07-14): creation auto-pins now; unpin
+    # to exercise the unplaced (spanned) path explicitly.
+    n.unpin_block(a)
     n.set_block_span(a, 2, 2)
     n.set_block_pin(a, 1, 3, 2, 2)
     lay = n.store.profile_layout(n.identity_pub)
@@ -72,7 +78,11 @@ def test_profile_view_annotates_pin_and_span(tmp_path):
     b = n.compose_post("spanned", scope="kreds", placement="profile")
     c = n.compose_post("legacy text", scope="kreds", placement="profile")
     n.set_block_pin(a, 2, 0, 2, 2)
+    # dynamic placement (spec 2026-07-14): creation auto-pins now, so
+    # reaching an unplaced/spanned block goes through an explicit unpin.
+    n.unpin_block(b)
     n.set_block_span(b, 1, 1)
+    n.unpin_block(c)
     view = n.profile_view(n.identity_pub)
     by_id = {p["msg_id"]: p for p in view["wall"]}
     assert by_id[a]["pin"] == {"x": 2, "y": 0, "w": 2, "h": 2}
@@ -80,7 +90,7 @@ def test_profile_view_annotates_pin_and_span(tmp_path):
     assert by_id[b]["pin"] is None
     assert by_id[b]["span"] == {"w": 1, "h": 1}
     assert by_id[c]["pin"] is None
-    assert by_id[c]["span"] == {"w": 4, "h": 1}       # legacy default, text
+    assert by_id[c]["span"] == {"w": 4, "h": 1}       # unpinned, kept its size
 
 
 def test_profile_view_legacy_sizes_map_to_default_spans(tmp_path):
@@ -89,6 +99,15 @@ def test_profile_view_legacy_sizes_map_to_default_spans(tmp_path):
     ph = n.compose_post("pic", scope="kreds", placement="profile",
                         photos=[b"\x89PNG fake"])
     n.set_block_size(t, "small")     # legacy Phase-A size
+    # dynamic placement (spec 2026-07-14): creation auto-pins now, so the
+    # never-pinned/never-spanned legacy fallback this test targets can no
+    # longer arise through the node API - simulate it directly, the way a
+    # pre-dynamic-placement wall actually looks on the wire.
+    from hearth.messages import make_profile_layout
+    cur = n.store.profile_layout(n.identity_pub)
+    n._publish(make_profile_layout(
+        n.device, cur["order"], grids=cur["grids"], sizes=cur["sizes"],
+        pins={}, spans={}, texts=cur["texts"]))
     view = n.profile_view(n.identity_pub)
     by_id = {p["msg_id"]: p for p in view["wall"]}
     assert by_id[t]["span"] == {"w": 1, "h": 1}       # small -> 1x1
