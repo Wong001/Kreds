@@ -793,11 +793,15 @@ class HearthNode:
         albums = self.store.albums(identity_pub)
         by_id = {p["msg_id"]: p for p in wall}
         member_of = {}
-        for aid, mids in albums.items():
+        # A member claimed by two albums folds into the lexically-smallest
+        # album_id -- content-deterministic, so every device resolves the
+        # conflict identically regardless of ingest order (review finding:
+        # dict order here is SQL scan order, which differs across devices).
+        for aid, mids in sorted(albums.items()):
             for mid in mids:
-                member_of.setdefault(mid, aid)     # first album wins a conflict
+                member_of.setdefault(mid, aid)     # smallest album_id wins a conflict
         folded = [p for p in wall if p["msg_id"] not in member_of]
-        for aid, mids in albums.items():
+        for aid, mids in sorted(albums.items()):
             photos, newest, scope_newest = [], None, "kreds"
             for mid in mids:
                 p = by_id.get(mid)

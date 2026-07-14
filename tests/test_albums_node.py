@@ -68,6 +68,24 @@ def test_profile_view_folds_members_into_album(tmp_path):
     assert alb["scope_newest"] == "kreds"
 
 
+def test_member_claimed_by_two_albums_resolves_deterministically(tmp_path):
+    # A member claimed by TWO album records must fold into the
+    # lexically-smallest album_id on EVERY device: dict order out of
+    # store.albums() is SQL scan order (per-device ingest history), so
+    # first-wins by insertion order would let synced devices disagree.
+    # Insertion order here deliberately OPPOSES lexical order ("ff" first).
+    n = _node(tmp_path)
+    a = _photo_post(n)
+    n.set_album([a], album_id="ff" * 32)
+    n.set_album([a], album_id="00" * 32)
+    view = n.profile_view(n.identity_pub)
+    albs = [p for p in view["wall"] if p.get("album")]
+    assert len(albs) == 1                          # loser album: zero photos, absent
+    assert albs[0]["msg_id"] == "00" * 32          # lexically smallest wins
+    assert [ph["m"] for ph in albs[0]["photos"]] == [a]
+    assert a not in [p["msg_id"] for p in view["wall"]]   # never standalone
+
+
 def test_ungroup_restores_standalone(tmp_path):
     n = _node(tmp_path)
     a = _photo_post(n)
