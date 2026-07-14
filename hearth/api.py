@@ -406,6 +406,7 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/block-unpin")
     async def block_unpin(body: dict = Body(...)):
+        # wire-compat: no UI caller since dynamic placement retired the tray.
         _400(lambda: node.unpin_block(body["msg_id"]))
         return {"ok": True}
 

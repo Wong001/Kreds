@@ -761,7 +761,11 @@ class HearthNode:
             sizes=cur["sizes"], pins=pins, spans=spans, texts=cur["texts"]))
 
     def unpin_block(self, msg_id: str) -> str:
-        """Send a block back to the unplaced tray, keeping its size."""
+        """Wire-compat: no UI caller since dynamic placement (spec
+        2026-07-14) retired the tray - kept for old clients. Strips the
+        block's pin, keeping its size in `spans` (unplaced); a re-pin or
+        the next owner-visit auto_place_unplaced adopts it back onto the
+        canvas."""
         self._check_block_id(msg_id)
         cur = self.store.profile_layout(self.identity_pub)
         pins = dict(cur["pins"])
@@ -872,13 +876,13 @@ class HearthNode:
             # member is never independently placed, so folding it into an
             # album must clear any pin it held, restoring it to `spans`
             # (kept size, unplaced) - an ungroup later then honestly
-            # returns the member to the tray with no stale pin able to
-            # overlap anything. If exactly one member carried a pin and
-            # the album itself has no pin yet, the album inherits that
-            # member's exact geometry (growing a pinned post's deck no
-            # longer silently un-places it); two-or-more pinned members
-            # have no deterministic choice of which geometry wins, so the
-            # album lands unplaced instead.
+            # top-inserts the member back onto the canvas with no stale
+            # pin able to overlap anything. If exactly one member carried
+            # a pin and the album itself has no pin yet, the album
+            # inherits that member's exact geometry (growing a pinned
+            # post's deck no longer silently un-places it); two-or-more
+            # pinned members have no deterministic choice of which
+            # geometry wins, so the album lands unplaced instead.
             cur = self.store.profile_layout(self.identity_pub)
             pins = dict(cur["pins"])
             spans = dict(cur["spans"])

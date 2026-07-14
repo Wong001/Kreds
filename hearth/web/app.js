@@ -1051,7 +1051,7 @@ function openBlockSettings(p, block, opener, focusSel) {
     const ungroup = el("button", "settings-opt", "Ungroup");
     ungroup.type = "button";
     ungroup.onclick = async () => {
-      // Members reappear standalone and unplaced (empty members = ungroup).
+      // Members reappear standalone, top-inserted onto the canvas (empty members = ungroup).
       await postJSON("/api/album", {album_id: p.msg_id, members: []});
       await reopenAfterAction(null);
     };
