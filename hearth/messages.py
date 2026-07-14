@@ -15,6 +15,7 @@ KIND_DM = "dm"
 KIND_STORY = "story"
 KIND_RING = "ring"
 KIND_PROFILE_LAYOUT = "profile_layout"
+KIND_ALBUM = "album"
 MAX_LAYOUT = 500
 GRID_LAYOUTS = ("auto", "cols2", "cols3", "hero", "masonry")
 SIZE_LAYOUTS = ("small", "wide", "full")
@@ -132,6 +133,14 @@ def make_profile_layout(device: DeviceKeys, order: Sequence[str],
         "kind": KIND_PROFILE_LAYOUT, "order": list(order),
         "grids": dict(grids or {}), "sizes": dict(sizes or {}),
         "pins": dict(pins or {}), "spans": dict(spans or {}),
+        "created_at": _now(now),
+    })
+
+
+def make_album(device: DeviceKeys, album_id: str, members: Sequence[str],
+              now: Optional[float] = None) -> SignedMessage:
+    return device.sign_message({
+        "kind": KIND_ALBUM, "album_id": album_id, "members": list(members),
         "created_at": _now(now),
     })
 
@@ -322,6 +331,20 @@ def validate_payload(p: dict) -> Tuple[bool, str]:
             if not _is_hex64(k) or not _ok_geom(v, False):
                 return False, "bad layout span"
 
+        return True, "ok"
+    if kind == KIND_ALBUM:
+        # A mutable grouping over immutable photo posts. Opaque ids only -
+        # the member list is plaintext metadata (same existence-disclosure
+        # class as the layout order/pins); content stays per-post encrypted.
+        if not _is_hex64(p.get("album_id")):
+            return False, "bad album id"
+        members = p.get("members")
+        if not isinstance(members, list) or len(members) > MAX_LAYOUT:
+            return False, "bad album members"
+        if not all(_is_hex64(x) for x in members):
+            return False, "bad album member"
+        if len(set(members)) != len(members):
+            return False, "duplicate album member"
         return True, "ok"
     return False, "unknown kind"
 
