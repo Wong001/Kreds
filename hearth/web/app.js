@@ -482,6 +482,11 @@ function renderBlock(p) {
       block.append(media);
     } else if (items.length) {
       block.append(renderDeck(p, items));   // 2+ photos: a swipeable .block-deck
+      // has-deck: deterministic opt-out of .block's cell-crop overflow:
+      // hidden (see .block.has-deck in style.css) - the deck's peek-out
+      // stacked edges live a few px outside the card and would otherwise
+      // be clipped away entirely. No :has() dependency.
+      block.classList.add("has-deck");
     }
   }
   if (p.text) block.append(el("p", "block-text-body", p.text));

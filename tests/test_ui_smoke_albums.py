@@ -83,29 +83,23 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             peeks = any(
                 sum(abs(x - y) for x, y in zip(px, bg)) > 30 for px in strip
             )
-            # KNOWN, CONFIRMED bug found by this exact probe - reported
-            # here, NOT fixed (out of this task's file scope: this test
-            # file + ROADMAP.md only; see .superpowers/sdd/task-7-report.md
-            # for full detail). Unlike the composer's .compose-preview
-            # (overflow: visible), the wall's ancestor .block carries a
+            # Bug found by this exact probe in Slice C Task 7 (see
+            # .superpowers/sdd/task-7-report.md) and fixed in the
+            # deck-fix follow-up: unlike the composer's .compose-preview
+            # (overflow: visible), the wall's ancestor .block carried a
             # pre-existing overflow:hidden (hearth/web/style.css, added
             # generically for photo/video corner-clipping, predates Slice
-            # C) - it clips .block-deck's ::before/::after peek-out edges
-            # entirely, so the "several photos stacked" look never actually
-            # paints on the live wall. Confirmed directly: forcing
-            # .block's overflow to visible in a live page makes this exact
-            # probe jump from diff 0 to 144 (threshold 30) - Task 5's
-            # z-index:0 stacking-context fix (carried over from the
-            # Slice-B lesson) is necessary but, on the wall, not sufficient.
-            # Soft-checked (printed, not hard-asserted) so this one
-            # confirmed, unrelated CSS regression doesn't block the rest
-            # of this smoke's coverage, which is all genuinely working.
-            # Flip this to a hard assert once the CSS is fixed.
-            print(
-                "deck edge paints outside the card (as intended)" if peeks
-                else "KNOWN BUG (reported in task-7-report.md, not fixed "
-                     "here): deck stacked edge does NOT paint outside "
-                     ".block - ancestor overflow:hidden clips it")
+            # C) that clipped .block-deck's ::before/::after peek-out
+            # edges entirely, so the "several photos stacked" look never
+            # actually painted on the live wall. Fix: renderBlock (app.js)
+            # tags a deck block with a deterministic "has-deck" class, and
+            # .block.has-deck { overflow: visible } (style.css) opts it out
+            # of the cell-crop clip. Hard assert, not a diagnostic print -
+            # a weakened assert here is exactly what let this regression
+            # class through undetected in Tasks 5/6.
+            assert peeks, (
+                "deck stacked edge does NOT paint outside .block - "
+                "ancestor overflow:hidden clips it")
 
             # arrow-flip to the last photo
             deck.locator(".deck-next").click()

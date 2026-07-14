@@ -480,6 +480,16 @@ body.desktop .desktop-only-panel { display: block; }
 #profile-wall-flow > .hint { grid-column: 1 / -1; }
 .block { min-width: 0; position: relative; overflow: hidden;
   border-radius: 12px; }
+/* Task 7 bug: the deck's stacked ::before/::after edges (a few px of
+   "polaroid peek" outside the card, see .block-deck below) were clipped
+   away entirely by the cell-crop overflow:hidden above - confirmed by a
+   live pixel probe (diff 0 -> 144 when overflow was forced visible).
+   has-deck (set in renderBlock, app.js) opts a deck block out of that
+   clip. Deck media itself self-rounds via .block-deck img's own
+   border-radius, so nothing else escapes the rounded corner. A caption
+   on a multi-photo (non-album) post is still clamped to the block's own
+   box below - see .block.has-deck .block-text-body. */
+.block.has-deck { overflow: visible; }
 /* media fills its cells, cropped (iOS-widget style) */
 .block-photo, .block-photo img, .block-video, .block-video video {
   width: 100%; height: 100%; }
@@ -514,6 +524,18 @@ body.desktop .desktop-only-panel { display: block; }
 .block-text-body { font-size: 15px; line-height: 1.5; white-space: pre-wrap;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 6;
   overflow: hidden; }
+/* A caption can coexist with a deck (a plain multi-photo post, not yet
+   grown into an album, still carries its composer text field). The deck
+   image is already height:100% of the fixed-height cell, so the caption
+   sits in normal flow below an already-full box and always extends past
+   it - previously invisible only as a side effect of .block's own
+   overflow:hidden. Now that .block.has-deck opts into overflow:visible
+   for the peek (above), that same caption would spill down the page
+   instead of the card, which is worse than the pre-existing (accidental)
+   "no visible inline caption under deck media" state. Cap it back to zero
+   height here rather than hiding the element outright, so the box still
+   exists (e.g. for any future affordance) but nothing paints or spills. */
+.block.has-deck .block-text-body { max-height: 0; overflow: hidden; }
 .block.text-w1 .block-text-body { font-size: 12.5px; }
 .block.text-w2 .block-text-body { font-size: 15px; }
 .block.text-w3 .block-text-body { font-size: 19px; }

@@ -1286,6 +1286,11 @@ def test_wall_deck_wired():
     deck_rule = _css_rule(css, ".block-deck")
     assert "z-index: 0" in deck_rule       # the Slice-B stacking lesson
     assert ".block-deck::before" in css
+    # Task 7's bug: .block's cell-crop overflow:hidden clipped the deck's
+    # peek-out edges. Fix: a deterministic has-deck class opts the block
+    # out of that clip (no :has() dependency).
+    assert "has-deck" in _js_fn_body(js, "renderBlock")
+    assert ".block.has-deck" in css
 
 
 def test_album_owner_controls_wired():
