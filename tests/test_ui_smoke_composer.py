@@ -52,6 +52,24 @@ def test_composer_preview_and_span_seed(tmp_path):
             assert page.locator(
                 '.size-chip.active[data-span="2x2"]').count() == 1
 
+            # regression guard: the deck's ::before/::after edges must
+            # actually paint (z-index stacking-context fix) - a pixel probe
+            # in the padding strip just outside the sized card, since a DOM
+            # assert can't see z-index paint order.
+            box = page.locator(".compose-preview").bounding_box()
+            clip = {"x": box["x"] - 8, "y": box["y"] - 8,
+                    "width": box["width"] + 16, "height": box["height"] + 16}
+            shot = tmp_path / "deck.png"
+            page.screenshot(path=str(shot), clip=clip)
+            from PIL import Image
+            im = Image.open(shot).convert("RGB")
+            bg = im.getpixel((1, 1))            # composer background corner
+            strip = [im.getpixel((im.width - 3, y))
+                     for y in range(10, im.height - 10, 4)]
+            assert any(
+                sum(abs(a - b) for a, b in zip(px, bg)) > 30 for px in strip
+            ), "deck edge does not paint outside the card"
+
             # pick 1x1, preview shrinks to ~one cell
             page.click('.size-chip[data-span="1x1"]')
             cell = page.evaluate(

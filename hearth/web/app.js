@@ -1666,6 +1666,15 @@ function profilePostComposer() {
   // on post; previewing is not acceptance.
   const preview = el("div", "compose-preview");
   preview.hidden = true;
+  preview.setAttribute("aria-live", "polite");
+
+  // -- video note: a SIBLING of the sized preview card, not a child of it -
+  // appended inside, overflow:visible spilled it past the card's fixed
+  // height onto the size chips below. aria-live so screen readers get the
+  // same "attached" confirmation the visible note gives sighted users.
+  const noteSlot = el("div", "preview-note");
+  noteSlot.hidden = true;
+  noteSlot.setAttribute("aria-live", "polite");
 
   // -- size chips: the block's starting w x h, previewed at true canvas
   // proportions via --cell (measureWallCell keeps it fresh on the
@@ -1712,6 +1721,7 @@ function profilePostComposer() {
     dropUrls();
     preview.replaceChildren();
     preview.hidden = true;
+    noteSlot.hidden = true;
     chips.hidden = true;
   };
   const showPreview = () => {
@@ -1725,18 +1735,25 @@ function profilePostComposer() {
       const u = URL.createObjectURL(videoFile);
       objectUrls.push(u);
       v.src = u;
-      preview.append(v, el("div", "preview-note",
-        videoFile.name + " - will be trimmed to the story rules on post"));
+      // WebKit won't paint a frame without an explicit seek.
+      v.addEventListener("loadedmetadata", () => { v.currentTime = 0.01; });
+      preview.append(v);
+      noteSlot.textContent =
+        videoFile.name + " - will be trimmed to the story rules on post";
+      noteSlot.hidden = false;
     } else if (files.length) {
       const wrap = el("div", files.length > 1 ? "preview-deck" : "preview-photo");
       const img = document.createElement("img");
       const u = URL.createObjectURL(files[0]);
       objectUrls.push(u);
-      img.src = u; img.alt = "";
+      img.src = u;
+      img.alt = files.length > 1
+        ? files.length + " photos attached" : "1 photo attached";
       wrap.append(img);
       if (files.length > 1)
         wrap.append(el("span", "deck-count", String(files.length)));
       preview.append(wrap);
+      noteSlot.hidden = true;
     } else { clearPreview(); return; }
     preview.hidden = false;
     chips.hidden = false;
@@ -1755,7 +1772,7 @@ function profilePostComposer() {
   bar.append(btn);
   // preview/chips must be appended WITH bar, not inserted before a bar that
   // isn't in the form yet (unconditional NotFoundError - live-smoke crash).
-  form.append(preview, chips, bar);
+  form.append(preview, noteSlot, chips, bar);
 
   form.onsubmit = async (ev) => {
     ev.preventDefault();

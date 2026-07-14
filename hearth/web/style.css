@@ -432,7 +432,11 @@ body.desktop .desktop-only-panel { display: block; }
   position: relative; max-width: 100%; }
 .compose-preview img, .compose-preview video { width: 100%; height: 100%;
   object-fit: cover; border-radius: 12px; display: block; }
-.preview-photo, .preview-deck { width: 100%; height: 100%; position: relative; }
+/* z-index: 0 establishes a stacking context so the ::before/::after deck
+   edges (z-index -1) paint above the composer's opaque background instead
+   of behind it. */
+.preview-photo, .preview-deck { width: 100%; height: 100%; position: relative;
+  z-index: 0; }
 .preview-deck::before, .preview-deck::after { content: ""; position: absolute;
   inset: 0; border-radius: 12px; background: var(--line-2);
   border: 1px solid var(--line); z-index: -1; }
