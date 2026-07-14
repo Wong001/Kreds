@@ -14,7 +14,7 @@ from .identity import (
     Verifier,
 )
 from .messages import (
-    KIND_DELETE, KIND_DM, KIND_ENCKEY, KIND_POST, KIND_PROFILE,
+    KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_ENCKEY, KIND_POST, KIND_PROFILE,
     KIND_PROFILE_LAYOUT, KIND_RING, KIND_STORY, MAX_BLOB_BYTES, blob_hash,
     validate_payload,
 )
@@ -463,6 +463,26 @@ class Store:
                     best_key = key
             return best or {"order": [], "grids": {}, "sizes": {},
                             "pins": {}, "spans": {}}
+
+    def albums(self, identity_pub: str) -> dict:
+        """Latest-wins {album_id: members} for this author (collage Slice
+        C). Same (created_at, seq, device_pub) tie-break as profile_layout;
+        resolved per album_id. Empty members lists are returned as-is -
+        the node layer treats them as ungrouped."""
+        with self._lock:
+            best: dict = {}
+            best_key: dict = {}
+            for seq, dpub, mj in self._db.execute(
+                    "SELECT seq, device_pub, msg_json FROM messages"
+                    " WHERE kind=? AND identity_pub=?",
+                    (KIND_ALBUM, identity_pub)):
+                p = json.loads(mj)["payload"]
+                aid = p["album_id"]
+                key = (p["created_at"], seq, dpub)
+                if aid not in best or key > best_key[aid]:
+                    best[aid] = list(p.get("members", []))
+                    best_key[aid] = key
+            return best
 
     def messages_not_in(self, summaries: dict, entitled: Set[str],
                         peer_identity: str) -> List[SignedMessage]:
