@@ -464,7 +464,9 @@ body.desktop .desktop-only-panel { display: block; }
   font-family: var(--disp); line-height: 1.25; }
 /* self-only overlays sit on the cell, not under it (fixed block heights) */
 .block .block-scope { position: absolute; top: 6px; left: 6px; z-index: 2; }
-.block .del { position: absolute; bottom: 6px; right: 6px; z-index: 2; }
+/* bottom-left, not bottom-right: Task 6's .block-resize corner handle
+   claims bottom-right on pinned blocks and the two must not collide. */
+.block .del { position: absolute; bottom: 6px; left: 6px; right: auto; z-index: 2; }
 .layout-pick { margin-top: 6px; }   /* profilePostComposer's compose-time grid preselect (Slice B) */
 /* Fix B: per-block audience badge (self-only - visible on your own wall so
    you can see at a glance what each block's scope is). */
@@ -491,9 +493,19 @@ body.desktop .desktop-only-panel { display: block; }
   border: 1px solid var(--line-2); background: var(--surface); color: var(--ink-2);
   font-size: 13px; line-height: 1; cursor: pointer; }
 .block-settings-btn:hover { color: var(--ink); border-color: var(--me); }
-.block.dragging { opacity: .85; box-shadow: var(--shadow);
-  border-radius: 12px; transition: box-shadow .12s; }
-@media (prefers-reduced-motion: reduce) { .block.dragging { transition: none; } }
+/* Arrange-mode collage affordances (Task 6): the dragged block stays put in
+   the DOM (no more reorder-by-reparenting) and just dims - the ghost below
+   previews the cell target instead. */
+.pin-ghost { border: 2px dashed var(--red); border-radius: 12px;
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  pointer-events: none; z-index: 3; }
+.pin-ghost.invalid { border-color: var(--ink-2); border-style: dotted;
+  background: color-mix(in srgb, var(--ink-2) 14%, transparent); }
+.block.dragging { opacity: .45; }
+.block-resize { position: absolute; right: 2px; bottom: 2px; width: 18px;
+  height: 18px; cursor: nwse-resize; z-index: 3; border-right: 3px solid
+  var(--ink-2); border-bottom: 3px solid var(--ink-2);
+  border-bottom-right-radius: 8px; touch-action: none; }
 /* one-line scope explainer next to the wall composer's keeps selector */
 .composer-note { font-size: 11px; color: var(--ink-2); margin-top: 6px; }
 /* video-attach cue in profilePostComposer (video wins over photos) */

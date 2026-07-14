@@ -427,6 +427,16 @@ function renderBlock(p) {
     cog.setAttribute("aria-label", "Block settings");
     cog.onclick = () => openBlockSettings(p, block, cog);   // remembers the gear as the opener (#5a)
     block.append(cog);
+    if (p.pin) {
+      const rz = el("div", "block-resize");
+      rz.setAttribute("aria-hidden", "true");   // modal presets are the a11y path
+      rz.addEventListener("pointerdown", (e) => {
+        if ((e.button != null && e.button !== 0) || !e.isPrimary) return;
+        e.preventDefault(); e.stopPropagation();   // never starts a move-drag
+        startBlockResize(block, e, p);
+      });
+      block.append(rz);
+    }
     // A small drag reorders; a tap (sub-threshold release) opens settings.
     block.addEventListener("pointerdown", (ev) => {
       if ((ev.button != null && ev.button !== 0) || !ev.isPrimary) return;
@@ -448,7 +458,7 @@ function renderBlock(p) {
       const move = (e) => {
         if (e.pointerId !== ev.pointerId) return;   // ignore a concurrent second touch
         if (!handed && Math.hypot(e.clientX - sx, e.clientY - sy) > 6) {
-          handed = true; teardown(); startBlockDrag(block, ev);    // hand off to the drag controller
+          handed = true; teardown(); startBlockDrag(block, ev, p);    // hand off to the drag controller
         }
       };
       const up = (e) => {
@@ -482,83 +492,153 @@ function renderBlock(p) {
   return block;
 }
 
-// Hand-rolled Pointer-Events block drag (mouse + touch + pen) - the sleek,
-// dependency-free path (native HTML5 DnD has no touch + an uncustomizable
-// ghost). Live reorder by nearest-center (2D, Task 3); the settings modal's
-// Move Up/Down remain the keyboard path; "Done" reads the resulting DOM
-// order and publishes as in Slice 2.
-function startBlockDrag(block, ev) {
-  // Primary pointer only; ignore secondary touches so a second finger can't
-  // start a concurrent, incoherent drag.
+// ---- collage geometry (Arrange mode) --------------------------------
+const WALL_GAP = 12;
+function wallMetrics() {
+  const wall = document.getElementById("profile-wall");
+  const r = wall.getBoundingClientRect();
+  const cell = (r.width - 3 * WALL_GAP) / 4;
+  return {wall, r, cell};
+}
+// Top-left cell for a w-wide block whose pointer is at (px, py); y is
+// unbounded downward (the canvas grows), x clamps into the 4 columns.
+function cellFromPoint(px, py, w) {
+  const {r, cell} = wallMetrics();
+  const step = cell + WALL_GAP;
+  const x = Math.max(0, Math.min(4 - w, Math.round((px - r.left) / step)));
+  const y = Math.max(0, Math.round((py - r.top) / step));
+  return {x, y};
+}
+function pinsOverlap(a, b) {
+  return a.x < b.x + b.w && b.x < a.x + a.w
+      && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+function pinFree(geom, exceptId) {
+  for (const [id, pin] of Object.entries(WALL_PINS))
+    if (id !== exceptId && pinsOverlap(geom, pin)) return false;
+  return true;
+}
+function ghostAt(geom, ok) {
+  let g = document.getElementById("pin-ghost");
+  if (!g) {
+    g = el("div", "pin-ghost"); g.id = "pin-ghost";
+    document.getElementById("profile-wall").append(g);
+  }
+  g.style.gridColumn = (geom.x + 1) + " / span " + geom.w;
+  g.style.gridRow = (geom.y + 1) + " / span " + geom.h;
+  g.classList.toggle("invalid", !ok);
+  return g;
+}
+function clearGhost() {
+  const g = document.getElementById("pin-ghost");
+  if (g) g.remove();
+}
+
+// Hand-rolled pointer drag (mouse + touch + pen), collage edition: the
+// gesture no longer reorders siblings - it carries the block's w x h
+// footprint to a cell target. The ghost previews the drop (green = free,
+// red = overlap/out of bounds); release on valid pins via /api/block-pin;
+// release over the tray/off-canvas unpins; invalid or cancelled drops
+// change nothing (no auto-push - blocks never displace each other, spec
+// 2026-07-13 section 3). Capture stays on the WALL (a reparented captured
+// element loses capture in Chromium - found live in Slice 3a); finish()
+// is idempotent and also wired to lostpointercapture (the autoscroll
+// dropped-event fix from Slice 3a still applies).
+function startBlockDrag(block, ev, p) {
   if ((ev.button != null && ev.button !== 0) || !ev.isPrimary) return;
   ev.preventDefault();
   const wall = document.getElementById("profile-wall");
-  const before = [...wall.children];                  // snapshot for cancel-restore
-  // Capture on the WALL, not the dragged block: reordering moves `block`
-  // itself via insertBefore/appendChild below, and a captured element that
-  // gets reparented mid-drag silently loses pointer capture in Chromium -
-  // found live (Task 3 2D-reorder smoke: capture was lost after exactly one
-  // reorder hop, killing the rest of the gesture). `wall` never moves, so
-  // capturing there survives every reorder for the whole gesture.
-  // Capture BEFORE marking .dragging: if capture throws (inactive pointer),
-  // bail out clean rather than leaving a lifted block with no way to end.
+  const wasPinned = !!p.pin;
+  const w = p.span.w, h = p.span.h;
   try { wall.setPointerCapture(ev.pointerId); } catch (e) { return; }
   block.classList.add("dragging");
-
-  // 2D-aware: the wall is a multi-column bento grid (not a vertical list), so
-  // pick the non-dragging block whose CENTER is nearest the pointer (x,y) and
-  // decide insert-before vs insert-after from there, instead of Y-midpoint
-  // alone (which broke cross-column reorder - see Task 2's report).
-  const afterElement = (x, y) => {
-    const els = [...wall.querySelectorAll(".block:not(.dragging)")];
-    let best = null, bestDist = Infinity, after = false;
-    for (const child of els) {
-      const b = child.getBoundingClientRect();
-      const cx = b.left + b.width/2, cy = b.top + b.height/2;
-      const d = Math.hypot(x - cx, y - cy);
-      if (d < bestDist) { bestDist = d; best = child;
-        after = (y > cy + b.height*0.25) || (Math.abs(y - cy) <= b.height*0.5 && x > cx); }
-    }
-    if (!best) return null;
-    return after ? best.nextElementSibling : best;   // insert BEFORE this (null => append)
-  };
+  let target = null, ok = false;
 
   const onMove = (e) => {
-    // IMPORTANT #4: these listeners are on the WALL (see the capture
-    // comment above), not the dragged block, so without a pointerId check
-    // a second concurrent finger anywhere on the wall would drive this
-    // same drag - teleporting or cancelling it mid-gesture.
     if (e.pointerId !== ev.pointerId) return;
-    const after = afterElement(e.clientX, e.clientY);
-    if (after == null) { if (block !== wall.lastElementChild) wall.appendChild(block); }
-    else if (after !== block.nextSibling) wall.insertBefore(block, after);
-    // edge auto-scroll so a long canvas stays reorderable
+    const {r} = wallMetrics();
+    const over = e.clientX >= r.left && e.clientX <= r.right
+              && e.clientY >= r.top - 40;   // small grace above row 0
+    if (!over) { clearGhost(); target = null; ok = false; }   // no #pin-ghost while off-canvas
+    else {
+      const c = cellFromPoint(e.clientX, e.clientY, w);
+      target = {x: c.x, y: c.y, w, h};
+      ok = pinFree(target, p.msg_id);
+      ghostAt(target, ok);   // paints/updates #pin-ghost at the target cell
+    }
     const M = 70;
     if (e.clientY < M) window.scrollBy(0, -12);
     else if (e.clientY > window.innerHeight - M) window.scrollBy(0, 12);
   };
   let done = false;
-  const finish = () => {           // idempotent: pointerup AND lostpointercapture can both fire
+  const finish = async (commit) => {
     if (done) return;
     done = true;
     wall.removeEventListener("pointermove", onMove);
     wall.removeEventListener("pointerup", onUp);
     wall.removeEventListener("pointercancel", onCancel);
     wall.removeEventListener("lostpointercapture", onLost);
+    try { wall.releasePointerCapture(ev.pointerId); } catch (e) { /* released */ }
     block.classList.remove("dragging");
+    clearGhost();   // #pin-ghost never survives past the gesture, valid or not
+    if (commit && target && ok) {
+      await postJSON("/api/block-pin", {msg_id: p.msg_id, ...target});
+    } else if (commit && !target && wasPinned) {
+      // dragged clean off the canvas: back to the tray
+      await postJSON("/api/block-unpin", {msg_id: p.msg_id});
+    } else if (!commit || !target) {
+      return void (CURRENT_PROFILE && openProfile(CURRENT_PROFILE));
+    }
+    if (CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
   };
-  const onUp = (e) => { if (e.pointerId !== ev.pointerId) return; finish(); };   // #4: filter concurrent pointers
-  const onCancel = (e) => {                             // restore pre-drag order
-    if (e.pointerId !== ev.pointerId) return;   // #4: filter concurrent pointers
-    before.forEach((el2) => wall.appendChild(el2));
-    finish();
+  const onUp = (e) => { if (e.pointerId === ev.pointerId) finish(true); };
+  const onCancel = (e) => { if (e.pointerId === ev.pointerId) finish(false); };
+  const onLost = () => finish(true);   // dropped-terminator safety net
+  wall.addEventListener("pointermove", onMove);
+  wall.addEventListener("pointerup", onUp);
+  wall.addEventListener("pointercancel", onCancel);
+  wall.addEventListener("lostpointercapture", onLost);
+}
+
+// Corner resize in cell steps: width/height derive from pointer distance
+// past the block's top-left cell; clamped to the canvas and validated
+// against neighbors like a move. Same capture/finish rules as the drag.
+function startBlockResize(block, ev, p) {
+  const wall = document.getElementById("profile-wall");
+  try { wall.setPointerCapture(ev.pointerId); } catch (e) { return; }
+  block.classList.add("dragging");
+  const pin = p.pin;
+  let target = null, ok = false;
+  const onMove = (e) => {
+    if (e.pointerId !== ev.pointerId) return;
+    const {r, cell} = wallMetrics();
+    const step = cell + WALL_GAP;
+    const w = Math.max(1, Math.min(4 - pin.x,
+      Math.round((e.clientX - (r.left + pin.x * step)) / step)));
+    const h = Math.max(1, Math.min(8,
+      Math.round((e.clientY - (r.top + pin.y * step)) / step)));
+    target = {x: pin.x, y: pin.y, w, h};
+    ok = pinFree(target, p.msg_id);
+    ghostAt(target, ok);
   };
-  // Safety net: lostpointercapture fires when capture is released even if the
-  // browser drops the terminating pointerup/pointercancel (observed during
-  // edge auto-scroll) - without this the block could stay stuck in .dragging
-  // with listeners attached. On a dropped up we keep the current (dragged)
-  // order, which is the right outcome for a completed drag.
-  const onLost = () => finish();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    wall.removeEventListener("pointermove", onMove);
+    wall.removeEventListener("pointerup", onUp);
+    wall.removeEventListener("pointercancel", onCancel);
+    wall.removeEventListener("lostpointercapture", onLost);
+    try { wall.releasePointerCapture(ev.pointerId); } catch (e) { /* released */ }
+    block.classList.remove("dragging");
+    clearGhost();
+    if (commit && target && ok)
+      await postJSON("/api/block-pin", {msg_id: p.msg_id, ...target});
+    if (CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
+  };
+  const onUp = (e) => { if (e.pointerId === ev.pointerId) finish(true); };
+  const onCancel = (e) => { if (e.pointerId === ev.pointerId) finish(false); };
+  const onLost = () => finish(true);
   wall.addEventListener("pointermove", onMove);
   wall.addEventListener("pointerup", onUp);
   wall.addEventListener("pointercancel", onCancel);
@@ -1527,27 +1607,21 @@ function profilePostComposer() {
 }
 
 document.getElementById("profile-back").onclick = () => goView(PRIOR_VIEW);
-// Arrange/Done toggle (self-only Wall canvas reordering): wired once here,
-// like the other topbar handlers - it reads CURRENT_PROFILE to know which
-// profile to re-render/publish against, rather than being rebound per render.
-document.getElementById("profile-arrange").onclick = async () => {
+// Arrange/Done toggle (self-only Wall canvas): wired once here, like the
+// other topbar handlers - it reads CURRENT_PROFILE to know which profile to
+// re-render against. Collage edition (Task 6): every pin/resize/nudge POSTs
+// itself the moment it happens (/api/block-pin, /api/block-unpin), so Done
+// has nothing left to publish - it just exits arrange mode and re-renders.
+async function toggleArrange() {
   if (ARRANGING) {
-    // Publish the current DOM order. Only leave arrange mode on success -
-    // on a failed POST, keep ARRANGING + the DOM order so the user's work
-    // survives for a retry instead of being silently discarded.
-    const order = [...document.getElementById("profile-wall").children]
-      .map(b => b.dataset.msgId).filter(Boolean);
-    const r = await fetch("/api/profile-layout", {method: "POST",
-      headers: {"Content-Type": "application/json"}, body: JSON.stringify({order})});
-    if (!r.ok) { alert("Couldn't save the arrangement: " + await r.text()); return; }
     ARRANGING = false;
-    await refresh();
     if (CURRENT_PROFILE) await openProfile(CURRENT_PROFILE);
   } else {
     ARRANGING = true;
     if (CURRENT_PROFILE) await openProfile(CURRENT_PROFILE);   // re-render with controls
   }
-};
+}
+document.getElementById("profile-arrange").onclick = toggleArrange;
 // Mobile journal disclosure: the rail is always open on desktop (CSS hides
 // the toggle there); on narrow screens it starts collapsed behind this button.
 document.getElementById("profile-journal-toggle").onclick = () => {

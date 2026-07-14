@@ -256,9 +256,14 @@ def test_profile_composer_has_photos_and_block_canvas():
 def test_arrange_mode_and_fixes():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     html = (WEB / "index.html").read_text(encoding="utf-8")
-    # arrange mode + layout POST
+    # arrange mode toggle exists
     assert "profile-arrange" in html or "profile-arrange" in js
-    assert "/api/profile-layout" in js
+    # Retired by Task 6 (collage drag-to-pin): Done used to publish the DOM
+    # order via /api/profile-layout; every pin/resize/nudge now persists
+    # itself (/api/block-pin, /api/block-unpin - see test_drag_to_pin_wired),
+    # so toggleArrange's Done branch has nothing left to POST.
+    assert "function toggleArrange" in js
+    assert "/api/profile-layout" not in js
     # Fix A: profile page uses the owner's accent (falling back to identityColor),
     # not the viewer's identity-hue, for the page color
     assert "p.accent || identityColor" in js
@@ -403,12 +408,14 @@ def test_whole_branch_review_fixes():
     # IMPORTANT #4: the drag controller's wall-level listeners filter by
     # pointerId, so a second concurrent touch on the wall can't hijack an
     # in-progress drag. onLost is exempt (per the fix spec) so it's not
-    # counted here.
-    drag_fn = js.split("function startBlockDrag(")[1].split("\nfunction ")[0]
-    assert 'const onUp = (e) => { if (e.pointerId !== ev.pointerId) return; finish(); };' in drag_fn
-    # onMove and onCancel each carry their own pointerId-filter line too
-    # (3 total: onMove, the onUp one-liner above, and onCancel).
-    assert drag_fn.count("if (e.pointerId !== ev.pointerId) return;") >= 3
+    # counted here. Task 6 rewrote startBlockDrag for cell-targeting (the
+    # reorder-era onUp/onCancel bodies this used to pin are gone), but the
+    # pointerId-filter discipline on every handler still holds - just in the
+    # new handlers' own idiom (onMove's early-return, onUp/onCancel's guard).
+    drag_fn = _js_fn_body(js, "startBlockDrag")
+    assert "if (e.pointerId !== ev.pointerId) return;" in drag_fn        # onMove
+    assert "const onUp = (e) => { if (e.pointerId === ev.pointerId) finish(true); };" in drag_fn
+    assert "const onCancel = (e) => { if (e.pointerId === ev.pointerId) finish(false); };" in drag_fn
 
     # IMPORTANT #5: the modal manages focus - remembers its opener, moves
     # focus in on open, traps Tab, and returns focus to the opener on close.
@@ -1192,3 +1199,21 @@ def test_collage_canvas_wired():
     assert "gridColumn" in rb and "gridRow" in rb
     assert "size-full" not in js          # Phase-A width classes retired
     assert "existence-disclosure" in js or "opaque ids" in js  # honesty note
+
+
+def test_drag_to_pin_wired():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    drag = _js_fn_body(js, "startBlockDrag")
+    assert "cellFromPoint" in drag and "pin-ghost" in drag
+    assert "/api/block-pin" in drag
+    assert "/api/block-unpin" in drag        # dropping off-canvas unpins
+    assert "insertBefore" not in drag        # reorder semantics are gone
+    ov = _js_fn_body(js, "pinsOverlap")
+    assert "w" in ov and "h" in ov
+    assert "block-resize" in js              # corner handle exists
+    _css_rule(css, ".pin-ghost")
+    assert ".pin-ghost.invalid" in css
+    done = _js_fn_body(js, "toggleArrange") if "function toggleArrange" in js \
+        else _js_fn_body(js, "renderProfilePage")
+    assert '"/api/profile-layout"' not in done   # Done no longer posts order
