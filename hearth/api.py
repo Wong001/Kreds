@@ -404,6 +404,12 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         _400(lambda: node.set_block_span(body["msg_id"], body["w"], body["h"]))
         return {"ok": True}
 
+    @app.post("/api/album")
+    async def album(body: dict = Body(...)):
+        aid = _400(lambda: node.set_album(body["members"],
+                                          body.get("album_id")))
+        return {"ok": True, "album_id": aid}
+
     @app.post("/api/unfriend")
     async def unfriend(body: dict = Body(...)):
         _400(lambda: node.unfriend(body["identity_pub"]))

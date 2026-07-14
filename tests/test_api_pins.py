@@ -6,6 +6,11 @@ from fastapi.testclient import TestClient
 from hearth.api import build_app
 from hearth.node import HearthNode
 
+# Same fake-PNG idiom as test_api_scoped_posts.py/test_api.py's photo-upload
+# tests -- compose_post never decodes the bytes, only the magic prefix
+# matters for /api/blob's sniffer.
+PNG = b"\x89PNG\r\n\x1a\nfakepixels"
+
 
 @pytest.fixture
 def client_self(tmp_path):
@@ -45,3 +50,25 @@ def test_pin_endpoint_400s(client_self):
                                           "w": 1, "h": 1}).status_code == 200
     assert c.post("/api/block-span", json={"msg_id": mid, "w": 2,
                                            "h": 2}).status_code == 400
+
+
+def test_album_api_roundtrip(client_self):
+    c, node = client_self
+    # two profile photo posts through the API (multipart pattern mirrors
+    # test_api_scoped_posts.py's photo-upload tests), then group, then ungroup
+    r1 = c.post("/api/post", data={"text": "one", "scope": "kreds",
+                                   "placement": "profile"},
+               files=[("photos", ("p1.png", PNG, "image/png"))])
+    r2 = c.post("/api/post", data={"text": "two", "scope": "kreds",
+                                   "placement": "profile"},
+               files=[("photos", ("p2.png", PNG, "image/png"))])
+    m1, m2 = r1.json()["msg_id"], r2.json()["msg_id"]
+    r = c.post("/api/album", json={"members": [m1, m2]})
+    assert r.status_code == 200
+    aid = r.json()["album_id"]
+    prof = c.get("/api/profile/" + node.identity_pub).json()
+    alb = next(p for p in prof["wall"] if p.get("album"))
+    assert alb["msg_id"] == aid and alb["count"] == 2
+    assert c.post("/api/album", json={"members": ["zz"]}).status_code == 400
+    assert c.post("/api/album",
+                  json={"members": [], "album_id": aid}).status_code == 200

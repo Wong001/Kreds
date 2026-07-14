@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -18,11 +19,11 @@ from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
 from .imagegate import AVATAR_MAX, BANNER_MAX, transcode
 from .videogate import STORY_IMAGE_MAX, transcode_video
 from .messages import (DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
-                       KIND_DELETE, KIND_DM, KIND_POST, MAX_BLOCK_H,
-                       MAX_CAPTION, MAX_LAYOUT, SIZE_LAYOUTS, WALL_COLS,
-                       make_delete, make_dm, make_enckey, make_post,
-                       make_profile, make_profile_layout, make_ring,
-                       make_story)
+                       KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_POST,
+                       MAX_BLOCK_H, MAX_CAPTION, MAX_LAYOUT, SIZE_LAYOUTS,
+                       WALL_COLS, make_album, make_delete, make_dm,
+                       make_enckey, make_post, make_profile,
+                       make_profile_layout, make_ring, make_story)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -714,6 +715,34 @@ class HearthNode:
             self.device, cur["order"], grids=cur["grids"],
             sizes=cur["sizes"], pins=cur["pins"], spans=spans))
 
+    def set_album(self, members, album_id: str | None = None) -> str:
+        """Group own profile photo posts into a growable album (collage
+        Slice C). Members must be THIS identity's own profile-placement
+        photo posts; empty members un-groups an EXISTING album. The record
+        carries opaque ids only - content stays per-post encrypted."""
+        if not isinstance(members, list) or len(members) > MAX_LAYOUT:
+            raise ValueError("bad album members")
+        if len(set(members)) != len(members):
+            raise ValueError("duplicate album member")
+        if not members and album_id is None:
+            raise ValueError("empty album needs an album_id (ungroup)")
+        for mid in members:
+            self._check_block_id(mid)
+            msg = self.store.get_message(mid)
+            if msg is None or msg.cert.identity_pub != self.identity_pub:
+                raise ValueError("album member must be your own post")
+            pl = msg.payload
+            if pl.get("kind") != KIND_POST or pl.get("placement") != "profile":
+                raise ValueError("album member must be a profile post")
+            if pl.get("media") == "video" or not pl.get("blobs"):
+                raise ValueError("album members are photo posts")
+        if album_id is None:
+            album_id = secrets.token_hex(32)
+        else:
+            self._check_block_id(album_id)
+        self._publish(make_album(self.device, album_id, members))
+        return album_id
+
     def profile_view(self, identity_pub: str):
         if identity_pub != self.identity_pub \
                 and not self.store.is_known(identity_pub):
@@ -754,6 +783,46 @@ class HearthNode:
                 p["span"] = {"w": pin["w"], "h": pin["h"]}
             else:
                 p["span"] = spans.get(p["msg_id"]) or _default_span(p)
+
+        # Album folding (Slice C): members render inside their album's
+        # deck, never standalone; the album pseudo-block borrows the
+        # msg_id slot (album_id, same 64-hex width) so every layout path
+        # (pins/spans/drag/modal) treats it like any block. A viewer's
+        # deck holds only members THEY decrypted; an album with none is
+        # simply absent (honest hole). Empty members = ungrouped.
+        albums = self.store.albums(identity_pub)
+        by_id = {p["msg_id"]: p for p in wall}
+        member_of = {}
+        for aid, mids in albums.items():
+            for mid in mids:
+                member_of.setdefault(mid, aid)     # first album wins a conflict
+        folded = [p for p in wall if p["msg_id"] not in member_of]
+        for aid, mids in albums.items():
+            photos, newest, scope_newest = [], None, "kreds"
+            for mid in mids:
+                p = by_id.get(mid)
+                if p is None or member_of.get(mid) != aid:
+                    continue                        # undecryptable/unknown/conflicted
+                for h in p.get("blobs") or []:
+                    photos.append({"m": mid, "h": h})
+                if newest is None or p["created_at"] > newest:
+                    newest = p["created_at"]
+                    scope_newest = p.get("scope", "kreds")
+            if not photos:
+                continue
+            pin = pins.get(aid)
+            folded.append({
+                "album": True, "msg_id": aid,
+                "mine": identity_pub == self.identity_pub,
+                "photos": photos, "count": len(photos),
+                "created_at": newest, "scope_newest": scope_newest,
+                "pin": pin,
+                "span": ({"w": pin["w"], "h": pin["h"]} if pin
+                         else spans.get(aid) or {"w": 2, "h": 2}),
+            })
+        folded.sort(key=lambda p: p["created_at"], reverse=True)
+        wall = folded
+
         return {**rec, "identity_pub": identity_pub,
                 "mine": identity_pub == self.identity_pub,
                 "ring": ring, "since": since,
