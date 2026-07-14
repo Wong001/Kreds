@@ -533,6 +533,19 @@ class HearthNode:
             # size (or the media/text default), pushed-place applied so
             # only whatever is actually in the way slides down - the
             # separate span-seed call is gone. August 2026-07-14.
+            #
+            # The post is ALREADY published at this point (the layout
+            # record needs its msg_id). If _push_place raises here (wall
+            # full), the caller sees a 400 with no msg_id while the post
+            # EXISTS, orphaned-unplaced: no pin, no span. That degrades
+            # honestly - profile_view's legacy flow-below fallback renders
+            # it for owner and visitors alike, and /api/wall-autoplace
+            # adopts it later. Do not "fix" this by hiding the post: this
+            # is the e29c53b "vanished orphan" bug class - content must
+            # never silently disappear on a placement error. And the
+            # trigger is sharper than a 500-posts-scale event: ONE block
+            # manually pinned at y=MAX_LAYOUT makes the next overlapping
+            # auto-place cascade past the cap and trip it.
             span = ({"w": span_w, "h": span_h} if span_w is not None
                     else ({"w": 2, "h": 2} if has_media else {"w": 4, "h": 1}))
             cur = self.store.profile_layout(self.identity_pub)

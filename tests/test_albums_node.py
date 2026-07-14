@@ -125,7 +125,7 @@ def test_group_two_pinned_posts_leaves_album_unplaced(tmp_path):
     assert layout["spans"][b] == {"w": 1, "h": 1}
 
 
-def test_ungroup_after_pin_inheritance_restores_unplaced(tmp_path):
+def test_ungroup_after_pin_inheritance_top_inserts(tmp_path):
     n = _node(tmp_path)
     a = _photo_post(n)
     n.set_block_pin(a, 1, 2, 2, 2)

@@ -1,8 +1,26 @@
 """One placement rule: anchor at target, push only overlapped blocks
 straight down, deterministically (spec 2026-07-14 dynamic placement)."""
+import os
+import subprocess
+import tempfile
+
 import pytest
 
 from hearth.node import HearthNode
+
+
+def clip(seconds=1):
+    # copied from tests/test_profile_video.py (itself from
+    # tests/test_node_story.py): synthetic mp4 via imageio_ffmpeg's
+    # bundled ffmpeg, for composing a real video post.
+    import imageio_ffmpeg
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    p = os.path.join(tempfile.mkdtemp(), "c.mp4")
+    subprocess.run([ff, "-f", "lavfi", "-i",
+        f"testsrc=size=480x360:rate=24:duration={seconds}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", p],
+        check=True, capture_output=True)
+    return open(p, "rb").read()
 
 
 def _node(tmp_path):
@@ -104,3 +122,56 @@ def test_auto_place_unplaced_single_publish(tmp_path):
     assert p[b]["y"] == 0                    # newest on top
     assert p[a]["y"] == 1
     assert n.auto_place_unplaced() == 0      # idempotent, no extra publish
+
+
+def test_video_post_auto_places_media_default(tmp_path):
+    """A profile video post without composer w/h gets the media default
+    2x2 auto-pin at the top (spec 2026-07-14), same as a photo post."""
+    n = _node(tmp_path)
+    mid = n.compose_post("clip", scope="kreds", placement="profile",
+                         video=clip(1))
+    assert _pins(n)[mid] == {"x": 0, "y": 0, "w": 2, "h": 2}
+
+
+def test_wall_full_compose_orphans_post_unplaced(tmp_path):
+    """The cascade raise site, from compose (spec 2026-07-14): the post
+    is ALREADY published when auto-place runs, so a wall-full push gives
+    the caller a ValueError (400, no msg_id) while the post EXISTS
+    orphaned-unplaced - no pin, no span - degrading honestly to the
+    legacy flow-below rendering until /api/wall-autoplace adopts it.
+    The trigger is deliberately NOT 500-posts-scale: a contiguous pinned
+    chain ending in one block AT y=MAX_LAYOUT means the very next
+    overlapping auto-place cascades past the cap."""
+    from hearth.messages import MAX_LAYOUT, make_profile_layout
+    n = _node(tmp_path)
+    # Synthetic full-height stack (raw layout write, same idiom as the
+    # autoplace test above): full-width blocks tiling rows 0..499
+    # contiguously, then one block AT the row cap. Any push of the chain
+    # crosses MAX_LAYOUT.
+    pins, y, i = {}, 0, 0
+    while y + 8 <= 496:
+        pins["%064x" % i] = {"x": 0, "y": y, "w": 4, "h": 8}
+        y, i = y + 8, i + 1
+    pins["%064x" % i] = {"x": 0, "y": 496, "w": 4, "h": 4}   # rows 496-499
+    pins["ff" * 32] = {"x": 0, "y": MAX_LAYOUT, "w": 4, "h": 1}
+    cur = n.store.profile_layout(n.identity_pub)
+    n._publish(make_profile_layout(n.device, cur["order"],
+                                   grids=cur["grids"], sizes=cur["sizes"],
+                                   pins=pins, spans={}, texts=cur["texts"]))
+    with pytest.raises(ValueError):
+        n.compose_post("boom", scope="kreds", placement="profile")
+    # The orphan-degrades contract: the post exists, unplaced on the wall.
+    wall = n.posts_by(n.identity_pub, "profile")
+    boom = next(p for p in wall if p["text"] == "boom")
+    lay = n.store.profile_layout(n.identity_pub)
+    assert boom["msg_id"] not in lay["pins"]
+    assert boom["msg_id"] not in lay["spans"]
+    assert lay["pins"] == pins                # layout untouched by the failure
+    view_row = next(p for p in n.profile_view(n.identity_pub)["wall"]
+                    if p["msg_id"] == boom["msg_id"])
+    assert view_row["pin"] is None            # flow-below fallback renders it
+    assert view_row["span"] == {"w": 4, "h": 1}
+    # ...and wall-autoplace would adopt it later; here it must raise too
+    # (the wall IS full), never silently drop the orphan.
+    with pytest.raises(ValueError):
+        n.auto_place_unplaced()
