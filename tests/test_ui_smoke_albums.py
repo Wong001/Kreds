@@ -128,28 +128,26 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             page.keyboard.press("Escape")
             page.wait_for_selector("#lightbox", state="detached")
 
-            # '+' Add photos: one more PNG grows the deck in place and
-            # mints an album wrapping [original post, new post].
+            # '+' Add photos: one more PNG grows the deck STRICTLY in
+            # place and mints an album wrapping [original post, new post].
             #
-            # Node-level verified interaction (spec 2026-07-14): the new
-            # photo posted by "+" auto-places itself PINNED at (0,0) at
-            # creation too - every profile post does now - so BOTH members
-            # already carry a pin by the time /api/album groups them.
-            # set_album's "two-or-more pinned members" branch (Slice C,
-            # predates dynamic placement) can't pick a winner between them,
-            # so it drops the freshly-minted album unpinned rather than
-            # taking its own documented "exactly one pinned member ->
-            # inherit" path. The deck doesn't hang unplaced for long
-            # though: addPhotosToBlock's own re-render surfaces the
-            # now-unpinned album, and renderWall's migration check
-            # (p.mine && unpinned.length) immediately fires one
-            # /api/wall-autoplace, re-pinning it at the top - which
-            # happens to equal its original (0,0) spot here (the wall's
-            # only other content), so the net effect on THIS wall matches
-            # "grows in place". A deck that ISN'T already at the top would
-            # visibly relocate to (0,0) instead of staying put - a real
-            # fragility in the two-pinned-members path, reported rather
-            # than fixed here (Task 1/2 territory - see task-3-report.md).
+            # Fixed contract (grow-flow fix, follows the transient this
+            # smoke originally documented): addPhotosToBlock sends
+            # place=0, so the album-bound photo skips creation auto-place
+            # entirely - it becomes deck CONTENT, never a wall block, and
+            # nothing on the wall moves. Before the fix, the new photo's
+            # own top-insert pushed the whole wall (including the very
+            # album it was joining) down, and only a wall-autoplace
+            # coincidence put a deck that happened to sit at (0,0) back.
+            # To make the assertion STRICT - not satisfiable by that
+            # (0,0) coincidence - move the deck OFF the top first: any
+            # push/unpin regression now shows up as a moved pin.
+            a.node.set_block_pin(orig_id, 1, 2, 2, 2)
+            pin_moved = {"x": 1, "y": 2, "w": 2, "h": 2}
+            page.reload()
+            page.wait_for_selector(".fchip")     # app booted (same as the goto)
+            page.click('.navlinks button[data-view="me"]')
+            page.wait_for_selector("#profile-wall .block-deck", timeout=8000)
             page.set_input_files(
                 ".block-add input", _pngs(tmp_path, 1, start=3))
             page.wait_for_function(
@@ -165,8 +163,13 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             assert len(members) == 2   # original post + newly added post
 
             lay = a.node.store.profile_layout(a.node.identity_pub)
-            assert lay["pins"][album_id] == pin_before   # grow keeps it in place
+            # strict pin-unchanged-through-grow: the deck stayed at its
+            # off-top spot, byte-identical - the wall never moved.
+            assert lay["pins"][album_id] == pin_moved
             assert orig_id not in lay["pins"]             # geometry moved to the album now
+            new_id_now = [m for m in members if m != orig_id][0]
+            assert new_id_now not in lay["pins"]          # deck content, never a block
+            assert new_id_now not in lay["spans"]
 
             # Arrange -> gear on the deck -> Ungroup
             page.click("#profile-arrange")

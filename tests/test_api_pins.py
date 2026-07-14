@@ -52,6 +52,19 @@ def test_pin_endpoint_400s(client_self):
                                            "h": 2}).status_code == 400
 
 
+def test_post_place_0_skips_auto_place(client_self):
+    # place=0 (the deck grow flow): the post exists but is NOT auto-pinned
+    # - it is album-bound deck content, not a wall block (spec 2026-07-14).
+    c, node = client_self
+    r = c.post("/api/post", data={"text": "", "scope": "kreds",
+                                  "placement": "profile", "place": "0"},
+               files=[("photos", ("p.png", PNG, "image/png"))])
+    assert r.status_code == 200
+    mid = r.json()["msg_id"]
+    lay = node.store.profile_layout(node.identity_pub)
+    assert mid not in lay["pins"] and mid not in lay["spans"]
+
+
 def test_album_api_roundtrip(client_self):
     c, node = client_self
     # two profile photo posts through the API (multipart pattern mirrors

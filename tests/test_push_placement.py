@@ -124,6 +124,31 @@ def test_auto_place_unplaced_single_publish(tmp_path):
     assert n.auto_place_unplaced() == 0      # idempotent, no extra publish
 
 
+def test_grow_pinned_album_leaves_wall_undisturbed(tmp_path):
+    """Deck grow (smoke-caught fix): an album-bound photo post composed
+    with auto_place=False is deck CONTENT, not a wall block - it must
+    not push anything. After compose(auto_place=False) + set_album, the
+    album's pin and every other pin are byte-identical to before, and
+    the new member never appears in pins or spans."""
+    n = _node(tmp_path)
+    other = _post(n, "other")                       # a block elsewhere
+    p1 = n.compose_post("one", scope="kreds", placement="profile",
+                        photos=[b"\x89PNG fake"])
+    aid = n.set_album([p1])                         # album inherits p1's pin
+    n.set_block_pin(other, 0, 0, 4, 1)
+    n.set_block_pin(aid, 0, 3, 2, 2)                # known geometry, off-top
+    before = n.store.profile_layout(n.identity_pub)["pins"]
+    new = n.compose_post("", scope="kreds", placement="profile",
+                         photos=[b"\x89PNG fake"], auto_place=False)
+    assert _pins(n) == before                       # compose alone: no touch
+    n.set_album([p1, new], album_id=aid)            # grow
+    lay = n.store.profile_layout(n.identity_pub)
+    assert lay["pins"] == before                    # wall undisturbed
+    assert lay["pins"][aid] == {"x": 0, "y": 3, "w": 2, "h": 2}
+    assert lay["pins"][other] == {"x": 0, "y": 0, "w": 4, "h": 1}
+    assert new not in lay["pins"] and new not in lay["spans"]
+
+
 def test_video_post_auto_places_media_default(tmp_path):
     """A profile video post without composer w/h gets the media default
     2x2 auto-pin at the top (spec 2026-07-14), same as a photo post."""

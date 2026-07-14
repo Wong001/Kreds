@@ -351,15 +351,20 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
                    photos: List[UploadFile] = File(default=[]),
                    video: UploadFile = File(default=None),
                    w: Optional[int] = Form(default=None),
-                   h: Optional[int] = Form(default=None)):
+                   h: Optional[int] = Form(default=None),
+                   place: str = Form("1")):
+        # place="0" skips the profile auto-place (spec 2026-07-14): the
+        # deck grow flow's album-bound photo must not disturb the wall.
         expiry = float(expires_seconds) if expires_seconds.strip() else None
+        auto_place = place != "0"
         if video is not None:
             vbytes = await video.read()
             if len(vbytes) > MAX_VIDEO_UPLOAD:
                 raise HTTPException(413, "video exceeds upload cap")
             mid = _400(lambda: node.compose_post(text, scope, (), expiry,
                                                  placement=placement, video=vbytes,
-                                                 span_w=w, span_h=h))
+                                                 span_w=w, span_h=h,
+                                                 auto_place=auto_place))
             return {"msg_id": mid}
         blobs = []
         for up in photos:
@@ -369,7 +374,8 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
             blobs.append(data)
         mid = _400(lambda: node.compose_post(text, scope, blobs, expiry,
                                              placement=placement,
-                                             span_w=w, span_h=h))
+                                             span_w=w, span_h=h,
+                                             auto_place=auto_place))
         return {"msg_id": mid}
 
     @app.post("/api/ring")

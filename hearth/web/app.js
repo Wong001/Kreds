@@ -427,6 +427,12 @@ async function addPhotosToBlock(p, files) {
   fd.append("text", "");
   fd.append("scope", scope);
   fd.append("placement", "profile");
+  // place=0: this post is album-bound - it becomes deck CONTENT, not a
+  // wall block, so it must skip creation auto-place (spec 2026-07-14).
+  // Without this, the new photo's own top-insert pushed the whole wall
+  // (including the very album it was joining) down before /api/album
+  // could fold it in - the deck lurched on every "+".
+  fd.append("place", "0");
   for (const f of files) fd.append("photos", f);
   const r = await fetch("/api/post", {method: "POST", body: fd});
   if (!r.ok) { alert("Couldn't add: " + await r.text()); return; }

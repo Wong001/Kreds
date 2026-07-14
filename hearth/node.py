@@ -489,7 +489,8 @@ class HearthNode:
     def compose_post(self, text: str, scope: str = "kreds",
                      photos=(), expires_seconds=None,
                      placement: str = "journal", video=None,
-                     span_w=None, span_h=None) -> str:
+                     span_w=None, span_h=None,
+                     auto_place: bool = True) -> str:
         if scope not in ("inner", "kreds"):
             raise ValueError("scope must be inner or kreds")
         if placement not in ("journal", "profile"):
@@ -527,12 +528,21 @@ class HearthNode:
                                           placement=placement))
             self._cache_message_key(mid, key)
             has_media = bool(refs)
-        if placement == "profile":
+        if placement == "profile" and auto_place:
             # Creation auto-places at the top, dense (spec 2026-07-14): a
             # new wall post is pinned at (0,0) with its composer-chosen
             # size (or the media/text default), pushed-place applied so
             # only whatever is actually in the way slides down - the
             # separate span-seed call is gone. August 2026-07-14.
+            #
+            # auto_place=False is for album-bound posts (the deck grow
+            # flow, "+"): the new photo becomes DECK CONTENT, not a wall
+            # block of its own, so it must not disturb the wall - the
+            # smoke-caught bug was this very auto-pin pushing the whole
+            # wall (including the album the photo was about to join) down
+            # before set_album could fold it in. Skew note: an old client
+            # growing without the flag still converges (set_album clears
+            # the member's pin) - it just shows the transient push.
             #
             # The post is ALREADY published at this point (the layout
             # record needs its msg_id). If _push_place raises here (wall
