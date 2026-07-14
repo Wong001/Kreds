@@ -223,3 +223,12 @@ time (core + web move together; Slice A/C touch core).
 - Journal feed and Journal rail rendering (untouched by this redesign).
 - iPhone-native swipe polish (the web deck works in mobile browsers;
   native gestures come with the iOS app).
+
+## Amendments (2026-07-14 Slice C final review)
+
+- Section 5's "Add photos... (scope chosen per post...)" ships as
+  **inherited scope, surfaced via tooltip/`aria-label` only** — the
+  `+` control posts at the block's (or album's newest member's) scope
+  automatically and states which scope in its title/aria text; it does
+  not yet offer a per-post scope chooser. A true per-post picker is a
+  named follow-up, not built in this slice.
