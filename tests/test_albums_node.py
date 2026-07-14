@@ -95,3 +95,43 @@ def test_ungroup_restores_standalone(tmp_path):
     ids = [p["msg_id"] for p in view["wall"]]
     assert a in ids
     assert not any(p.get("album") for p in view["wall"])
+
+
+# --- album/pin-map interplay (review finding: albums and the pin map now
+# talk to each other in set_album) ---
+
+def test_mint_from_pinned_single_photo_inherits_pin(tmp_path):
+    n = _node(tmp_path)
+    a = _photo_post(n)
+    n.set_block_pin(a, 1, 2, 2, 2)
+    aid = n.set_album([a])
+    layout = n.store.profile_layout(n.identity_pub)
+    assert layout["pins"].get(aid) == {"x": 1, "y": 2, "w": 2, "h": 2}
+    assert a not in layout["pins"]                 # never independently placed
+    assert layout["spans"][a] == {"w": 2, "h": 2}  # kept size, unplaced
+
+
+def test_group_two_pinned_posts_leaves_album_unplaced(tmp_path):
+    n = _node(tmp_path)
+    a = _photo_post(n)
+    b = _photo_post(n)
+    n.set_block_pin(a, 0, 0, 1, 1)
+    n.set_block_pin(b, 2, 0, 1, 1)
+    aid = n.set_album([a, b])
+    layout = n.store.profile_layout(n.identity_pub)
+    assert aid not in layout["pins"]                # no deterministic winner
+    assert a not in layout["pins"] and b not in layout["pins"]
+    assert layout["spans"][a] == {"w": 1, "h": 1}
+    assert layout["spans"][b] == {"w": 1, "h": 1}
+
+
+def test_ungroup_after_pin_inheritance_restores_unplaced(tmp_path):
+    n = _node(tmp_path)
+    a = _photo_post(n)
+    n.set_block_pin(a, 1, 2, 2, 2)
+    aid = n.set_album([a])
+    n.set_album([], album_id=aid)                  # ungroup
+    view = n.profile_view(n.identity_pub)
+    member = next(p for p in view["wall"] if p["msg_id"] == a)
+    assert member["pin"] is None
+    assert member["span"] == {"w": 2, "h": 2}       # span preserved, no pin

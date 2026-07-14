@@ -507,8 +507,9 @@ body.desktop .desktop-only-panel { display: block; }
   border: 1px solid var(--line); z-index: -1; }
 .block-deck::before { transform: rotate(2deg) translate(4px, 2px); }
 .block-deck::after { transform: rotate(-1.6deg) translate(-3px, 3px); }
-.block-deck .deck-count { position: absolute; top: 8px; right: 8px;
-  z-index: 2; }
+/* base .deck-count already sets position/top/right (line ~445) - only
+   z-index needs adding for the wall variant's stacking context */
+.block-deck .deck-count { z-index: 2; }
 .deck-nav { position: absolute; top: 50%; transform: translateY(-50%);
   z-index: 2; width: 28px; height: 28px; border-radius: 50%;
   border: none; background: color-mix(in srgb, var(--ink) 55%, transparent);

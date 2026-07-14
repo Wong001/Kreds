@@ -38,3 +38,14 @@ def test_bad_albums_rejected():
     assert not ok
     ok, _ = validate_payload(_mk([MID] + ["%064x" % i for i in range(MAX_LAYOUT)]).payload)
     assert not ok
+
+
+def test_max_layout_members_valid_boundary():
+    ok, why = validate_payload(_mk(["%064x" % i for i in range(MAX_LAYOUT)]).payload)
+    assert ok, why
+
+
+def test_non_list_members_rejected():
+    ok, _ = validate_payload({"kind": KIND_ALBUM, "album_id": AID,
+                              "members": MID, "created_at": 0})
+    assert not ok

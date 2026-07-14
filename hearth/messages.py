@@ -138,7 +138,7 @@ def make_profile_layout(device: DeviceKeys, order: Sequence[str],
 
 
 def make_album(device: DeviceKeys, album_id: str, members: Sequence[str],
-              now: Optional[float] = None) -> SignedMessage:
+               now: Optional[float] = None) -> SignedMessage:
     return device.sign_message({
         "kind": KIND_ALBUM, "album_id": album_id, "members": list(members),
         "created_at": _now(now),

@@ -66,3 +66,46 @@ def test_album_grows_and_scopes_over_sync(tmp_path):
         for s in (sa, sb):
             await s.stop()
     asyncio.run(scenario())
+
+
+def test_delete_everywhere_album_member_shrinks_deck_over_sync(tmp_path):
+    """A delete-everywhere on one album member shrinks the deck to the
+    remaining decryptable members - on B's synced view AND on A's own
+    (the album-folding loop's existing "p is None -> continue" branch,
+    same path as an undecryptable/conflicted member, handles a deleted
+    member with no special-casing needed)."""
+    async def scenario():
+        a = HearthNode.create(tmp_path / "a", "Anna", "anna-pc")
+        b = HearthNode.create(tmp_path / "b", "Bo", "bo-pc")
+        befriend(a, b)
+        for n in (a, b):
+            n.ensure_enckey()
+        sa, aa = await started(a)
+        sb, ba = await started(b)
+        await sa.sync_with(ba)
+
+        p1 = a.compose_post("uno", scope="kreds", placement="profile", photos=[PNG])
+        p2 = a.compose_post("dos", scope="kreds", placement="profile", photos=[PNG])
+        a.set_album([p1, p2])
+        await sa.sync_with(ba)
+
+        a.delete_post(p1)
+        await sa.sync_with(ba)
+
+        view_b = b.profile_view(a.identity_pub)
+        alb_b = next(p for p in view_b["wall"] if p.get("album"))
+        assert [ph["m"] for ph in alb_b["photos"]] == [p2]
+        assert alb_b["count"] == 1
+        ids_b = [p["msg_id"] for p in view_b["wall"]]
+        assert p1 not in ids_b                       # deleted, not resurrected standalone
+
+        view_a = a.profile_view(a.identity_pub)
+        alb_a = next(p for p in view_a["wall"] if p.get("album"))
+        assert [ph["m"] for ph in alb_a["photos"]] == [p2]
+        assert alb_a["count"] == 1
+        ids_a = [p["msg_id"] for p in view_a["wall"]]
+        assert p1 not in ids_a
+
+        for s in (sa, sb):
+            await s.stop()
+    asyncio.run(scenario())

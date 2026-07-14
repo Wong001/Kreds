@@ -514,7 +514,13 @@ function renderBlock(p) {
     // it explicitly (video posts are never album-eligible either way).
     if (p.media !== "video" && blockPhotoItems(p).length > 0) {
       const add = el("label", "block-add");
-      add.title = "Add photos";
+      // Silent-scope fix (review finding): Add-photos inherits the block's
+      // (or album's newest member's) scope automatically - surface which
+      // scope via tooltip/aria rather than a per-post picker (spec
+      // Amendments 2026-07-14: picker is a named follow-up).
+      const addScope = p.album ? (p.scope_newest || "kreds") : (p.scope || "kreds");
+      add.title = "Add photos (posts at " + addScope + " scope)";
+      add.setAttribute("aria-label", "Add photos (posts at " + addScope + " scope)");
       add.textContent = "+";
       const addInput = document.createElement("input");
       addInput.type = "file"; addInput.accept = "image/*"; addInput.multiple = true;

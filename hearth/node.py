@@ -740,6 +740,39 @@ class HearthNode:
             album_id = secrets.token_hex(32)
         else:
             self._check_block_id(album_id)
+        # album_id shares the msg_id namespace (pins/spans/settings-modal
+        # all key on it uniformly) - refuse one that collides with a real
+        # message id so an album pseudo-block can never be confused with,
+        # or shadow, an actual message (review finding).
+        if self.store.get_message(album_id) is not None:
+            raise ValueError("album_id collides with a message id")
+        if members:
+            # The album/pin-map interplay (review finding): a grouped
+            # member is never independently placed, so folding it into an
+            # album must clear any pin it held, restoring it to `spans`
+            # (kept size, unplaced) - an ungroup later then honestly
+            # returns the member to the tray with no stale pin able to
+            # overlap anything. If exactly one member carried a pin and
+            # the album itself has no pin yet, the album inherits that
+            # member's exact geometry (growing a pinned post's deck no
+            # longer silently un-places it); two-or-more pinned members
+            # have no deterministic choice of which geometry wins, so the
+            # album lands unplaced instead.
+            cur = self.store.profile_layout(self.identity_pub)
+            pins = dict(cur["pins"])
+            spans = dict(cur["spans"])
+            pinned_geoms = [pins[m] for m in members if m in pins]
+            for mid in members:
+                geom = pins.pop(mid, None)
+                if geom is not None:
+                    spans[mid] = {"w": geom["w"], "h": geom["h"]}
+            if album_id not in pins and len(pinned_geoms) == 1:
+                pins[album_id] = dict(pinned_geoms[0])
+            if len(spans) > MAX_LAYOUT:      # pre-check -> 400, not a 500 from _publish
+                raise ValueError("too many sized blocks")
+            self._publish(make_profile_layout(
+                self.device, cur["order"], grids=cur["grids"],
+                sizes=cur["sizes"], pins=pins, spans=spans))
         self._publish(make_album(self.device, album_id, members))
         return album_id
 
@@ -807,6 +840,8 @@ class HearthNode:
                 p = by_id.get(mid)
                 if p is None or member_of.get(mid) != aid:
                     continue                        # undecryptable/unknown/conflicted
+                if p.get("media") == "video":
+                    continue    # hostile/legacy record naming a video post - never fold an mp4 into photos
                 for h in p.get("blobs") or []:
                     photos.append({"m": mid, "h": h})
                 if newest is None or p["created_at"] > newest:
