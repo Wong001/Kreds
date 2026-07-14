@@ -207,7 +207,7 @@ class Store:
 
     def put_blob(self, data: bytes) -> str:
         if len(data) > MAX_BLOB_BYTES:
-            raise ValueError("blob exceeds 5 MB cap")
+            raise ValueError("blob exceeds 10 MB cap")
         h = blob_hash(data)
         with self._lock:
             self._db.execute("INSERT OR IGNORE INTO blobs VALUES(?,?)",

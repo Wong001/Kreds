@@ -48,7 +48,14 @@ ACCENTS = ("#2743d6", "#c0563b", "#3e7c55", "#8a5cd0", "#17191e",
 AVATAR_SHAPES = ("circle", "squircle", "square", "triangle")
 AVATAR_SIZES = ("s", "m", "l")
 AVATAR_ALIGNS = ("left", "center", "right")
-MAX_BLOB_BYTES = 5 * 1024 * 1024
+MAX_BLOB_BYTES = 10 * 1024 * 1024      # PROTOCOL: store + sync + doors all
+                                       # key off this. Raised 5->10 MB in
+                                       # 0.3.11; peers on <=0.3.10 refuse
+                                       # bigger blobs until they update
+                                       # (accepted single-release window).
+MAX_IMAGE_UPLOAD = 50 * 1024 * 1024    # raw image upload cap, checked before
+                                       # the photo gate (gate output is still
+                                       # bound by MAX_BLOB_BYTES)
 MAX_VIDEO_UPLOAD = 100 * 1024 * 1024   # raw upload cap, checked before the
                                        # transcode gate (transcoded output is
                                        # still bound by MAX_BLOB_BYTES)
