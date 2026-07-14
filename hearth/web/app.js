@@ -695,6 +695,12 @@ function openBlockSettings(p, block, opener, focusSel) {
   // to the close button when focusSel doesn't resolve, same as any fresh
   // open - #5d below). If the block is no longer on the canvas/tray at all
   // (deleted meanwhile), close the modal instead of reopening on nothing.
+  // The re-render detaches EVERY node, including whatever opened the modal -
+  // BLOCK_SETTINGS_OPENER would go stale, and #5(e)'s isConnected guard
+  // would then silently drop focus to <body> on close (the exact failure it
+  // exists to prevent). So the freshly-found block is handed in as the
+  // opener, keeping focus-return on a live node; the close-fallback path
+  // leaves the opener alone (nothing sensible left to focus).
   const reopenAfterAction = async (focusSel) => {
     let np;
     try {
@@ -706,7 +712,7 @@ function openBlockSettings(p, block, opener, focusSel) {
     const post = np.wall && np.wall.find(b => b.msg_id === p.msg_id);
     const nextBlock = document.querySelector('[data-msg-id="' + p.msg_id + '"]');
     if (!post || !nextBlock) { closeBlockSettings(); return; }
-    openBlockSettings(post, nextBlock, null, focusSel);
+    openBlockSettings(post, nextBlock, nextBlock, focusSel);
   };
 
   // Size presets - the keyboard path for what corner-drag does by pointer.

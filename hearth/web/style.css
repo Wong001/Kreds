@@ -549,7 +549,7 @@ body.desktop .desktop-only-panel { display: block; }
 .settings-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .settings-opt { border: 1px solid var(--line-2); background: var(--surface); color: var(--ink);
   border-radius: 10px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
-.settings-opt.on { border-color: var(--me); color: var(--me); }
+.settings-opt.on, .settings-opt.active { border-color: var(--me); color: var(--me); }
 
 @media (max-width: 760px) {
   .navlinks { display: none; }
