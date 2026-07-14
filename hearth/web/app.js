@@ -381,16 +381,26 @@ function renderDeck(p, items) {
   };
   prev.onclick = (e) => { e.stopPropagation(); if (i > 0) { i--; show(); } };
   next.onclick = (e) => { e.stopPropagation(); if (i < items.length - 1) { i++; show(); } };
-  img.onclick = () => { if (!ARRANGING) openLightbox(items, i, img); };
+  // a mouse swipe's trailing click must not open the lightbox - pointer
+  // events precede the click, so `swiped` is set in time to suppress it.
+  img.onclick = () => {
+    if (swiped) { swiped = false; return; }
+    if (!ARRANGING) openLightbox(items, i, img);
+  };
   // touch swipe, same 40px threshold as the lightbox; passive pointer
   // tracking only - Arrange mode's drag takes pointerdown before us via
   // the block handler, so gate on !ARRANGING.
   let sx = null;
-  deck.addEventListener("pointerdown", (e) => { if (!ARRANGING) sx = e.clientX; });
+  let swiped = false;
+  deck.addEventListener("pointerdown", (e) => {
+    swiped = false;                    // a stale flag must not eat a genuine later tap
+    if (!ARRANGING) sx = e.clientX;
+  });
   deck.addEventListener("pointerup", (e) => {
     if (sx == null) return;
     const dx = e.clientX - sx; sx = null;
     if (Math.abs(dx) > 40) {
+      swiped = true;                   // even an end-of-deck swipe (no flip) is not a tap
       if (dx < 0 && i < items.length - 1) { i++; show(); }
       else if (dx > 0 && i > 0) { i--; show(); }
     }

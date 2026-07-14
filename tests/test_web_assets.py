@@ -1278,6 +1278,9 @@ def test_wall_deck_wired():
     assert "photos" in items and "blobs" in items
     lb = _js_fn_body(js, "openLightbox")
     assert "items[i].m" in lb or "items[i].h" in lb
+    # a mouse swipe's trailing click must not also open the lightbox
+    # (pointerup precedes click - review-traced fix)
+    assert "swiped" in _js_fn_body(js, "renderDeck")
     deck_rule = _css_rule(css, ".block-deck")
     assert "z-index: 0" in deck_rule       # the Slice-B stacking lesson
     assert ".block-deck::before" in css
