@@ -601,7 +601,14 @@ function startBlockDrag(block, ev, p) {
   };
   const onUp = (e) => { if (e.pointerId === ev.pointerId) finish(true); };
   const onCancel = (e) => { if (e.pointerId === ev.pointerId) finish(false); };
-  const onLost = () => finish(true);   // dropped-terminator safety net
+  const onLost = (e) => {
+    // Dropped-terminator safety net - but only the WALL losing its own
+    // capture ends the gesture: the tap-phase handoff releases the BLOCK's
+    // capture, whose lostpointercapture bubbles up here and must not kill
+    // the drag before it starts (found live by the Task-8 smoke, 5/5
+    // deterministic - it unpinned every dragged block on the first move).
+    if (e.target === wall && e.pointerId === ev.pointerId) finish(true);
+  };
   wall.addEventListener("pointermove", onMove);
   wall.addEventListener("pointerup", onUp);
   wall.addEventListener("pointercancel", onCancel);
@@ -646,7 +653,13 @@ function startBlockResize(block, ev, p) {
   };
   const onUp = (e) => { if (e.pointerId === ev.pointerId) finish(true); };
   const onCancel = (e) => { if (e.pointerId === ev.pointerId) finish(false); };
-  const onLost = () => finish(true);
+  const onLost = (e) => {
+    // Same scoping as startBlockDrag's onLost: only the wall's OWN capture
+    // loss ends the gesture (a descendant's bubbled lostpointercapture
+    // must not). Resize isn't reachable by the tap-handoff bug today, but
+    // it shares the same latent exposure class.
+    if (e.target === wall && e.pointerId === ev.pointerId) finish(true);
+  };
   wall.addEventListener("pointermove", onMove);
   wall.addEventListener("pointerup", onUp);
   wall.addEventListener("pointercancel", onCancel);
