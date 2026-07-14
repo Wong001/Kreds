@@ -22,6 +22,12 @@ let CURRENT_DM = null;
 let CURRENT_DM_NAME = "";
 let PRIOR_VIEW = "journal";   // where the profile page's Back button returns
 let CURRENT_PROFILE = null;   // identity of the profile page currently shown
+// AUTHOR's resolved accent (hex) for the profile page currently rendered -
+// same module-level idiom as CURRENT_PROFILE, needed because renderBlock
+// only sees the per-block post `p`, not the profile object renderProfilePage
+// has; set there (same place it computes `color` for --pcolor/avatar) so
+// renderBlock's text-style color:"accent" resolves like the profile banner.
+let CURRENT_PROFILE_ACCENT = null;
 let ARRANGING = false;        // self-only Wall Arrange mode (Up/Down controls shown)
 let BLOCK_SETTINGS_OPENER = null;   // #5: element to return focus to when the block-settings modal closes
 let NEEDS_WIZARD = false;   // set by boot() when onboarding_done is false; Task 3's bootData() consumes it
@@ -437,6 +443,37 @@ async function addPhotosToBlock(p, files) {
   if (CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
 }
 
+// TEXT_COLORS: the ten ACCENTS hexes, copied verbatim from the server's
+// source of truth (hearth/messages.py's ACCENTS) - a wall text block's
+// color option is restricted to these plus "default"/"accent" (spec
+// 2026-07-14, structured-options-never-user-CSS rule). Keep in sync by
+// hand if messages.py's ACCENTS ever changes.
+const TEXT_COLORS = ["#2743d6", "#c0563b", "#3e7c55", "#8a5cd0", "#17191e",
+  "#1f8a8a", "#c79a2e", "#c0567e", "#4a5568", "#7a4e8a"];
+
+// Applies a wall text block's style (spec 2026-07-14) to `wrap` (the
+// .block-text-wrap flex container around .block-text-body): h/v alignment
+// via justify-content/align-items (+ text-align) on the flex container;
+// size (when not "auto" - auto keeps the caller's text-w* span-scaled
+// path) via a text-size-* class; font/weight/style via classes; color via
+// the --text-color CSS var ("accent" resolves to authorAccent, the AUTHOR's
+// own accent, like the profile banner; a raw hex is set as-is; "default"
+// sets nothing, so .block-text-wrap's var(--text-color, inherit) falls
+// through to theme ink - the dark-mode-honest monochrome default).
+function applyTextStyle(block, wrap, ts, authorAccent) {
+  const JUSTIFY = {left: "flex-start", center: "center", right: "flex-end"};
+  const ALIGN = {top: "flex-start", middle: "center", bottom: "flex-end"};
+  wrap.style.setProperty("justify-content", JUSTIFY[ts.h] || "flex-start");
+  wrap.style.setProperty("align-items", ALIGN[ts.v] || "flex-start");
+  wrap.style.textAlign = ts.h || "left";
+  if (ts.size && ts.size !== "auto") wrap.classList.add("text-size-" + ts.size);
+  if (ts.font === "disp") wrap.classList.add("text-font-disp");
+  if (ts.weight === "bold") wrap.classList.add("text-bold");
+  if (ts.style === "italic") wrap.classList.add("text-italic");
+  if (ts.color === "accent") wrap.style.setProperty("--text-color", authorAccent || "");
+  else if (ts.color && ts.color !== "default") wrap.style.setProperty("--text-color", ts.color);
+}
+
 function renderBlock(p) {
   const block = el("article", "block");
   block.dataset.msgId = p.msg_id;   // read back by Arrange mode's Done handler
@@ -454,7 +491,11 @@ function renderBlock(p) {
     block.style.gridColumn = "span " + span.w;
     block.style.gridRow = "span " + span.h;
   }
-  if (p.text && !(p.blobs && p.blobs.length))
+  // Auto size keeps the existing span-scaled text-w* look; an explicit
+  // text_style.size (s/m/l/xl) opts out of it - applyTextStyle below adds
+  // its own text-size-* class instead (spec 2026-07-14).
+  if (p.text && !(p.blobs && p.blobs.length)
+      && (!p.text_style || p.text_style.size === "auto"))
     block.classList.add("text-w" + span.w);
   if (p.media === "video" && p.blobs && p.blobs.length) {
     const wrap = el("div", "block-video");
@@ -489,7 +530,15 @@ function renderBlock(p) {
       block.classList.add("has-deck");
     }
   }
-  if (p.text) block.append(el("p", "block-text-body", p.text));
+  if (p.text) {
+    // text_style is only annotated by the server for genuine text blocks
+    // (never blobs/video, spec 2026-07-14) - a caption on a photo/video
+    // post still renders plainly, no wrap-level style applied.
+    const wrap = el("div", "block-text-wrap");
+    wrap.append(el("p", "block-text-body", p.text));
+    block.append(wrap);
+    if (p.text_style) applyTextStyle(block, wrap, p.text_style, CURRENT_PROFILE_ACCENT);
+  }
   if (p.mine) {
     // Album pseudo-blocks fold members at possibly-different scopes, so a
     // single Inner/Kreds badge would misrepresent the mix - skip it.
@@ -906,6 +955,104 @@ function openBlockSettings(p, block, opener, focusSel) {
     srow.append(btn);
   }
   sizes.append(srow); body.append(sizes);
+
+  // Text group (spec 2026-07-14): text blocks only - p.text_style presence
+  // is the gate (the server only annotates genuine text blocks, never
+  // photo/video/deck/album ones - see profile_view). Immediate-apply like
+  // every other control here: every button POSTs the COMPLETE current
+  // selection (server drops defaults) then reopenAfterAction with the
+  // control's own data-sel, same idiom as Size above.
+  if (p.text_style) {
+    const ts = p.text_style;
+    const postStyle = async (patch, sel) => {
+      await postJSON("/api/block-text", {
+        msg_id: p.msg_id, h: ts.h, v: ts.v, size: ts.size, font: ts.font,
+        weight: ts.weight, style: ts.style, color: ts.color, ...patch});
+      await reopenAfterAction('[data-sel="' + sel + '"]');
+    };
+    const text = el("div", "settings-group");
+    text.append(el("div", "settings-label", "Text"));
+
+    const hrow = el("div", "settings-row");
+    for (const [label, val] of [["Left", "left"], ["Center", "center"], ["Right", "right"]]) {
+      const btn = el("button", "settings-opt", label);
+      btn.type = "button";
+      btn.dataset.sel = "text-h-" + val;
+      if (ts.h === val) btn.classList.add("active");
+      btn.onclick = () => postStyle({h: val}, "text-h-" + val);
+      hrow.append(btn);
+    }
+    text.append(el("div", "settings-label", "Align"), hrow);
+
+    const vrow = el("div", "settings-row");
+    for (const [label, val] of [["Top", "top"], ["Middle", "middle"], ["Bottom", "bottom"]]) {
+      const btn = el("button", "settings-opt", label);
+      btn.type = "button";
+      btn.dataset.sel = "text-v-" + val;
+      if (ts.v === val) btn.classList.add("active");
+      btn.onclick = () => postStyle({v: val}, "text-v-" + val);
+      vrow.append(btn);
+    }
+    text.append(vrow);
+
+    const szrow = el("div", "settings-row");
+    for (const [label, val] of [["Auto", "auto"], ["S", "s"], ["M", "m"], ["L", "l"], ["XL", "xl"]]) {
+      const btn = el("button", "settings-opt", label);
+      btn.type = "button";
+      btn.dataset.sel = "text-size-" + val;
+      if (ts.size === val) btn.classList.add("active");
+      btn.onclick = () => postStyle({size: val}, "text-size-" + val);
+      szrow.append(btn);
+    }
+    text.append(el("div", "settings-label", "Text size"), szrow);
+
+    const frow = el("div", "settings-row");
+    for (const [label, val] of [["Sans", "sans"], ["Display", "disp"]]) {
+      const btn = el("button", "settings-opt", label);
+      btn.type = "button";
+      btn.dataset.sel = "text-font-" + val;
+      if (ts.font === val) btn.classList.add("active");
+      btn.onclick = () => postStyle({font: val}, "text-font-" + val);
+      frow.append(btn);
+    }
+    const bold = el("button", "settings-opt", "B");
+    bold.type = "button";
+    bold.dataset.sel = "text-weight";
+    if (ts.weight === "bold") bold.classList.add("active");
+    bold.onclick = () => postStyle({weight: ts.weight === "bold" ? "normal" : "bold"}, "text-weight");
+    const italic = el("button", "settings-opt", "I");
+    italic.type = "button";
+    italic.dataset.sel = "text-style";
+    if (ts.style === "italic") italic.classList.add("active");
+    italic.onclick = () => postStyle({style: ts.style === "italic" ? "normal" : "italic"}, "text-style");
+    frow.append(bold, italic);
+    text.append(frow);
+
+    const crow = el("div", "settings-row");
+    const colorBtn = (label, val, sel) => {
+      const btn = el("button", "settings-opt", label);
+      btn.type = "button";
+      btn.dataset.sel = sel;
+      if (ts.color === val) btn.classList.add("active");
+      btn.onclick = () => postStyle({color: val}, sel);
+      return btn;
+    };
+    crow.append(colorBtn("Default", "default", "text-color-default"));
+    crow.append(colorBtn("Accent", "accent", "text-color-accent"));
+    TEXT_COLORS.forEach((hex, i) => {
+      const sw = el("button", "sw", "");
+      sw.type = "button";
+      sw.dataset.sel = "text-color-" + i;
+      sw.setAttribute("aria-label", "Text color " + hex);
+      sw.style.background = hex;
+      if (ts.color === hex) sw.classList.add("on");
+      sw.onclick = () => postStyle({color: hex}, "text-color-" + i);
+      crow.append(sw);
+    });
+    text.append(el("div", "settings-label", "Color"), crow);
+
+    body.append(text);
+  }
 
   if (p.pin) {
     // Nudge - one cell per press, refused (disabled feel) when blocked.
@@ -1634,6 +1781,7 @@ window.addEventListener("resize", measureWallCell);
 
 function renderProfilePage(p) {
   const color = p.accent || identityColor(p.identity_pub);   // owner's chosen accent for all viewers
+  CURRENT_PROFILE_ACCENT = color;   // renderWall -> renderBlock reads this for text-style color:"accent"
   const page = document.getElementById("profile-page");
   page.style.setProperty("--pcolor", color);
 

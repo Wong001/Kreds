@@ -542,6 +542,23 @@ body.desktop .desktop-only-panel { display: block; }
 .block.text-w3 .block-text-body { font-size: 19px; }
 .block.text-w4 .block-text-body { font-size: 24px; font-weight: 650;
   font-family: var(--disp); line-height: 1.25; }
+/* Text block styling (spec 2026-07-14): .block-text-wrap is the flex
+   container renderBlock puts around .block-text-body so applyTextStyle
+   (app.js) has something to set justify-content/align-items on for H/V
+   alignment; height:100% gives V (top/middle/bottom) room to work inside
+   the block's own fixed-height cell. color: var(--text-color, inherit) -
+   "default" never sets the var, so theme ink flows through untouched
+   (dark-mode-honest monochrome, per August's note); "accent"/a palette hex
+   set it explicitly. Size/font/weight/style are independent axes from H/V
+   and from each other, applied as their own classes by applyTextStyle. */
+.block-text-wrap { display: flex; height: 100%; color: var(--text-color, inherit); }
+.text-size-s .block-text-body { font-size: 12.5px; }
+.text-size-m .block-text-body { font-size: 15px; }
+.text-size-l .block-text-body { font-size: 19px; }
+.text-size-xl .block-text-body { font-size: 26px; }
+.text-font-disp .block-text-body { font-family: var(--disp); }
+.text-bold .block-text-body { font-weight: 700; }
+.text-italic .block-text-body { font-style: italic; }
 /* self-only overlays sit on the cell, not under it (fixed block heights) */
 .block .block-scope { position: absolute; top: 6px; left: 6px; z-index: 2; }
 /* bottom-left, not bottom-right: Task 6's .block-resize corner handle
@@ -773,7 +790,12 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
 .editor .lbl { font-size: 10.5px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
   color: var(--ink-2); margin: 14px 0 6px; }
 .swatches, .shapes { display: flex; gap: 8px; flex-wrap: wrap; }
-.sw { width: 28px; height: 28px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; }
+/* padding: 0 matters for the Text-group modal's swatch <button>s (the
+   profile editor's own swatches are plain <div>s, unaffected either way) -
+   without it the generic `button` rule's 8px 11px padding would eat almost
+   all of the fixed 28px box (border-box). */
+.sw { width: 28px; height: 28px; padding: 0; border-radius: 50%;
+  border: 2px solid transparent; cursor: pointer; }
 .sw.on { border-color: var(--ink); }
 .opt { padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
   font-size: 13px; background: var(--surface); }

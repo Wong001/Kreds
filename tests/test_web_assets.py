@@ -1302,3 +1302,18 @@ def test_album_owner_controls_wired():
     assert "p.album" in rb                       # album blocks skip the del button
     modal = _js_fn_body(js, "openBlockSettings")
     assert "Ungroup" in modal
+
+
+def test_text_styling_wired():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    rb = _js_fn_body(js, "renderBlock")
+    assert "text_style" in rb and "applyTextStyle" in rb
+    ats = _js_fn_body(js, "applyTextStyle")
+    for needle in ("justify-content", "align-items", "--text-color",
+                   "text-font-disp", "text-size-", "text-bold",
+                   "text-italic"):
+        assert needle in ats or needle in css, needle
+    modal = _js_fn_body(js, "openBlockSettings")
+    assert '"/api/block-text"' in modal and "TEXT_COLORS" in modal
+    assert ".block-text-wrap" in css
