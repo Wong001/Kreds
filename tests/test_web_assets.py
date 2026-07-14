@@ -249,8 +249,10 @@ def test_profile_composer_has_photos_and_block_canvas():
     assert 'fd.append("photos"' in js or "fd.append('photos'" in js
     # a dedicated block renderer exists and the wall uses it (not buildEntry)
     assert "function renderBlock" in js
-    # photo block distinguishes one (big) vs several (gallery)
-    assert "block-photo" in css and "block-gallery" in css
+    # photo block distinguishes one (big) vs several (swipeable deck) -
+    # the cropped .block-gallery is retired by collage Slice C,
+    # spec 2026-07-13 SS5 (see test_wall_deck_wired)
+    assert "block-photo" in css and "block-deck" in css
 
 
 def test_arrange_mode_and_fixes():
@@ -284,13 +286,15 @@ def test_journal_rail_and_self_only_friends():
 
 def test_photo_grid_layouts():
     # Retired by the collage redesign, spec 2026-07-13: the Slice-3b
-    # cols2/cols3/hero/masonry photo-grid picker no longer drives rendering -
-    # photoGridClass is now a two-way big-vs-gallery split and renderBlock/
-    # renderWall never read p.grid (see test_collage_canvas_wired). The
-    # composer's own compose-time preselect (gridSelect / /api/block-grid)
-    # is itself retired by collage Slice B, spec 2026-07-13 SS4 (see
-    # test_composer_preview_wired): the live preview + size chips replace
-    # it, and /api/block-grid now has zero client callers.
+    # cols2/cols3/hero/masonry photo-grid picker no longer drives rendering,
+    # and renderBlock/renderWall never read p.grid (see
+    # test_collage_canvas_wired). photoGridClass's own big-vs-gallery split
+    # is itself retired by collage Slice C, spec 2026-07-13 SS5 - multi-photo
+    # blocks are decks now (see test_wall_deck_wired). The composer's own
+    # compose-time preselect (gridSelect / /api/block-grid) is retired by
+    # collage Slice B, spec 2026-07-13 SS4 (see test_composer_preview_wired):
+    # the live preview + size chips replace it, and /api/block-grid now has
+    # zero client callers.
     js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert "p.grid" not in js
@@ -1259,3 +1263,21 @@ def test_composer_preview_wired():
     _css_rule(css, ".compose-preview")
     assert ".preview-deck" in css and ".deck-count" in css
     assert "layout-pick" not in css
+
+
+def test_wall_deck_wired():
+    # Slice C: any multi-photo block - album or plain post - is a
+    # swipeable stacked deck; the transitional cropped gallery is gone.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "photoGridClass" not in js
+    assert "block-gallery" not in js and "block-gallery" not in css
+    rb = _js_fn_body(js, "renderBlock")
+    assert "blockPhotoItems" in rb and "block-deck" in rb
+    items = _js_fn_body(js, "blockPhotoItems")
+    assert "photos" in items and "blobs" in items
+    lb = _js_fn_body(js, "openLightbox")
+    assert "items[i].m" in lb or "items[i].h" in lb
+    deck_rule = _css_rule(css, ".block-deck")
+    assert "z-index: 0" in deck_rule       # the Slice-B stacking lesson
+    assert ".block-deck::before" in css

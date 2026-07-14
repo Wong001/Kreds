@@ -485,10 +485,27 @@ body.desktop .desktop-only-panel { display: block; }
   width: 100%; height: 100%; }
 .block-photo img, .block-video video { object-fit: cover; display: block;
   border-radius: 12px; }
-.block-gallery { display: grid; grid-template-columns: repeat(2, 1fr);
-  gap: 8px; height: 100%; }
-.block-gallery img { width: 100%; height: 100%; object-fit: cover;
-  border-radius: 10px; }
+/* Wall deck (Slice C): the composer preview's stacked look, wall
+   edition. z-index: 0 establishes a stacking context so the ::before/
+   ::after edges (z-index -1) paint above the page background - the
+   Slice-B pixel-probed lesson, do not remove. */
+.block-deck { position: relative; width: 100%; height: 100%; z-index: 0; }
+.block-deck img { width: 100%; height: 100%; object-fit: cover;
+  border-radius: 12px; display: block; }
+.block-deck::before, .block-deck::after { content: ""; position: absolute;
+  inset: 0; border-radius: 12px; background: var(--line-2);
+  border: 1px solid var(--line); z-index: -1; }
+.block-deck::before { transform: rotate(2deg) translate(4px, 2px); }
+.block-deck::after { transform: rotate(-1.6deg) translate(-3px, 3px); }
+.block-deck .deck-count { position: absolute; top: 8px; right: 8px;
+  z-index: 2; }
+.deck-nav { position: absolute; top: 50%; transform: translateY(-50%);
+  z-index: 2; width: 28px; height: 28px; border-radius: 50%;
+  border: none; background: color-mix(in srgb, var(--ink) 55%, transparent);
+  color: var(--paper); font-size: 18px; line-height: 1; cursor: pointer; }
+.deck-nav:disabled { opacity: .25; cursor: default; }
+.deck-prev { left: 8px; }
+.deck-next { right: 8px; }
 /* text scales to its width-span: 4-wide is a headliner, 1x1 a note.
    Overflow ellipsis rather than cell growth (spec 2026-07-13): a long post
    in a fixed-height pinned block clips with a fading/ellipsis cutoff

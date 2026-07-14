@@ -342,14 +342,62 @@ function buildEntry(p) {
 }
 
 // Profile canvas block: a profile post rendered by inferred type - text, or
-// photo (one big, several as a gallery). Distinct from the compact journal
-// buildEntry(). Delete-everywhere (self) routes through the shared helper.
-// Photo container class: one photo renders big, several as a cropped
-// 2-col gallery (interim until Slice C's album decks). The Slice-3b grid
-// layouts are retired - a synced record's grids map is deliberately
-// ignored (spec 2026-07-13 decision 4).
-function photoGridClass(count) {
-  return count === 1 ? "block-photo" : "block-gallery";
+// photo (one big, several as a swipeable deck). Distinct from the compact
+// journal buildEntry(). Delete-everywhere (self) routes through the shared
+// helper. The Slice-3b grid layouts are retired - a synced record's grids
+// map is deliberately ignored (spec 2026-07-13 decision 4).
+
+// Uniform photo list for a block: a plain post contributes its own
+// msg_id per blob; an album pseudo-block (server-folded, Slice C) already
+// carries cross-post {m, h} pairs. Either way the deck and lightbox see
+// one shape.
+function blockPhotoItems(p) {
+  if (p.album) return p.photos;
+  return (p.blobs || []).map(h => ({m: p.msg_id, h}));
+}
+
+// Stacked deck (Slice C): the top photo fills the cells; stacked edges +
+// a count badge say "there's more"; arrows/swipe flip through, and a tap
+// (outside Arrange) opens the lightbox at the current photo. No photo is
+// ever hidden - the 3rd, 5th, 12th are one swipe away at any size.
+function renderDeck(p, items) {
+  const deck = el("div", "block-deck");
+  let i = 0;
+  const img = document.createElement("img");
+  img.alt = ""; img.draggable = false; img.style.cursor = "zoom-in";
+  img.tabIndex = -1;
+  const badge = el("span", "deck-count");
+  const prev = el("button", "deck-nav deck-prev");
+  prev.type = "button"; prev.textContent = "‹";
+  prev.setAttribute("aria-label", "Previous photo");
+  const next = el("button", "deck-nav deck-next");
+  next.type = "button"; next.textContent = "›";
+  next.setAttribute("aria-label", "Next photo");
+  const show = () => {
+    img.src = "/api/post-blob/" + items[i].m + "/" + items[i].h;
+    badge.textContent = (i + 1) + "/" + items.length;
+    prev.disabled = i === 0;
+    next.disabled = i === items.length - 1;
+  };
+  prev.onclick = (e) => { e.stopPropagation(); if (i > 0) { i--; show(); } };
+  next.onclick = (e) => { e.stopPropagation(); if (i < items.length - 1) { i++; show(); } };
+  img.onclick = () => { if (!ARRANGING) openLightbox(items, i, img); };
+  // touch swipe, same 40px threshold as the lightbox; passive pointer
+  // tracking only - Arrange mode's drag takes pointerdown before us via
+  // the block handler, so gate on !ARRANGING.
+  let sx = null;
+  deck.addEventListener("pointerdown", (e) => { if (!ARRANGING) sx = e.clientX; });
+  deck.addEventListener("pointerup", (e) => {
+    if (sx == null) return;
+    const dx = e.clientX - sx; sx = null;
+    if (Math.abs(dx) > 40) {
+      if (dx < 0 && i < items.length - 1) { i++; show(); }
+      else if (dx > 0 && i > 0) { i--; show(); }
+    }
+  });
+  deck.append(img, badge, prev, next);
+  show();
+  return deck;
 }
 
 function renderBlock(p) {
@@ -379,11 +427,12 @@ function renderBlock(p) {
     const src = document.createElement("source");
     src.src = "/api/post-blob/" + p.msg_id + "/" + p.blobs[0];
     v.append(src); wrap.append(v); block.append(wrap);
-  } else if (p.blobs && p.blobs.length) {
-    const media = el("div", photoGridClass(p.blobs.length));
-    p.blobs.forEach((h, idx) => {
+  } else if (p.album || (p.blobs && p.blobs.length)) {
+    const items = blockPhotoItems(p);
+    if (items.length === 1) {
+      const media = el("div", "block-photo");
       const img = document.createElement("img");
-      img.src = "/api/post-blob/" + p.msg_id + "/" + h;
+      img.src = "/api/post-blob/" + items[0].m + "/" + items[0].h;
       img.alt = "";
       // whole-branch review IMPORTANT #3: images are draggable by default,
       // so a real-mouse block drag in Arrange mode would start a native
@@ -391,10 +440,12 @@ function renderBlock(p) {
       img.draggable = false;
       img.style.cursor = "zoom-in";
       img.tabIndex = -1;   // scriptable focus target so the lightbox can return focus here on close
-      img.onclick = () => { if (!ARRANGING) openLightbox(p.msg_id, p.blobs, idx, img); };
+      img.onclick = () => { if (!ARRANGING) openLightbox(items, 0, img); };
       media.append(img);
-    });
-    block.append(media);
+      block.append(media);
+    } else if (items.length) {
+      block.append(renderDeck(p, items));   // 2+ photos: a swipeable .block-deck
+    }
   }
   if (p.text) block.append(el("p", "block-text-body", p.text));
   if (p.mine) {
@@ -1960,11 +2011,13 @@ function openStoryViewer(groups, startIdentity) {
 }
 
 // Fullscreen photo lightbox: click a photo in a profile photo block to enlarge
-// it and swipe/arrow through THAT block's photos (p.blobs). Fit-to-screen, no
-// zoom; clamped at the ends; view-only (own + others). Mirrors #story-viewer.
-function openLightbox(msgId, blobs, index, opener) {
-  if (!blobs || !blobs.length) return;
-  let i = Math.max(0, Math.min(index, blobs.length - 1));
+// it and swipe/arrow through its items (generalized in Slice C: a plain
+// post's own blobs, or an album's cross-post photos - both arrive as a
+// uniform [{m, h}] list via blockPhotoItems). Fit-to-screen, no zoom;
+// clamped at the ends; view-only (own + others). Mirrors #story-viewer.
+function openLightbox(items, index, opener) {
+  if (!items || !items.length) return;
+  let i = Math.max(0, Math.min(index, items.length - 1));
   opener = opener || document.activeElement;          // restore focus on close (the clicked photo)
   const ov = el("div"); ov.id = "lightbox";
   ov.setAttribute("role", "dialog");
@@ -1981,14 +2034,14 @@ function openLightbox(msgId, blobs, index, opener) {
   ov.append(img, prev, next, count, x);
 
   function render() {
-    img.src = "/api/post-blob/" + msgId + "/" + blobs[i];
-    count.textContent = (i + 1) + " / " + blobs.length;
-    const multi = blobs.length > 1;
+    img.src = "/api/post-blob/" + items[i].m + "/" + items[i].h;
+    count.textContent = (i + 1) + " / " + items.length;
+    const multi = items.length > 1;
     prev.style.display = next.style.display = count.style.display = multi ? "" : "none";
     prev.disabled = i === 0;
-    next.disabled = i === blobs.length - 1;
+    next.disabled = i === items.length - 1;
   }
-  function go(d) { i = Math.max(0, Math.min(i + d, blobs.length - 1)); render(); }
+  function go(d) { i = Math.max(0, Math.min(i + d, items.length - 1)); render(); }
   function close() {
     document.removeEventListener("keydown", onKey);
     ov.remove(); document.body.classList.remove("lb-open");
