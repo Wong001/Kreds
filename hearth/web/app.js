@@ -410,6 +410,33 @@ function renderDeck(p, items) {
   return deck;
 }
 
+// Add photos to an own photo block (Slice C): posts ONE new immutable
+// photo post at the block's scope, then republishes the album record
+// with it appended - growing a plain post-deck mints the album that
+// wraps it (spec 2026-07-13 section 5). Post immutability untouched.
+async function addPhotosToBlock(p, files) {
+  if (!files || !files.length) return;
+  const scope = p.album ? (p.scope_newest || "kreds") : (p.scope || "kreds");
+  const fd = new FormData();
+  fd.append("text", "");
+  fd.append("scope", scope);
+  fd.append("placement", "profile");
+  for (const f of files) fd.append("photos", f);
+  const r = await fetch("/api/post", {method: "POST", body: fd});
+  if (!r.ok) { alert("Couldn't add: " + await r.text()); return; }
+  const { msg_id } = await r.json();
+  const members = p.album
+    ? [...new Set(p.photos.map(ph => ph.m))].concat(msg_id)
+    : [p.msg_id, msg_id];
+  const ar = await fetch("/api/album", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(p.album
+      ? {album_id: p.msg_id, members}
+      : {members})});
+  if (!ar.ok) alert("Added the photos, but couldn't grow the album: " + await ar.text());
+  if (CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
+}
+
 function renderBlock(p) {
   const block = el("article", "block");
   block.dataset.msgId = p.msg_id;   // read back by Arrange mode's Done handler
@@ -459,15 +486,38 @@ function renderBlock(p) {
   }
   if (p.text) block.append(el("p", "block-text-body", p.text));
   if (p.mine) {
-    const badge = el("span", "block-scope", p.scope === "inner" ? "Inner" : "Kreds");
-    block.append(badge);
-    const del = el("button", "pact del", "Delete everywhere");
-    del.onclick = async () => {
-      if (!await deleteEverywhere(p.msg_id)) return;
-      await refresh();
-      if (currentView() === "profile" && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
-    };
-    block.append(del);
+    // Album pseudo-blocks fold members at possibly-different scopes, so a
+    // single Inner/Kreds badge would misrepresent the mix - skip it.
+    if (!p.album) {
+      const badge = el("span", "block-scope", p.scope === "inner" ? "Inner" : "Kreds");
+      block.append(badge);
+    }
+    // No one-tap "Delete everywhere" on an album: ungroup first, then
+    // delete the standalone post (v1 honest limit - see Ungroup in the
+    // settings modal).
+    if (!p.album) {
+      const del = el("button", "pact del", "Delete everywhere");
+      del.onclick = async () => {
+        if (!await deleteEverywhere(p.msg_id)) return;
+        await refresh();
+        if (currentView() === "profile" && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
+      };
+      block.append(del);
+    }
+    // blockPhotoItems() doesn't itself discriminate media type - a video
+    // post's own blob would otherwise satisfy .length > 0 too, so exclude
+    // it explicitly (video posts are never album-eligible either way).
+    if (p.media !== "video" && blockPhotoItems(p).length > 0) {
+      const add = el("label", "block-add");
+      add.title = "Add photos";
+      add.textContent = "+";
+      const addInput = document.createElement("input");
+      addInput.type = "file"; addInput.accept = "image/*"; addInput.multiple = true;
+      addInput.className = "visually-hidden";
+      addInput.onchange = () => addPhotosToBlock(p, [...addInput.files]);
+      add.append(addInput);
+      block.append(add);
+    }
   }
   if (ARRANGING && p.mine) {
     block.classList.add("arranging");
@@ -501,7 +551,9 @@ function renderBlock(p) {
     // A small drag reorders; a tap (sub-threshold release) opens settings.
     block.addEventListener("pointerdown", (ev) => {
       if ((ev.button != null && ev.button !== 0) || !ev.isPrimary) return;
-      if (ev.target.closest("button, a, select, video")) return;   // let controls work
+      // label included so .block-add's file-input trigger stays clickable
+      // (it isn't a button/a/select/video, so it would otherwise start a tap/drag)
+      if (ev.target.closest("button, a, select, video, label")) return;   // let controls work
       // IMPORTANT #3(c): preventDefault SYNCHRONOUSLY here, not inside the
       // eventual startBlockDrag handoff - by the time that call happens,
       // the browser's default action for this same event (native image
@@ -883,6 +935,17 @@ function openBlockSettings(p, block, opener, focusSel) {
       await reopenAfterAction(null);
     };
     body.append(place);
+  }
+
+  if (p.album) {
+    const ungroup = el("button", "settings-opt", "Ungroup");
+    ungroup.type = "button";
+    ungroup.onclick = async () => {
+      // Members reappear standalone and unplaced (empty members = ungroup).
+      await postJSON("/api/album", {album_id: p.msg_id, members: []});
+      await reopenAfterAction(null);
+    };
+    body.append(ungroup);
   }
 
   document.getElementById("block-settings").classList.remove("hidden");

@@ -408,7 +408,9 @@ def test_whole_branch_review_fixes():
     # still work) but before the tap/drag bookkeeping starts, not only
     # (too late) inside startBlockDrag's own preventDefault.
     handler_start = js.index('block.addEventListener("pointerdown"')
-    closest_idx = js.index('closest("button, a, select, video")', handler_start)
+    # Task 6 (albums) added "label" to the bail list so .block-add's file
+    # input stays clickable in Arrange - the ordering guard still holds.
+    closest_idx = js.index('closest("button, a, select, video, label")', handler_start)
     prevent_idx = js.index("ev.preventDefault()", handler_start)
     move_def_idx = js.index("const move = (e) =>", handler_start)
     assert closest_idx < prevent_idx < move_def_idx
@@ -1284,3 +1286,14 @@ def test_wall_deck_wired():
     deck_rule = _css_rule(css, ".block-deck")
     assert "z-index: 0" in deck_rule       # the Slice-B stacking lesson
     assert ".block-deck::before" in css
+
+
+def test_album_owner_controls_wired():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    body = _js_fn_body(js, "addPhotosToBlock")
+    assert '"/api/album"' in body and "scope_newest" in body
+    rb = _js_fn_body(js, "renderBlock")
+    assert "block-add" in rb
+    assert "p.album" in rb                       # album blocks skip the del button
+    modal = _js_fn_body(js, "openBlockSettings")
+    assert "Ungroup" in modal
