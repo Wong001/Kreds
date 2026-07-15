@@ -169,3 +169,41 @@ def test_notify_already_running_copy_covers_startup_window(monkeypatch):
     monkeypatch.setattr(ctypes, "windll", FakeWindll(), raising=False)
     desktop._notify_already_running()
     assert "still starting up" in captured["text"]
+
+
+def test_shutdown_drain_constants():
+    # Exit drain (0.3.12): the join must out-wait TorProcess.stop()'s own
+    # internal worst case (~16s: 5s SIGNAL SHUTDOWN grace + 10s terminate
+    # wait + kill); the restart lock-wait must out-wait the drain.
+    assert desktop.SHUTDOWN_DRAIN_TIMEOUT == 30.0
+    assert desktop.RESTART_LOCK_WAIT == 30.0
+    assert desktop.RESTART_LOCK_WAIT >= desktop.SHUTDOWN_DRAIN_TIMEOUT
+
+
+def test_spawn_window_plus_bootstrap_budget_fits_ready_wait():
+    # C's spawn window + the unchanged 2x bootstrap budget + one retry gap
+    # must stay under the shell's ready-wait, or a worst-case-but-
+    # successful startup gets declared failed mid-recovery.
+    from hearth.tor import TorProcess
+    worst = (TorProcess._SPAWN_RETRY_WINDOW + 2 * 90.0
+             + TorProcess._SPAWN_RETRY_GAP)
+    assert worst < desktop.READY_TIMEOUT_TOR
+
+
+def test_drain_timeout_leaves_evidence(tmp_path, monkeypatch):
+    # A node thread still alive after the drain window must log the orphan
+    # warning to app.log. Drive the same code launch() runs post-join.
+    class _StuckThread:
+        def join(self, timeout=None): pass
+        def is_alive(self): return True
+    desktop._drain_node_thread(_StuckThread(), tmp_path)
+    log = (tmp_path / "app.log").read_text(encoding="utf-8")
+    assert "shutdown drain timed out" in log
+
+
+def test_drain_clean_exit_logs_nothing(tmp_path):
+    class _DoneThread:
+        def join(self, timeout=None): pass
+        def is_alive(self): return False
+    desktop._drain_node_thread(_DoneThread(), tmp_path)
+    assert not (tmp_path / "app.log").exists()

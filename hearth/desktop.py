@@ -406,6 +406,16 @@ def _signal_shutdown(holder: dict) -> None:
                           # otherwise this re-raises out of launch() as an unhandled
                           # traceback + nonzero exit on an otherwise-clean quit
 
+def _drain_node_thread(t, data_dir: Path) -> None:
+    """Bounded wait for the node thread's shutdown (sync teardown + tor
+    stop). On timeout, leave evidence -- the orphaned tor will hold the
+    fixed ports for ~15s and the NEXT launch's spawn-retry window is what
+    absorbs it (tor.py _SPAWN_RETRY_WINDOW)."""
+    t.join(timeout=SHUTDOWN_DRAIN_TIMEOUT)
+    if t.is_alive():
+        _log_error(data_dir,
+                   "shutdown drain timed out; a tor orphan may linger ~15s")
+
 def _show_error_window(webview_module, message: str) -> None:
     """A minimal error page instead of a frozen blank window."""
     html = ("<html><body style='font-family:sans-serif;padding:2em'>"
@@ -427,6 +437,16 @@ def _show_error_window(webview_module, message: str) -> None:
 # overran, landing in the "always fails after an update" pattern.
 READY_TIMEOUT_TOR = 240.0
 READY_TIMEOUT_PLAIN = 25.0
+
+# Exit drain (0.3.12): quit destroys the window instantly, but the process
+# must stay alive until the node thread's finally has actually stopped tor
+# (TorProcess.stop() is internally bounded at ~16s worst case) -- otherwise
+# the daemon thread dies mid-stop and tor is orphaned for ~15s, colliding
+# with the next launch's fixed ports (the update-restart failure, 0.3.12).
+# Still bounded: a wedged node thread must not turn quit into a zombie.
+SHUTDOWN_DRAIN_TIMEOUT = 30.0
+# A restarting instance must out-wait the exiting instance's drain.
+RESTART_LOCK_WAIT = 30.0
 
 _LOADING_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
@@ -536,7 +556,7 @@ def launch(data_dir=None):
 
     # On a restart the prior instance is still releasing its lock, so wait for
     # it; a normal launch fails fast. Consume the flag so it's one-shot.
-    _restart_wait = 15.0 if os.environ.pop("KREDS_RESTARTING", None) else 0.0
+    _restart_wait = RESTART_LOCK_WAIT if os.environ.pop("KREDS_RESTARTING", None) else 0.0
     lock = acquire_single_instance(data_dir, wait_seconds=_restart_wait)
     if lock is None:
         _notify_already_running()
@@ -584,8 +604,8 @@ def launch(data_dir=None):
         # DevTools opt-in: set KREDS_DEVTOOLS=1 to enable right-click -> Inspect
         # in the WebView2 window (for diagnosing rendering). Off by default.
         webview.start(debug=os.environ.get("KREDS_DEVTOOLS") == "1")
-        # window gone -> ensure the node is asked to stop, then join
+        # window gone -> ensure the node is asked to stop, then drain fully
         _signal_shutdown(holder)
-        t.join(timeout=8)
+        _drain_node_thread(t, data_dir)
     finally:
         release_single_instance(lock)
