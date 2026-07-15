@@ -389,6 +389,13 @@ body.desktop .desktop-only-panel { display: block; }
   border-radius: 16px; overflow: hidden; box-shadow: var(--shadow); }
 .profile-banner { height: 120px; background: var(--pcolor, var(--red));
   background-size: cover; background-position: center; }
+/* Banner crop (spec 2026-07-15): the editor's drag-up/down preview -
+   same 120px strip as .profile-banner so what you frame is what ships. */
+.banner-crop { margin-top: 8px; }
+.banner-crop-preview { height: 120px; border-radius: 10px; cursor: ns-resize;
+  background-size: cover; background-position: center 50%;
+  border: 1px solid var(--line-2); touch-action: none; }
+.banner-crop input[type="range"] { width: 100%; margin-top: 6px; padding: 0; }
 .profile-head { display: flex; align-items: flex-end; gap: 14px; padding: 0 22px;
   margin-top: -34px; }
 .profile-head.align-center { justify-content: center; text-align: center; }

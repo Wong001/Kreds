@@ -1419,3 +1419,19 @@ def test_composer_note_reflects_wall_wrap_grants():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert "Moving someone into a ring reveals only future posts." not in js
     assert "Inner posts reach only your Inner kreds" in js
+
+
+def test_banner_crop_control_wired():
+    # Banner crop (spec 2026-07-15): drag the editor preview up/down (or
+    # use the paired range slider - the keyboard path); the profile
+    # banner renders background-position from banner_pos.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    editor = _js_fn_body(js, "profileEditor")
+    assert "banner_pos" in editor and "banner-crop" in editor
+    assert 'type = "range"' in editor or 'type="range"' in editor
+    assert "pointerdown" in editor                   # drag path
+    page = _js_fn_body(js, "renderProfilePage")
+    assert "backgroundPosition" in page and "banner_pos" in page
+    rule = _css_rule(css, ".banner-crop-preview")
+    assert "cover" in rule and "ns-resize" in rule

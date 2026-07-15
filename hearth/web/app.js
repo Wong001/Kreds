@@ -1676,14 +1676,14 @@ function fallbackProfile(identityPub) {
     // No longer a known identity server-side (unfriended, either side) -
     // an inert profile: no bio/ring/posts/Message, just the marker.
     return {identity_pub: identityPub, name: disc.name, bio: "", mine: false,
-            avatar: null, banner: null, avatar_shape: "circle",
+            avatar: null, banner: null, banner_pos: 50, avatar_shape: "circle",
             avatar_size: "m", avatar_align: "left", ring: null, since: null,
             wall: [], journal: [], disconnected: true};
   }
   const known = (STATE && STATE.friends || []).find(f => f.identity_pub === identityPub)
     || KREDS.find(k => k.identity_pub === identityPub);
   return {identity_pub: identityPub, name: (known && known.name) || identityPub.slice(0, 8),
-          bio: "", mine: false, avatar: null, banner: null,
+          bio: "", mine: false, avatar: null, banner: null, banner_pos: 50,
           avatar_shape: "circle", avatar_size: "m", avatar_align: "left",
           ring: null, since: null, wall: [], journal: [], unavailable: true};
 }
@@ -1748,6 +1748,10 @@ function renderProfilePage(p) {
 
   const banner = document.getElementById("profile-banner");
   banner.style.backgroundImage = p.banner ? `url(/api/blob/${p.banner})` : "";
+  // banner_pos (spec 2026-07-15): vertical crop percent, 0 = top of the
+  // image, 100 = bottom; 50 = the old hardcoded center.
+  banner.style.backgroundPosition =
+    "center " + (Number.isInteger(p.banner_pos) ? p.banner_pos : 50) + "%";
 
   const head = document.getElementById("profile-head");
   head.className = "profile-head align-" + (p.avatar_align || "left");
@@ -2956,12 +2960,58 @@ function profileEditor(p) {
   const av = document.createElement("input"); av.type="file"; av.accept="image/*"; box.append(av);
   box.append(el("div","lbl","Banner"));
   const bn = document.createElement("input"); bn.type="file"; bn.accept="image/*"; box.append(bn);
+  // Banner crop (spec 2026-07-15): drag the preview up/down to pick which
+  // band of the image the banner strip shows; the range slider is the
+  // same value's keyboard path. banner_pos = background-position-y
+  // percent (0 top, 100 bottom). Shown only once a banner exists.
+  let bannerPos = Number.isInteger(p.banner_pos) ? p.banner_pos : 50;
+  const crop = el("div", "banner-crop hidden");
+  const preview = el("div", "banner-crop-preview");
+  preview.setAttribute("aria-hidden", "true");   // the slider is the accessible control
+  const slider = document.createElement("input");
+  slider.type = "range"; slider.min = "0"; slider.max = "100";
+  slider.value = String(bannerPos);
+  slider.setAttribute("aria-label", "Banner crop position");
+  const applyPos = (v) => {
+    bannerPos = Math.max(0, Math.min(100, Math.round(v)));
+    slider.value = String(bannerPos);
+    preview.style.backgroundPosition = "center " + bannerPos + "%";
+  };
+  slider.oninput = () => applyPos(Number(slider.value));
+  preview.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault();                       // no text-selection smear
+    const start = bannerPos, sy = ev.clientY;
+    const rect = preview.getBoundingClientRect();
+    try { preview.setPointerCapture(ev.pointerId); } catch (e) { /* not fatal */ }
+    const move = (e) => {
+      if (e.pointerId !== ev.pointerId) return;
+      // dragging the image DOWN reveals more of its top = smaller percent
+      applyPos(start - ((e.clientY - sy) / rect.height) * 100);
+    };
+    const up = (e) => {
+      if (e.pointerId !== ev.pointerId) return;
+      preview.removeEventListener("pointermove", move);
+      preview.removeEventListener("pointerup", up);
+    };
+    preview.addEventListener("pointermove", move);
+    preview.addEventListener("pointerup", up);
+  });
+  const showCrop = (url) => {
+    preview.style.backgroundImage = `url(${url})`;
+    preview.style.backgroundPosition = "center " + bannerPos + "%";
+    crop.classList.remove("hidden");
+  };
+  if (p.banner) showCrop("/api/blob/" + p.banner);
+  bn.onchange = () => { if (bn.files[0]) showCrop(URL.createObjectURL(bn.files[0])); };
+  crop.append(preview, slider);
+  box.append(crop);
   const save = el("button","btn-accent","Save profile"); save.style.marginTop="14px";
   save.onclick = async () => {
     const fd = new FormData();
     fd.append("name", name.value); fd.append("bio", bio.value);
     fd.append("accent", accent.toLowerCase()); fd.append("avatar_shape", shape.v);
     fd.append("avatar_size", size.v); fd.append("avatar_align", align.v);
+    fd.append("banner_pos", String(bannerPos));
     if (av.files[0]) fd.append("avatar", av.files[0]);
     if (bn.files[0]) fd.append("banner", bn.files[0]);
     const r = await fetch("/api/profile", {method:"POST", body:fd});
