@@ -346,18 +346,18 @@ body.desktop .desktop-only-panel { display: block; }
 .pact:hover { color: var(--ink); background: var(--paper); border-color: transparent; }
 .pact.del:hover { color: var(--red); background: var(--red-soft); }
 .entry img { max-width: 100%; border-radius: 10px; margin-top: 8px; display: block; }
-/* Same specificity as .entry img above (both 0,1,1) and .eavatar sits
-   inside .entry - must come AFTER it here so source order breaks the tie
-   in its favor, or the entry-photo rule's max-width/no-height silently
-   wins and the avatar photo renders at a tiny non-square size (caught by
-   live rendered-geometry check, 0.3.13). margin: 0 is needed too - cascade
-   resolves per PROPERTY, so .entry img's margin-top: 8px (meant for an
-   attached post photo) isn't overridden just because this rule wins on
-   width/height/etc; left unset it still applies here and, combined with
-   .eavatar's align-items: center (not stretch), pushes the image 4px off
-   center instead of filling the circle (also caught live). */
-.eavatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover;
-  display: block; margin: 0; }
+/* button.eavatar (0,1,2) outranks .entry img (0,1,1) - the avatar sits
+   inside .entry, and at equal specificity only source order kept the
+   entry-photo rule's max-width/no-height from shrinking the avatar to a
+   tiny non-square size (caught by live rendered-geometry check, 0.3.13;
+   final review hardened order-dependence into specificity). margin: 0 is
+   needed too - cascade resolves per PROPERTY, so .entry img's
+   margin-top: 8px (meant for an attached post photo) isn't overridden
+   just because this rule wins on width/height/etc; left unset it pushes
+   the image 4px off center instead of filling the circle (also caught
+   live). */
+button.eavatar img { width: 100%; height: 100%; border-radius: 50%;
+  object-fit: cover; display: block; margin: 0; }
 
 .theend { margin-top: 26px; display: flex; flex-direction: column; align-items: center;
   gap: 8px; padding: 18px 0 6px; text-align: center; }

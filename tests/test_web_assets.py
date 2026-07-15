@@ -1507,8 +1507,13 @@ def test_entry_avatar_renders_profile_picture_with_ring_fallback():
     body = _js_fn_body(js, "buildEntry")
     assert "author_avatar" in body
     assert '"/api/blob/" + p.author_avatar' in body
+    # missing blob (row gossiped before the avatar) falls back to the
+    # letter circle instead of an empty ring
+    assert "im.onerror" in body
     css = (WEB / "style.css").read_text(encoding="utf-8")
-    rule = _css_rule(css, ".eavatar img")
+    # button.eavatar img: specificity (0,1,2) outranks .entry img (0,1,1)
+    # so the avatar sizing never depends on rule ORDER (final review)
+    rule = _css_rule(css, "button.eavatar img")
     assert "object-fit: cover" in rule and "border-radius: 50%" in rule
 
 

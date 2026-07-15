@@ -289,13 +289,21 @@ function buildEntry(p) {
   article.dataset.created = p.created_at;
 
   const avatar = el("button", "eavatar");
+  const letter = () => {
+    avatar.replaceChildren();
+    avatar.textContent = (p.author_name || "?").slice(0, 1).toUpperCase();
+  };
   if (p.author_avatar) {
     const im = document.createElement("img");
     im.src = "/api/blob/" + p.author_avatar;
     im.alt = "";
+    // blob may not have gossiped in yet (post row can arrive first):
+    // fall back to the letter circle instead of an empty ring; the next
+    // re-render after blob sync shows the photo (final review, 0.3.13)
+    im.onerror = letter;
     avatar.append(im);
   } else {
-    avatar.textContent = (p.author_name || "?").slice(0, 1).toUpperCase();
+    letter();
   }
   // ring + color stay unconditional: identity color remains visible over
   // photos, and IS the circle for the letter fallback (August 2026-07-15)
