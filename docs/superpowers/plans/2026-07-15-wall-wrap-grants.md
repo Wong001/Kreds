@@ -813,7 +813,11 @@ def test_wall_back_catalog_opens_to_new_friend_over_sync(tmp_path):
         wong.maintain_wrap_grants()         # the sweep (gossip-loop hook)
         await sw.sync_with(ja)              # grant + post row flow
         await sw.sync_with(ja)              # second round: blob want/give
-        assert "bagkatalog" in [p["text"] for p in josh.feed()]
+        # NOTE (plan amended after Task 4): feed() is journal-only
+        # (node.py:1196), wall posts render via posts_by/profile_view.
+        wall_texts = [p["text"] for p in
+                      josh.posts_by(wong.identity_pub, "profile")]
+        assert "bagkatalog" in wall_texts
         assert josh.store.get_message(wall) is not None
         assert josh.store.missing_blobs() == set()          # photo followed
         assert josh.store.get_message(journal) is None      # journal: never
@@ -849,7 +853,9 @@ def test_row_before_grant_ordering_unpoisons_negative_cache(tmp_path):
         await sw.sync_with(fa)              # grant arrives
         assert mid not in freja.store.undecryptable_ids()   # un-poisoned
         freja.cache_message_keys()          # next gossip-round sweep
-        assert "foerst raekken" in [p["text"] for p in freja.feed()]
+        assert "foerst raekken" in [p["text"] for p in
+                                    freja.posts_by(wong.identity_pub,
+                                                   "profile")]
         for s in (sw, sf):
             await s.stop()
     asyncio.run(scenario())
@@ -900,7 +906,8 @@ def test_kreds_wall_back_catalog_opens_but_inner_stays_closed(tmp_path):
     for m in wong.store.messages_not_in({}, {wong.identity_pub},
                                         freja.identity_pub):
         freja.store.ingest_message(m)
-    texts = [p["text"] for p in freja.feed()]
+    texts = [p["text"] for p in
+             freja.posts_by(wong.identity_pub, "profile")]
     assert "foer venskab" in texts          # kreds wall: opened
     assert "indre foer" not in texts        # inner wall: honest hole
     assert freja.store.get_message(inner_wall) is None
