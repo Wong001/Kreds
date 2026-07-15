@@ -85,3 +85,35 @@ def test_banner_pos_default_and_bad_value(tmp_path):
     assert n.profile_view(n.identity_pub)["banner_pos"] == 50
     with pytest.raises(ValueError):
         n.set_profile("Wong", banner_pos=101)
+
+
+def test_feed_rows_carry_author_avatar(tmp_path):
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    node.compose_post("before avatar", scope="kreds")
+    node.set_profile("Wong", avatar_bytes=png())
+    node.compose_post("after avatar", scope="kreds")
+    rows = node.feed()
+    avatar = node.store.profile(node.identity_pub)["avatar"]
+    # enrichment is by AUTHOR's current profile, not post age: both rows
+    # carry the avatar
+    assert [r["author_avatar"] for r in rows] == [avatar, avatar]
+    # journal surface on the profile rides posts_by and inherits it
+    journal = node.profile_view(node.identity_pub)["journal"]
+    assert journal[0]["author_avatar"] == avatar
+
+
+def test_feed_rows_avatarless_author_is_none(tmp_path):
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    node.compose_post("no avatar yet", scope="kreds")
+    assert node.feed()[0]["author_avatar"] is None
+
+
+def test_profile_avatars_latest_wins(tmp_path):
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    assert node.store.profile_avatars() == {}          # no profile yet
+    node.set_profile("Wong", avatar_bytes=png(color=(1, 2, 3)))
+    first = node.store.profile_avatars()[node.identity_pub]
+    node.set_profile("Wong", avatar_bytes=png(color=(4, 5, 6)))
+    second = node.store.profile_avatars()[node.identity_pub]
+    assert first != second                             # latest wins
+    assert second == node.store.profile(node.identity_pub)["avatar"]

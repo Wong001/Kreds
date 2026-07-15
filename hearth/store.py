@@ -481,6 +481,22 @@ class Store:
                     best[ipub] = (key, p["name"])
             return {k: v[1] for k, v in best.items()}
 
+    def profile_avatars(self) -> Dict[str, str]:
+        """identity_pub -> avatar blob hash from each author's latest
+        profile record (same latest-wins tie-break as profiles()).
+        Authors whose latest profile has no avatar are absent -- post-row
+        enrichment reads .get() and falls back to the letter circle."""
+        with self._lock:
+            best: Dict[str, tuple] = {}
+            for ipub, seq, dpub, mj in self._db.execute(
+                    "SELECT identity_pub, seq, device_pub, msg_json"
+                    " FROM messages WHERE kind=?", (KIND_PROFILE,)):
+                p = json.loads(mj)["payload"]
+                key = (p["created_at"], seq, dpub)
+                if ipub not in best or key > best[ipub][0]:
+                    best[ipub] = (key, p.get("avatar"))
+            return {k: v[1] for k, v in best.items() if v[1]}
+
     def profile(self, identity_pub: str) -> Optional[dict]:
         with self._lock:
             best = None

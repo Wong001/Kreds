@@ -1205,7 +1205,8 @@ class HearthNode:
             raise ValueError("cannot delete a delete tag")
         return self._publish(make_delete(self.device, target_msg_id))
 
-    def _decrypt_post_row(self, msg, names, now):
+    def _decrypt_post_row(self, msg, names, now, avatars=None):
+        avatars = avatars or {}
         p = msg.payload
         if p.get("expires_at") is not None and p["expires_at"] <= now:
             return None
@@ -1219,6 +1220,7 @@ class HearthNode:
         return {
             "msg_id": msg.msg_id, "identity_pub": ipub,
             "author_name": names.get(ipub, ipub[:8]),
+            "author_avatar": avatars.get(ipub),
             "text": body["text"], "blobs": body["blobs"],
             "scope": p["scope"], "created_at": p["created_at"],
             "expires_at": p.get("expires_at"),
@@ -1231,9 +1233,10 @@ class HearthNode:
     def feed(self) -> List[dict]:
         now = time.time()
         names = self.store.profiles()
+        avatars = self.store.profile_avatars()
         out = []
         for msg in self.store.post_messages():
-            row = self._decrypt_post_row(msg, names, now)
+            row = self._decrypt_post_row(msg, names, now, avatars)
             if row is not None and row["placement"] == "journal":
                 out.append(row)
         return out
@@ -1241,9 +1244,10 @@ class HearthNode:
     def posts_by(self, identity_pub: str, placement=None) -> List[dict]:
         now = time.time()
         names = self.store.profiles()
+        avatars = self.store.profile_avatars()
         out = []
         for msg in self.store.post_messages(identity_pub):
-            row = self._decrypt_post_row(msg, names, now)
+            row = self._decrypt_post_row(msg, names, now, avatars)
             if row is not None and (placement is None
                                     or row["placement"] == placement):
                 out.append(row)

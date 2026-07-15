@@ -92,3 +92,15 @@ def test_post_profile_banner_pos_bad_400_and_absent_default(tmp_path):
                   data={"name": "Wong", "banner_pos": "150"}).status_code == 400
     assert c.post("/api/profile", data={"name": "Wong"}).status_code == 200
     assert c.get(f"/api/profile/{node.identity_pub}").json()["banner_pos"] == 50
+
+
+def test_state_feed_carries_author_avatar(tmp_path):
+    # /api/state itself carries no feed rows -- app.js fetches rows
+    # separately from /api/feed (see FEED = await j("/api/feed")), so
+    # that's the surface pinned here.
+    c, node = client(tmp_path)
+    node.set_profile("Wong", avatar_bytes=png())
+    node.compose_post("med billede", scope="kreds")
+    rows = c.get("/api/feed").json()
+    assert rows[0]["author_avatar"] == node.store.profile(
+        node.identity_pub)["avatar"]
