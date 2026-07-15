@@ -121,6 +121,17 @@ body.desktop { padding-top: 40px; --chrome-h: 40px; }
 body.desktop #first-run, body.desktop #lock-screen, body.desktop #onboarding-wizard {
   top: 40px; }
 
+/* Corner resize grip (0.3.13): frameless window = no native resize
+   borders, so the chrome rebuilds corner drag itself. Hidden by
+   default; app.js reveals it only when the pywebview bridge exists (a
+   plain browser's OS frame already resizes). */
+#win-resize { display: none; position: fixed; right: 0; bottom: 0;
+  width: 16px; height: 16px; cursor: nwse-resize; z-index: 60;
+  background: linear-gradient(135deg, transparent 0 50%,
+    var(--line-2) 50% 60%, transparent 60% 70%,
+    var(--line-2) 70% 80%, transparent 80%); }
+#win-resize.on { display: block; }
+
 /* Desktop-only section on the self-only Settings page (cog-gated, spec
    2026-07-15): defaults to display:none and only body.desktop (see
    above) reveals it. This is what keeps a plain browser from ever

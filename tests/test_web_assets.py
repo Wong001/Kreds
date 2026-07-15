@@ -1592,3 +1592,26 @@ def test_journal_keeps_readable_column_and_idstrip_stays_on_screen():
     # strip-blind 106px)
     shell = _css_rule(css, ".dm-shell")
     assert "calc(100vh - 144px)" in shell
+
+
+# ---------------------------------------------------------------------
+# Corner resize grip (Task 2, 0.3.13, Josh): frameless window silently
+# kills native drag-resize (resizable=True is inert with no OS frame),
+# so the chrome rebuilds it - a bottom-right grip drives Api.resize_to.
+# ---------------------------------------------------------------------
+
+def test_resize_grip_desktop_only_and_wired():
+    # Frameless regression rebuilt (Josh, 0.3.13): a chrome corner grip
+    # drives Api.resize_to; a plain browser never shows it (the OS frame
+    # already resizes there).
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="win-resize"' in html
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "resize_to" in js
+    body = _js_fn_body(js, "initResizeGrip")
+    assert "requestAnimationFrame" in body        # bridge-flood throttle
+    assert "setPointerCapture" in body
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    rule = _css_rule(css, "#win-resize")
+    assert "nwse-resize" in rule
+    assert "display: none" in rule                # hidden until JS reveals

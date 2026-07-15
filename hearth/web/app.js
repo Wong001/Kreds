@@ -3763,9 +3763,54 @@ function wireDesktopChrome() {
       else api.minimize();
     } else api.quit();
   };
+  initResizeGrip();
 }
 window.addEventListener("pywebviewready", wireDesktopChrome);
 if (window.pywebview) wireDesktopChrome();   // already ready before this script ran
+
+// Corner resize grip (0.3.13): rebuilds the drag-resize a frameless
+// window loses (no OS borders). Desktop only - the grip stays hidden in
+// a browser. One bridge call per animation frame: unthrottled
+// pointermoves flood the pywebview Invoke marshal. Called from
+// wireDesktopChrome() so it shares that function's own retry idiom
+// (pywebviewready event + boot-time check) for late bridge injection.
+function initResizeGrip() {
+  const grip = document.getElementById("win-resize");
+  if (!grip || !window.pywebview || !window.pywebview.api) return;
+  // wireDesktopChrome (its caller) can itself run twice under the same
+  // late-bridge race its own comment documents (pywebviewready firing
+  // after the boot-time check already saw window.pywebview) - guard the
+  // same way the titlebar buttons do (idempotent re-wiring), just via
+  // the "on" class already used as the reveal flag, so a second call
+  // never stacks a second set of pointer listeners on the grip.
+  if (grip.classList.contains("on")) return;
+  grip.classList.add("on");
+  let startX = 0, startY = 0, startW = 0, startH = 0, raf = 0;
+  let nextW = 0, nextH = 0;
+  const push = () => {
+    raf = 0;
+    window.pywebview.api.resize_to(nextW, nextH);
+  };
+  grip.addEventListener("pointerdown", (e) => {
+    startX = e.screenX; startY = e.screenY;
+    startW = window.innerWidth; startH = window.innerHeight;
+    grip.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  grip.addEventListener("pointermove", (e) => {
+    if (!grip.hasPointerCapture || !grip.hasPointerCapture(e.pointerId)) return;
+    nextW = startW + (e.screenX - startX);
+    nextH = startH + (e.screenY - startY);
+    if (!raf) raf = requestAnimationFrame(push);
+  });
+  const drop = (e) => {
+    if (grip.hasPointerCapture && grip.hasPointerCapture(e.pointerId))
+      grip.releasePointerCapture(e.pointerId);
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+  };
+  grip.addEventListener("pointerup", drop);
+  grip.addEventListener("pointercancel", drop);
+}
 
 // ---------------------------------------------------------------------
 // One-time onboarding wizard (Task 3): shown once right after a fresh

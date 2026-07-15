@@ -32,6 +32,12 @@
     <button class="titlebar-btn titlebar-close" id="titlebar-close" aria-label="Close" title="Close">&times;</button>
   </div>
 </div>
+<!-- Corner resize grip (0.3.13): frameless window has no native resize
+     borders, so the chrome rebuilds corner drag itself. Hidden by
+     default (display:none in style.css) - app.js's initResizeGrip()
+     reveals it only when the pywebview bridge exists (a plain
+     browser's OS frame already resizes). -->
+<div id="win-resize" aria-hidden="true" title="Resize"></div>
 <div class="app" id="app">
   <nav class="appnav">
     <svg class="mark" viewBox="0 0 100 100" aria-hidden="true">

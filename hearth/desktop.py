@@ -160,6 +160,25 @@ class Api:
         else: self.window.maximize()
         self._maximized = not self._maximized
 
+    # create_window's min_size; WinForms MinimumSize is the native
+    # backstop, this clamp just keeps the JS grip from flooding the
+    # bridge with sub-minimum calls.
+    MIN_W, MIN_H = 900, 600
+
+    def resize_to(self, w, h):
+        """Chrome corner grip (frameless windows have no native resize
+        borders - resizable=True is inert without an OS frame, the
+        regression Josh reported). window.resize marshals onto the GUI
+        thread (pywebview winforms Invoke), same safety class as
+        load_url."""
+        if not self.window or self._maximized:
+            return                      # maximized: native corner no-op
+        try:
+            self.window.resize(max(int(w), self.MIN_W),
+                               max(int(h), self.MIN_H))
+        except Exception:
+            pass                        # mid-teardown; nothing to resize
+
     def quit(self):
         loop = self._holder.get("loop"); ev = self._holder.get("ev")
         if loop is not None and ev is not None:

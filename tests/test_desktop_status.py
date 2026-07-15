@@ -219,3 +219,51 @@ def test_drain_clean_exit_logs_nothing(tmp_path):
         def is_alive(self): return False
     desktop._drain_node_thread(_DoneThread(), tmp_path)
     assert not (tmp_path / "app.log").exists()
+
+
+# ---------------------------------------------------------------------
+# Corner resize grip (0.3.13, Josh): frameless window has no native
+# resize borders (resizable=True is inert with no OS frame), so the
+# chrome grip drives this bridge method directly.
+# ---------------------------------------------------------------------
+
+class _ResizableFakeWindow:
+    def __init__(self):
+        self.sizes = []
+
+    def resize(self, w, h):
+        self.sizes.append((w, h))
+
+
+def test_api_resize_to_drives_window():
+    api = desktop.Api({})
+    api.window = _ResizableFakeWindow()
+    api.resize_to(1300, 900)
+    assert api.window.sizes == [(1300, 900)]
+
+
+def test_api_resize_to_clamps_to_min_size():
+    api = desktop.Api({})
+    api.window = _ResizableFakeWindow()
+    api.resize_to(200, 5000)
+    assert api.window.sizes == [(900, 5000)]
+    api.resize_to(5000, 100)
+    assert api.window.sizes[-1] == (5000, 600)
+
+
+def test_api_resize_to_ignored_while_maximized_or_windowless():
+    api = desktop.Api({})
+    api.resize_to(1300, 900)                 # no window: no crash
+    api.window = _ResizableFakeWindow()
+    api._maximized = True
+    api.resize_to(1300, 900)                 # maximized: native no-op
+    assert api.window.sizes == []
+
+
+def test_api_resize_to_survives_destroyed_window():
+    class _DeadWindow:
+        def resize(self, w, h):
+            raise RuntimeError("window destroyed")
+    api = desktop.Api({})
+    api.window = _DeadWindow()
+    api.resize_to(1300, 900)                 # must not raise
