@@ -3,7 +3,8 @@ import subprocess
 import imageio_ffmpeg
 import pytest
 
-from hearth.videogate import MAX_VIDEO_SECONDS, probe_duration, transcode_video
+from hearth.videogate import (MAX_VIDEO_BYTES, MAX_VIDEO_SECONDS,
+                              probe_duration, transcode_video)
 
 
 def _make_clip(seconds, w=640, h=480, with_audio=True):
@@ -65,7 +66,7 @@ def test_downscales_large_video():
     mp4, poster = transcode_video(_make_clip(2, w=1920, h=1080))
     # poster reflects the re-encoded (<=720p tall) frame, capped again by image gate
     assert max(Image.open(io.BytesIO(poster)).size) <= 1080
-    assert len(mp4) <= 5 * 1024 * 1024
+    assert len(mp4) <= MAX_VIDEO_BYTES
 
 
 def test_odd_height_source_still_transcodes():

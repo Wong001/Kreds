@@ -15,11 +15,17 @@ import tempfile
 import imageio_ffmpeg
 
 from .imagegate import transcode as image_transcode
-from .messages import MAX_BLOB_BYTES
 
 MAX_VIDEO_SECONDS = 15.0
 VIDEO_MAX_DIM = 720
 STORY_IMAGE_MAX = 1080
+# Video's own long-standing transcoded-output bound. Deliberately does NOT
+# ride MAX_BLOB_BYTES (whole-branch review, Finding 2): when 0.3.11 raised
+# the protocol blob cap 5->10 MB to give the photo gate's compressed output
+# room, the video path was spec'd as untouched -- this constant keeps the
+# video transcode gate's output ceiling at its original 5 MB regardless of
+# where MAX_BLOB_BYTES goes.
+MAX_VIDEO_BYTES = 5 * 1024 * 1024
 _TIMEOUT = 60
 
 _DUR = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
@@ -80,7 +86,7 @@ def transcode_video(data: bytes) -> tuple[bytes, bytes]:
             raise ValueError("could not transcode video")
         with open(out, "rb") as f:
             mp4 = f.read()
-        if len(mp4) > MAX_BLOB_BYTES:
+        if len(mp4) > MAX_VIDEO_BYTES:
             raise ValueError("transcoded video exceeds 5 MB")
         pf = _run(["-protocol_whitelist", "file", "-i", out, "-frames:v", "1",
                    "-f", "image2", "-y", frame])
