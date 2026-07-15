@@ -827,7 +827,15 @@ def test_wall_back_catalog_opens_to_new_friend_over_sync(tmp_path):
     asyncio.run(scenario())
 
 
-def test_row_before_grant_ordering_unpoisons_negative_cache(tmp_path):
+def test_stale_grant_poison_then_remint_unpoisons(tmp_path):
+    # PLAN AMENDED after Task 5 first run: a post the recipient was never
+    # wrapped for is not a decrypt CANDIDATE (uncached_message_ids gates
+    # on payload-or-grant coverage), so a bare row can never be poisoned.
+    # The REAL permanent-poisoning path the spec worried about is a STALE
+    # grant: sealed to an enc key the recipient no longer holds -> the
+    # post IS a candidate, decrypt fails, negative-cached -- and without
+    # grant-ingest clearing, the author's re-mint could never heal it.
+    # This also exercises the rotation re-mint flow end to end.
     async def scenario():
         wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
         freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
@@ -836,21 +844,23 @@ def test_row_before_grant_ordering_unpoisons_negative_cache(tmp_path):
                                 placement="profile")
         befriend(wong, freja)
         freja.ensure_enckey()
-        # force the poisoned ordering: the post ROW lands at freja first
-        # (hand-carried, as a relaying mutual friend would), decryption
-        # fails, the sweep negative-caches it
-        post = wong.store.get_message(mid)
-        # simulate: freja got the row via a mutual friend before any grant
-        # (messages_not_in wouldn't offer it -- force-ingest is the point)
-        freja.store.ingest_message(post)
-        freja.cache_message_keys()
-        assert mid in freja.store.undecryptable_ids()       # poisoned
-        # now the author's sweep mints the grant and it syncs over
         sw, wa = await started(wong)
         sf, fa = await started(freja)
         await sf.sync_with(wa)              # enckeys cross
+        # Simulate a grant minted before "rotation": author-signed, names
+        # freja's device, but sealed to a key she never had; the enc_pub
+        # annotation records that stale key so the sweep can see it.
+        from hearth.messages import make_wrap_grant
+        stale = {freja.device.device_pub: {
+            "eph_pub": "ab" * 32, "nonce": "cd" * 12,
+            "wrapped_key": "ef" * 48, "enc_pub": "00" * 32}}
+        wong.store.ingest_message(make_wrap_grant(wong.device, mid, stale))
+        await sw.sync_with(fa)              # row + stale grant arrive
+        freja.cache_message_keys()          # decrypt fails -> poisoned
+        assert mid in freja.store.undecryptable_ids()
+        # the author's sweep detects the stale enc_pub and re-mints
         wong.maintain_wrap_grants()
-        await sw.sync_with(fa)              # grant arrives
+        await sw.sync_with(fa)              # real grant arrives -> clears
         assert mid not in freja.store.undecryptable_ids()   # un-poisoned
         freja.cache_message_keys()          # next gossip-round sweep
         assert "foerst raekken" in [p["text"] for p in
@@ -927,7 +937,7 @@ Expected: green. Confirm `tests/test_scoped_posts_e2e.py` passed WITHOUT modific
 
 ```bash
 git add tests/test_wrap_grants_e2e.py tests/test_node_scoped_posts.py
-git commit -m "test(grants): e2e acceptance - back catalog opens over real sockets, journal/inner stay closed, row-before-grant un-poisons, delete-then-sweep mints nothing"
+git commit -m "test(grants): e2e acceptance - back catalog opens over real sockets, journal/inner stay closed, stale-grant poisoning heals on re-mint, delete-then-sweep mints nothing"
 ```
 
 ---
