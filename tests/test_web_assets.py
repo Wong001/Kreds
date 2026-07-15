@@ -210,9 +210,9 @@ def test_profile_two_sections_and_cogwheel():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     # two distinct sections (journal now lives in the right-column rail)
     assert 'id="profile-wall"' in html and 'id="profile-journal-rail"' in html
-    # cogwheel edit + overlay, not an inline dump / prominent button
+    # cogwheel now opens the Settings page (spec 2026-07-15), not an overlay
     assert "profile-cog" in html or "profile-cog" in js
-    assert "profile-edit-overlay" in html or "profile-edit-overlay" in js
+    assert "openSettings" in js
     # renders wall + journal splits from the profile payload
     assert "p.wall" in js and "p.journal" in js
     # profile-post composer posts with placement=profile
@@ -390,9 +390,8 @@ def test_whole_branch_review_fixes():
     # IMPORTANT #1: both self-only overlays are viewport-fixed, not
     # absolute-inside-#app (which grows with content while the body
     # scrolls, stranding a "centered" card thousands of px away on a tall
-    # wall). #story-viewer already used fixed; these two must match it.
+    # wall). #story-viewer already used fixed; #block-settings must match it.
     assert "position: fixed" in _css_rule(css, "#block-settings")
-    assert "position: fixed" in _css_rule(css, "#profile-edit-overlay")
 
     # IMPORTANT #2: pointercancel is an aborted gesture, not a tap - it
     # must have its own handler that only tears down, never one shared
@@ -498,9 +497,7 @@ def test_applock_throttle_countdown():
 def test_applock_settings_section_present():
     html = (WEB / "index.html").read_text(encoding="utf-8")
     js = (WEB / "app.js").read_text(encoding="utf-8")
-    assert 'id="profile-applock-panel"' in html      # self-only, mirrors Friends/Devices
-    assert "selfonly" in html.split('id="profile-applock-panel"')[0][-80:] \
-        or 'class="panel selfonly" id="profile-applock-panel"' in html
+    assert 'id="sec-applock"' in html                # Settings page section (spec 2026-07-15)
     assert 'id="applock-settings"' in html
     assert "renderApplockSettings" in js
     assert "/api/applock/setup" in js
@@ -802,7 +799,7 @@ def test_wizard_close_behavior_step_desktop_only():
 def test_settings_toggle_desktop_only_in_me_area():
     html = (WEB / "index.html").read_text(encoding="utf-8")
     js = (WEB / "app.js").read_text(encoding="utf-8")
-    assert 'id="profile-desktop-panel"' in html
+    assert 'id="sec-desktop"' in html
     assert 'id="desktop-settings"' in html
     assert "renderDesktopSettings" in js
     render = _js_fn_body(js, "renderDesktopSettings")
@@ -820,13 +817,9 @@ def test_settings_toggle_desktop_only_in_me_area():
 
 def test_updates_panel_markup_present():
     html = (WEB / "index.html").read_text(encoding="utf-8")
-    assert 'id="profile-updates-panel"' in html
+    assert 'id="sec-updates"' in html
     assert 'id="update-settings"' in html
-    updates_html = html.split('id="profile-updates-panel"')[1][:200]
-    assert "selfonly" in html.split('id="profile-updates-panel"')[0][-80:] \
-        or 'class="panel selfonly" id="profile-updates-panel"' in html
-    assert "Updates" in updates_html or "<h2>Updates</h2>" in \
-        html.split('id="profile-updates-panel"')[1][:60]
+    assert "Updates" in html.split('id="sec-updates"')[1][:120]
 
 
 def test_updates_ui_wired_into_app():
@@ -1479,3 +1472,34 @@ def test_scope_tag_small_ringless_bottom_right():
     assert "top" not in pos and "left" not in pos
     hide = _css_rule(css, ".block.arranging .block-scope")
     assert "display: none" in hide
+
+
+def test_settings_view_markup_and_rehomed_panels():
+    # Spec 2026-07-15: the self-only side panels move to a Settings page
+    # (cog opens it); the profile right column keeps ONLY the journal
+    # rail, so own and friends' profiles finally align.
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="view-settings"' in html
+    for sec in ("sec-editprofile", "sec-friends", "sec-devices",
+                "sec-applock", "sec-desktop", "sec-updates"):
+        assert f'id="{sec}"' in html
+    settings = html.split('id="view-settings"')[1].split('id="idstrip')[0]
+    for inner in ("settings-editprofile", 'id="friends"', 'id="ceremony"',
+                  'id="devices"', "applock-settings", "desktop-settings",
+                  "update-settings"):
+        assert inner in settings
+    assert "desktop-only-panel" in settings          # browser never sees Desktop
+    side = html.split('id="profile-side"')[1].split("</aside>")[0]
+    assert "journal-rail" in side
+    assert "applock-settings" not in side and 'id="friends"' not in side
+    assert 'id="profile-edit-overlay"' not in html   # overlay is dead
+    assert "manage in Settings" in html
+
+
+def test_settings_page_wiring_and_collapse_memory():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    body = _js_fn_body(js, "openSettings")
+    assert "settings-editprofile" in body and "profileEditor" in body
+    assert "renderMeStrip" in body and 'setView("settings")' in body
+    assert "kreds_settings_open_" in js              # collapse state remembered
+    assert "openProfileEditor" not in js and "closeEditOverlay" not in js

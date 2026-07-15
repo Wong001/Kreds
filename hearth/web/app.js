@@ -1778,12 +1778,12 @@ function renderProfilePage(p) {
     "identity " + p.identity_pub.slice(0, 8) + "…";
   document.getElementById("profile-bio").textContent = p.bio || "";
 
-  // Cogwheel: self-only entry into the editor overlay. Header/bio above
+  // Cogwheel: self-only entry into the Settings page. Header/bio above
   // render identically for self and others (see comment above); the only
   // self-specific chrome is this button, not an inline dump.
   const cog = document.getElementById("profile-cog");
   cog.classList.toggle("hidden", !p.mine);
-  cog.onclick = p.mine ? () => openProfileEditor(p) : null;
+  cog.onclick = p.mine ? () => openSettings() : null;
 
   // Arrange/Done toggle: self-only, its click handler is wired once at load
   // (see below) and reads CURRENT_PROFILE - this just reflects state.
@@ -1791,13 +1791,10 @@ function renderProfilePage(p) {
   arrangeBtn.textContent = ARRANGING ? "Done" : "Arrange";
   arrangeBtn.classList.toggle("hidden", !p.mine);
 
-  // Right column: the Journal rail shows on EVERY profile; Friends/Devices
-  // panels are self-only. The Back button still hides on your own profile.
+  // Right column: ONLY the Journal rail now, on every profile (spec
+  // 2026-07-15) - the self-only panels live on the Settings page.
   document.getElementById("profile-back").classList.toggle("hidden", !!p.mine);
   document.getElementById("profile-layout").classList.add("has-side");   // always two-col on desktop
-  document.querySelectorAll("#profile-side .selfonly").forEach(el2 =>
-    el2.classList.toggle("hidden", !p.mine));
-  if (p.mine) renderMeStrip();     // fills #friends / #devices / #ceremony
 
   const meta = document.getElementById("profile-meta");
   const acts = document.getElementById("profile-actions");
@@ -1858,20 +1855,34 @@ function renderProfilePage(p) {
   for (const post of p.journal) rail.append(buildEntry(post));
 }
 
-// Cogwheel editor overlay (self only): reuses the existing profileEditor()
-// form, just re-homed from an inline #profile-actions dump into a modal
-// layer so self and others render the same profile page underneath.
-function openProfileEditor(p) {
-  const wrap = document.getElementById("profile-edit-wrap");
-  wrap.replaceChildren(profileEditor(p));
-  document.getElementById("profile-edit-overlay").classList.remove("hidden");
+// Settings page (spec 2026-07-15): the self-only side panels + the
+// profile editor, re-homed - the cog opens this instead of the old edit
+// overlay. Like the profile page, content refreshes on entry, not on
+// every WS tick. Section collapse is a local UI preference
+// (localStorage), deliberately not synced state.
+async function openSettings() {
+  let p;
+  try {
+    p = await j("/api/profile/" + STATE.identity_pub);
+  } catch (e) {
+    p = fallbackProfile(STATE.identity_pub);
+  }
+  document.getElementById("settings-editprofile")
+    .replaceChildren(profileEditor(p));
+  renderMeStrip();   // fills #friends / #devices / App-lock / Desktop / Updates
+  setView("settings");
 }
-function closeEditOverlay() {
-  document.getElementById("profile-edit-overlay").classList.add("hidden");
+document.getElementById("settings-back").onclick = () => openMe();
+function wireSettingsSections() {
+  document.querySelectorAll("#view-settings .settings-section").forEach(d => {
+    const key = "kreds_settings_open_" + d.id;
+    const saved = localStorage.getItem(key);
+    if (saved !== null) d.open = saved === "1";
+    d.addEventListener("toggle", () =>
+      localStorage.setItem(key, d.open ? "1" : "0"));
+  });
 }
-document.getElementById("profile-edit-overlay").addEventListener("click", (ev) => {
-  if (ev.target.id === "profile-edit-overlay") closeEditOverlay();
-});
+wireSettingsSections();
 
 // Wall composer (self only): same keeps-button (inner/kreds) pattern as the
 // journal composer in index.html, but built in JS since this composer only
@@ -2090,7 +2101,7 @@ document.getElementById("profile-journal-toggle").onclick = () => {
   btn.setAttribute("aria-expanded", String(open));
 };
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") { closeCircleOverlay(); closeEditOverlay(); }
+  if (ev.key === "Escape") { closeCircleOverlay(); }
 });
 
 // ---------------------------------------------------------------------
@@ -2273,7 +2284,7 @@ function openLightbox(items, index, opener) {
 
 // ---------------------------------------------------------------------
 // Chrome (nav whoami + identity strip) + Me strip (friends, devices - now
-// a self-only side strip on the profile page, not its own view; ceremony
+// sections on the self-only Settings page (spec 2026-07-15); ceremony
 // + profile-editor functions preserved below)
 // ---------------------------------------------------------------------
 
@@ -3036,11 +3047,10 @@ function profileEditor(p) {
     if (r.ok) {
       if (bannerObjUrl) { URL.revokeObjectURL(bannerObjUrl); bannerObjUrl = null; }
       await refresh();
-      // The editor now lives in the cogwheel overlay, not inline on the
-      // page; re-render the profile underneath so the saved name/bio/
-      // avatar/banner show immediately, then close the overlay.
-      openProfile(STATE.identity_pub);
-      closeEditOverlay();
+      // The editor lives on the Settings page now (spec 2026-07-15):
+      // re-enter it so the saved values (and a fresh banner blob ref)
+      // show immediately, staying on Settings.
+      openSettings();
     } else alert("Save failed: " + await r.text());
   };
   box.append(save);
@@ -3514,16 +3524,15 @@ document.getElementById("composer").onsubmit = async (ev) => {
 
 function setView(which) {
   if (which !== "profile") ARRANGING = false;   // leaving the profile exits arrange mode
-  for (const v of ["journal", "messages", "profile"])
+  for (const v of ["journal", "messages", "profile", "settings"])
     document.getElementById("view-" + v).classList.toggle("hidden", v !== which);
   document.querySelectorAll(".navlinks button").forEach(b =>
     b.classList.toggle("active", b.dataset.view === which));
-  if (which !== "profile") localStorage.setItem("hearth_view", which);
+  if (which !== "profile" && which !== "settings") localStorage.setItem("hearth_view", which);
   if (which === "messages") { loadConversations(); if (!CURRENT_DM) dmPlaceholder(); }
 }
 
 function goView(tab) {
-  closeEditOverlay();   // a tab switch dismisses an open profile-edit overlay
   const vj = document.getElementById("view-journal");
   if (tab === "circle") { setView("journal"); vj.classList.add("show-circle"); }
   else { vj.classList.remove("show-circle"); setView(tab); }
@@ -3535,7 +3544,6 @@ function goView(tab) {
 // instead of a separate card-summary view. Records "me" as the remembered
 // view so a reload lands back on your own profile (restoreView below).
 function openMe() {
-  closeEditOverlay();
   localStorage.setItem("hearth_view", "me");   // remembered across reloads
   if (STATE) openProfile(STATE.identity_pub);
 }
