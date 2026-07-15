@@ -76,3 +76,137 @@ def test_tor_launched_with_no_window_flag(monkeypatch, tmp_path):
     asyncio.run(scenario())
     expected = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     assert captured.get("creationflags") == expected
+
+
+class _PctFakeProc:
+    """Feeds scripted 'Bootstrapped NN%' lines through start()'s parsing."""
+    def __init__(self, lines):
+        self.stdout = self
+        self._lines = list(lines)
+
+    async def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+    def terminate(self):
+        pass
+
+    async def wait(self):
+        return 0
+
+
+def test_bootstrap_percent_reported(monkeypatch, tmp_path):
+    lines = [b"May 1 [notice] Bootstrapped 10% (conn): Connecting\n",
+             b"May 1 [notice] Bootstrapped 45% (loading): Loading\n",
+             b"May 1 [notice] Bootstrapped 100% (done): Done\n"]
+    seen = []
+
+    async def fake_exec(*args, **kwargs):
+        return _PctFakeProc(lines)
+
+    async def scenario():
+        monkeypatch.setattr(tor.asyncio, "create_subprocess_exec", fake_exec)
+        tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+        await asyncio.wait_for(
+            tp.start(bootstrap_timeout=5.0, status=seen.append), timeout=8)
+
+    asyncio.run(scenario())
+    assert seen == [10, 45, 100]
+
+
+def test_bootstrap_status_exception_does_not_kill_startup(monkeypatch, tmp_path):
+    # A broken progress callback must never abort tor startup.
+    lines = [b"May 1 [notice] Bootstrapped 10% (conn): Connecting\n",
+             b"May 1 [notice] Bootstrapped 100% (done): Done\n"]
+
+    def bad_status(pct):
+        raise ValueError("boom")
+
+    async def fake_exec(*args, **kwargs):
+        return _PctFakeProc(lines)
+
+    async def scenario():
+        monkeypatch.setattr(tor.asyncio, "create_subprocess_exec", fake_exec)
+        tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+        await asyncio.wait_for(
+            tp.start(bootstrap_timeout=5.0, status=bad_status), timeout=8)
+
+    asyncio.run(scenario())               # must not raise
+
+
+class _StopFakeProc:
+    """For TorProcess.stop() tests: simulates SIGNAL SHUTDOWN either being
+    honored (proc exits promptly) or ignored (wait() hangs past the grace
+    period until terminate() unblocks it)."""
+    def __init__(self, exits_after_signal):
+        self.terminated = False
+        self._done = asyncio.Event()
+        if exits_after_signal:
+            self._done.set()
+
+    def terminate(self):
+        self.terminated = True
+        self._done.set()
+
+    async def wait(self):
+        await self._done.wait()
+        return 0
+
+
+def test_stop_sends_shutdown_signal_before_terminate(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_control(control_port, cookie_path, command):
+        calls.append(command)
+        return []
+
+    tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+    fake_proc = _StopFakeProc(exits_after_signal=True)
+    tp._proc = fake_proc
+
+    async def scenario():
+        monkeypatch.setattr(tor, "_control_command", fake_control)
+        await tp.stop()
+
+    asyncio.run(scenario())
+    assert calls == ["SIGNAL SHUTDOWN"]
+    assert not fake_proc.terminated       # graceful path won; no hard kill
+    assert tp._proc is None               # cleaned up after stop
+
+
+def test_stop_falls_back_to_terminate_when_signal_ignored(monkeypatch, tmp_path):
+    async def fake_control(control_port, cookie_path, command):
+        return []                          # tor accepts the connection but
+                                            # never actually shuts down
+
+    tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+    tp._SHUTDOWN_GRACE = 0.05              # patched short so the test is fast
+    fake_proc = _StopFakeProc(exits_after_signal=False)
+    tp._proc = fake_proc
+
+    async def scenario():
+        monkeypatch.setattr(tor, "_control_command", fake_control)
+        await tp.stop()
+
+    asyncio.run(scenario())
+    assert fake_proc.terminated            # fallback fired
+    assert tp._proc is None
+
+
+def test_stop_falls_back_when_control_command_raises(monkeypatch, tmp_path):
+    # No control connection at all (e.g. tor already dead) must still reach
+    # the hard-terminate fallback instead of raising out of stop().
+    async def fake_control(control_port, cookie_path, command):
+        raise ConnectionRefusedError("no control port")
+
+    tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+    tp._SHUTDOWN_GRACE = 0.05
+    fake_proc = _StopFakeProc(exits_after_signal=False)
+    tp._proc = fake_proc
+
+    async def scenario():
+        monkeypatch.setattr(tor, "_control_command", fake_control)
+        await tp.stop()
+
+    asyncio.run(scenario())
+    assert fake_proc.terminated
+    assert tp._proc is None

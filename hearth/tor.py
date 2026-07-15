@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -133,7 +134,7 @@ class TorProcess:
         self._proc = None
         self._drain_task = None
 
-    async def start(self, bootstrap_timeout: float = 90.0):
+    async def start(self, bootstrap_timeout: float = 90.0, status=None):
         torrc = _gen_torrc(self.data_dir, self.socks_port,
                            self.control_port)
         # CREATE_NO_WINDOW: tor.exe is a console program; when a windowed
@@ -146,13 +147,22 @@ class TorProcess:
         # bootstrap (a transient failure, or a just-crashed prior tor still
         # releasing its ports). Kill the failed process first so it can't hold
         # the socks/control ports, then try again before giving up.
+        _BOOTSTRAP_RE = re.compile(rb"Bootstrapped (\d+)%")
         async def _await_bootstrap():
             while True:
                 raw = await self._proc.stdout.readline()
                 if not raw:
                     raise RuntimeError("tor exited before bootstrap")
-                if b"Bootstrapped 100%" in raw:
-                    return
+                m = _BOOTSTRAP_RE.search(raw)
+                if m:
+                    pct = int(m.group(1))
+                    if status is not None:
+                        try:
+                            status(pct)
+                        except Exception:
+                            pass       # progress display must never kill tor startup
+                    if pct >= 100:
+                        return
 
         last_err = None
         for attempt in range(2):
@@ -177,7 +187,7 @@ class TorProcess:
                     raise RuntimeError(
                         "tor failed to bootstrap after 2 attempts: "
                         + str(last_err))
-                await asyncio.sleep(1.5)                # let ports free up
+                await asyncio.sleep(5.0)  # let the prior tor's ports actually free (was 1.5s: too tight after an update restart)
 
         # Tor keeps logging (heartbeats, warnings) after bootstrap; the
         # torrc has "Log notice stdout" so if nobody keeps reading, the
@@ -191,11 +201,26 @@ class TorProcess:
                 pass
         self._drain_task = asyncio.create_task(_drain())
 
+    _SHUTDOWN_GRACE = 5.0
+
     async def stop(self):
         if self._drain_task is not None:
             self._drain_task.cancel()
         if self._proc is None:
             return
+        # Graceful first: a hard TerminateProcess can leave tor's consensus
+        # cache unclean, forcing the NEXT start into a cold bootstrap (the
+        # post-update always-fails pattern, 0.3.11). SIGNAL SHUTDOWN lets
+        # tor flush state; fall back to the old hard path if it's ignored.
+        try:
+            await _control_command(self.control_port, self.cookie_path,
+                                   "SIGNAL SHUTDOWN")
+            await asyncio.wait_for(self._proc.wait(),
+                                   timeout=self._SHUTDOWN_GRACE)
+            self._proc = None
+            return
+        except Exception:
+            pass                        # control conn dead / ignored: hard path
         try:
             self._proc.terminate()
         except ProcessLookupError:
