@@ -129,7 +129,7 @@ body.desktop #first-run, body.desktop #lock-screen, body.desktop #onboarding-wiz
 body.desktop .desktop-only-panel { display: block; }
 
 /* ---------- app chrome ---------- */
-.app { max-width: 1220px; margin: 22px auto; min-height: calc(100vh - 44px);
+.app { max-width: 1720px; margin: 22px auto; min-height: calc(100vh - 44px);
   background: var(--paper); border: 1px solid var(--line-2); border-radius: 18px;
   /* overflow: clip (NOT hidden) - identical rounded-corner clipping, but
      hidden would make .app a scroll container and silently kill the
@@ -752,8 +752,20 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
 .update-notes { font-style: italic; }
 
 /* conversations + thread */
+/* Fullscreen fill (0.3.13, August): height derives from the viewport
+   instead of the old min(640px, 70vh) cap, which left dead space below
+   the chat on tall/fullscreen windows. Offset measured live (Playwright,
+   chromium, 127.0.0.1:7201, Messages view, 1280x800 and 2400x1300,
+   2026-07-15 - both viewports agreed since none of these are vh-based):
+   nav (.appnav rendered height, 59.92px) + .app top margin+border
+   (22px + 1px) + view padding above .dm-shell (0px) + bottom clearance
+   (.app bottom border+margin, 1px + 22px, mirrors the top so the shell's
+   bottom edge sits the same visual distance from the viewport edge as
+   its top edge sits from the top) = 105.92px -> 106px.
+   min 420px keeps the panel usable if 100vh ever shrinks small (e.g. a
+   short embedded window). */
 .dm-shell { display: grid; grid-template-columns: 240px minmax(0,1fr); gap: 0;
-  height: min(640px, 70vh); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  height: max(420px, calc(100vh - 106px)); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 .conv-col { border-right: 1px solid var(--line); padding: 16px 12px; overflow-y: auto;
   background: var(--surface); }
 .thread-col { display: flex; flex-direction: column; min-height: 0; background: var(--surface); }

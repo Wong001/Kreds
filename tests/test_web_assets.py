@@ -1559,3 +1559,18 @@ def test_topbar_addfriend_popover():
     assert "FRIENDADD_OPENER" in js
     assert 'document.getElementById("friendadd-overlay").addEventListener("keydown"' in js
     assert "isConnected" in _js_fn_body(js, "buildShareTab")
+
+
+# ---------------------------------------------------------------------
+# Fullscreen fill (Task 1, 0.3.13): the chat shell derives its height
+# from the viewport instead of the old min(640px, 70vh) cap, and the
+# app box caps at 1720px (fixed cap, NOT 100vw - ultrawides would
+# stretch the nav away from content).
+# ---------------------------------------------------------------------
+
+def test_chat_fills_viewport_and_shell_widens():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    shell = _css_rule(css, ".dm-shell")
+    assert "min(640px" not in shell and "70vh" not in shell
+    assert "100vh" in shell and "max(420px" in shell
+    assert "max-width: 1720px" in _css_rule(css, ".app")
