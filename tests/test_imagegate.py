@@ -74,3 +74,76 @@ def test_decompression_bomb_rejected_as_valueerror():
     bomb = sig + chunk(b"IHDR", ihdr_data) + chunk(b"IEND", b"")
     with pytest.raises(ValueError):
         transcode(bomb, AVATAR_MAX)
+
+
+import os
+
+from hearth.imagegate import PHOTO_MAX, PHOTO_CAP, transcode_photo
+
+
+def noise_jpeg_bytes(w, h, quality=95):
+    # Random noise compresses terribly - the cheapest way to make a
+    # genuinely multi-megabyte JPEG without a fixture file.
+    img = Image.frombytes("RGB", (w, h), os.urandom(w * h * 3))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def test_big_photo_compressed_under_cap_and_downscaled():
+    src = noise_jpeg_bytes(4000, 3000)
+    assert len(src) > 5 * 1024 * 1024        # premise: bigger than the OLD cap
+    out = transcode_photo(src)
+    assert len(out) <= PHOTO_CAP
+    img = Image.open(io.BytesIO(out))
+    assert img.format == "JPEG"
+    assert max(img.size) <= PHOTO_MAX
+    assert abs(img.size[0] / img.size[1] - 4 / 3) < 0.05   # aspect kept
+
+
+def test_orientation_baked_in_and_exif_stripped():
+    img = Image.new("RGB", (100, 50), (10, 200, 30))
+    exif = Image.Exif()
+    exif[274] = 6                             # Orientation: rotate 90 CW
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", exif=exif)
+    out = transcode_photo(buf.getvalue())
+    outimg = Image.open(io.BytesIO(out))
+    assert outimg.size == (50, 100)           # transpose applied to pixels
+    assert dict(outimg.getexif()) == {}       # no metadata carried (incl. GPS)
+
+
+def test_png_screenshot_stays_png():
+    out = transcode_photo(png_bytes(800, 600))
+    assert Image.open(io.BytesIO(out)).format == "PNG"
+
+
+def test_never_upscales():
+    out = transcode_photo(png_bytes(64, 64))
+    assert Image.open(io.BytesIO(out)).size == (64, 64)
+
+
+def test_animated_gif_passes_through_byte_identical():
+    src = animated_gif_bytes()
+    assert transcode_photo(src) == src
+
+
+def test_oversized_gif_rejected_honestly():
+    src = animated_gif_bytes()
+    with pytest.raises(ValueError, match="animations can't be compressed"):
+        transcode_photo(src, cap=len(src) - 1)
+
+
+def test_non_image_rejected():
+    with pytest.raises(ValueError, match="not an image"):
+        transcode_photo(b"definitely not pixels" * 100)
+
+
+def test_dimension_ladder_when_quality_floor_is_not_enough():
+    # A tiny artificial cap forces the gate past q55 into halving the
+    # dimensions - output must still be a valid image under the cap.
+    out = transcode_photo(noise_jpeg_bytes(800, 600), cap=15_000)
+    assert len(out) <= 15_000
+    img = Image.open(io.BytesIO(out))
+    assert img.format == "JPEG"
+    assert max(img.size) <= 400               # at least one halving happened
