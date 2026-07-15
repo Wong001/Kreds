@@ -47,6 +47,18 @@ FRIEND_ADD_TIMEOUT = 30
 # given any special-case handling here.
 BLOB_GIVE_BUDGET = MAX_FRAME - 1024 * 1024
 
+# Bound on peer dial timeout: plain TCP needs a short backstop (LAN
+# responsiveness expectation) while clearnet/cellular can be slow but
+# must not stall the whole gossip round. open_connection has no builtin
+# timeout, so one dead peer would hang indefinitely; this bounds it.
+TCP_DIAL_TIMEOUT = 20.0
+
+# Bound on onion peer dial timeout: TorTransport's own 60s budget for the
+# full SOCKS negotiation + connection. This backstop sits above that so
+# the transport's error (if it occurs) surfaces first, and we fall back to
+# offline-peer handling.
+ONION_DIAL_TIMEOUT = 75.0
+
 
 def _auth_body(nonce_hex: str) -> bytes:
     # Domain-separated: never sign raw peer-supplied bytes.
@@ -192,9 +204,11 @@ class SyncService:
         if self.node.revoked:
             return False, None, []
         try:
-            reader, writer = await self.transport.connect(address)
-        except OSError:
-            return False, None, []      # peer offline: retry next round
+            timeout = ONION_DIAL_TIMEOUT if _is_onion(address) else TCP_DIAL_TIMEOUT
+            reader, writer = await asyncio.wait_for(
+                self.transport.connect(address), timeout=timeout)
+        except (OSError, asyncio.TimeoutError):
+            return False, None, []      # peer offline/unreachable: next round
         try:
             peer_identity, applied = await self._session(
                 reader, writer, initiator=True)

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 
 from hearth.node import HearthNode
 from hearth.sync import SyncService
@@ -308,5 +309,24 @@ def test_sync_fetch_refuses_blob_over_cap(tmp_path):
         assert over_hash in freja.store.missing_blobs()
         await sw.stop()
         await sf.stop()
+
+    asyncio.run(scenario())
+
+
+def test_hanging_dial_is_bounded(tmp_path, monkeypatch):
+    async def scenario():
+        wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+        svc = SyncService(wong)
+        await svc.start("127.0.0.1", 0)
+
+        async def hang(address):
+            await asyncio.sleep(30)
+        monkeypatch.setattr(svc.transport, "connect", hang)
+        monkeypatch.setattr("hearth.sync.TCP_DIAL_TIMEOUT", 0.2)
+        t0 = time.monotonic()
+        ok = await svc.sync_with("127.0.0.1:9")
+        assert ok is False
+        assert time.monotonic() - t0 < 2.0   # bounded, not the 30s hang
+        await svc.stop()
 
     asyncio.run(scenario())
