@@ -55,6 +55,29 @@ def test_ring_move_rekeys_future_only(tmp_path):
     assert freja.device.device_pub not in b.payload["wraps"]  # new: excluded
 
 
+def test_kreds_wall_back_catalog_opens_but_inner_stays_closed(tmp_path):
+    # "A wall is a wall" (0.3.11): the kreds-wall HALF of the old
+    # future-only rule is gone -- the back catalog opens via wrap grants.
+    # The inner half survives verbatim above (test_ring_move_rekeys_
+    # future_only): this pair of tests IS the spec's two-scope split.
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    wall = wong.compose_post("foer venskab", scope="kreds",
+                             placement="profile")
+    inner_wall = wong.compose_post("indre foer", scope="inner",
+                                   placement="profile")
+    befriend_with_enckeys(wong, freja)
+    wong.maintain_wrap_grants()
+    for m in wong.store.messages_not_in({}, {wong.identity_pub},
+                                        freja.identity_pub):
+        freja.store.ingest_message(m)
+    texts = [p["text"] for p in
+             freja.posts_by(wong.identity_pub, "profile")]
+    assert "foer venskab" in texts          # kreds wall: opened
+    assert "indre foer" not in texts        # inner wall: honest hole
+    assert freja.store.get_message(inner_wall) is None
+
+
 def test_feed_hides_undecryptable(tmp_path):
     wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
     freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
