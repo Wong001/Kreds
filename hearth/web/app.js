@@ -2331,21 +2331,32 @@ function renderMeStrip() {
 // ---------------------------------------------------------------------
 
 // The bootstrap->full-app handoff closes the bootstrap uvicorn and starts
-// the full node app on the SAME port (see runner.run_serve) - GET
-// /api/state throws or refuses for a beat mid-handoff, then 200s once the
-// full app is serving. Capped at 40 tries (~20s) so a genuinely stuck
-// handoff doesn't poll forever; statusEl (optional) gets an honest message
-// if it gives up.
+// the full node app on the SAME port (see runner.run_serve). The full app
+// only binds after Tor bootstrap + onion publish, which can take minutes
+// cold - so poll FOREVER with backoff (500ms -> 2s) and surface the
+// desktop shell's startup stage when available (pywebview api; absent in
+// a plain browser, where the text fallback carries it).
 async function pollForFullApp(statusEl) {
-  for (let i = 0; i < 40; i++) {
+  let delay = 500;
+  while (true) {
     try {
       const r = await fetch("/api/state");
       if (r.ok) { location.reload(); return; }
-    } catch (e) { /* mid-handoff: server briefly unreachable - keep polling */ }
-    await new Promise(res => setTimeout(res, 500));
+    } catch (e) { /* mid-handoff / tor still bootstrapping - keep polling */ }
+    if (statusEl) {
+      let msg = "Starting your node - this can take a few minutes...";
+      try {
+        const s = await window.pywebview?.api?.get_startup_status?.();
+        if (s && s.stage === "tor-bootstrap" && s.pct != null)
+          msg = "Connecting to Tor - " + s.pct + "%";
+        else if (s && s.stage === "failed")
+          msg = "Startup hit a problem - see app.log in the Kreds data folder.";
+      } catch (e) { /* bridge absent (plain browser): keep the fallback text */ }
+      statusEl.textContent = msg;
+    }
+    await new Promise(res => setTimeout(res, delay));
+    delay = Math.min(delay * 1.5, 2000);
   }
-  if (statusEl) statusEl.textContent =
-    "Still starting up - this is taking longer than expected. You can leave this page open.";
 }
 
 function renderFirstRun() {

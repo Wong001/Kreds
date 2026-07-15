@@ -1390,3 +1390,19 @@ def test_text_styling_wired():
     wrap_rule = re.search(r"(?m)^\.block-text-wrap\s*\{([^}]*)\}", css)
     assert wrap_rule, "no base .block-text-wrap rule found"
     assert "align-items: flex-start" in wrap_rule.group(1)
+
+
+def test_onboarding_poll_never_gives_up():
+    # Launch loading states (0.3.11): the bootstrap->full-app handoff can
+    # legitimately take minutes (cold Tor bootstrap), so pollForFullApp
+    # must poll forever with backoff - the old 40-try cap ended in a
+    # dead-end message telling the user to "leave this page open" while
+    # nothing would ever arrive.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "You can leave this page open" not in js       # the dead-end lie
+    body = _js_fn_body(js, "pollForFullApp")
+    assert "while (true)" in body                          # polls forever
+    assert "get_startup_status" in body       # desktop bridge stage surfaced
+    assert "Connecting to Tor" in body
+    assert "pywebview?.api?.get_startup_status?." in body  # optional-chained:
+    # a plain browser (dev) has no bridge and must keep the text fallback
