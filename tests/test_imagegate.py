@@ -134,7 +134,7 @@ def test_oversized_gif_rejected_honestly():
         transcode_photo(src, cap=len(src) - 1)
 
 
-def test_non_image_rejected():
+def test_photo_non_image_rejected():
     with pytest.raises(ValueError, match="not an image"):
         transcode_photo(b"definitely not pixels" * 100)
 
