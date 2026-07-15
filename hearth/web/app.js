@@ -3138,6 +3138,14 @@ function buildShareTab(container) {
   let timer = null;
 
   const tickCountdown = (expiresAt) => {
+    // Host-agnostic self-cleanup (review fix): if the panel this tab lives
+    // in was torn down mid-countdown (popover closed, or any host rebuilt
+    // its panel), the countdown node detaches - stop the interval instead
+    // of ticking against dead DOM forever.
+    if (!countdown.isConnected) {
+      if (timer) { clearInterval(timer); timer = null; }
+      return;
+    }
     const remaining = Math.max(0, Math.floor(expiresAt - Date.now() / 1000));
     if (remaining <= 0) {
       if (timer) { clearInterval(timer); timer = null; }
@@ -3380,22 +3388,49 @@ function ceremonyUI() {
 // Topbar "+" (spec 2026-07-15): quick add-friend without leaving the
 // profile. Rebuilt fresh per open so a prior invite's countdown state
 // never leaks into a new session.
+let FRIENDADD_OPENER = null;   // same shape as BLOCK_SETTINGS_OPENER
 function openFriendAdd() {
   const body = document.getElementById("friendadd-body");
   body.replaceChildren();
   const panel = el("div", "ceremony-panel");
   buildFriendAdd(panel);
   body.append(panel);
+  FRIENDADD_OPENER = document.getElementById("profile-addfriend");
   document.getElementById("friendadd-overlay").classList.remove("hidden");
   panel.friendaddFocus();
 }
 function closeFriendAdd() {
   document.getElementById("friendadd-overlay").classList.add("hidden");
+  // Block-settings parity: return focus to the topbar "+" that opened the
+  // dialog - without this, Esc/backdrop/close-button all drop focus to
+  // <body>, losing the user's place on the profile.
+  const opener = FRIENDADD_OPENER;
+  FRIENDADD_OPENER = null;
+  if (opener && opener.isConnected) opener.focus();
 }
 document.getElementById("profile-addfriend").onclick = openFriendAdd;
 document.getElementById("friendadd-close").onclick = closeFriendAdd;
 document.getElementById("friendadd-overlay").addEventListener("click", (ev) => {
   if (ev.target.id === "friendadd-overlay") closeFriendAdd();
+});
+// Block-settings parity: trap Tab within the card while the dialog is
+// open (it declares aria-modal="true"). Scoped naturally - this only
+// fires when the Tab keydown bubbles up from a focused descendant of
+// #friendadd-overlay, which can't happen while it's hidden.
+document.getElementById("friendadd-overlay").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Tab") return;
+  const card = document.querySelector("#friendadd-overlay .block-settings-card");
+  if (!card) return;
+  const focusables = [...card.querySelectorAll(
+    'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
+  )];
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  if (ev.shiftKey && document.activeElement === first) {
+    ev.preventDefault(); last.focus();
+  } else if (!ev.shiftKey && document.activeElement === last) {
+    ev.preventDefault(); first.focus();
+  }
 });
 
 // ---------------------------------------------------------------------

@@ -1076,30 +1076,50 @@ function ceremonyUI() {
   </div>
 ```
 
-(c) `app.js`, after the `ceremonyUI` function:
+(c) `app.js`, after the `ceremonyUI` function (amended per task-7 review:
+focus return via `FRIENDADD_OPENER` + Tab trap, both block-settings
+parity — the original snippet declared `aria-modal="true"` without either):
 
 ```js
 // Topbar "+" (spec 2026-07-15): quick add-friend without leaving the
 // profile. Rebuilt fresh per open so a prior invite's countdown state
 // never leaks into a new session.
+let FRIENDADD_OPENER = null;   // same shape as BLOCK_SETTINGS_OPENER
 function openFriendAdd() {
   const body = document.getElementById("friendadd-body");
   body.replaceChildren();
   const panel = el("div", "ceremony-panel");
   buildFriendAdd(panel);
   body.append(panel);
+  FRIENDADD_OPENER = document.getElementById("profile-addfriend");
   document.getElementById("friendadd-overlay").classList.remove("hidden");
   panel.friendaddFocus();
 }
 function closeFriendAdd() {
   document.getElementById("friendadd-overlay").classList.add("hidden");
+  // Block-settings parity: return focus to the topbar "+" that opened the
+  // dialog - without this, Esc/backdrop/close-button all drop focus to
+  // <body>, losing the user's place on the profile.
+  const opener = FRIENDADD_OPENER;
+  FRIENDADD_OPENER = null;
+  if (opener && opener.isConnected) opener.focus();
 }
 document.getElementById("profile-addfriend").onclick = openFriendAdd;
 document.getElementById("friendadd-close").onclick = closeFriendAdd;
 document.getElementById("friendadd-overlay").addEventListener("click", (ev) => {
   if (ev.target.id === "friendadd-overlay") closeFriendAdd();
 });
+// Block-settings parity: trap Tab within the card while the dialog is
+// open (it declares aria-modal="true") - mirror the #block-settings
+// keydown listener (same focusables selector, same shift/tab wrap) on
+// #friendadd-overlay, scoped to its .block-settings-card.
 ```
+
+Also (amended per task-7 review): guard the top of `buildShareTab`'s
+countdown tick with `if (!countdown.isConnected) { if (timer)
+{ clearInterval(timer); timer = null; } return; }` so the interval
+self-clears when the popover closes (or any host rebuilds its panel)
+mid-countdown, instead of ticking against detached DOM forever.
 
 (d) `app.js` `renderProfilePage`, next to the cog/arrange toggles (~line 1778):
 
@@ -1109,10 +1129,13 @@ document.getElementById("friendadd-overlay").addEventListener("click", (ev) => {
 
 (e) `app.js` global Escape handler (~line 1074): change its body to `{ if (ev.key === "Escape") { closeBlockSettings(); closeFriendAdd(); } }`.
 
-(f) `style.css`, after `.profile-cog:hover` (~line 387):
+(f) `style.css`, after `.profile-cog:hover` (~line 387) (amended per
+task-7 review: explicit `var(--line-2)` border so the "+" matches its
+topbar siblings instead of inheriting the generic button `var(--line)`):
 
 ```css
-.profile-addfriend { border-radius: 50%; width: 34px; height: 34px; padding: 0;
+.profile-addfriend { border: 1px solid var(--line-2); border-radius: 50%;
+  width: 34px; height: 34px; padding: 0;
   display: grid; place-items: center; font-size: 20px; line-height: 1;
   color: var(--ink-2); flex: none; transition: .15s; }
 .profile-addfriend:hover { color: var(--ink); border-color: var(--ink-2); }

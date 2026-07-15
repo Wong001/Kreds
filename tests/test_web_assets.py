@@ -1519,3 +1519,10 @@ def test_topbar_addfriend_popover():
     assert "profile-addfriend" in _js_fn_body(js, "renderProfilePage")
     assert "position: fixed" in _css_rule(css, "#friendadd-overlay")
     assert "closeFriendAdd" in js
+    # Review fixes (block-settings parity): focus returns to the opener on
+    # close, Tab is trapped inside the card while the dialog is open, and
+    # the share tab's countdown interval self-clears once its node is
+    # detached (popover closed / panel rebuilt mid-countdown).
+    assert "FRIENDADD_OPENER" in js
+    assert 'document.getElementById("friendadd-overlay").addEventListener("keydown"' in js
+    assert "isConnected" in _js_fn_body(js, "buildShareTab")

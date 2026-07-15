@@ -394,7 +394,8 @@ body.desktop .desktop-only-panel { display: block; }
 .profile-cog:hover { color: var(--ink); border-color: var(--ink-2); }
 /* Topbar "+" (self only, spec 2026-07-15): quick add-friend, styled to
    match the cog's round icon-button treatment. */
-.profile-addfriend { border-radius: 50%; width: 34px; height: 34px; padding: 0;
+.profile-addfriend { border: 1px solid var(--line-2); border-radius: 50%;
+  width: 34px; height: 34px; padding: 0;
   display: grid; place-items: center; font-size: 20px; line-height: 1;
   color: var(--ink-2); flex: none; transition: .15s; }
 .profile-addfriend:hover { color: var(--ink); border-color: var(--ink-2); }
