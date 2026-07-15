@@ -90,9 +90,22 @@ def enable(secrets: dict, credential: str, cred_type: str, seal) -> tuple[dict, 
                 "salt_hex": salt.hex()},
         "sealed_device_secret_hex": seal(device_secret).hex(),
         "nonce_hex": nonce.hex(), "ct_hex": ct.hex(),
-        "settings": {"idle_minutes": 0, "lock_on_sleep": True},
+        "settings": {"idle_minutes": 0, "lock_on_sleep": False},
+        "settings_v": 2,
     }
     return record, master
+
+def migrate_settings(record: dict) -> tuple[dict, bool]:
+    """One-time 0.3.11 migration: lock_on_sleep shipped default-ON and
+    nobody chose it; flip unmarked records to OFF. settings_v marks the
+    record so a user who re-enables it afterwards keeps their choice."""
+    if record.get("settings_v", 1) >= 2:
+        return record, False
+    settings = record.setdefault("settings",
+                                 {"idle_minutes": 0, "lock_on_sleep": False})
+    settings["lock_on_sleep"] = False
+    record["settings_v"] = 2
+    return record, True
 
 def unlock(record: dict, credential: str, unseal) -> tuple[dict, bytes]:
     device_secret = unseal(bytes.fromhex(record["sealed_device_secret_hex"]))

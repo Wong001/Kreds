@@ -35,7 +35,7 @@ def test_applock_status_readable_while_locked(tmp_path):
     assert body["enabled"] is True
     assert body["locked"] is True
     assert body["cred_type"] == "pin"
-    assert body["settings"] == {"idle_minutes": 0, "lock_on_sleep": True}
+    assert body["settings"] == {"idle_minutes": 0, "lock_on_sleep": False}
     assert body["throttle_wait"] == 0
 
 
@@ -268,7 +268,7 @@ def test_non_applock_node_routes_normal(tmp_path):
     assert c.get("/api/feed").status_code == 200
     status = c.get("/api/applock").json()
     assert status == {"enabled": False, "locked": False, "cred_type": None,
-                      "settings": {"idle_minutes": 0, "lock_on_sleep": True},
+                      "settings": {"idle_minutes": 0, "lock_on_sleep": False},
                       "throttle_wait": 0}
     r = c.post("/api/post", data={"text": "hello", "scope": "kreds"})
     assert r.status_code == 200
@@ -298,7 +298,8 @@ def test_idle_autolock_off_when_zero(tmp_path):
 
 def test_sleep_autolock_on_wall_clock_jump(tmp_path):
     n = _fresh(tmp_path)
-    n.enable_applock("1234", "pin")           # lock_on_sleep defaults True
+    n.enable_applock("1234", "pin")           # lock_on_sleep defaults False
+    n.update_applock_settings(idle_minutes=0, lock_on_sleep=True)  # opt in
     n.last_activity = time.time()
     n._last_tick = time.time() - 1000          # process "suspended" a while
     n.maybe_autolock(interval=3.0)
@@ -335,7 +336,9 @@ def test_slow_round_does_not_fake_a_suspend(tmp_path):
     # maybe_autolock sees is sleep-duration only -- a 60s gossip round
     # cannot masquerade as a suspend anymore.
     n = _fresh(tmp_path)
-    n.enable_applock("1234", "pin")            # lock_on_sleep defaults True
+    n.enable_applock("1234", "pin")            # lock_on_sleep defaults False
+    n.update_applock_settings(idle_minutes=0, lock_on_sleep=True)  # opt in --
+    # otherwise this would pass vacuously regardless of the tick fix below
     t0 = time.time()
     n.stamp_autolock_tick(now=t0)
     # 3s of sleep elapsed, regardless of how long the round before it took:
@@ -345,7 +348,8 @@ def test_slow_round_does_not_fake_a_suspend(tmp_path):
 
 def test_real_suspend_still_locks(tmp_path):
     n = _fresh(tmp_path)
-    n.enable_applock("1234", "pin")            # lock_on_sleep defaults True
+    n.enable_applock("1234", "pin")            # lock_on_sleep defaults False
+    n.update_applock_settings(idle_minutes=0, lock_on_sleep=True)  # opt in
     t0 = time.time()
     n.stamp_autolock_tick(now=t0)
     n.maybe_autolock(interval=3.0, now=t0 + 3.0 + 31.0)   # woke up 31s late
@@ -433,3 +437,42 @@ def test_unlock_already_unlocked_node_ok_credential_unchecked(tmp_path):
     assert r.status_code == 200
     assert n.locked is False
     assert c.get("/api/state").status_code == 200
+
+
+# -- 0.3.11 misfire fix: lock_on_sleep defaults OFF + one-time migration ------
+
+def test_new_records_default_lock_on_sleep_off(tmp_path):
+    record, _ = applock.enable({"k": "v"}, "1234", "pin", seal=lambda b: b)
+    assert record["settings"]["lock_on_sleep"] is False
+    assert record["settings_v"] == 2
+
+
+def test_migration_flips_unmarked_record_once():
+    v1 = {"settings": {"idle_minutes": 5, "lock_on_sleep": True}}
+    migrated, changed = applock.migrate_settings(dict(v1))
+    assert changed and migrated["settings"]["lock_on_sleep"] is False
+    assert migrated["settings"]["idle_minutes"] == 5      # untouched
+    assert migrated["settings_v"] == 2
+    # user re-enables afterwards: marker prevents re-flip
+    migrated["settings"]["lock_on_sleep"] = True
+    again, changed2 = applock.migrate_settings(dict(migrated))
+    assert not changed2 and again["settings"]["lock_on_sleep"] is True
+
+
+def test_status_fallback_defaults_off(tmp_path):
+    n = _fresh(tmp_path)               # node WITHOUT applock enabled
+    assert n.applock_status()["settings"]["lock_on_sleep"] is False
+
+
+def test_update_settings_preserves_settings_v(tmp_path):
+    # update_applock_settings rewrites only record["settings"] -- confirm
+    # the sibling settings_v marker (set by enable()) survives that write
+    # unclobbered, since migrate_settings relies on it for idempotency.
+    n = _fresh(tmp_path)
+    n.enable_applock("1234", "pin")
+    on_disk = json.loads((n.data_dir / "applock.json").read_text())
+    assert on_disk["settings_v"] == 2
+    n.update_applock_settings(idle_minutes=10, lock_on_sleep=True)
+    on_disk = json.loads((n.data_dir / "applock.json").read_text())
+    assert on_disk["settings_v"] == 2
+    assert on_disk["settings"] == {"idle_minutes": 10, "lock_on_sleep": True}

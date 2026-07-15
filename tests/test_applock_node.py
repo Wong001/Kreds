@@ -196,6 +196,42 @@ def test_leftover_paper_seed_scrub_is_logged(tmp_path, caplog):
     assert "paper_seed.txt" in caplog.text
 
 
+# -- 0.3.11 misfire fix: lock_on_sleep migration runs at applock boot ---------
+
+def test_pre_migration_record_flipped_on_boot(tmp_path):
+    """A record written before 0.3.11 (no settings_v marker, lock_on_sleep
+    left at its old True default) must be migrated the next time the node
+    boots with App-lock enabled -- not just when applock.migrate_settings is
+    called directly (unit-tested in test_applock_api.py); this pins the
+    node.py __init__ wiring that actually invokes it."""
+    n = _node(tmp_path)
+    n.enable_applock("1234", "pin")
+    record = json.loads((n.data_dir / "applock.json").read_text())
+    del record["settings_v"]
+    record["settings"]["lock_on_sleep"] = True
+    _atomic_write(n.data_dir / "applock.json", json.dumps(record))
+
+    n2 = HearthNode(n.data_dir)             # reboot: migration should run
+    on_disk = json.loads((n2.data_dir / "applock.json").read_text())
+    assert on_disk["settings_v"] == 2
+    assert on_disk["settings"]["lock_on_sleep"] is False
+    assert n2.applock_status()["settings"]["lock_on_sleep"] is False
+
+
+def test_already_migrated_record_untouched_on_boot(tmp_path):
+    """Idempotency at the node level: a record already marked settings_v=2
+    with lock_on_sleep re-enabled by the user must survive a reboot
+    unchanged (the migration must not re-flip it)."""
+    n = _node(tmp_path)
+    n.enable_applock("1234", "pin")
+    n.update_applock_settings(idle_minutes=0, lock_on_sleep=True)  # user opt-in
+
+    n2 = HearthNode(n.data_dir)
+    assert n2.applock_status()["settings"]["lock_on_sleep"] is True
+    on_disk = json.loads((n2.data_dir / "applock.json").read_text())
+    assert on_disk["settings_v"] == 2
+
+
 # -- IMPORTANT #3: atomic-write helper -----------------------------------------
 
 def test_atomic_write_helper_roundtrips_and_cleans_up_tmp(tmp_path):

@@ -141,6 +141,16 @@ class HearthNode:
                     "at %s (crash residue from a prior enable_applock -- "
                     "already sealed in applock.json)", paper_seed_path)
                 paper_seed_path.unlink()
+            # 0.3.11 misfire fix: lock_on_sleep shipped default-ON and
+            # nobody chose it -- migrate any record that predates the
+            # settings_v marker to OFF, once. applock.migrate_settings is
+            # idempotent (a record already marked, or one where the user
+            # re-enabled the setting since, is returned unchanged).
+            applock_record = json.loads(self._applock_path.read_text())
+            applock_record, applock_migrated = applock.migrate_settings(
+                applock_record)
+            if applock_migrated:
+                _atomic_write(self._applock_path, json.dumps(applock_record))
             self.device = DeviceKeys.locked_from_json(raw)
             self.locked = True
             # The revoked-view discovery and legacy-storage-key migration
@@ -314,12 +324,12 @@ class HearthNode:
         (applock.json is plaintext except for its ciphertext blob)."""
         if not self.applock_enabled:
             return {"enabled": False, "locked": False, "cred_type": None,
-                    "settings": {"idle_minutes": 0, "lock_on_sleep": True}}
+                    "settings": {"idle_minutes": 0, "lock_on_sleep": False}}
         record = json.loads(self._applock_path.read_text())
         return {"enabled": True, "locked": self.locked,
                 "cred_type": record.get("cred_type"),
                 "settings": record.get(
-                    "settings", {"idle_minutes": 0, "lock_on_sleep": True})}
+                    "settings", {"idle_minutes": 0, "lock_on_sleep": False})}
 
     def update_applock_settings(self, idle_minutes: int, lock_on_sleep: bool):
         """Persist idle_minutes (0 = idle timer off) / lock_on_sleep into
@@ -430,7 +440,7 @@ class HearthNode:
         settings = self.applock_status()["settings"]
         gap = now - self._last_tick
         self._last_tick = now
-        if settings.get("lock_on_sleep", True) and gap > interval + 30:
+        if settings.get("lock_on_sleep", False) and gap > interval + 30:
             self.lock()
             return
         idle_minutes = settings.get("idle_minutes", 0)
