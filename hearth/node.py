@@ -150,7 +150,21 @@ class HearthNode:
             applock_record, applock_migrated = applock.migrate_settings(
                 applock_record)
             if applock_migrated:
-                _atomic_write(self._applock_path, json.dumps(applock_record))
+                try:
+                    _atomic_write(self._applock_path,
+                                  json.dumps(applock_record))
+                except OSError:
+                    # A read-only/permission/disk-full failure here must
+                    # not crash startup -- boot anyway. The on-disk record
+                    # stays unmarked (no settings_v), so migrate_settings
+                    # simply retries on the next boot; until a write lands,
+                    # the record's old explicit lock_on_sleep value keeps
+                    # applying (applock_status re-reads from disk).
+                    logger.warning(
+                        "app-lock: could not persist the lock_on_sleep "
+                        "migration to %s -- continuing; the migration will "
+                        "retry on the next boot", self._applock_path,
+                        exc_info=True)
             self.device = DeviceKeys.locked_from_json(raw)
             self.locked = True
             # The revoked-view discovery and legacy-storage-key migration

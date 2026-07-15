@@ -2472,7 +2472,7 @@ let APPLOCK_HEARTBEAT_LAST = null;  // wall-clock reference for the sleep-jump h
 async function getApplockStatus() {
   const r = await fetch("/api/applock");
   if (!r.ok) return {enabled: false, locked: false, cred_type: null,
-                      settings: {idle_minutes: 0, lock_on_sleep: true}, throttle_wait: 0};
+                      settings: {idle_minutes: 0, lock_on_sleep: false}, throttle_wait: 0};
   return r.json();
 }
 

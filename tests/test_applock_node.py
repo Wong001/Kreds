@@ -218,6 +218,34 @@ def test_pre_migration_record_flipped_on_boot(tmp_path):
     assert n2.applock_status()["settings"]["lock_on_sleep"] is False
 
 
+def test_migration_write_failure_does_not_crash_boot(tmp_path, monkeypatch):
+    """The migration's persist is best-effort: a read-only/permission/
+    disk-full failure on the _atomic_write must not raise out of
+    HearthNode.__init__ -- the node still boots, the on-disk record stays
+    unmarked, and the migration retries (and lands) on the next boot."""
+    import hearth.node as node_mod
+    n = _node(tmp_path)
+    n.enable_applock("1234", "pin")
+    record = json.loads((n.data_dir / "applock.json").read_text())
+    del record["settings_v"]
+    record["settings"]["lock_on_sleep"] = True
+    _atomic_write(n.data_dir / "applock.json", json.dumps(record))
+
+    def boom(path, text):
+        raise OSError("disk full / read-only")
+    monkeypatch.setattr(node_mod, "_atomic_write", boom)
+    n2 = HearthNode(n.data_dir)                  # must NOT raise
+    assert n2.locked is True                     # booted normally
+    on_disk = json.loads((n2.data_dir / "applock.json").read_text())
+    assert "settings_v" not in on_disk           # write really failed
+
+    monkeypatch.undo()                           # next boot: write works
+    n3 = HearthNode(n.data_dir)
+    on_disk = json.loads((n3.data_dir / "applock.json").read_text())
+    assert on_disk["settings_v"] == 2            # retry landed
+    assert on_disk["settings"]["lock_on_sleep"] is False
+
+
 def test_already_migrated_record_untouched_on_boot(tmp_path):
     """Idempotency at the node level: a record already marked settings_v=2
     with lock_on_sleep re-enabled by the user must survive a reboot

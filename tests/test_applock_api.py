@@ -459,6 +459,16 @@ def test_migration_flips_unmarked_record_once():
     assert not changed2 and again["settings"]["lock_on_sleep"] is True
 
 
+def test_migration_flips_explicit_v1_marker():
+    # settings_v explicitly present as 1 (not just missing) is still
+    # pre-migration: < 2 must migrate exactly like an unmarked record.
+    v1 = {"settings_v": 1,
+          "settings": {"idle_minutes": 5, "lock_on_sleep": True}}
+    migrated, changed = applock.migrate_settings(v1)
+    assert changed and migrated["settings"]["lock_on_sleep"] is False
+    assert migrated["settings_v"] == 2
+
+
 def test_status_fallback_defaults_off(tmp_path):
     n = _fresh(tmp_path)               # node WITHOUT applock enabled
     assert n.applock_status()["settings"]["lock_on_sleep"] is False
