@@ -1574,3 +1574,21 @@ def test_chat_fills_viewport_and_shell_widens():
     assert "min(640px" not in shell and "70vh" not in shell
     assert "100vh" in shell and "max(420px" in shell
     assert "max-width: 1720px" in _css_rule(css, ".app")
+
+
+def test_journal_keeps_readable_column_and_idstrip_stays_on_screen():
+    # Review follow-up (0.3.13, owner decision): ONLY Messages consumes the
+    # widened 1720px shell. The journal view keeps its pre-widen readable
+    # column - #view-journal (the container wrapping chipbar + #journal +
+    # circle rail) caps at the old 1220 app cap's inner width and centers,
+    # so .entry rows render at their pre-change ~952px (measured at a 2400px
+    # viewport). And the chat height offset folds in the identity strip so
+    # the always-visible fingerprint footer is never pushed below the fold.
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    view = _css_rule(css, "#view-journal")
+    assert "max-width: 1218px" in view
+    assert "margin: 0 auto" in view
+    # the chat offset accounts for the idstrip (144px total, not the
+    # strip-blind 106px)
+    shell = _css_rule(css, ".dm-shell")
+    assert "calc(100vh - 144px)" in shell

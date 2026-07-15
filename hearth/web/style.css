@@ -175,7 +175,17 @@ body.desktop .desktop-only-panel { display: block; }
 .idstrip .devs b { color: var(--ink); font-weight: 500; }
 
 /* ---------- journal view layout ---------- */
-#view-journal { display: grid; grid-template-columns: 1fr 218px; gap: 0; }
+/* Readable-column cap (0.3.13 review follow-up, owner decision): ONLY
+   Messages consumes the widened 1720px app shell - the journal keeps its
+   pre-widen column. 1218px is the old 1220px .app cap minus its 2px of
+   side borders (the inner width this view rendered at before the shell
+   widened): journal column = 1218 - 218 (rail) = 1000, minus .journal's
+   48px side padding = .entry rows back at their pre-change 952px
+   (measured 952 exactly, Playwright at 2400x1300, 2026-07-15). Capping
+   the view container (not .entry) keeps the chipbar/composer/dayheads
+   centered with the entries. */
+#view-journal { display: grid; grid-template-columns: 1fr 218px; gap: 0;
+  max-width: 1218px; margin: 0 auto; }
 .journal { padding: 20px 24px 26px; background: var(--surface); min-height: 560px; }
 
 /* ---------- circle rail (compact) - ported from docs/design/
@@ -758,14 +768,16 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
    chromium, 127.0.0.1:7201, Messages view, 1280x800 and 2400x1300,
    2026-07-15 - both viewports agreed since none of these are vh-based):
    nav (.appnav rendered height, 59.92px) + .app top margin+border
-   (22px + 1px) + view padding above .dm-shell (0px) + bottom clearance
-   (.app bottom border+margin, 1px + 22px, mirrors the top so the shell's
-   bottom edge sits the same visual distance from the viewport edge as
-   its top edge sits from the top) = 105.92px -> 106px.
+   (22px + 1px) + view padding above .dm-shell (0px) + .idstrip rendered
+   height incl. its 1px top border (37.27px - the identity fingerprint
+   footer must stay on-screen below the chat, review follow-up) + .app
+   bottom border+margin (1px + 22px) = 143.19px -> rounded UP to 144 so
+   the strip and the app's bottom margin fully clear the viewport with
+   no fractional overflow.
    min 420px keeps the panel usable if 100vh ever shrinks small (e.g. a
    short embedded window). */
 .dm-shell { display: grid; grid-template-columns: 240px minmax(0,1fr); gap: 0;
-  height: max(420px, calc(100vh - 106px)); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  height: max(420px, calc(100vh - 144px)); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 .conv-col { border-right: 1px solid var(--line); padding: 16px 12px; overflow-y: auto;
   background: var(--surface); }
 .thread-col { display: flex; flex-direction: column; min-height: 0; background: var(--surface); }
