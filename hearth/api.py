@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import applock, invitecodec, update
 from .messages import (_is_hex_color, AVATAR_ALIGNS, AVATAR_SHAPES,
-                       AVATAR_SIZES, MAX_BIO, MAX_BLOB_BYTES,
+                       AVATAR_SIZES, MAX_BIO, MAX_IMAGE_UPLOAD,
                        MAX_VIDEO_UPLOAD)
 from .node import HearthNode
 
@@ -369,8 +369,8 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         blobs = []
         for up in photos:
             data = await up.read()
-            if len(data) > MAX_BLOB_BYTES:
-                raise HTTPException(413, "photo exceeds 5 MB cap")
+            if len(data) > MAX_IMAGE_UPLOAD:
+                raise HTTPException(413, "photo exceeds the 50 MB upload cap")
             blobs.append(data)
         mid = _400(lambda: node.compose_post(text, scope, blobs, expiry,
                                              placement=placement,
@@ -481,8 +481,8 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         for up, setter in ((avatar, "av"), (banner, "bn")):
             if up is not None:
                 data = await up.read()
-                if len(data) > MAX_BLOB_BYTES:
-                    raise HTTPException(413, "image exceeds 5 MB cap")
+                if len(data) > MAX_IMAGE_UPLOAD:
+                    raise HTTPException(413, "image exceeds the 50 MB upload cap")
                 if setter == "av":
                     av_bytes = data
                 else:
@@ -574,8 +574,8 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         blobs = []
         for up in photos:
             data = await up.read()
-            if len(data) > MAX_BLOB_BYTES:
-                raise HTTPException(413, "photo exceeds 5 MB cap")
+            if len(data) > MAX_IMAGE_UPLOAD:
+                raise HTTPException(413, "photo exceeds the 50 MB upload cap")
             blobs.append(data)
         expiry = float(expires_seconds) if expires_seconds.strip() else None
         mid = _400(lambda: node.compose_dm(to, text, blobs, expiry))
@@ -603,8 +603,8 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
     @app.post("/api/story")
     async def story(media: UploadFile = File(...), caption: str = Form("")):
         data = await media.read()
-        if len(data) > MAX_BLOB_BYTES:
-            raise HTTPException(413, "media exceeds 5 MB cap")
+        if len(data) > MAX_IMAGE_UPLOAD:
+            raise HTTPException(413, "media exceeds the 50 MB upload cap")
         mid = _400(lambda: node.compose_story(data, caption))
         return {"msg_id": mid}
 

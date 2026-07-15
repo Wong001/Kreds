@@ -64,14 +64,37 @@ def test_ws_notified_on_post(tmp_path):
 
 
 def test_oversized_photo_rejected_413(tmp_path):
-    from hearth.messages import MAX_BLOB_BYTES
+    from hearth.messages import MAX_IMAGE_UPLOAD
     c, _ = client(tmp_path)
-    big = b"\x89PNG" + b"\x00" * MAX_BLOB_BYTES   # cap + 4 bytes
+    big = b"\x89PNG" + b"\x00" * MAX_IMAGE_UPLOAD   # cap + 4 bytes
     r = c.post("/api/post",
                data={"text": "too big", "expires_seconds": ""},
                files=[("photos", ("big.png", big, "image/png"))])
     assert r.status_code == 413
     assert c.get("/api/feed").json() == []        # nothing was stored
+
+
+def test_big_photo_upload_now_accepted(tmp_path):
+    from tests.test_imagegate import noise_jpeg_bytes
+    c, _ = client(tmp_path)
+    big = noise_jpeg_bytes(4000, 3000)
+    assert len(big) > 5 * 1024 * 1024
+    r = c.post("/api/post", data={"text": "big", "scope": "kreds",
+                                  "expires_seconds": ""},
+               files=[("photos", ("p.jpg", big, "image/jpeg"))])
+    assert r.status_code == 200
+
+
+def test_image_over_upload_cap_413(tmp_path):
+    from hearth.messages import MAX_IMAGE_UPLOAD
+    c, _ = client(tmp_path)
+    r = c.post("/api/post", data={"text": "too big", "scope": "kreds",
+                                  "expires_seconds": ""},
+               files=[("photos", ("p.jpg",
+                       b"\xff\xd8" + b"x" * MAX_IMAGE_UPLOAD,
+                       "image/jpeg"))])
+    assert r.status_code == 413
+    assert "50 MB" in r.text
 
 
 def test_missing_body_keys_return_400(tmp_path):

@@ -2130,7 +2130,7 @@ async function renderStories() {
         alert("That video is longer than 15 seconds. In-app trimming is "
           + "coming soon - for now, please shorten it to 15s or less.");
       else if (r.status === 413)
-        alert("That file is too large (5 MB max for now).");
+        alert("That file is too large (50 MB max).");
       else alert("Could not post story: " + body);
     } catch (e) {
       alert("Could not post story: " + e.message);
