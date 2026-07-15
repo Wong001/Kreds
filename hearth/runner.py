@@ -19,16 +19,25 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
                    tor_process: "TorProcess | None" = None,
                    publish: bool = True,
                    shutdown: "asyncio.Event | None" = None,
-                   web_dir=None):
+                   web_dir=None,
+                   status=None):
+    # Display-only startup progress for the desktop shell. Stage names are
+    # a contract with desktop.py's loading page and app.js: starting,
+    # tor-binary, tor-bootstrap, onion-publish, serving, ready, failed.
+    status = status or (lambda stage, pct=None: None)
+    status("starting")
     node = HearthNode(data_dir)
     own_tor = None
     sync = None
     try:
         if tor:
             if tor_process is None:
+                status("tor-binary")
                 exe = ensure_tor_binary()
                 own_tor = TorProcess(exe, node.data_dir / "tordata")
-                await own_tor.start()          # inside try: a failed start
+                status("tor-bootstrap", 0)
+                await own_tor.start(           # inside try: a failed start
+                    status=lambda pct: status("tor-bootstrap", pct))
                 tor_process = own_tor          # is stopped by the finally
             sync = SyncService(node,
                                transport=TorTransport(tor_process.socks_port))
@@ -36,6 +45,7 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
             # published address must point at the port we actually listen on.
             await sync.start("127.0.0.1", gossip_port)
             if publish:
+                status("onion-publish")
                 service_id, blob = await publish_onion(
                     tor_process.control_port, tor_process.cookie_path,
                     gossip_port, node.onion_key)
@@ -48,6 +58,7 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
             sync = SyncService(node)
             port = await sync.start("127.0.0.1", gossip_port)
             node.store.set_meta("gossip_addr", f"127.0.0.1:{port}")
+        status("serving")
         server = uvicorn.Server(uvicorn.Config(
             build_app(node, web_dir=web_dir), host="127.0.0.1", port=http_port,
             log_level="warning"))
@@ -59,6 +70,10 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
             watcher = asyncio.create_task(_watch())
         loop_task = asyncio.create_task(sync.gossip_loop(interval))
         try:
+            # Display-only: the port binds inside serve(), so the desktop
+            # shell's HTTP poll (_await_node_ready) stays the authoritative
+            # readiness check.
+            status("ready")
             await server.serve()
         finally:
             loop_task.cancel()
@@ -96,13 +111,17 @@ def _enrolled(data_dir) -> bool:
 async def run_serve(data_dir, gossip_port: int, http_port: int,
                     interval: float = 3.0, tor: bool = False,
                     shutdown: "asyncio.Event | None" = None,
-                    web_dir=None):
+                    web_dir=None,
+                    status=None):
     """Two-phase `hearth serve`: if no identity is enrolled yet, run the
     node-less bootstrap app (create/pair endpoints) on http_port until a
     create or pair-install completes, then shut it down and hand off to
     the full node app on the same port. If already enrolled, skip
     straight to run_node."""
     if not _enrolled(data_dir):
+        if status is not None:
+            status("starting")   # bootstrap phase; run_node re-emits the
+                                 # full sequence at handoff
         from .bootstrap import build_bootstrap_app
         ready = asyncio.Event()
         app = build_bootstrap_app(data_dir, ready.set, web_dir=web_dir)
@@ -152,4 +171,4 @@ async def run_serve(data_dir, gossip_port: int, http_port: int,
         server.should_exit = True
         await task                        # graceful shutdown frees the port
     await run_node(data_dir, gossip_port, http_port, interval, tor=tor,
-                   shutdown=shutdown, web_dir=web_dir)
+                   shutdown=shutdown, web_dir=web_dir, status=status)
