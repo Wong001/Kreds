@@ -1886,7 +1886,7 @@ function profilePostComposer() {
     bar.append(b);
   }
   form.append(el("div", "composer-note",
-    "Inner posts reach only your Inner kreds. Moving someone into a ring reveals only future posts."));
+    "Inner posts reach only your Inner kreds, and moving someone into Inner reveals only future Inner posts. Kreds wall posts are visible to all your current kreds."));
   const photoLabel = el("label", "keep");
   photoLabel.textContent = "Photo";
   const photoInput = document.createElement("input");

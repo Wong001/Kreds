@@ -1406,3 +1406,14 @@ def test_onboarding_poll_never_gives_up():
     assert "Connecting to Tor" in body
     assert "pywebview?.api?.get_startup_status?." in body  # optional-chained:
     # a plain browser (dev) has no bridge and must keep the text fallback
+
+
+def test_composer_note_reflects_wall_wrap_grants():
+    # "A wall is a wall" (0.3.11): the blanket "reveals only future
+    # posts" claim is now wrong for the kreds wall -- the note must
+    # scope the future-only rule to Inner and say kreds wall posts are
+    # for current friends. DRAFT copy pinned here; August owns final
+    # wording (update the pin together with the string).
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "Moving someone into a ring reveals only future posts." not in js
+    assert "Inner posts reach only your Inner kreds" in js
