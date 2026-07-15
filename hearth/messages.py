@@ -16,6 +16,7 @@ KIND_STORY = "story"
 KIND_RING = "ring"
 KIND_PROFILE_LAYOUT = "profile_layout"
 KIND_ALBUM = "album"
+KIND_WRAP_GRANT = "wrap_grant"
 MAX_LAYOUT = 500
 GRID_LAYOUTS = ("auto", "cols2", "cols3", "hero", "masonry")
 SIZE_LAYOUTS = ("small", "wide", "full")
@@ -161,6 +162,18 @@ def make_album(device: DeviceKeys, album_id: str, members: Sequence[str],
                now: Optional[float] = None) -> SignedMessage:
     return device.sign_message({
         "kind": KIND_ALBUM, "album_id": album_id, "members": list(members),
+        "created_at": _now(now),
+    })
+
+
+def make_wrap_grant(device: DeviceKeys, target_msg_id: str, wraps: dict,
+                    now: Optional[float] = None) -> SignedMessage:
+    """Extra sealed content-key wraps for an EXISTING post ("a wall is a
+    wall", spec 2026-07-15): additive, deduplicable — multiple grants for
+    one target union at the reader. Only meaningful when signed by the
+    target post's own author; consumers enforce that, not this shape."""
+    return device.sign_message({
+        "kind": KIND_WRAP_GRANT, "target": target_msg_id, "wraps": wraps,
         "created_at": _now(now),
     })
 
@@ -385,6 +398,20 @@ def validate_payload(p: dict) -> Tuple[bool, str]:
             return False, "bad album member"
         if len(set(members)) != len(members):
             return False, "duplicate album member"
+        return True, "ok"
+    if kind == KIND_WRAP_GRANT:
+        if not _is_hex64(p.get("target")):
+            return False, "bad target"
+        wraps = p.get("wraps")
+        if not _valid_wraps(wraps) or not wraps:
+            return False, "bad wraps"
+        # optional per-entry annotation: which enc_pub the wrap was sealed
+        # to, so the author-side sweep can detect stale wraps after the
+        # recipient rotates (unwrap_key ignores the extra field)
+        for w in wraps.values():
+            ep = w.get("enc_pub")
+            if ep is not None and not _is_hex64(ep):
+                return False, "bad enc_pub"
         return True, "ok"
     return False, "unknown kind"
 
