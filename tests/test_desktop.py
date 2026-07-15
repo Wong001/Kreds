@@ -256,7 +256,7 @@ def test_launch_exits_zero_when_already_running(tmp_path, monkeypatch):
 def test_start_node_passes_tor_and_web_dir_through(tmp_path, monkeypatch):
     captured = {}
     async def fake_run_serve(data_dir, gossip_port, http_port, tor=False,
-                             shutdown=None, web_dir=None):
+                             shutdown=None, web_dir=None, status=None):
         captured.update(data_dir=data_dir, gossip_port=gossip_port,
                         http_port=http_port, tor=tor, web_dir=web_dir,
                         shutdown=shutdown)
@@ -282,7 +282,7 @@ def test_start_node_tor_off_keeps_gossip_port_zero(tmp_path, monkeypatch):
     # gossip_port=0 ("any free port") is correct and must NOT change.
     captured = {}
     async def fake_run_serve(data_dir, gossip_port, http_port, tor=False,
-                             shutdown=None, web_dir=None):
+                             shutdown=None, web_dir=None, status=None):
         captured["gossip_port"] = gossip_port
     monkeypatch.setattr(desktop, "run_serve", fake_run_serve)
     t, holder = desktop._start_node(tmp_path, 5556, tmp_path / "web", False)
@@ -369,16 +369,8 @@ def test_log_error_writes_app_log(tmp_path):
     text = (tmp_path / "app.log").read_text(encoding="utf-8")
     assert "boom" in text
 
-def test_handle_start_failure_logs_and_avoids_real_gui(tmp_path, monkeypatch):
-    shown = []
-    monkeypatch.setattr(desktop, "_show_error_window",
-                        lambda wv, msg: shown.append(msg))
-    holder = {"error": "kaboom traceback"}
-    desktop._handle_start_failure(tmp_path, _FakeThread(False), holder)
-    log = (tmp_path / "app.log").read_text(encoding="utf-8")
-    assert "node thread died" in log
-    assert "kaboom traceback" in log
-    assert len(shown) == 1                       # error window path was taken, not a hang
+# start-failure handling moved into _watch_ready (window-first launch,
+# 0.3.11) -- covered by tests/test_desktop_status.py.
 
 
 def test_launch_frozen_tor_on_passes_nonzero_gossip_port_to_run_serve(tmp_path, monkeypatch):
@@ -392,7 +384,7 @@ def test_launch_frozen_tor_on_passes_nonzero_gossip_port_to_run_serve(tmp_path, 
 
     captured = {}
     async def fake_run_serve(data_dir, gossip_port, http_port, tor=False,
-                             shutdown=None, web_dir=None):
+                             shutdown=None, web_dir=None, status=None):
         captured.update(gossip_port=gossip_port, tor=tor)
         await shutdown.wait()          # block like the real node until asked to stop
     monkeypatch.setattr(desktop, "run_serve", fake_run_serve)
@@ -401,6 +393,7 @@ def test_launch_frozen_tor_on_passes_nonzero_gossip_port_to_run_serve(tmp_path, 
 
     class FakeWindow:
         def destroy(self): pass
+        def load_url(self, url): pass   # _watch_ready navigates on ready
     monkeypatch.setattr("webview.create_window", lambda *a, **k: FakeWindow())
     monkeypatch.setattr("webview.start", lambda **k: None)  # returns immediately, no real GUI (accepts debug=)
 

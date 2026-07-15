@@ -88,6 +88,19 @@ class Api:
     def is_desktop(self):
         return True
 
+    def get_startup_status(self):
+        """Polled by the loading page (and app.js's onboarding poll):
+        {"stage": ..., "pct": ...} mirroring runner's status callback via
+        holder["startup"]. A recorded node-thread error overrides everything
+        as stage "failed" - the loading page renders it in place (no
+        separate error window)."""
+        if "error" in self._holder:
+            return {"stage": "failed",
+                    "error": str(self._holder["error"])
+                    + "\n\nSee app.log in the Kreds data folder."}
+        return dict(self._holder.get("startup")
+                    or {"stage": "starting", "pct": None})
+
     def minimize(self):
         if self.window: self.window.minimize()
 
@@ -254,9 +267,14 @@ def _notify_already_running() -> None:
     full webview window since there is nothing else to show."""
     try:
         import ctypes
+        # Copy covers the startup phase too: a second click during a slow
+        # Tor bootstrap is most likely a double-launch, not a hidden
+        # instance.
         ctypes.windll.user32.MessageBoxW(
-            0, "Kreds is already running. It may be in the background - "
-            "check your system tray.", "Kreds", 0x40)  # MB_ICONINFORMATION
+            0, "Kreds is already running or still starting up. If it just "
+            "launched, give it a moment - the window appears when it is "
+            "ready. Otherwise check the system tray.",
+            "Kreds", 0x40)  # MB_ICONINFORMATION
     except Exception:
         pass
 
@@ -330,6 +348,12 @@ def _start_node(data_dir: Path, port: int, web_dir: Path, use_tor: bool):
     run_serve is captured into holder["error"] instead of dying silently in
     the background thread."""
     holder: dict = {}
+    holder["startup"] = {"stage": "starting", "pct": None}
+
+    def _status(stage, pct=None):
+        # Whole-dict replacement (not mutation): the GUI thread reads this
+        # concurrently via Api.get_startup_status.
+        holder["startup"] = {"stage": stage, "pct": pct}
 
     def _node_thread():
         loop = asyncio.new_event_loop()
@@ -347,7 +371,7 @@ def _start_node(data_dir: Path, port: int, web_dir: Path, use_tor: bool):
             gossip_port = _free_port() if use_tor else 0
             loop.run_until_complete(run_serve(
                 data_dir, gossip_port, port, tor=use_tor, shutdown=ev,
-                web_dir=web_dir))
+                web_dir=web_dir, status=_status))
         except BaseException:
             holder["error"] = traceback.format_exc()
         finally:
@@ -391,14 +415,112 @@ def _show_error_window(webview_module, message: str) -> None:
     webview_module.create_window("Kreds", html=html, width=480, height=260)
     webview_module.start()
 
-def _handle_start_failure(data_dir: Path, t: threading.Thread, holder: dict) -> None:
+
+# Window-first launch (launch loading states, 0.3.11): the window opens
+# immediately on _LOADING_HTML; _watch_ready navigates it to the app when
+# the node answers, or flips the page to its failed state via
+# holder["error"] (which Api.get_startup_status reports as stage "failed").
+
+# The tor ready-wait must exceed tor.py's own retry budget (2 x 90s
+# bootstrap attempts + 5s gap) plus AV-scan overhead on freshly written
+# binaries -- was 120, which a legitimately slow post-update cold bootstrap
+# overran, landing in the "always fails after an update" pattern.
+READY_TIMEOUT_TOR = 240.0
+READY_TIMEOUT_PLAIN = 25.0
+
+_LOADING_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  html, body { height: 100%; margin: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #17191b;
+         color: #e8e6e3; display: flex; flex-direction: column; }
+  .titlebar { height: 36px; flex: none; display: flex; align-items: stretch; }
+  .titlebar .pywebview-drag-region { flex: 1; }
+  .titlebar button { width: 46px; border: 0; background: transparent;
+          color: #9a9691; font-size: 14px; cursor: default; }
+  .titlebar button:hover { background: #c8102e; color: #fff; }
+  main { flex: 1; display: flex; flex-direction: column;
+         align-items: center; justify-content: center; gap: 18px; }
+  h1 { font-size: 28px; font-weight: 600; letter-spacing: 1px; margin: 0; }
+  #stage { color: #9a9691; font-size: 14px; min-height: 20px;
+           max-width: 80%; text-align: center; white-space: pre-wrap; }
+  #barbox { width: 260px; height: 4px; background: #2a2d30;
+            border-radius: 2px; overflow: hidden; }
+  #bar { width: 8%; height: 100%; background: #c8102e; border-radius: 2px;
+         transition: width .4s; }
+  #barbox.pulse #bar { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0% {margin-left:0%} 50% {margin-left:92%} 100% {margin-left:0%} }
+  .failed #barbox { display: none; }
+</style></head><body>
+<div class="titlebar"><span class="pywebview-drag-region"></span>
+<button onclick="doQuit()" title="Close">&#10005;</button></div>
+<main>
+  <h1>Kreds</h1>
+  <div id="barbox" class="pulse"><div id="bar"></div></div>
+  <div id="stage">Starting Kreds...</div>
+</main>
+<script>
+  function doQuit() {
+    try { window.pywebview.api.quit(); } catch (e) { /* bridge not up yet */ }
+  }
+  var COPY = { "starting": "Starting Kreds...",
+               "tor-binary": "Starting Kreds...",
+               "onion-publish": "Publishing your address...",
+               "serving": "Almost there...",
+               "ready": "Almost there..." };
+  var timer = setInterval(poll, 500);
+  async function poll() {
+    // the js_api bridge is injected asynchronously after page load --
+    // just keep trying until it exists
+    if (!window.pywebview || !window.pywebview.api) return;
+    var s;
+    try { s = await window.pywebview.api.get_startup_status(); }
+    catch (e) { return; }
+    if (!s) return;
+    var stageEl = document.getElementById("stage");
+    var barbox = document.getElementById("barbox");
+    var bar = document.getElementById("bar");
+    if (s.stage === "failed") {
+      clearInterval(timer);
+      document.body.classList.add("failed");
+      stageEl.textContent = "Kreds failed to start.\\n\\n" + (s.error || "");
+      return;
+    }
+    if (s.stage === "tor-bootstrap") {
+      var pct = (s.pct == null) ? 0 : s.pct;
+      stageEl.textContent = "Connecting to Tor - " + pct + "%";
+      barbox.classList.remove("pulse");
+      bar.style.width = Math.max(pct, 4) + "%";
+    } else {
+      stageEl.textContent = COPY[s.stage] || "Starting Kreds...";
+      barbox.classList.add("pulse");
+    }
+  }
+</script>
+</body></html>"""
+
+def _watch_ready(t: threading.Thread, holder: dict, port: int, window,
+                 data_dir: Path, use_tor: bool) -> None:
+    """Runs on a daemon thread beside the already-open loading window:
+    bounded wait for the node, then navigate the window to the app. On
+    failure, log exactly as the old pre-window _handle_start_failure did
+    and make sure holder["error"] is set -- the loading page's own polling
+    renders the failed state in place (no separate error window)."""
+    timeout = READY_TIMEOUT_TOR if use_tor else READY_TIMEOUT_PLAIN
+    if _await_node_ready(t, holder, port, timeout=timeout):
+        try:
+            # Thread-safe: pywebview's winforms backend marshals load_url
+            # onto the GUI thread (BrowserView.load_url -> self.Invoke).
+            window.load_url(f"http://127.0.0.1:{port}")
+        except Exception:
+            pass    # window destroyed while we waited (user quit during
+                    # startup) -- the process is on its way down
+        return
     reason = "node thread died before startup" if not t.is_alive() \
         else "node did not answer within the startup timeout"
     detail = holder.get("error", "")
     _log_error(data_dir, reason + ("\n" + detail if detail else ""))
-    _signal_shutdown(holder)
-    import webview                                   # LAZY (GUI dep)
-    _show_error_window(webview, "The Kreds node failed to start.")
+    if "error" not in holder:
+        holder["error"] = reason    # flips the loading page to failed
 
 
 def launch(data_dir=None):
@@ -419,22 +541,20 @@ def launch(data_dir=None):
         use_tor = _tor_enabled()
 
         t, holder = _start_node(data_dir, port, web, use_tor)
-        # Tor bootstrap is slow (TorProcess.start() allows ~90s) -- the
-        # ready-wait must exceed that or a legitimately slow-but-successful
-        # cold bootstrap gets declared "failed to start" mid-bootstrap
-        # (task review IMPORTANT). Dev's fast plain-TCP start stays quick.
-        timeout = 120.0 if use_tor else 25.0
-        if not _await_node_ready(t, holder, port, timeout=timeout):
-            _handle_start_failure(data_dir, t, holder)
-            return
 
+        # Window-first: open on the loading page immediately instead of
+        # blocking here through a (minutes-long, cold-Tor) startup with no
+        # window at all. _watch_ready does the bounded ready-wait beside it.
         import webview                              # LAZY (GUI dep not needed for import)
         api = Api(holder)
         window = webview.create_window(
-            "Kreds", url=f"http://127.0.0.1:{port}", frameless=True, js_api=api,
+            "Kreds", html=_LOADING_HTML, frameless=True, js_api=api,
             width=1100, height=760, min_size=(900, 600))
         api.window = window
         api._data_dir = data_dir
+        threading.Thread(target=_watch_ready,
+                         args=(t, holder, port, window, data_dir, use_tor),
+                         name="kreds-ready-watch", daemon=True).start()
         # Tray failures degrade, never block: without a tray the app still
         # runs and hide_to_tray falls back to minimize.
         try:
