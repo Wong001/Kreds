@@ -241,6 +241,7 @@ class SyncService:
         if self.node.store.sweep_expired():
             self.node.notify()
         self.node.store.prune_superseded_enckeys()
+        self.node.store.prune_superseded_wrap_grants()
         self.node.cache_message_keys()
 
     async def gossip_loop(self, interval: float = 3.0, now=None):
@@ -252,9 +253,21 @@ class SyncService:
             # Auto-lock tick brackets ONLY the sleep: baseline before,
             # check after, so the gap can't include the round's dial time
             # (the 0.3.11 misfire: one offline peer > 33s round -> lock).
-            self.node.stamp_autolock_tick()
+            # Guarded in its own try/except: maybe_autolock reads+parses
+            # applock.json, and a transient OSError/JSONDecodeError (a
+            # Windows read racing the settings endpoint's os.replace) must
+            # never propagate and permanently kill the gossip loop -- the
+            # next round retries the tick. The sleep stays outside so a
+            # failed stamp still yields the interval.
+            try:
+                self.node.stamp_autolock_tick()
+            except Exception:
+                pass
             await asyncio.sleep(interval)
-            self.node.maybe_autolock(interval)
+            try:
+                self.node.maybe_autolock(interval)
+            except Exception:
+                pass
 
     # -- pre-friend friend-add handshake (auto-delivery over Tor) ---------
     #

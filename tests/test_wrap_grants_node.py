@@ -86,6 +86,35 @@ def test_sweep_remints_after_recipient_enckey_rotation(tmp_path):
         freja.identity_pub)[freja.device.device_pub]
 
 
+def test_daily_rotation_sweep_and_prune_leave_one_grant_recipient_decrypts(tmp_path):
+    # The unbounded-accumulation fix end to end: each daily enc rotation
+    # stales the grant, the sweep re-mints a FULL-COVERAGE grant, and the
+    # prune collapses the pile back to one row per (author, target) -- while
+    # the recipient still decrypts via the surviving newest grant.
+    import time
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    mid = wong.compose_post("bagkatalog", scope="kreds", placement="profile")
+    befriend_with_enckeys(wong, freja)
+    wong.maintain_wrap_grants()                       # day 0: first mint
+    for _ in range(3):                                # 3 more daily rotations
+        freja.device.rotate_enc(time.time())
+        freja.ensure_enckey()
+        for m in freja.store.messages_not_in(
+                {}, {freja.identity_pub}, wong.identity_pub):
+            wong.store.ingest_message(m)
+        wong.maintain_wrap_grants()                   # stale -> re-mint
+    # 4 grant rows accumulated for this one post; prune keeps exactly one
+    assert wong.store.prune_superseded_wrap_grants() == 3
+    assert wong.store.prune_superseded_wrap_grants() == 0     # only one left
+    assert _grants(wong, mid)                                 # survivor holds
+    # the survivor is self-sufficient: freja ingests it and still decrypts
+    for m in wong.store.messages_not_in({}, {wong.identity_pub}, freja.identity_pub):
+        freja.store.ingest_message(m)
+    assert "bagkatalog" in [p["text"] for p in
+                           freja.posts_by(wong.identity_pub, "profile")]
+
+
 def test_sweep_noop_when_locked_or_no_friends(tmp_path):
     wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
     mid = wong.compose_post("alene", scope="kreds", placement="profile")

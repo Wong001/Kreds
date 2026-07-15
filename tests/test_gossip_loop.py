@@ -150,3 +150,43 @@ def test_gossip_loop_ticks_autolock_at_sleep_boundary(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
     assert calls[:4] == ["round", "stamp", "sleep", "tick"]
+
+
+def test_gossip_loop_survives_raising_autolock_tick(tmp_path, monkeypatch):
+    # maybe_autolock reads+parses applock.json; a transient OSError (a
+    # Windows read racing the settings endpoint's os.replace) must never
+    # kill the loop -- it sits OUTSIDE _gossip_round's guard, so it needs
+    # its own. Without the fix the first raise propagates out of gossip_loop
+    # and no second round ever runs.
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    svc = SyncService(node)
+    rounds = []
+
+    async def fake_round(interval=3.0, now=None):
+        rounds.append(1)
+    svc._gossip_round = fake_round
+
+    node.stamp_autolock_tick = lambda now=None: None
+    calls = {"n": 0}
+
+    def boom(interval):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("applock.json read raced os.replace")
+    node.maybe_autolock = boom
+
+    async def fake_sleep(interval):
+        if len(rounds) >= 2:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(sync.asyncio, "sleep", fake_sleep)
+
+    async def scenario():
+        loop_task = asyncio.create_task(svc.gossip_loop(interval=0.0))
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+    asyncio.run(scenario())
+
+    assert calls["n"] >= 1        # the raising maybe_autolock actually ran
+    assert len(rounds) >= 2       # and the loop survived into another round

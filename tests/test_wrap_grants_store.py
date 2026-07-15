@@ -3,7 +3,8 @@ negative-cache clearing, tombstone interactions), the author-filtered
 accessor, and grant GC on delete/expiry."""
 import time
 
-from hearth.messages import make_post, make_wrap_grant, make_delete
+from hearth.messages import (KIND_WRAP_GRANT, make_post, make_wrap_grant,
+                             make_delete)
 from hearth.node import HearthNode
 
 
@@ -134,6 +135,54 @@ def test_routing_gate_ignores_non_author_grants(tmp_path):
     offered = {m.msg_id for m in freja.store.messages_not_in(
         {}, {wong.identity_pub, freja.identity_pub}, mikkel.identity_pub)}
     assert mid not in offered              # her grant is inert for routing
+
+
+def test_prune_superseded_wrap_grants_keeps_newest(tmp_path):
+    # Daily enc rotation re-mints one grant per granted post per day; the
+    # prune must tombstone all but the latest per (author, target) so the
+    # table doesn't grow forever (mirrors prune_superseded_enckeys).
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    befriend_with_enckeys(wong, freja)
+    mid = _wall_post(wong)
+    g1 = make_wrap_grant(wong.device, mid, {"11" * 32: _wrap_entry()},
+                         now=1000.0)
+    g2 = make_wrap_grant(wong.device, mid, {"22" * 32: _wrap_entry()},
+                         now=2000.0)
+    g3 = make_wrap_grant(wong.device, mid, {"33" * 32: _wrap_entry()},
+                         now=3000.0)
+    for g in (g1, g2, g3):
+        assert wong.store.ingest_message(g).accepted
+    assert wong.store.prune_superseded_wrap_grants() == 2   # 3 rows -> 1
+    assert wong.store.is_tombstoned(g1.msg_id)
+    assert wong.store.is_tombstoned(g2.msg_id)
+    assert wong.store.message_kind(g3.msg_id) == KIND_WRAP_GRANT   # survivor
+    # the accessor now returns only the surviving (newest) grant's wraps
+    assert set(wong.store.wrap_grants(mid, wong.identity_pub)) == {"33" * 32}
+    assert wong.store.prune_superseded_wrap_grants() == 0   # idempotent
+
+
+def test_prune_superseded_wrap_grants_independent_per_author_and_target(tmp_path):
+    # Grouping is (identity_pub, target_id): different authors of the same
+    # target, and different targets of one author, prune independently.
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    befriend_with_enckeys(wong, freja)
+    a = _wall_post(wong, "a")
+    b = _wall_post(wong, "b")
+    # target a, author wong: two rows, older superseded
+    a1 = make_wrap_grant(wong.device, a, {"11" * 32: _wrap_entry()}, now=1.0)
+    a2 = make_wrap_grant(wong.device, a, {"22" * 32: _wrap_entry()}, now=2.0)
+    # target b, author wong: sole row, kept
+    b1 = make_wrap_grant(wong.device, b, {"44" * 32: _wrap_entry()}, now=1.0)
+    # target a, author freja: different (author,target) group -> kept
+    af = make_wrap_grant(freja.device, a, {"33" * 32: _wrap_entry()}, now=1.0)
+    for g in (a1, a2, b1, af):
+        assert wong.store.ingest_message(g).accepted
+    assert wong.store.prune_superseded_wrap_grants() == 1   # only a1 drops
+    assert wong.store.is_tombstoned(a1.msg_id)
+    for kept in (a2, b1, af):
+        assert wong.store.message_kind(kept.msg_id) == KIND_WRAP_GRANT
 
 
 def test_uncached_ids_include_grant_wrapped_posts(tmp_path):

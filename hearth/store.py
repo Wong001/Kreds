@@ -430,6 +430,43 @@ class Store:
                 self._db.commit()
             return pruned
 
+    def prune_superseded_wrap_grants(self) -> int:
+        """Tombstone (reason 'superseded') every wrap_grant row that is not
+        the latest for its (identity_pub, target_id), by the same
+        (created_at, seq) tie-break wrap_grants() unions with. Recipients
+        rotate enc keys daily (ENC_ROTATION_PERIOD), so maintain_wrap_grants
+        re-mints a fresh grant per granted wall post per day; without this
+        the wrap_grant table grows one row per granted post per day forever,
+        replicated to every friend -- exactly the growth
+        prune_superseded_enckeys exists to stop, one level up.
+
+        SAFE ONLY BECAUSE MINTS ARE FULL-COVERAGE. maintain_wrap_grants
+        wraps the content key to EVERY currently-grantable device on each
+        mint, so the newest grant per (author, target) covers every device
+        any older grant did. An older PARTIAL grant could cover a device the
+        newest one doesn't -- so reverting the sweep to missing-only mints
+        would make this prune silently strip a still-needed wrap. The
+        full-coverage mint and this prune must land, and stay, together.
+        Tombstone, never DELETE (see prune_superseded_enckeys for why)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT msg_id, identity_pub, target_id, created_at, seq "
+                "FROM messages WHERE kind=?", (KIND_WRAP_GRANT,)).fetchall()
+            latest = {}
+            for mid, ident, target, created, seq in rows:
+                cur = latest.get((ident, target))
+                if cur is None or (created, seq) > cur[1]:
+                    latest[(ident, target)] = (mid, (created, seq))
+            keep = {v[0] for v in latest.values()}
+            pruned = 0
+            for mid, *_rest in rows:
+                if mid not in keep:
+                    self._tombstone(mid, "superseded")
+                    pruned += 1
+            if pruned:
+                self._db.commit()
+            return pruned
+
     # -- reads -----------------------------------------------------------------------
 
     def profiles(self) -> Dict[str, str]:

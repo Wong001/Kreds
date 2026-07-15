@@ -1613,6 +1613,10 @@ class HearthNode:
                    if i != self.identity_pub]
         if not friends:
             return
+        # Hoist the per-friend enckey scan out of the post loop: it is
+        # identity-scoped, not post-scoped, so running it inside the loop
+        # was P*F kind-scan queries every ~3s round (whole-branch review).
+        friend_keys = {f: self.store.enckeys(f) for f in friends}
         for msg in self.store.post_messages(self.identity_pub):
             p = msg.payload
             if (p.get("placement", "journal") != "profile"
@@ -1620,26 +1624,34 @@ class HearthNode:
                 continue
             wrapped = set(p.get("wraps", {}))
             granted = self.store.wrap_grants(msg.msg_id, self.identity_pub)
-            missing = {}
+            grantable = {}       # every current friend device the post does
+                                 # NOT already wrap -> its CURRENT enc key
+            missing = False      # any grantable device lacking coverage?
             for friend in friends:
-                for dpub, enc_pub in self.store.enckeys(friend).items():
+                for dpub, enc_pub in friend_keys[friend].items():
                     if dpub in wrapped:
                         continue
+                    grantable[dpub] = enc_pub
                     g = granted.get(dpub)
-                    # covered only if the grant's wrap was sealed to the
-                    # device's CURRENT enc key (enc_pub annotation from
-                    # mint time; a pre-annotation grant counts as covered)
-                    if g is not None and g.get("enc_pub", enc_pub) == enc_pub:
-                        continue
-                    missing[dpub] = enc_pub
+                    # covered only if a prior grant sealed to the device's
+                    # CURRENT enc key (enc_pub annotation from mint time; a
+                    # pre-annotation grant counts as covered)
+                    if g is None or g.get("enc_pub", enc_pub) != enc_pub:
+                        missing = True
             if not missing:
                 continue
             key, aad = self._content_key(msg)
             if key is None:
                 continue    # own post yet unrecoverable: never mint garbage
-            wraps = wrap_key(key, missing, aad)
+            # FULL-COVERAGE mint: wrap to ALL currently-grantable devices,
+            # not just the missing ones, so the newest grant per (author,
+            # target) is self-sufficient. This is the invariant
+            # store.prune_superseded_wrap_grants relies on to safely
+            # tombstone every older (possibly partial) grant -- the two
+            # must stay together.
+            wraps = wrap_key(key, grantable, aad)
             for dpub in wraps:
-                wraps[dpub]["enc_pub"] = missing[dpub]
+                wraps[dpub]["enc_pub"] = grantable[dpub]
             if wraps:
                 self._publish(make_wrap_grant(self.device, msg.msg_id,
                                               wraps, now=now))
