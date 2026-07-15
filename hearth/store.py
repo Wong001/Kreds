@@ -15,8 +15,8 @@ from .identity import (
 )
 from .messages import (
     KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_ENCKEY, KIND_POST, KIND_PROFILE,
-    KIND_PROFILE_LAYOUT, KIND_RING, KIND_STORY, MAX_BLOB_BYTES, blob_hash,
-    validate_payload,
+    KIND_PROFILE_LAYOUT, KIND_RING, KIND_STORY, KIND_WRAP_GRANT,
+    MAX_BLOB_BYTES, blob_hash, validate_payload,
 )
 
 _SCHEMA = """
@@ -275,7 +275,7 @@ class Store:
 
             kind = msg.payload["kind"]
             target = (msg.payload.get("target")
-                      if kind == KIND_DELETE else None)
+                      if kind in (KIND_DELETE, KIND_WRAP_GRANT) else None)
             recipient = (msg.payload.get("to")
                          if kind == KIND_DM else None)
             deleted_target = None
@@ -299,6 +299,16 @@ class Store:
                                             mid)
                     self._tombstone(target, "deleted")
                     deleted_target = target
+                # "A wall is a wall" GC: a deleted post's grants must stop
+                # gossiping too (mirror of the meta-delete hygiene below).
+                # Keyed on the delete's target regardless of whether the
+                # post row was present -- grants can be held even when the
+                # post row never arrived or died earlier.
+                for (g,) in self._db.execute(
+                        "SELECT msg_id FROM messages WHERE kind=?"
+                        " AND target_id=?",
+                        (KIND_WRAP_GRANT, target)).fetchall():
+                    self._tombstone(g, "invalid")
             else:
                 # A delete tag for this message may have gossiped in first
                 # (out-of-order delivery hits every kind, not just posts).
@@ -313,6 +323,15 @@ class Store:
                     self.gc_blobs()
                     return IngestResult(True, "deleted on arrival", mid,
                                         deleted_target=mid)
+
+            if kind == KIND_WRAP_GRANT and self.is_tombstoned(target):
+                # Target already deleted/expired. Views were saved above,
+                # so the seq is consumed; tombstone the grant so peers
+                # stop offering it (a bare refusal would leave a summary
+                # gap and re-offers forever).
+                self._tombstone(mid, "invalid")
+                self._db.commit()
+                return IngestResult(True, "grant for tombstoned target", mid)
 
             self._db.execute(
                 "INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -329,6 +348,12 @@ class Store:
                         "SELECT msg_id FROM messages WHERE kind=?"
                         " AND target_id=?", (KIND_DELETE, mid)).fetchall():
                     self._tombstone(bad, "invalid")
+            if kind == KIND_WRAP_GRANT:
+                # Un-poison: the post row may have arrived first, failed to
+                # decrypt, and been negative-cached -- this grant is exactly
+                # the missing key material, so let the next sweep retry.
+                self._db.execute("DELETE FROM undecryptable WHERE msg_id=?",
+                                 (target,))
             self._db.commit()
             if deleted_target:
                 self.gc_blobs()
@@ -365,6 +390,10 @@ class Store:
                 " AND expires_at<=?", (now,))]
             for mid in swept:
                 self._tombstone(mid, "expired")
+                for (g,) in self._db.execute(
+                        "SELECT msg_id FROM messages WHERE kind=?"
+                        " AND target_id=?", (KIND_WRAP_GRANT, mid)).fetchall():
+                    self._tombstone(g, "expired")
             self._db.commit()
             if swept:
                 self.gc_blobs()
@@ -532,6 +561,25 @@ class Store:
                 if dpub not in best or rank > best[dpub][0]:
                     best[dpub] = (rank, p["enc_pub"])
             return {d: (rank[0], pub) for d, (rank, pub) in best.items()}
+
+    def wrap_grants(self, target_msg_id: str,
+                    author_identity: str) -> dict:
+        """device_pub -> wrap entry, unioned over every wrap-grant BY THAT
+        AUTHOR for this target; later mints override earlier per device
+        (a re-mint after enc-key rotation supersedes the stale wrap).
+        Author-filtered on purpose: a grant is only honored when signed by
+        the post's own author -- anyone else's 'grant' must neither widen
+        routing nor feed key resolution (see messages_not_in and
+        node._content_key)."""
+        with self._lock:
+            out: dict = {}
+            for (mj,) in self._db.execute(
+                    "SELECT msg_json FROM messages WHERE kind=?"
+                    " AND target_id=? AND identity_pub=?"
+                    " ORDER BY created_at ASC, seq ASC",
+                    (KIND_WRAP_GRANT, target_msg_id, author_identity)):
+                out.update(json.loads(mj)["payload"].get("wraps", {}))
+            return out
 
     def enckeys(self, identity_pub: str) -> Dict[str, str]:
         return {d: pub for d, (_, pub) in
