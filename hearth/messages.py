@@ -97,12 +97,13 @@ def make_profile(device: DeviceKeys, name: str, bio: str = "",
                  accent: str = "#2743d6", avatar: Optional[str] = None,
                  avatar_shape: str = "circle", avatar_size: str = "m",
                  avatar_align: str = "left", banner: Optional[str] = None,
+                 banner_pos: int = 50,
                  now: Optional[float] = None) -> SignedMessage:
     return device.sign_message({
         "kind": KIND_PROFILE, "name": name, "bio": bio, "accent": accent,
         "avatar": avatar, "avatar_shape": avatar_shape,
         "avatar_size": avatar_size, "avatar_align": avatar_align,
-        "banner": banner, "created_at": _now(now),
+        "banner": banner, "banner_pos": banner_pos, "created_at": _now(now),
     })
 
 
@@ -265,6 +266,9 @@ def validate_payload(p: dict) -> Tuple[bool, str]:
             return False, "bad avatar_size"
         if p.get("avatar_align", "left") not in AVATAR_ALIGNS:
             return False, "bad avatar_align"
+        bp = p.get("banner_pos", 50)
+        if not isinstance(bp, int) or isinstance(bp, bool) or not 0 <= bp <= 100:
+            return False, "bad banner_pos"
         return True, "ok"
     if kind == KIND_DELETE:
         if not _is_hex64(p.get("target")):

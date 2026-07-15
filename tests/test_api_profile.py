@@ -75,3 +75,20 @@ def test_state_includes_accent(tmp_path):
     n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
     c = TestClient(build_app(n))
     assert c.get("/api/state").json()["accent"] == "#2743d6"
+
+
+def test_post_profile_banner_pos_roundtrip(tmp_path):
+    c, node = client(tmp_path)
+    r = c.post("/api/profile", data={"name": "Wong", "banner_pos": "15"},
+               files=[("banner", ("b.png", png(1200, 400), "image/png"))])
+    assert r.status_code == 200
+    prof = c.get(f"/api/profile/{node.identity_pub}").json()
+    assert prof["banner_pos"] == 15
+
+
+def test_post_profile_banner_pos_bad_400_and_absent_default(tmp_path):
+    c, node = client(tmp_path)
+    assert c.post("/api/profile",
+                  data={"name": "Wong", "banner_pos": "150"}).status_code == 400
+    assert c.post("/api/profile", data={"name": "Wong"}).status_code == 200
+    assert c.get(f"/api/profile/{node.identity_pub}").json()["banner_pos"] == 50

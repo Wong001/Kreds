@@ -687,7 +687,8 @@ class HearthNode:
     def set_profile(self, name: str, bio: str = "",
                     accent: str = "#2743d6", avatar_bytes=None,
                     avatar_shape: str = "circle", avatar_size: str = "m",
-                    avatar_align: str = "left", banner_bytes=None) -> str:
+                    avatar_align: str = "left", banner_bytes=None,
+                    banner_pos=None) -> str:
         current = self.store.profile(self.identity_pub) or {}
         avatar = current.get("avatar")
         banner = current.get("banner")
@@ -695,10 +696,15 @@ class HearthNode:
             avatar = self.store.put_blob(transcode(avatar_bytes, AVATAR_MAX))
         if banner_bytes is not None:
             banner = self.store.put_blob(transcode(banner_bytes, BANNER_MAX))
+        if banner_pos is None:                       # editor didn't touch the crop
+            banner_pos = current.get("banner_pos", 50)
+        if not isinstance(banner_pos, int) or isinstance(banner_pos, bool) \
+                or not 0 <= banner_pos <= 100:       # pre-check -> 400, not a 500 from _publish
+            raise ValueError("bad banner_pos")
         return self._publish(make_profile(
             self.device, name, bio=bio, accent=accent, avatar=avatar,
             avatar_shape=avatar_shape, avatar_size=avatar_size,
-            avatar_align=avatar_align, banner=banner))
+            avatar_align=avatar_align, banner=banner, banner_pos=banner_pos))
 
     def set_profile_layout(self, order: List[str]) -> str:
         # Pre-validate (mirrors set_ring/compose_post) so a bad order surfaces
@@ -1102,7 +1108,8 @@ class HearthNode:
                        identity_pub, identity_pub[:8]),
                    "bio": "", "accent": "#2743d6", "avatar": None,
                    "avatar_shape": "circle", "avatar_size": "m",
-                   "avatar_align": "left", "banner": None}
+                   "avatar_align": "left", "banner": None,
+                   "banner_pos": 50}
         ring, since = (("kreds", None) if identity_pub == self.identity_pub
                        else self._ring_and_since(identity_pub))
         # The collage is geometry-ruled (spec 2026-07-13): pins say where a

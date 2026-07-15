@@ -505,6 +505,7 @@ class Store:
                 "avatar_size": best.get("avatar_size", "m"),
                 "avatar_align": best.get("avatar_align", "left"),
                 "banner": best.get("banner"),
+                "banner_pos": best.get("banner_pos", 50),
             }
 
     def profile_layout(self, identity_pub: str) -> dict:

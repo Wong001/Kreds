@@ -468,6 +468,7 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
                       avatar_shape: str = Form("circle"),
                       avatar_size: str = Form("m"),
                       avatar_align: str = Form("left"),
+                      banner_pos: Optional[int] = Form(default=None),
                       avatar: UploadFile = File(default=None),
                       banner: UploadFile = File(default=None)):
         if not _is_hex_color(accent):
@@ -491,7 +492,8 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         _400(lambda: node.set_profile(
             name, bio=bio, accent=accent, avatar_bytes=av_bytes,
             avatar_shape=avatar_shape, avatar_size=avatar_size,
-            avatar_align=avatar_align, banner_bytes=bn_bytes))
+            avatar_align=avatar_align, banner_bytes=bn_bytes,
+            banner_pos=banner_pos))
         return {"ok": True}
 
     @app.post("/api/device/revoke")

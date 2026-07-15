@@ -63,3 +63,27 @@ def test_accent_membership_case_insensitive_not_required():
     assert validate_payload({"kind": "profile", "name": "W",
                              "accent": "#2743D6", "created_at": 1.0})[0] \
         is False
+
+
+def test_banner_pos_roundtrip_and_default():
+    # banner_pos (spec 2026-07-15): vertical background-position percent,
+    # 0 = top of the image, 100 = bottom, default 50 (center). Additive -
+    # old validators ignore unknown fields, so no protocol bump.
+    d = device()
+    m = make_profile(d, "Wong", banner="cd" * 32, banner_pos=10)
+    assert m.payload["banner_pos"] == 10
+    assert validate_payload(m.payload) == (True, "ok")
+    assert make_profile(d, "Wong").payload["banner_pos"] == 50   # default
+
+
+def test_banner_pos_validation_bounds():
+    ok = lambda p: validate_payload(p)[0]
+    base = {"kind": "profile", "name": "Wong", "created_at": 1.0}
+    assert ok(base)                                  # absent -> default 50
+    assert ok({**base, "banner_pos": 0})
+    assert ok({**base, "banner_pos": 100})
+    assert not ok({**base, "banner_pos": -1})
+    assert not ok({**base, "banner_pos": 101})
+    assert not ok({**base, "banner_pos": 50.5})      # int only
+    assert not ok({**base, "banner_pos": True})      # bool is not an int here
+    assert not ok({**base, "banner_pos": "50"})

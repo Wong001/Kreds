@@ -65,3 +65,23 @@ def test_profile_view_includes_own_posts(tmp_path):
     v = n.profile_view(n.identity_pub)
     assert [p["text"] for p in v["journal"]] == ["hello world"]
     assert v["wall"] == []
+
+
+def test_banner_pos_saved_and_carried_forward(tmp_path):
+    n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    n.set_profile("Wong", banner_bytes=png(1200, 400), banner_pos=20)
+    p = n.store.profile(n.identity_pub)
+    assert p["banner_pos"] == 20 and p["banner"] is not None
+    n.set_profile("Wong Two")                # no banner_pos: keep stored
+    p = n.store.profile(n.identity_pub)
+    assert p["banner_pos"] == 20 and p["name"] == "Wong Two"
+    assert n.profile_view(n.identity_pub)["banner_pos"] == 20
+
+
+def test_banner_pos_default_and_bad_value(tmp_path):
+    n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    n.set_profile("Wong")
+    assert n.store.profile(n.identity_pub)["banner_pos"] == 50
+    assert n.profile_view(n.identity_pub)["banner_pos"] == 50
+    with pytest.raises(ValueError):
+        n.set_profile("Wong", banner_pos=101)
