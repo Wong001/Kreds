@@ -520,9 +520,18 @@ class Store:
         with self._lock:
             out = []
             peer_devices = set(self.load_views(peer_identity).keys())
-            for ipub, dpub, seq, kind, rcpt, mj in self._db.execute(
-                    "SELECT identity_pub, device_pub, seq, kind, recipient,"
-                    " msg_json FROM messages ORDER BY seq ASC"):
+            # (author, target) -> devices named by the AUTHOR's own grants.
+            # Author-keyed so a hostile friend's grant for someone else's
+            # post can never widen that post's audience.
+            grant_devs: Dict[tuple, set] = {}
+            for gipub, gtarget, gmj in self._db.execute(
+                    "SELECT identity_pub, target_id, msg_json FROM messages"
+                    " WHERE kind=?", (KIND_WRAP_GRANT,)):
+                grant_devs.setdefault((gipub, gtarget), set()).update(
+                    json.loads(gmj)["payload"].get("wraps", {}))
+            for mid, ipub, dpub, seq, kind, rcpt, mj in self._db.execute(
+                    "SELECT msg_id, identity_pub, device_pub, seq, kind,"
+                    " recipient, msg_json FROM messages ORDER BY seq ASC"):
                 if ipub not in entitled:
                     continue
                 if kind == KIND_DM and peer_identity not in (ipub, rcpt):
@@ -531,8 +540,13 @@ class Store:
                     continue          # ring records are author-private
                 if kind == KIND_POST:
                     wr = set(json.loads(mj)["payload"].get("wraps", {}))
+                    wr |= grant_devs.get((ipub, mid), set())
                     if peer_identity != ipub and not (peer_devices & wr):
-                        continue      # only the wrap-set audience + author
+                        continue      # wrap-set union grant audience + author
+                if kind == KIND_WRAP_GRANT:
+                    wr = set(json.loads(mj)["payload"].get("wraps", {}))
+                    if peer_identity != ipub and not (peer_devices & wr):
+                        continue      # grants route to named devices + author
                 dev = summaries.get(ipub, {}).get(dpub)
                 if dev is not None and SeenSet.summary_has(dev, seq):
                     continue
@@ -705,7 +719,12 @@ class Store:
                     if ipub == self_identity:
                         out.append(mid); continue
                     my_devs = set(self.load_views(self_identity).keys())
-                    if my_devs & set(json.loads(mj)["payload"].get("wraps", {})):
+                    wrapped = set(json.loads(mj)["payload"].get("wraps", {}))
+                    if not (my_devs & wrapped):
+                        # not in the at-post-time audience -- but a wall
+                        # wrap-grant from the author may cover us
+                        wrapped |= set(self.wrap_grants(mid, ipub))
+                    if my_devs & wrapped:
                         out.append(mid)
             return out
 

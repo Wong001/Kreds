@@ -94,3 +94,58 @@ def test_sweep_expired_gcs_grants_of_expired_targets(tmp_path):
     wong.store.sweep_expired(now=time.time() + 5)
     assert wong.store.wrap_grants(mid, wong.identity_pub) == {}
     assert wong.store.is_tombstoned(g.msg_id)
+
+
+def test_routing_gate_offers_granted_post(tmp_path):
+    # Freja was NOT wrapped at post time; a grant naming her device must
+    # open the offer gate for the post AND for the grant itself.
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    mid = _wall_post(wong)                          # composed pre-friendship
+    befriend_with_enckeys(wong, freja)
+    offered = {m.msg_id for m in wong.store.messages_not_in(
+        {}, {wong.identity_pub}, freja.identity_pub)}
+    assert mid not in offered                       # not wrapped, no grant
+    g = make_wrap_grant(wong.device, mid,
+                        {freja.device.device_pub: _wrap_entry()})
+    assert wong.store.ingest_message(g).accepted
+    offered = {m.msg_id for m in wong.store.messages_not_in(
+        {}, {wong.identity_pub}, freja.identity_pub)}
+    assert mid in offered                           # grant opened the gate
+    assert g.msg_id in offered                      # grant routes to named device
+
+
+def test_routing_gate_ignores_non_author_grants(tmp_path):
+    # A grant signed by someone OTHER than the post's author must not
+    # widen the post's audience (hostile-friend containment).
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    mikkel = HearthNode.create(tmp_path / "m", "Mikkel", "mikkel-phone")
+    befriend_with_enckeys(wong, freja); befriend_with_enckeys(wong, mikkel)
+    befriend_with_enckeys(freja, mikkel)
+    wong.set_ring(freja.identity_pub, "inner")
+    mid = wong.compose_post("kun inner", scope="inner", placement="profile")
+    # Freja (holds the post) maliciously "grants" it to Mikkel
+    g = make_wrap_grant(freja.device, mid,
+                        {mikkel.device.device_pub: _wrap_entry()})
+    for m in wong.store.messages_not_in({}, {wong.identity_pub}, freja.identity_pub):
+        freja.store.ingest_message(m)
+    assert freja.store.ingest_message(g).accepted
+    offered = {m.msg_id for m in freja.store.messages_not_in(
+        {}, {wong.identity_pub, freja.identity_pub}, mikkel.identity_pub)}
+    assert mid not in offered              # her grant is inert for routing
+
+
+def test_uncached_ids_include_grant_wrapped_posts(tmp_path):
+    wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    mid = _wall_post(wong)
+    befriend_with_enckeys(wong, freja)
+    # freja holds the row but is not in payload wraps
+    post = wong.store.get_message(mid)
+    freja.store.ingest_message(post)
+    assert mid not in freja.store.uncached_message_ids(freja.identity_pub)
+    g = make_wrap_grant(wong.device, mid,
+                        {freja.device.device_pub: _wrap_entry()})
+    freja.store.ingest_message(g)
+    assert mid in freja.store.uncached_message_ids(freja.identity_pub)
