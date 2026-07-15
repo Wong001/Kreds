@@ -1055,7 +1055,12 @@ function openBlockSettings(p, block, opener, focusSel) {
     del.type = "button";
     del.onclick = async () => {
       if (!await deleteEverywhere(p.msg_id)) return;
-      closeBlockSettings();                       // the block is gone
+      // The opener (gear) is doomed with its post - drop it BEFORE the
+      // close so focus-restore can't re-arm a stale settings modal during
+      // the refresh round-trip (same end state as reopenAfterAction's
+      // deleted-meanwhile path: nothing sensible left to focus).
+      BLOCK_SETTINGS_OPENER = null;
+      closeBlockSettings();
       await refresh();
       if (currentView() === "profile" && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
     };

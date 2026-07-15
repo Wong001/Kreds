@@ -610,8 +610,8 @@ body.desktop .desktop-only-panel { display: block; }
 .block:hover .block-settings-btn, .block:focus-within .block-settings-btn,
 .block.arranging .block-settings-btn { opacity: 1; }
 @media (pointer: coarse) { .block .block-settings-btn { opacity: 1; } }
-.settings-del { color: var(--red); }
-.settings-del:hover { background: var(--red-soft); }
+.settings-opt.settings-del { color: var(--red); }
+.settings-opt.settings-del:hover { background: var(--red-soft); }
 /* Arrange-mode collage affordances (Task 6): the dragged block stays put in
    the DOM (no more reorder-by-reparenting) and just dims - the ghost below
    previews the cell target instead. */

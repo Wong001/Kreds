@@ -602,7 +602,12 @@ In `openBlockSettings`, after the `if (p.album) { ... body.append(ungroup); }` b
     del.type = "button";
     del.onclick = async () => {
       if (!await deleteEverywhere(p.msg_id)) return;
-      closeBlockSettings();                       // the block is gone
+      // The opener (gear) is doomed with its post - drop it BEFORE the
+      // close so focus-restore can't re-arm a stale settings modal during
+      // the refresh round-trip (same end state as reopenAfterAction's
+      // deleted-meanwhile path: nothing sensible left to focus).
+      BLOCK_SETTINGS_OPENER = null;
+      closeBlockSettings();
       await refresh();
       if (currentView() === "profile" && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
     };
@@ -621,9 +626,11 @@ In `style.css`, add AFTER the existing `.block-settings-btn:hover` rule (~line 6
 .block:hover .block-settings-btn, .block:focus-within .block-settings-btn,
 .block.arranging .block-settings-btn { opacity: 1; }
 @media (pointer: coarse) { .block .block-settings-btn { opacity: 1; } }
-.settings-del { color: var(--red); }
-.settings-del:hover { background: var(--red-soft); }
+.settings-opt.settings-del { color: var(--red); }
+.settings-opt.settings-del:hover { background: var(--red-soft); }
 ```
+
+(Compound selector, not bare `.settings-del`: a bare class ties on specificity with the later `.settings-opt { color: var(--ink); }` rule and loses the cascade — same precedent as `.pact.del`.)
 
 Also DELETE the now-dead positional rule `.block .del { position: absolute; bottom: 6px; left: 6px; right: auto; z-index: 2; }` (~line 570) and its two comment lines — the wall no longer renders a `.pact del` (journal's `.pact.del` styling at ~line 340 stays).
 

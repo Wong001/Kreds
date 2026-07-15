@@ -1449,6 +1449,9 @@ def test_delete_everywhere_rehomed_into_block_settings():
     assert "block-settings-btn" in rb              # gear on every own block
     obs = _js_fn_body(js, "openBlockSettings")
     assert "Delete everywhere" in obs and "deleteEverywhere" in obs
+    # Review fix: the doomed gear is dropped as opener BEFORE the close so
+    # focus-restore can't re-arm a stale modal during the refresh round-trip.
+    assert "BLOCK_SETTINGS_OPENER = null" in obs
     assert "Delete everywhere" in _js_fn_body(js, "buildEntry")
 
 
@@ -1458,3 +1461,7 @@ def test_block_gear_hover_revealed_outside_arrange():
     assert "opacity: 0" in rule
     assert ".block:hover .block-settings-btn" in css
     assert "pointer: coarse" in css                # touch always shows it
+    # Review fix: bare .settings-del ties with the later .settings-opt color
+    # rule and loses the cascade - the compound selector wins on specificity
+    # (same precedent as .pact.del).
+    assert ".settings-opt.settings-del" in css
