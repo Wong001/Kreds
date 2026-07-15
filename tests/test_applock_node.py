@@ -246,6 +246,18 @@ def test_migration_write_failure_does_not_crash_boot(tmp_path, monkeypatch):
     assert on_disk["settings"]["lock_on_sleep"] is False
 
 
+def test_corrupt_applock_json_does_not_brick_boot(tmp_path):
+    """A corrupt/unreadable applock.json must not raise out of
+    HearthNode.__init__ (the migration read is guarded): the node boots
+    locked, and the record recovers at unlock time as before."""
+    n = _node(tmp_path)
+    n.enable_applock("1234", "pin")
+    (n.data_dir / "applock.json").write_text("{ not valid json at all",
+                                             encoding="utf-8")
+    n2 = HearthNode(n.data_dir)                   # must NOT raise
+    assert n2.locked is True
+
+
 def test_already_migrated_record_untouched_on_boot(tmp_path):
     """Idempotency at the node level: a record already marked settings_v=2
     with lock_on_sleep re-enabled by the user must survive a reboot

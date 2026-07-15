@@ -511,9 +511,12 @@ def _watch_ready(t: threading.Thread, holder: dict, port: int, window,
             # Thread-safe: pywebview's winforms backend marshals load_url
             # onto the GUI thread (BrowserView.load_url -> self.Invoke).
             window.load_url(f"http://127.0.0.1:{port}")
-        except Exception:
-            pass    # window destroyed while we waited (user quit during
-                    # startup) -- the process is on its way down
+        except Exception as e:
+            # window destroyed while we waited (user quit during startup) --
+            # the process is on its way down. Still log (not a bare pass) so a
+            # navigation failure that ISN'T a quit leaves evidence in app.log.
+            _log_error(data_dir,
+                       "loading-page navigation failed: " + repr(e))
         return
     reason = "node thread died before startup" if not t.is_alive() \
         else "node did not answer within the startup timeout"
@@ -521,6 +524,10 @@ def _watch_ready(t: threading.Thread, holder: dict, port: int, window,
     _log_error(data_dir, reason + ("\n" + detail if detail else ""))
     if "error" not in holder:
         holder["error"] = reason    # flips the loading page to failed
+    # Past the (240s) tor-exceeding timeout the node is not legitimately
+    # mid-bootstrap; a "failed" screen over a live, syncing node is
+    # dishonest, so tear it down (restores the pre-window-first semantics).
+    _signal_shutdown(holder)
 
 
 def launch(data_dir=None):

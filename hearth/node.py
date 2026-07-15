@@ -147,9 +147,20 @@ class HearthNode:
             # settings_v marker to OFF, once. applock.migrate_settings is
             # idempotent (a record already marked, or one where the user
             # re-enabled the setting since, is returned unchanged).
-            applock_record = json.loads(self._applock_path.read_text())
-            applock_record, applock_migrated = applock.migrate_settings(
-                applock_record)
+            try:
+                applock_record = json.loads(self._applock_path.read_text())
+            except (OSError, ValueError):
+                # Corrupt/unreadable applock.json must NOT brick boot: skip
+                # the one-time settings migration this boot. The record
+                # recovers at unlock time exactly as before (unlock re-reads
+                # applock.json); until then the migration simply retries on a
+                # future boot once the file is readable again.
+                applock_record = None
+            if applock_record is not None:
+                applock_record, applock_migrated = applock.migrate_settings(
+                    applock_record)
+            else:
+                applock_migrated = False
             if applock_migrated:
                 try:
                     _atomic_write(self._applock_path,

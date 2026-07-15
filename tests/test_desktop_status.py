@@ -117,11 +117,29 @@ def test_watch_ready_timeout_tracks_tor_mode(tmp_path, monkeypatch):
 def test_watch_ready_survives_destroyed_window(tmp_path, monkeypatch):
     # The user can close the window while the watcher is still waiting;
     # load_url on the destroyed window must not spill an exception out of
-    # the watcher thread.
+    # the watcher thread -- but the failure is now logged, not swallowed.
     monkeypatch.setattr(desktop, "_await_node_ready",
                         lambda t, holder, port, timeout: True)
     desktop._watch_ready(_FakeThread(True), {}, 4321,
                          _FakeWindow(raise_on_load=True), tmp_path, False)
+    log = (tmp_path / "app.log").read_text(encoding="utf-8")
+    assert "navigation failed" in log
+
+
+def test_watch_ready_failure_signals_shutdown(tmp_path, monkeypatch):
+    # Past the ready timeout the node is not legitimately mid-bootstrap; a
+    # "failed" screen over a live node is dishonest, so the watcher tears
+    # the node down (restores the pre-window-first semantics).
+    import asyncio
+    monkeypatch.setattr(desktop, "_await_node_ready",
+                        lambda t, holder, port, timeout: False)
+    loop = asyncio.new_event_loop()
+    ev = asyncio.Event()
+    holder = {"loop": loop, "ev": ev}
+    desktop._watch_ready(_FakeThread(True), holder, 4321, _FakeWindow(),
+                         tmp_path, True)
+    loop.run_until_complete(asyncio.wait_for(ev.wait(), timeout=2))  # got set
+    loop.close()
 
 
 def test_loading_html_polls_status_and_maps_stages():

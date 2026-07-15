@@ -99,6 +99,46 @@ def test_tor_status_sequence(tmp_path, monkeypatch):
     assert boot == [0, 50, 100]
 
 
+def test_run_node_quit_during_tor_bootstrap_returns_and_stops_tor(
+        tmp_path, monkeypatch):
+    # Quitting DURING the (long) tor bootstrap must not wedge the node
+    # thread: run_node races own_tor.start against shutdown, returns
+    # promptly, and the finally still stops own_tor (so tor.exe isn't
+    # orphaned holding its fixed ports).
+    node_dir = tmp_path / "n"
+    HearthNode.create(node_dir, "Test Person", "test-device")
+
+    class _BlockingTor:
+        stopped = []
+
+        def __init__(self, exe, data_dir):
+            self.socks_port = 19050
+            self.control_port = 19051
+            self.cookie_path = data_dir / "control_auth_cookie"
+
+        async def start(self, bootstrap_timeout: float = 90.0, status=None):
+            if status is not None:
+                status(10)
+            await asyncio.Event().wait()          # never bootstraps
+
+        async def stop(self):
+            _BlockingTor.stopped.append(True)
+
+    async def scenario():
+        monkeypatch.setattr(runner, "ensure_tor_binary", lambda: "tor")
+        monkeypatch.setattr(runner, "TorProcess", _BlockingTor)
+        shutdown = asyncio.Event()
+        task = asyncio.create_task(runner.run_node(
+            node_dir, gossip_port=12345, http_port=_free_port(), tor=True,
+            shutdown=shutdown, status=lambda *a, **k: None))
+        await asyncio.sleep(0.2)                   # reach the blocking start
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=5)    # returns promptly
+
+    asyncio.run(scenario())
+    assert _BlockingTor.stopped                    # own_tor was stopped
+
+
 def test_run_serve_forwards_status_to_run_node(tmp_path, monkeypatch):
     """Enrolled dir: run_serve skips the bootstrap phase and must hand the
     status callback straight to run_node."""

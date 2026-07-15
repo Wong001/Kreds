@@ -36,8 +36,33 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
                 exe = ensure_tor_binary()
                 own_tor = TorProcess(exe, node.data_dir / "tordata")
                 status("tor-bootstrap", 0)
-                await own_tor.start(           # inside try: a failed start
-                    status=lambda pct: status("tor-bootstrap", pct))
+                # own_tor.start blocks ~90-185s; race it against a shutdown
+                # request so quitting DURING bootstrap doesn't leave the
+                # daemon thread wedged here and tor.exe orphaned (its fixed
+                # socks/control ports would then collide with the next
+                # launch). If shutdown wins, cancel the start and return --
+                # the finally still stops own_tor (cancelling start leaves
+                # its _proc set, so stop() can terminate it).
+                start_task = asyncio.ensure_future(own_tor.start(
+                    status=lambda pct: status("tor-bootstrap", pct)))
+                waiters = {start_task}
+                sd_task = (asyncio.ensure_future(shutdown.wait())
+                           if shutdown is not None else None)
+                if sd_task is not None:
+                    waiters.add(sd_task)
+                done, _pending = await asyncio.wait(
+                    waiters, return_when=asyncio.FIRST_COMPLETED)
+                if sd_task is not None and sd_task in done:  # quit mid-bootstrap
+                    start_task.cancel()
+                    await asyncio.gather(start_task, return_exceptions=True)
+                    return
+                if sd_task is not None:
+                    sd_task.cancel()
+                    try:
+                        await sd_task
+                    except asyncio.CancelledError:
+                        pass
+                await start_task               # re-raise a failed bootstrap
                 tor_process = own_tor          # is stopped by the finally
             sync = SyncService(node,
                                transport=TorTransport(tor_process.socks_port))
