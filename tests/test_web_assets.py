@@ -1505,6 +1505,10 @@ def test_settings_page_wiring_and_collapse_memory():
     assert "renderMeStrip" in body and 'setView("settings")' in body
     assert "kreds_settings_open_" in js              # collapse state remembered
     assert "openProfileEditor" not in js and "closeEditOverlay" not in js
+    # Settings > Friends is the friend-list home now - currentView() must
+    # report "settings" so a profile opened from there has PRIOR_VIEW set
+    # correctly and Back returns to Settings, not Journal.
+    assert '"settings"' in _js_fn_body(js, "currentView")
 
 
 def test_topbar_addfriend_popover():

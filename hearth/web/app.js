@@ -1622,7 +1622,7 @@ function currentView() {
   const vj = document.getElementById("view-journal");
   if (!vj.classList.contains("hidden") && vj.classList.contains("show-circle"))
     return "circle";
-  for (const v of ["journal", "messages", "profile"])
+  for (const v of ["journal", "messages", "profile", "settings"])
     if (!document.getElementById("view-" + v).classList.contains("hidden")) return v;
   return "journal";
 }
@@ -3696,7 +3696,9 @@ if (dmBtn) dmBtn.innerHTML = ICONS.send + "<span>Send</span>";
 // here is gated on window.pywebview - a plain browser (dev/demo) gets
 // none of it: no body.desktop class, #titlebar stays display:none via
 // its static .hidden class, and .desktop-only-panel (style.css) stays
-// display:none regardless of the panel's selfonly hidden-class state.
+// display:none regardless - the Desktop section lives on the cog-gated
+// Settings page now (index.html), not behind a self-view hidden-class
+// toggle.
 // pywebview may not have injected window.pywebview by the time this
 // script runs, so wireDesktopChrome is called on BOTH the "pywebviewready"
 // event it fires on window AND a boot-time check right below in case
