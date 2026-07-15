@@ -227,13 +227,6 @@ class SyncService:
             self.node.notify()
         self.node.store.prune_superseded_enckeys()
         self.node.cache_message_keys()
-        # Auto-lock (Kreds security slice): node-side idle/sleep check,
-        # ticked once per round with THIS loop's real interval so a
-        # wall-clock jump can be told apart from normal spacing between
-        # ticks. Uses real time.time() (via HearthNode.maybe_autolock's
-        # default) -- this is runtime, not the `now` monotonic-clock
-        # injection point above (which only paces onion-sync throttling).
-        self.node.maybe_autolock(interval)
 
     async def gossip_loop(self, interval: float = 3.0, now=None):
         while True:
@@ -241,7 +234,12 @@ class SyncService:
                 await self._gossip_round(interval=interval, now=now)
             except Exception:
                 pass                    # never let one bad round kill gossip
+            # Auto-lock tick brackets ONLY the sleep: baseline before,
+            # check after, so the gap can't include the round's dial time
+            # (the 0.3.11 misfire: one offline peer > 33s round -> lock).
+            self.node.stamp_autolock_tick()
             await asyncio.sleep(interval)
+            self.node.maybe_autolock(interval)
 
     # -- pre-friend friend-add handshake (auto-delivery over Tor) ---------
     #

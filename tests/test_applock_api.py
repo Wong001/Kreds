@@ -328,6 +328,30 @@ def test_maybe_autolock_noop_when_already_locked(tmp_path):
     assert n.locked is True
 
 
+# -- 0.3.11 misfire fix: tick brackets only gossip_loop's sleep ----------------
+
+def test_slow_round_does_not_fake_a_suspend(tmp_path):
+    # New contract: the baseline is stamped at sleep START, so the gap
+    # maybe_autolock sees is sleep-duration only -- a 60s gossip round
+    # cannot masquerade as a suspend anymore.
+    n = _fresh(tmp_path)
+    n.enable_applock("1234", "pin")            # lock_on_sleep defaults True
+    t0 = time.time()
+    n.stamp_autolock_tick(now=t0)
+    # 3s of sleep elapsed, regardless of how long the round before it took:
+    n.maybe_autolock(interval=3.0, now=t0 + 3.1)
+    assert not n.locked
+
+
+def test_real_suspend_still_locks(tmp_path):
+    n = _fresh(tmp_path)
+    n.enable_applock("1234", "pin")            # lock_on_sleep defaults True
+    t0 = time.time()
+    n.stamp_autolock_tick(now=t0)
+    n.maybe_autolock(interval=3.0, now=t0 + 3.0 + 31.0)   # woke up 31s late
+    assert n.locked
+
+
 # -- IMPORTANT #5 (redone): idle-autolock tracks an explicit activity signal
 # (POST /api/activity) instead of inferring it from request traffic --------
 

@@ -1,5 +1,6 @@
 import asyncio
 
+from hearth import sync
 from hearth.messages import make_enckey
 from hearth.node import HearthNode
 from hearth.sync import SyncService
@@ -117,3 +118,35 @@ def test_gossip_loop_prunes_superseded_enckeys(tmp_path):
         await sw.stop()
         await sf.stop()
     asyncio.run(scenario())
+
+
+def test_gossip_loop_ticks_autolock_at_sleep_boundary(tmp_path, monkeypatch):
+    # Pin the wiring order: round -> stamp -> sleep -> maybe_autolock (the
+    # 0.3.11 misfire fix -- the tick must bracket ONLY the sleep, not the
+    # round, so a slow round's dial time can't masquerade as a suspend).
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    svc = SyncService(node)
+    calls = []
+
+    async def fake_round(interval=3.0, now=None):
+        calls.append("round")
+    svc._gossip_round = fake_round
+
+    node.stamp_autolock_tick = lambda now=None: calls.append("stamp")
+    node.maybe_autolock = lambda interval: calls.append("tick")
+
+    async def fake_sleep(interval):
+        calls.append("sleep")
+        if calls.count("sleep") >= 2:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(sync.asyncio, "sleep", fake_sleep)
+
+    async def scenario():
+        loop_task = asyncio.create_task(svc.gossip_loop(interval=0.0))
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+    asyncio.run(scenario())
+
+    assert calls[:4] == ["round", "stamp", "sleep", "tick"]

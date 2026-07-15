@@ -299,6 +299,16 @@ class HearthNode:
         locked guard actually let through, and by unlock() itself."""
         self.last_activity = time.time()
 
+    def stamp_autolock_tick(self, now: Optional[float] = None):
+        """Set the sleep-gap baseline. Called by gossip_loop immediately
+        BEFORE its inter-round sleep, so maybe_autolock (called right
+        after the sleep) measures sleep-duration + suspend time ONLY --
+        a slow gossip round's dial time can no longer masquerade as a
+        suspend (0.3.11 misfire fix). Honest limit: a suspend that
+        happens mid-round is not detected by this heuristic; the idle
+        timer remains the backstop for long absences."""
+        self._last_tick = now if now is not None else time.time()
+
     def applock_status(self) -> dict:
         """Non-secret App-lock status -- safe to read even while locked
         (applock.json is plaintext except for its ciphertext blob)."""
@@ -404,9 +414,10 @@ class HearthNode:
 
     def maybe_autolock(self, interval: float = 3.0,
                        now: Optional[float] = None):
-        """Ticked by the gossip/periodic loop -- NOT by the HTTP layer,
-        since request arrival timing is not a reliable clock for sleep
-        detection. Locks on either: (a) idle -- no touched activity for
+        """Ticked by gossip_loop immediately after its inter-round sleep;
+        stamp_autolock_tick sets the baseline immediately before it. Not by
+        the HTTP layer, since request arrival timing is not a reliable clock
+        for sleep detection. Locks on either: (a) idle -- no touched activity for
         settings.idle_minutes (0 = off); or (b) a wall-clock jump bigger
         than `interval + 30s` since the last tick, when settings.
         lock_on_sleep is on -- the process was almost certainly suspended
