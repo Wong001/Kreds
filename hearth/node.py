@@ -999,21 +999,31 @@ class HearthNode:
         spans = dict(cur["spans"])
         posts = self.posts_by(self.identity_pub, "profile")
         by_id = {p["msg_id"]: p for p in posts}
+        # posts is posts_by's canonical newest-first order (created_at DESC,
+        # rowid DESC - the 0.3.10 store fix). rank turns that ordering into
+        # a tie-break: 0 = newest. This rank is LOCAL (rowid arrival order)
+        # - acceptable here because auto_place_unplaced is the owner-device
+        # migration that PUBLISHES a layout record (other devices receive
+        # the record and never recompute it), unlike _push_place's own
+        # (y, x, msg_id) tie-break, which stays content-deterministic
+        # because every device runs it.
+        rank = {p["msg_id"]: i for i, p in enumerate(posts)}
         albums = self.store.albums(self.identity_pub)
         member_of = self._fold_album_members(albums)
         album_members = set(member_of)
-        candidates = []          # (msg_id, created_at, default_span)
+        candidates = []          # (msg_id, created_at, rank, default_span)
         for p in posts:
             mid = p["msg_id"]
             if mid in pins or mid in album_members:
                 continue        # already placed, or rendered inside its album
             has_media = bool(p.get("blobs")) or p.get("media") == "video"
-            candidates.append((mid, p["created_at"],
+            candidates.append((mid, p["created_at"], rank[mid],
                                {"w": 2, "h": 2} if has_media else {"w": 4, "h": 1}))
         for aid, mids in albums.items():
             if aid in pins:
                 continue
             newest = None
+            newest_rank = None
             for mid in mids:
                 if member_of.get(mid) != aid:
                     continue    # shadowed by a lexically-smaller album -
@@ -1022,14 +1032,20 @@ class HearthNode:
                 m = by_id.get(mid)
                 if m is None or m.get("media") == "video" or not m.get("blobs"):
                     continue
-                if newest is None or m["created_at"] > newest:
+                if newest is None or m["created_at"] > newest or (
+                        m["created_at"] == newest and rank[mid] < newest_rank):
                     newest = m["created_at"]
+                    newest_rank = rank[mid]
             if newest is not None:       # an unpinned album with photos counts
-                candidates.append((aid, newest, {"w": 2, "h": 2}))
+                candidates.append((aid, newest, newest_rank, {"w": 2, "h": 2}))
         if not candidates:
             return 0
-        candidates.sort(key=lambda c: c[1])    # oldest first -> newest ends on top
-        for mid, _created_at, default_span in candidates:
+        # oldest first -> newest ends on top; created_at alone ties on
+        # same-second composes, so the secondary key rides posts_by's
+        # canonical rank instead of relying on sort-stability happenstance
+        # (which reversed newest-on-top: build order is newest-first).
+        candidates.sort(key=lambda c: (c[1], -c[2]))
+        for mid, _created_at, _rank, default_span in candidates:
             span = spans.pop(mid, None) or default_span
             pins = self._push_place(pins, mid, {"x": 0, "y": 0, **span})
         if len(pins) > MAX_LAYOUT:

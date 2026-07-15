@@ -104,7 +104,16 @@ def test_ungroup_top_inserts_members(tmp_path):
     assert aid not in p                       # album pin gone
 
 
-def test_auto_place_unplaced_single_publish(tmp_path):
+def test_auto_place_unplaced_single_publish(tmp_path, monkeypatch):
+    """Regression (root-caused 2026-07-15): candidates used to sort by
+    created_at alone, so a same-second tie fell back to Python's stable
+    sort preserving posts_by's build order - which is newest-first - and
+    that INVERTED the newest-on-top contract (the older post ended on
+    top). Forcing both composes onto the identical time.time() value
+    (rather than hoping two back-to-back composes land in the same
+    tick, which only happened ~80% of the time on this machine) pins the
+    tie case deterministically on every machine, not just fast ones."""
+    monkeypatch.setattr("hearth.node.time.time", lambda: 1_700_000_000.0)
     n = _node(tmp_path)
     a = _post(n, "a")
     b = _post(n, "b")
