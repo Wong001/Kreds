@@ -1498,6 +1498,30 @@ def test_settings_view_markup_and_rehomed_panels():
     assert "manage in Settings" in html
 
 
+def test_entry_avatar_renders_profile_picture_with_ring_fallback():
+    # Profile polish batch (0.3.13): buildEntry shows the author's
+    # uploaded avatar inside the circle; the identity ring stays ON TOP
+    # of photos and the colored letter circle stays the fallback
+    # (August, 2026-07-15).
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    body = _js_fn_body(js, "buildEntry")
+    assert "author_avatar" in body
+    assert '"/api/blob/" + p.author_avatar' in body
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    rule = _css_rule(css, ".eavatar img")
+    assert "object-fit: cover" in rule and "border-radius: 50%" in rule
+
+
+def test_topbar_addfriend_spacing_and_rail_padding():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    # + button carries the same 8px rhythm Arrange already has, so it no
+    # longer sits flush against the cog (August, 2026-07-15)
+    assert "margin-right: 8px" in _css_rule(css, ".profile-addfriend")
+    # the rail scroll box pads inward so .eavatar::after's -4px identity
+    # ring isn't clipped at the container edge
+    assert "padding: 6px" in _css_rule(css, ".profile-side #profile-journal-rail")
+
+
 def test_settings_page_wiring_and_collapse_memory():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     body = _js_fn_body(js, "openSettings")

@@ -288,7 +288,17 @@ function buildEntry(p) {
   article.dataset.author = p.identity_pub;
   article.dataset.created = p.created_at;
 
-  const avatar = el("button", "eavatar", (p.author_name || "?").slice(0, 1).toUpperCase());
+  const avatar = el("button", "eavatar");
+  if (p.author_avatar) {
+    const im = document.createElement("img");
+    im.src = "/api/blob/" + p.author_avatar;
+    im.alt = "";
+    avatar.append(im);
+  } else {
+    avatar.textContent = (p.author_name || "?").slice(0, 1).toUpperCase();
+  }
+  // ring + color stay unconditional: identity color remains visible over
+  // photos, and IS the circle for the letter fallback (August 2026-07-15)
   avatar.style.background = color;
   avatar.style.setProperty("--ring", color);
   if (p.mine) {
