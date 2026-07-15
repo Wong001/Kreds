@@ -2988,13 +2988,15 @@ function profileEditor(p) {
       // dragging the image DOWN reveals more of its top = smaller percent
       applyPos(start - ((e.clientY - sy) / rect.height) * 100);
     };
-    const up = (e) => {
+    const stop = (e) => {
       if (e.pointerId !== ev.pointerId) return;
       preview.removeEventListener("pointermove", move);
-      preview.removeEventListener("pointerup", up);
+      preview.removeEventListener("pointerup", stop);
+      preview.removeEventListener("pointercancel", stop);   // aborted gesture: stop tracking, keep the last applied pos
     };
     preview.addEventListener("pointermove", move);
-    preview.addEventListener("pointerup", up);
+    preview.addEventListener("pointerup", stop);
+    preview.addEventListener("pointercancel", stop);
   });
   const showCrop = (url) => {
     preview.style.backgroundImage = `url(${url})`;
@@ -3002,7 +3004,13 @@ function profileEditor(p) {
     crop.classList.remove("hidden");
   };
   if (p.banner) showCrop("/api/blob/" + p.banner);
-  bn.onchange = () => { if (bn.files[0]) showCrop(URL.createObjectURL(bn.files[0])); };
+  let bannerObjUrl = null;   // re-pick revokes the prior URL (same blob-URL lifecycle rule as the composer's objectUrls/dropUrls)
+  bn.onchange = () => {
+    if (!bn.files[0]) return;
+    if (bannerObjUrl) URL.revokeObjectURL(bannerObjUrl);
+    bannerObjUrl = URL.createObjectURL(bn.files[0]);
+    showCrop(bannerObjUrl);
+  };
   crop.append(preview, slider);
   box.append(crop);
   const save = el("button","btn-accent","Save profile"); save.style.marginTop="14px";
@@ -3016,6 +3024,7 @@ function profileEditor(p) {
     if (bn.files[0]) fd.append("banner", bn.files[0]);
     const r = await fetch("/api/profile", {method:"POST", body:fd});
     if (r.ok) {
+      if (bannerObjUrl) { URL.revokeObjectURL(bannerObjUrl); bannerObjUrl = null; }
       await refresh();
       // The editor now lives in the cogwheel overlay, not inline on the
       // page; re-render the profile underneath so the saved name/bio/

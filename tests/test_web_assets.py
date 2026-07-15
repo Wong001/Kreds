@@ -1431,6 +1431,8 @@ def test_banner_crop_control_wired():
     assert "banner_pos" in editor and "banner-crop" in editor
     assert 'type = "range"' in editor or 'type="range"' in editor
     assert "pointerdown" in editor                   # drag path
+    assert "pointercancel" in editor                 # aborted gesture tears down tracking
+    assert "revokeObjectURL" in editor               # picked-banner blob URL lifecycle
     page = _js_fn_body(js, "renderProfilePage")
     assert "backgroundPosition" in page and "banner_pos" in page
     rule = _css_rule(css, ".banner-crop-preview")
