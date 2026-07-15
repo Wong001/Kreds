@@ -229,6 +229,12 @@ class TorProcess:
     # of its owner's death (__OwningControllerProcess polling), so retry for
     # 2x that. Bootstrap TIMEOUTS are a different failure (tor alive but
     # slow) and keep their own 2-attempt budget.
+    # Known, deliberately deferred: a bootstrap-TIMEOUT attempt consumes
+    # wall-clock against the same window, so a spawn-exit AFTER a timeout
+    # can give up early. Only reachable via an external port squatter
+    # appearing mid-start (fails honestly either way). Do NOT "fix" by
+    # resetting the window per failure kind without also raising
+    # desktop.READY_TIMEOUT_TOR -- the reset pushes the worst case past it.
     _SPAWN_RETRY_GAP = 5.0
     _SPAWN_RETRY_WINDOW = 30.0
 

@@ -435,7 +435,11 @@ def _show_error_window(webview_module, message: str) -> None:
 # bootstrap attempts + 5s gap) plus AV-scan overhead on freshly written
 # binaries -- was 120, which a legitimately slow post-update cold bootstrap
 # overran, landing in the "always fails after an update" pattern.
-READY_TIMEOUT_TOR = 240.0
+# 0.3.12: the spawn-retry window (30s window + 5s gap + 2x5s bounded reap
+# waits alongside the unchanged 2x90s bootstrap budget = 225s worst case)
+# consumed most of 240's headroom. Raised to 300 to restore the >=60s
+# AV-scan margin over the full worst-case retry budget.
+READY_TIMEOUT_TOR = 300.0
 READY_TIMEOUT_PLAIN = 25.0
 
 # Exit drain (0.3.12): quit destroys the window instantly, but the process
@@ -446,6 +450,10 @@ READY_TIMEOUT_PLAIN = 25.0
 # Still bounded: a wedged node thread must not turn quit into a zombie.
 SHUTDOWN_DRAIN_TIMEOUT = 30.0
 # A restarting instance must out-wait the exiting instance's drain.
+# Equality with SHUTDOWN_DRAIN_TIMEOUT is safe because the restarting
+# instance's 30s clock starts only after the launcher's self-extract +
+# staged-core verify + payload boot -- several seconds after the old
+# instance began draining -- and that head start is the actual margin.
 RESTART_LOCK_WAIT = 30.0
 
 _LOADING_HTML = """<!DOCTYPE html>

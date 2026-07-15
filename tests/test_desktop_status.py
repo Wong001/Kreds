@@ -50,7 +50,9 @@ def test_ready_wait_timeout_constants():
     # conscious-edit pin per spec: the tor ready-wait must exceed tor.py's
     # own 2x90s + 5s retry budget or a slow-but-successful cold bootstrap
     # gets declared dead mid-bootstrap (the post-update always-fails bug).
-    assert desktop.READY_TIMEOUT_TOR == 240.0
+    # Value moved 240 -> 300 in 0.3.12 when the spawn-retry window landed
+    # and ate most of 240's AV-overhead headroom.
+    assert desktop.READY_TIMEOUT_TOR == 300.0
     assert desktop.READY_TIMEOUT_PLAIN == 25.0
 
 
@@ -183,13 +185,18 @@ def test_shutdown_drain_constants():
 
 
 def test_spawn_window_plus_bootstrap_budget_fits_ready_wait():
-    # C's spawn window + the unchanged 2x bootstrap budget + one retry gap
-    # must stay under the shell's ready-wait, or a worst-case-but-
-    # successful startup gets declared failed mid-recovery.
+    # C's spawn window + the unchanged 2x bootstrap budget must fit the
+    # shell's ready-wait WITH the margin the 0.3.11 fix established for
+    # AV-scan overhead on fresh binaries (the reason 120 originally
+    # failed). Deterministic worst case: full spawn window + the gap
+    # after the first timeout attempt + two bootstrap timeouts + two
+    # bounded reap waits.
     from hearth.tor import TorProcess
-    worst = (TorProcess._SPAWN_RETRY_WINDOW + 2 * 90.0
-             + TorProcess._SPAWN_RETRY_GAP)
-    assert worst < desktop.READY_TIMEOUT_TOR
+    REAP_WAIT = 5.0                      # tor.py start()'s except path
+    worst = (TorProcess._SPAWN_RETRY_WINDOW + TorProcess._SPAWN_RETRY_GAP
+             + 2 * 90.0 + 2 * REAP_WAIT)
+    assert worst == 225.0                # conscious-edit pin (30+5+180+10)
+    assert desktop.READY_TIMEOUT_TOR - worst >= 60.0   # AV-overhead margin
 
 
 def test_drain_timeout_leaves_evidence(tmp_path, monkeypatch):
