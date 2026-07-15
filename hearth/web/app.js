@@ -3792,6 +3792,9 @@ function initResizeGrip() {
     window.pywebview.api.resize_to(nextW, nextH);
   };
   grip.addEventListener("pointerdown", (e) => {
+    // primary button/touch only, matching the wall drag's house rule -
+    // native grips don't respond to right-drag or a second finger
+    if ((e.button != null && e.button !== 0) || !e.isPrimary) return;
     startX = e.screenX; startY = e.screenY;
     startW = window.innerWidth; startH = window.innerHeight;
     grip.setPointerCapture(e.pointerId);

@@ -1591,7 +1591,9 @@ def test_journal_keeps_readable_column_and_idstrip_stays_on_screen():
     # the chat offset accounts for the idstrip (144px total, not the
     # strip-blind 106px)
     shell = _css_rule(css, ".dm-shell")
-    assert "calc(100vh - 144px)" in shell
+    # the offset subtracts the desktop titlebar via --chrome-h (0 in a
+    # browser) - measured 144px browser-side, +40px chrome in the shell
+    assert "calc(100vh - 144px - var(--chrome-h, 0px))" in shell
 
 
 # ---------------------------------------------------------------------

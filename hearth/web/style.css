@@ -196,7 +196,10 @@ body.desktop .desktop-only-panel { display: block; }
    the view container (not .entry) keeps the chipbar/composer/dayheads
    centered with the entries. */
 #view-journal { display: grid; grid-template-columns: 1fr 218px; gap: 0;
-  max-width: 1218px; margin: 0 auto; }
+  max-width: 1218px; margin: 0 auto; width: 100%; }
+  /* width: 100% pins the view to min(100%, 1218px): margin auto alone
+     disables the flex-column stretch, and a sparse journal would size to
+     fit-content and jitter as entries arrive (final review) */
 .journal { padding: 20px 24px 26px; background: var(--surface); min-height: 560px; }
 
 /* ---------- circle rail (compact) - ported from docs/design/
@@ -788,7 +791,12 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
    min 420px keeps the panel usable if 100vh ever shrinks small (e.g. a
    short embedded window). */
 .dm-shell { display: grid; grid-template-columns: 240px minmax(0,1fr); gap: 0;
-  height: max(420px, calc(100vh - 144px)); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  /* --chrome-h: the desktop shell's 40px titlebar (body.desktop) shifts
+     every offset contributor down - without subtracting it the shell
+     overshoots by exactly that much IN THE APP while looking perfect in a
+     browser, where the var falls back to 0 (final review catch). */
+  height: max(420px, calc(100vh - 144px - var(--chrome-h, 0px)));
+  border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 .conv-col { border-right: 1px solid var(--line); padding: 16px 12px; overflow-y: auto;
   background: var(--surface); }
 .thread-col { display: flex; flex-direction: column; min-height: 0; background: var(--surface); }
