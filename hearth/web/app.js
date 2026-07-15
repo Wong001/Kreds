@@ -3806,7 +3806,10 @@ function initResizeGrip() {
   const drop = (e) => {
     if (grip.hasPointerCapture && grip.hasPointerCapture(e.pointerId))
       grip.releasePointerCapture(e.pointerId);
-    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    // flush, don't discard: a pending frame holds the LAST computed size,
+    // and dropping it would settle the window one throttle-frame short of
+    // where the pointer was released (review finding)
+    if (raf) { cancelAnimationFrame(raf); push(); }
   };
   grip.addEventListener("pointerup", drop);
   grip.addEventListener("pointercancel", drop);

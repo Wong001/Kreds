@@ -1611,6 +1611,12 @@ def test_resize_grip_desktop_only_and_wired():
     body = _js_fn_body(js, "initResizeGrip")
     assert "requestAnimationFrame" in body        # bridge-flood throttle
     assert "setPointerCapture" in body
+    # double-wire guard: wireDesktopChrome legitimately runs twice (boot
+    # check + pywebviewready) - without this, pointer listeners stack
+    assert 'grip.classList.contains("on")' in body
+    # drop FLUSHES the last pending frame instead of discarding it, so the
+    # window settles exactly where the pointer released
+    assert "cancelAnimationFrame(raf); push();" in body
     css = (WEB / "style.css").read_text(encoding="utf-8")
     rule = _css_rule(css, "#win-resize")
     assert "nwse-resize" in rule
