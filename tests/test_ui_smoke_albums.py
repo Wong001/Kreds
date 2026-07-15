@@ -184,9 +184,9 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
                                    state="detached", timeout=8000)
 
             # two standalone blocks reappear, both PINNED on the canvas
-            # (dynamic placement, spec 2026-07-14: ungroup top-inserts -
-            # no limbo, no tray to fall back into): the 3-photo deck and
-            # the 1-photo block.
+            # (spec 2026-07-15 first-fit: ungroup restores members newest
+            # first into the first open slot - no limbo, no tray to fall
+            # back into): the 3-photo deck and the 1-photo block.
             assert page.locator("#profile-wall .block").count() == 2
             assert page.locator("#profile-wall-flow .block").count() == 0
             assert page.locator(".block-deck").count() == 1
@@ -194,15 +194,16 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
                 ".block-deck .deck-count").inner_text() == "1/3"
             assert page.locator(".block-photo").count() == 1
 
-            # restored-newest-on-top: the 1-photo block (added via "+",
-            # the younger member) ends at y==0; the 3-photo deck (the
-            # original, older member) settles below it - never sideways.
+            # restored-newest-first-fit (spec 2026-07-15): the wall was
+            # empty at ungroup time (the album was the only block), so
+            # the 1-photo block (added via "+", the younger member)
+            # claims the first open slot (0,0); the 3-photo deck (the
+            # original, older member) - both being 2x2 - lands BESIDE it
+            # at (2,0), not pushed below it.
             new_id = [m for m in members if m != orig_id][0]
             lay = a.node.store.profile_layout(a.node.identity_pub)
-            assert lay["pins"][new_id]["y"] == 0
-            assert lay["pins"][orig_id]["y"] >= lay["pins"][new_id]["y"]
-            assert lay["pins"][new_id]["x"] == 0
-            assert lay["pins"][orig_id]["x"] == 0
+            assert lay["pins"][new_id] == {"x": 0, "y": 0, "w": 2, "h": 2}
+            assert lay["pins"][orig_id] == {"x": 2, "y": 0, "w": 2, "h": 2}
 
             albums_after = a.node.store.albums(a.node.identity_pub)
             assert albums_after.get(album_id) == []

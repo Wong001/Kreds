@@ -577,11 +577,11 @@ class HearthNode:
             self._cache_message_key(mid, key)
             has_media = bool(refs)
         if placement == "profile" and auto_place:
-            # Creation auto-places at the top, dense (spec 2026-07-14): a
-            # new wall post is pinned at (0,0) with its composer-chosen
-            # size (or the media/text default), pushed-place applied so
-            # only whatever is actually in the way slides down - the
-            # separate span-seed call is gone. August 2026-07-14.
+            # Creation is FIRST-FIT (spec 2026-07-15, August's revert of
+            # the 2026-07-14 top-insert-push): the new post takes the
+            # first open slot its composer-chosen (or default) size fits
+            # - gaps get used, nothing already placed ever moves. The
+            # separate span-seed call stays gone.
             #
             # auto_place=False is for album-bound posts (the deck grow
             # flow, "+"): the new photo becomes DECK CONTENT, not a wall
@@ -607,7 +607,7 @@ class HearthNode:
             span = ({"w": span_w, "h": span_h} if span_w is not None
                     else ({"w": 2, "h": 2} if has_media else {"w": 4, "h": 1}))
             cur = self.store.profile_layout(self.identity_pub)
-            pins = self._push_place(cur["pins"], mid, {"x": 0, "y": 0, **span})
+            pins = self._first_fit_place(cur["pins"], mid, span)
             spans = dict(cur["spans"])
             spans.pop(mid, None)
             if len(pins) > MAX_LAYOUT:
@@ -786,6 +786,28 @@ class HearthNode:
             final[oid] = g
         return final
 
+    def _first_fit_place(self, pins: dict, msg_id: str, span: dict) -> dict:
+        """Creation/ungroup placement rule (spec 2026-07-15, reverting
+        2026-07-14's top-insert-push for creation): scan cells in (y, x)
+        order and settle the block at the first open spot its w x h
+        footprint fits inside the canvas - gaps in the middle get used,
+        and NOTHING already placed ever moves. With no fitting gap the
+        scan lands just below the lowest block. Content-deterministic
+        like _push_place; the published record carries the RESULT."""
+        def overlaps(a, b):
+            return (a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"]
+                    and a["y"] < b["y"] + b["h"] and b["y"] < a["y"] + a["h"])
+        others = [g for k, g in pins.items() if k != msg_id]
+        w, h = span["w"], span["h"]
+        for y in range(MAX_LAYOUT + 1):        # same top-row cap as set_block_pin
+            for x in range(WALL_COLS - w + 1):
+                geom = {"x": x, "y": y, "w": w, "h": h}
+                if not any(overlaps(geom, g) for g in others):
+                    return {**{k: dict(v) for k, v in pins.items()
+                               if k != msg_id},
+                            msg_id: geom}
+        raise ValueError("wall is full")
+
     def set_block_pin(self, msg_id: str, x: int, y: int, w: int, h: int) -> str:
         """Place (or move/resize) a block at explicit cell coordinates:
         pushes any block already in the way straight down (spec
@@ -953,8 +975,9 @@ class HearthNode:
             # below (that publish IS what erases them). Fold in the
             # album's own residual pin/span here too (review finding,
             # folded in since this branch is being touched anyway), then
-            # top-insert each restored member oldest first so the newest
-            # ends on top - same push rule, no limbo.
+            # first-fit each restored member NEWEST first so the newest
+            # claims the highest open slot (spec 2026-07-15) - nothing
+            # already placed moves, no limbo.
             prior_members = self.store.albums(self.identity_pub).get(album_id, [])
             cur = self.store.profile_layout(self.identity_pub)
             pins = dict(cur["pins"])
@@ -965,7 +988,7 @@ class HearthNode:
                 def _created_at(mid):
                     msg = self.store.get_message(mid)
                     return msg.payload["created_at"] if msg else 0
-                for mid in sorted(prior_members, key=_created_at):
+                for mid in sorted(prior_members, key=_created_at, reverse=True):
                     span = spans.pop(mid, None)
                     if span is None:
                         msg = self.store.get_message(mid)
@@ -973,7 +996,7 @@ class HearthNode:
                         has_media = (bool(pl.get("blobs"))
                                     or pl.get("media") == "video")
                         span = {"w": 2, "h": 2} if has_media else {"w": 4, "h": 1}
-                    pins = self._push_place(pins, mid, {"x": 0, "y": 0, **span})
+                    pins = self._first_fit_place(pins, mid, span)
             if len(pins) > MAX_LAYOUT:
                 raise ValueError("too many pinned blocks")
             self._publish(make_profile_layout(

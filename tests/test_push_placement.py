@@ -36,13 +36,16 @@ def _pins(n):
     return n.store.profile_layout(n.identity_pub)["pins"]
 
 
-def test_create_auto_places_at_top_dense(tmp_path):
+def test_create_fills_first_open_slot_nothing_moves(tmp_path):
+    # Spec 2026-07-15 (profile feedback batch): creation is first-fit -
+    # the push-down-on-post behavior of 2026-07-14 was August's own
+    # called-out mistake and is reverted. Nothing moves on post.
     n = _node(tmp_path)
-    a = _post(n, "a")                       # text default 4x1 at (0,0)
+    a = _post(n, "a")                       # empty wall: (0,0)
     assert _pins(n)[a] == {"x": 0, "y": 0, "w": 4, "h": 1}
-    b = _post(n, "b")                       # pushes a down by 1
-    assert _pins(n)[b] == {"x": 0, "y": 0, "w": 4, "h": 1}
-    assert _pins(n)[a] == {"x": 0, "y": 1, "w": 4, "h": 1}
+    b = _post(n, "b")                       # row 0 taken: first open slot is row 1
+    assert _pins(n)[b] == {"x": 0, "y": 1, "w": 4, "h": 1}
+    assert _pins(n)[a] == {"x": 0, "y": 0, "w": 4, "h": 1}   # never moved
 
 
 def test_create_with_span_fields_and_dense_beside(tmp_path):
@@ -54,6 +57,41 @@ def test_create_with_span_fields_and_dense_beside(tmp_path):
                        span_w=2, span_h=2)  # lands (0,0); a NOT in the way
     assert _pins(n)[b] == {"x": 0, "y": 0, "w": 2, "h": 2}
     assert _pins(n)[a] == {"x": 3, "y": 0, "w": 1, "h": 1}   # never moved
+
+
+def test_create_uses_open_gap_between_blocks(tmp_path):
+    n = _node(tmp_path)
+    a = _post(n, "a")
+    b = _post(n, "b")
+    n.set_block_pin(a, 0, 0, 4, 1)
+    n.set_block_pin(b, 0, 3, 4, 1)          # rows 1-2 left open in the middle
+    c = _post(n, "c")                       # 4x1 fits in the gap at (0,1)
+    p = _pins(n)
+    assert p[c] == {"x": 0, "y": 1, "w": 4, "h": 1}
+    assert p[a] == {"x": 0, "y": 0, "w": 4, "h": 1}
+    assert p[b] == {"x": 0, "y": 3, "w": 4, "h": 1}
+
+
+def test_create_skips_too_small_gap(tmp_path):
+    n = _node(tmp_path)
+    a = n.compose_post("a", scope="kreds", placement="profile",
+                       span_w=3, span_h=1)   # row 0 keeps a 1-wide hole at x=3
+    b = n.compose_post("b", scope="kreds", placement="profile",
+                       span_w=2, span_h=1)   # 2 wide: can't use the 1-wide hole
+    p = _pins(n)
+    assert p[a] == {"x": 0, "y": 0, "w": 3, "h": 1}
+    assert p[b] == {"x": 0, "y": 1, "w": 2, "h": 1}
+
+
+def test_create_lands_beside_when_it_fits(tmp_path):
+    n = _node(tmp_path)
+    a = n.compose_post("a", scope="kreds", placement="profile",
+                       span_w=2, span_h=2)
+    b = n.compose_post("b", scope="kreds", placement="profile",
+                       span_w=2, span_h=2)   # fits beside a in row 0
+    p = _pins(n)
+    assert p[a] == {"x": 0, "y": 0, "w": 2, "h": 2}
+    assert p[b] == {"x": 2, "y": 0, "w": 2, "h": 2}
 
 
 def test_pin_onto_occupied_pushes_cascade(tmp_path):
@@ -88,20 +126,24 @@ def test_row_cap_400s(tmp_path):
         n.set_block_pin(a, 0, 501, 1, 1)    # beyond MAX_LAYOUT rows
 
 
-def test_ungroup_top_inserts_members(tmp_path):
+def test_ungroup_first_fits_members_newest_first(tmp_path):
+    # Ungroup follows creation's first-fit rule (spec 2026-07-15):
+    # members are restored newest-first so the newest claims the highest
+    # open slot, and nothing already placed ever moves.
     n = _node(tmp_path)
     p1 = n.compose_post("one", scope="kreds", placement="profile",
-                        photos=[png_bytes(8, 8)])
+                        photos=[png_bytes(8, 8)])            # (0,0) 2x2
     p2 = n.compose_post("two", scope="kreds", placement="profile",
-                        photos=[png_bytes(8, 8)])
-    solo = _post(n, "solo")                  # occupies the top
-    aid = n.set_album([p1, p2])
-    n.set_album([], album_id=aid)            # ungroup
+                        photos=[png_bytes(8, 8)])            # (2,0) 2x2
+    solo = _post(n, "solo")                                  # (0,2) 4x1
+    aid = n.set_album([p1, p2])       # both pinned -> album lands unplaced
+    before_solo = _pins(n)[solo]
+    n.set_album([], album_id=aid)     # ungroup
     p = _pins(n)
-    assert p[p2]["y"] == 0                   # newest restored member on top
-    assert p[p1]["y"] >= p[p2]["y"]          # older below or beside
-    assert solo in p                          # pushed, still pinned
-    assert aid not in p                       # album pin gone
+    assert p[solo] == before_solo                            # never moved
+    assert p[p2] == {"x": 0, "y": 0, "w": 2, "h": 2}         # newest, highest slot
+    assert p[p1] == {"x": 2, "y": 0, "w": 2, "h": 2}         # older, next open spot
+    assert aid not in p                                      # album pin gone
 
 
 def test_auto_place_unplaced_single_publish(tmp_path, monkeypatch):
@@ -200,11 +242,12 @@ def test_video_post_auto_places_media_default(tmp_path):
 
 
 def test_wall_full_compose_orphans_post_unplaced(tmp_path):
-    """The cascade raise site, from compose (spec 2026-07-14): the post
-    is ALREADY published when auto-place runs, so a wall-full push gives
-    the caller a ValueError (400, no msg_id) while the post EXISTS
-    orphaned-unplaced - no pin, no span - degrading honestly to the
-    legacy flow-below rendering until /api/wall-autoplace adopts it.
+    """The creation raise site (spec 2026-07-15 first-fit): the post is
+    ALREADY published when auto-place runs, so a wall with no open cell
+    at or above the row cap gives the caller a ValueError (400, no
+    msg_id) while the post EXISTS orphaned-unplaced - no pin, no span -
+    degrading honestly to the legacy flow-below rendering until
+    /api/wall-autoplace adopts it.
     The trigger is deliberately NOT 500-posts-scale: a contiguous pinned
     chain ending in one block AT y=MAX_LAYOUT means the very next
     overlapping auto-place cascades past the cap."""

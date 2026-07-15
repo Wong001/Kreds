@@ -145,16 +145,17 @@ def test_pin_drag_resize_and_synced_view(tmp_path):
             bid = a.node.compose_post("push me", scope="kreds",
                                       placement="profile",
                                       span_w=1, span_h=1)
-            # compose_post's own creation auto-place would land B at (0,0)
-            # too (pushing A down at CREATE time) - move B to a free cell
-            # first so the drag itself is what triggers the push under
-            # test, not creation. Row 1 (not further down): the drag needs
-            # both B's start and the wall's (0,0) drop target visible in
-            # the SAME 900px viewport without scrolling - row 6 measured
-            # off-screen (y ~1523px) and made the whole gesture a silent
-            # no-op, confirmed via an isolated bounding-box repro before
-            # landing on row 1. Re-pin A last: it must land exactly at
-            # (0,0) with nothing else in the way.
+            # compose_post's own creation auto-place is first-fit (spec
+            # 2026-07-15): with A pinned at (0,0) it would land B in the
+            # next open cell WITHOUT touching A - move B to a free cell
+            # explicitly anyway so the drag itself is what triggers the
+            # push under test, not creation. Row 1 (not further down): the
+            # drag needs both B's start and the wall's (0,0) drop target
+            # visible in the SAME 900px viewport without scrolling - row 6
+            # measured off-screen (y ~1523px) and made the whole gesture a
+            # silent no-op, confirmed via an isolated bounding-box repro
+            # before landing on row 1. Re-pin A last: it must land exactly
+            # at (0,0) with nothing else in the way.
             a.node.set_block_pin(bid, 2, 1, 1, 1)
             a.node.set_block_pin(mid, 0, 0, 1, 1)
 
