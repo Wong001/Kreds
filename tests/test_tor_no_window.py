@@ -210,3 +210,103 @@ def test_stop_falls_back_when_control_command_raises(monkeypatch, tmp_path):
     asyncio.run(scenario())
     assert fake_proc.terminated
     assert tp._proc is None
+
+
+class _ExitNTimesThenGood:
+    """Factory state for create_subprocess_exec fakes: the first `n` procs
+    exit before bootstrap (stdout EOF immediately), later ones bootstrap."""
+    def __init__(self, n):
+        self.n = n
+        self.calls = 0
+
+    async def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return _FailThenEofProc() if self.calls <= self.n else _FakeProc()
+
+
+def test_spawn_exit_retries_past_two_attempts_within_window(monkeypatch, tmp_path):
+    # The orphan case: 4 instant-exits, then success -- must NOT give up
+    # at 2 attempts like the old flat loop did.
+    fake = _ExitNTimesThenGood(4)
+    waits = []
+
+    async def scenario():
+        monkeypatch.setattr(tor.asyncio, "create_subprocess_exec", fake)
+        tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+        tp._SPAWN_RETRY_GAP = 0.01          # fast test; window stays ample
+        await asyncio.wait_for(
+            tp.start(bootstrap_timeout=5, waiting=lambda: waits.append(None)), timeout=8)
+
+    asyncio.run(scenario())
+    assert fake.calls == 5                  # 4 failures + the success
+    assert len(waits) == 4                  # waiting() per scheduled retry
+    # waits entries are None (waiting takes no args); presence is the signal
+
+
+def test_spawn_exit_gives_up_after_window(monkeypatch, tmp_path):
+    fake = _ExitNTimesThenGood(10 ** 6)     # never succeeds
+
+    async def scenario():
+        monkeypatch.setattr(tor.asyncio, "create_subprocess_exec", fake)
+        tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+        tp._SPAWN_RETRY_GAP = 0.01
+        tp._SPAWN_RETRY_WINDOW = 0.05
+        await tp.start(bootstrap_timeout=5)
+
+    import pytest
+    with pytest.raises(RuntimeError, match="tor failed to bootstrap"):
+        asyncio.run(scenario())
+    assert fake.calls >= 2                  # it did keep retrying first
+
+
+def test_waiting_callback_exception_never_kills_startup(monkeypatch, tmp_path):
+    fake = _ExitNTimesThenGood(1)
+
+    def bad_waiting():
+        raise ValueError("boom")
+
+    async def scenario():
+        monkeypatch.setattr(tor.asyncio, "create_subprocess_exec", fake)
+        tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+        tp._SPAWN_RETRY_GAP = 0.01
+        await asyncio.wait_for(
+            tp.start(bootstrap_timeout=5, waiting=bad_waiting), timeout=8)
+
+    asyncio.run(scenario())                 # must not raise
+    assert fake.calls == 2
+
+
+class _HangForeverProc:
+    """Never emits a bootstrap line and never EOFs: forces the TIMEOUT
+    failure kind (asyncio.TimeoutError), not the spawn-exit kind."""
+    def __init__(self):
+        self.stdout = self
+        self.returncode = None
+
+    async def readline(self):
+        await asyncio.sleep(3600)
+
+    def terminate(self):
+        self.returncode = 1
+
+    async def wait(self):
+        return 1
+
+
+def test_bootstrap_timeout_budget_still_two_attempts(monkeypatch, tmp_path):
+    calls = {"n": 0}
+
+    async def fake_exec(*args, **kwargs):
+        calls["n"] += 1
+        return _HangForeverProc()
+
+    async def scenario():
+        monkeypatch.setattr(tor.asyncio, "create_subprocess_exec", fake_exec)
+        tp = tor.TorProcess(exe="tor", data_dir=tmp_path)
+        tp._SPAWN_RETRY_GAP = 0.01
+        await tp.start(bootstrap_timeout=0.05)
+
+    import pytest
+    with pytest.raises(RuntimeError, match="tor failed to bootstrap"):
+        asyncio.run(scenario())
+    assert calls["n"] == 2                  # timeout budget unchanged

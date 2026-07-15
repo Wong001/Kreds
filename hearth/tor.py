@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -134,7 +135,7 @@ class TorProcess:
         self._proc = None
         self._drain_task = None
 
-    async def start(self, bootstrap_timeout: float = 90.0, status=None):
+    async def start(self, bootstrap_timeout: float = 90.0, status=None, waiting=None):
         torrc = _gen_torrc(self.data_dir, self.socks_port,
                            self.control_port)
         # CREATE_NO_WINDOW: tor.exe is a console program; when a windowed
@@ -143,10 +144,13 @@ class TorProcess:
         # mid-setup. Hide it entirely. Windows-only flag; 0 (no-op) elsewhere.
         creationflags = (subprocess.CREATE_NO_WINDOW
                          if sys.platform == "win32" else 0)
-        # Retry the spawn+bootstrap once: a first tor can die before
-        # bootstrap (a transient failure, or a just-crashed prior tor still
-        # releasing its ports). Kill the failed process first so it can't hold
-        # the socks/control ports, then try again before giving up.
+        # Spawn-exit vs. bootstrap-timeout retries: tor can fail to bootstrap
+        # in two ways. (1) Spawn-exit: tor dies before emitting a bootstrap
+        # line (signature of a prior tor holding the ports). Retry within a
+        # time window (_SPAWN_RETRY_WINDOW) to outlast the orphan's ~15s
+        # self-reap. (2) Bootstrap timeout: tor alive but slow, same 2-attempt
+        # budget as before. Call waiting() (no args, exceptions swallowed) each
+        # time a spawn-exit retry is scheduled.
         _BOOTSTRAP_RE = re.compile(rb"Bootstrapped (\d+)%")
         async def _await_bootstrap():
             while True:
@@ -165,7 +169,11 @@ class TorProcess:
                         return
 
         last_err = None
-        for attempt in range(2):
+        attempts = 0
+        timeout_attempts = 0
+        first_spawn = time.monotonic()
+        while True:
+            attempts += 1
             self._proc = await asyncio.create_subprocess_exec(
                 str(self.exe), "-f", str(torrc),
                 stdout=asyncio.subprocess.PIPE,
@@ -183,11 +191,25 @@ class TorProcess:
                         await asyncio.wait_for(self._proc.wait(), timeout=5.0)
                 except Exception:
                     pass
-                if attempt == 1:
-                    raise RuntimeError(
-                        "tor failed to bootstrap after 2 attempts: "
-                        + str(last_err))
-                await asyncio.sleep(5.0)  # let the prior tor's ports actually free (was 1.5s: too tight after an update restart)
+                if isinstance(e, asyncio.TimeoutError):
+                    # tor alive but slow: same 2-attempt budget as always
+                    timeout_attempts += 1
+                    if timeout_attempts >= 2:
+                        raise RuntimeError(
+                            f"tor failed to bootstrap after {attempts} "
+                            f"attempts: {last_err}")
+                else:
+                    # spawn-exit: the orphan signature (see class attrs)
+                    if time.monotonic() - first_spawn >= self._SPAWN_RETRY_WINDOW:
+                        raise RuntimeError(
+                            f"tor failed to bootstrap after {attempts} "
+                            f"attempts: {last_err}")
+                    if waiting is not None:
+                        try:
+                            waiting()
+                        except Exception:
+                            pass    # display must never kill tor startup
+                await asyncio.sleep(self._SPAWN_RETRY_GAP)
 
         # Tor keeps logging (heartbeats, warnings) after bootstrap; the
         # torrc has "Log notice stdout" so if nobody keeps reading, the
@@ -200,6 +222,15 @@ class TorProcess:
             except Exception:
                 pass
         self._drain_task = asyncio.create_task(_drain())
+
+    # Spawn-exit retry (0.3.12): a tor that EXITS instantly at spawn is the
+    # signature of a prior instance's orphaned tor still holding the fixed
+    # socks/control ports + tordata lock. The orphan self-reaps within ~15s
+    # of its owner's death (__OwningControllerProcess polling), so retry for
+    # 2x that. Bootstrap TIMEOUTS are a different failure (tor alive but
+    # slow) and keep their own 2-attempt budget.
+    _SPAWN_RETRY_GAP = 5.0
+    _SPAWN_RETRY_WINDOW = 30.0
 
     _SHUTDOWN_GRACE = 5.0
 
