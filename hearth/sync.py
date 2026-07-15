@@ -227,6 +227,7 @@ class SyncService:
     async def _gossip_round(self, interval: float = 3.0, now=None):
         now = now or time.monotonic
         self.node.maintain_enckey()
+        self.node.maintain_wrap_grants()
         for peer in self.node.store.list_peers():
             addr = peer["address"]
             if _is_onion(addr):

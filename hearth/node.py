@@ -20,10 +20,11 @@ from .imagegate import AVATAR_MAX, BANNER_MAX, transcode, transcode_photo
 from .videogate import STORY_IMAGE_MAX, transcode_video
 from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_POST,
-                       MAX_BLOCK_H, MAX_CAPTION, MAX_LAYOUT, SIZE_LAYOUTS,
-                       TEXT_STYLE_ENUMS, WALL_COLS, make_album, make_delete,
-                       make_dm, make_enckey, make_post, make_profile,
-                       make_profile_layout, make_ring, make_story)
+                       KIND_WRAP_GRANT, MAX_BLOCK_H, MAX_CAPTION, MAX_LAYOUT,
+                       SIZE_LAYOUTS, TEXT_STYLE_ENUMS, WALL_COLS, is_expired,
+                       make_album, make_delete, make_dm, make_enckey,
+                       make_post, make_profile, make_profile_layout,
+                       make_ring, make_story, make_wrap_grant)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -1593,6 +1594,56 @@ class HearthNode:
             self._save_keys()
             self._publish(make_enckey(self.device, now=now))
 
+    def maintain_wrap_grants(self, now: Optional[float] = None):
+        """'A wall is a wall' (0.3.11): kreds-scope PROFILE posts are for
+        CURRENT friends, not friends-at-post-time. For each own kreds wall
+        post, mint an author-signed wrap_grant covering any current
+        friend device the payload wraps + existing grants miss. Also heals
+        the enckey-not-yet-synced transient (a post composed right after
+        friend-add gets granted on the next sweep). Journal and inner are
+        deliberately untouched -- a journal is a moment in time, and inner
+        stays future-only (spec 2026-07-15-wall-wrap-grants).
+
+        Guard mirrors maintain_enckey: minting signs, so locked/revoked/
+        unenrolled skip entirely. Multi-device races just union."""
+        if self.revoked or self.locked or self.device.identity_pub is None:
+            return
+        now = now if now is not None else time.time()
+        friends = [i for i in self.store.known_identities()
+                   if i != self.identity_pub]
+        if not friends:
+            return
+        for msg in self.store.post_messages(self.identity_pub):
+            p = msg.payload
+            if (p.get("placement", "journal") != "profile"
+                    or p.get("scope") != "kreds" or is_expired(p, now)):
+                continue
+            wrapped = set(p.get("wraps", {}))
+            granted = self.store.wrap_grants(msg.msg_id, self.identity_pub)
+            missing = {}
+            for friend in friends:
+                for dpub, enc_pub in self.store.enckeys(friend).items():
+                    if dpub in wrapped:
+                        continue
+                    g = granted.get(dpub)
+                    # covered only if the grant's wrap was sealed to the
+                    # device's CURRENT enc key (enc_pub annotation from
+                    # mint time; a pre-annotation grant counts as covered)
+                    if g is not None and g.get("enc_pub", enc_pub) == enc_pub:
+                        continue
+                    missing[dpub] = enc_pub
+            if not missing:
+                continue
+            key, aad = self._content_key(msg)
+            if key is None:
+                continue    # own post yet unrecoverable: never mint garbage
+            wraps = wrap_key(key, missing, aad)
+            for dpub in wraps:
+                wraps[dpub]["enc_pub"] = missing[dpub]
+            if wraps:
+                self._publish(make_wrap_grant(self.device, msg.msg_id,
+                                              wraps, now=now))
+
     def _dm_device_pubs(self, to_identity: str) -> dict:
         theirs = self.store.enckeys(to_identity)
         if not theirs:
@@ -1661,6 +1712,23 @@ class HearthNode:
                 else:
                     self._cache_message_key(msg.msg_id, key)
                 return key, aad
+        # 3) wall wrap-grant unwrap (kreds back-catalog): only grants
+        # signed by the POST'S author count -- store.wrap_grants filters
+        # on author, so a hostile friend's grant naming someone else's
+        # post is inert here (and in routing).
+        if kind == KIND_POST:
+            grants = self.store.wrap_grants(msg.msg_id,
+                                            msg.cert.identity_pub)
+            if grants:
+                for priv in self.device.enc_privs():
+                    key = unwrap_key(grants, self.device.device_pub, priv,
+                                     aad)
+                    if key is not None:
+                        if stale_row:
+                            self._replace_message_key(msg.msg_id, key)
+                        else:
+                            self._cache_message_key(msg.msg_id, key)
+                        return key, aad
         return None, aad
 
     def cache_message_keys(self):
