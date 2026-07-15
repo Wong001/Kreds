@@ -14,7 +14,7 @@ from .identity import (
     canonical, _sig_ok,
 )
 from .messages import MAX_BLOB_BYTES, ONION_SYNC_INTERVAL, blob_hash
-from .transport import TcpTransport, read_frame, write_frame
+from .transport import MAX_FRAME, TcpTransport, read_frame, write_frame
 
 # Bound on the pre-auth friend-add handshake reads (whole-branch review,
 # Fix 2): _on_conn's shared first-frame read and deliver_friend_add's reply
@@ -25,6 +25,27 @@ from .transport import TcpTransport, read_frame, write_frame
 # same first-frame read in _on_conn) is never at risk, while staying
 # Tor-tolerant (see TorTransport's 60s onion-dial allowance for comparison).
 FRIEND_ADD_TIMEOUT = 30
+
+# Bound on one round's BLOBS-phase give dict (whole-branch review, Finding
+# 1): the give dict used to collect EVERY blob a peer wants into a single
+# JSON frame, so an ordinary want-set (e.g. one big GIF + one photo posted
+# while a peer was offline, now normal at the 10 MB blob cap) could exceed
+# MAX_FRAME (transport.py, 16 MB) once base64-inflated (4/3x) -- write_frame
+# would raise "frame too large", killing the session at the blob phase, and
+# since store.missing_blobs() is stable the SAME oversized frame would be
+# rebuilt every round: blob sync with that peer wedged permanently. Budget
+# the give dict to this many encoded bytes per round instead; whatever
+# doesn't fit is simply left for the next sync round -- store.missing_blobs()
+# is recomputed fresh every session, and the receive loop below only ever
+# processes whatever keys ARE present in the peer's reply, so a partial give
+# is tolerated for free (nothing asserts the reply is complete; unfulfilled
+# hashes just stay "missing" and get re-requested next round).
+#
+# A single MAX_BLOB_BYTES blob (10 MB) can never overflow this budget on its
+# own: base64 inflates it to ~13.3 MB, comfortably under both MAX_FRAME and
+# this budget -- so "one blob alone doesn't fit" is unreachable and is not
+# given any special-case handling here.
+BLOB_GIVE_BUDGET = MAX_FRAME - 1024 * 1024
 
 
 def _auth_body(nonce_hex: str) -> bytes:
@@ -551,10 +572,16 @@ class SyncService:
         want = {"t": "blob_want", "hashes": sorted(store.missing_blobs())}
         peer_want = await self._swap(reader, writer, initiator, want)
         give = {}
+        give_size = 0
         for h in peer_want.get("hashes", []):
             data = store.get_blob(h)
-            if data is not None:
-                give[h] = base64.b64encode(data).decode()
+            if data is None:
+                continue
+            b64 = base64.b64encode(data).decode()
+            if give and give_size + len(b64) > BLOB_GIVE_BUDGET:
+                break            # leave the rest for the next sync round
+            give[h] = b64
+            give_size += len(b64)
         blobs = {"t": "blobs", "blobs": give}
         peer_blobs = await self._swap(reader, writer, initiator, blobs)
         for h, b64 in peer_blobs.get("blobs", {}).items():
