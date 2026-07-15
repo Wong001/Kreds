@@ -874,18 +874,20 @@ def test_updates_ui_checks_response_ok_before_parsing():
 
 def test_friend_add_entry_point_and_tabs_present():
     js = (WEB / "app.js").read_text(encoding="utf-8")
-    # ceremonyUI stays the one-time boot entry point (bootData calls it),
-    # and the toggle keeps saying "Add friend" (test_shipped_features_
-    # preserved already pins both strings at the top level).
+    # ceremonyUI stays the Settings>Friends entry point (bootData calls
+    # it); the tab panel itself now comes from buildFriendAdd so the
+    # topbar "+" popover hosts the identical flow (spec 2026-07-15).
     ceremony = _js_fn_body(js, "ceremonyUI")
-    assert "friendadd-tab" in ceremony
-    assert "Share my code" in ceremony and "Enter a code" in ceremony
-    assert "buildShareTab" in ceremony and "buildEnterTab" in ceremony
+    assert "buildFriendAdd" in ceremony
+    panel = _js_fn_body(js, "buildFriendAdd")
+    assert "friendadd-tab" in panel
+    assert "Share my code" in panel and "Enter a code" in panel
+    assert "buildShareTab" in panel and "buildEnterTab" in panel
 
 
 def test_friend_add_manual_fallback_still_reachable():
     js = (WEB / "app.js").read_text(encoding="utf-8")
-    ceremony = _js_fn_body(js, "ceremonyUI")
+    ceremony = _js_fn_body(js, "buildFriendAdd")
     assert "buildManualCeremony" in ceremony
     assert "manual code exchange" in ceremony
     # the manual builder still drives the SAME four endpoints as before --
@@ -1503,3 +1505,17 @@ def test_settings_page_wiring_and_collapse_memory():
     assert "renderMeStrip" in body and 'setView("settings")' in body
     assert "kreds_settings_open_" in js              # collapse state remembered
     assert "openProfileEditor" not in js and "closeEditOverlay" not in js
+
+
+def test_topbar_addfriend_popover():
+    # Spec 2026-07-15: a small self-only "+" next to Arrange/cog opens the
+    # add-friend flow as a dialog - no trip to Settings to add someone.
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert 'id="profile-addfriend"' in html
+    assert 'id="friendadd-overlay"' in html and 'id="friendadd-close"' in html
+    assert "buildFriendAdd" in _js_fn_body(js, "openFriendAdd")
+    assert "profile-addfriend" in _js_fn_body(js, "renderProfilePage")
+    assert "position: fixed" in _css_rule(css, "#friendadd-overlay")
+    assert "closeFriendAdd" in js

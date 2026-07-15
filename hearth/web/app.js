@@ -1082,7 +1082,7 @@ document.getElementById("block-settings").addEventListener("click", (ev) => {
   if (ev.target.id === "block-settings") closeBlockSettings();   // backdrop
 });
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") closeBlockSettings();
+  if (ev.key === "Escape") { closeBlockSettings(); closeFriendAdd(); }
 });
 // IMPORTANT #5(c): trap Tab within the card while the modal is open. Scoped
 // naturally - this only fires when the Tab keydown bubbles up from a
@@ -1790,6 +1790,10 @@ function renderProfilePage(p) {
   const arrangeBtn = document.getElementById("profile-arrange");
   arrangeBtn.textContent = ARRANGING ? "Done" : "Arrange";
   arrangeBtn.classList.toggle("hidden", !p.mine);
+
+  // Topbar "+" (self-only, spec 2026-07-15): quick add-friend without a
+  // trip to Settings.
+  document.getElementById("profile-addfriend").classList.toggle("hidden", !p.mine);
 
   // Right column: ONLY the Journal rail now, on every profile (spec
   // 2026-07-15) - the self-only panels live on the Settings page.
@@ -3312,18 +3316,11 @@ function buildManualCeremony(container) {
     status);
 }
 
-function ceremonyUI() {
-  const root = document.getElementById("ceremony");
-  root.replaceChildren();
-  const toggle = el("button", "btn-accent", "Add friend");
-  toggle.innerHTML = ICONS.plus + "<span>Add friend</span>";
-  const panel = el("div", "ceremony-panel hidden");
-  toggle.onclick = () => {
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden")) activeTab.friendaddFocus();
-  };
-  root.append(toggle, panel);
-
+// The Share-my-code / Enter-a-code panel, home-agnostic (spec
+// 2026-07-15): ceremonyUI hosts it in Settings > Friends behind the
+// "Add friend" toggle; openFriendAdd hosts the same panel in the topbar
+// "+" dialog. Sets panel.friendaddFocus() for whichever host opens it.
+function buildFriendAdd(panel) {
   const tabs = el("div", "friendadd-tabs");
   tabs.setAttribute("role", "tablist");
   const shareTabBtn = el("button", "friendadd-tab active", "Share my code");
@@ -3363,7 +3360,43 @@ function ceremonyUI() {
   fallbackToggle.onclick = () => manualPanel.classList.toggle("hidden");
 
   panel.append(tabs, shareTab, enterTab, fallbackToggle, manualPanel);
+  panel.friendaddFocus = () => activeTab.friendaddFocus();
 }
+
+function ceremonyUI() {
+  const root = document.getElementById("ceremony");
+  root.replaceChildren();
+  const toggle = el("button", "btn-accent", "Add friend");
+  toggle.innerHTML = ICONS.plus + "<span>Add friend</span>";
+  const panel = el("div", "ceremony-panel hidden");
+  buildFriendAdd(panel);
+  toggle.onclick = () => {
+    panel.classList.toggle("hidden");
+    if (!panel.classList.contains("hidden")) panel.friendaddFocus();
+  };
+  root.append(toggle, panel);
+}
+
+// Topbar "+" (spec 2026-07-15): quick add-friend without leaving the
+// profile. Rebuilt fresh per open so a prior invite's countdown state
+// never leaks into a new session.
+function openFriendAdd() {
+  const body = document.getElementById("friendadd-body");
+  body.replaceChildren();
+  const panel = el("div", "ceremony-panel");
+  buildFriendAdd(panel);
+  body.append(panel);
+  document.getElementById("friendadd-overlay").classList.remove("hidden");
+  panel.friendaddFocus();
+}
+function closeFriendAdd() {
+  document.getElementById("friendadd-overlay").classList.add("hidden");
+}
+document.getElementById("profile-addfriend").onclick = openFriendAdd;
+document.getElementById("friendadd-close").onclick = closeFriendAdd;
+document.getElementById("friendadd-overlay").addEventListener("click", (ev) => {
+  if (ev.target.id === "friendadd-overlay") closeFriendAdd();
+});
 
 // ---------------------------------------------------------------------
 // Messages / DM chat (unchanged, re-homed into #view-messages)
