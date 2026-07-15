@@ -13,10 +13,11 @@ affordance here - .fchip only sets the journal filter (renderChipbar's
 onclick), it never calls openProfile; and Anna's only post in this test is
 placement="profile" (posts_by(..., "profile")), so it never lands in Bo's
 FEED/journal for a by-name entry click either. The real openProfile path for
-a known friend with no journal entry to click is the self profile's Friends
-panel (#friends .friend, populated by renderMeStrip() from STATE.friends -
-see app.js's openMe()/renderMeStrip()): click #nav-me to open Bo's own
-profile (selfonly panels reveal), then click the .friend row for Anna.
+a known friend with no journal entry to click is the Friends section on the
+Settings page (#friends .friend, populated by renderMeStrip() from
+STATE.friends - see app.js's openSettings()/renderMeStrip()): click #nav-me
+to open Bo's own profile, click the cog (#profile-cog) to open Settings
+(spec 2026-07-15), then click the .friend row for Anna.
 """
 import os
 
@@ -124,6 +125,10 @@ def test_pin_drag_resize_and_synced_view(tmp_path):
             # docstring: the chip/journal-entry path the brief drafted isn't
             # a real openProfile call site for a profile-only post).
             page2.click("#nav-me")
+            # nav-me -> cog opens Settings -> the Friends section hosts the
+            # .friend rows now (spec 2026-07-15); the row's onclick is still
+            # openProfile, which lands on the profile view as before.
+            page2.click("#profile-cog")
             page2.wait_for_selector("#friends .friend")
             page2.click(".friend:has-text('Anna')")
             page2.wait_for_selector("#profile-wall .block")

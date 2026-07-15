@@ -2707,7 +2707,7 @@ function startActivityPing(intervalMs = 22000) {
   }, intervalMs);
 }
 
-// Self-only settings panel (profile-side, mirrors Friends/Devices): fills
+// Settings-page section (spec 2026-07-15): fills
 // #applock-settings from the current GET /api/applock status. Rebuilt
 // wholesale on every state change (enable/change/disable) rather than
 // patched in place - this panel is small and rarely touched, unlike the

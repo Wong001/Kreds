@@ -322,15 +322,19 @@ def test_text_block_styling_via_modal_persists_and_syncs(tmp_path):
             assert styles_after_reload == styles
 
             # friend leg: Bo syncs and sees the same styled render on
-            # Anna's profile (Friends panel is the real openProfile path
-            # for a friend with no journal entry - see module docstring
-            # precedent in test_ui_smoke_collage.py).
+            # Anna's profile (the Settings page's Friends section is the
+            # real openProfile path for a friend with no journal entry -
+            # see module docstring precedent in test_ui_smoke_collage.py).
             a.sync_with(b)
             page2 = browser.new_page(viewport={"width": 1280, "height": 900})
             page2.on("pageerror", lambda e: errors.append(str(e)))
             page2.goto(f"http://127.0.0.1:{b.http_port}/")
             page2.wait_for_selector(".fchip")
             page2.click("#nav-me")
+            # nav-me -> cog opens Settings -> the Friends section hosts the
+            # .friend rows now (spec 2026-07-15); the row's onclick is still
+            # openProfile, which lands on the profile view as before.
+            page2.click("#profile-cog")
             page2.wait_for_selector("#friends .friend")
             page2.click(".friend:has-text('Anna')")
             page2.wait_for_selector("#profile-wall .block-text-wrap")

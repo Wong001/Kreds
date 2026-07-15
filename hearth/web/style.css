@@ -121,11 +121,10 @@ body.desktop { padding-top: 40px; --chrome-h: 40px; }
 body.desktop #first-run, body.desktop #lock-screen, body.desktop #onboarding-wizard {
   top: 40px; }
 
-/* Desktop-only Settings panel (profile-side, Task 3): same selfonly
-   hidden-class handling as the panels above it, PLUS this - defaults to
-   display:none regardless of selfonly state, and only body.desktop (see
+/* Desktop-only section on the self-only Settings page (cog-gated, spec
+   2026-07-15): defaults to display:none and only body.desktop (see
    above) reveals it. This is what keeps a plain browser from ever
-   showing the close-behavior toggle even on your own profile. */
+   showing the close-behavior toggle even on your own Settings page. */
 .desktop-only-panel { display: none; }
 body.desktop .desktop-only-panel { display: block; }
 
@@ -688,8 +687,8 @@ body.desktop .desktop-only-panel { display: block; }
 /* =======================================================================
    Messages view + profile editor/friends/devices/ceremony/stories -
    re-homed from the pre-reskin client, functionally unchanged (friends +
-   devices now live in self-only panels inside #profile-side, gated on
-   p.mine, not their own Me view). Re-tokenized to the v3 set (--surface/--ink-2/--line-2/--body)
+   devices now live as sections on the self-only Settings page, reached
+   via the profile cog - spec 2026-07-15). Re-tokenized to the v3 set (--surface/--ink-2/--line-2/--body)
    rather than the pre-reskin --card/--muted/--faint/--fill/--sans aliases,
    so these views render on the same tokens as the journal. --me/--me-fg
    remain: they hold the user's chosen accent color, not a v3 token.
