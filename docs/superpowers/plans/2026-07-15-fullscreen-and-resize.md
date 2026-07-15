@@ -70,7 +70,7 @@ First measure: `.venv\Scripts\python.exe -m hearth demo` (fresh `run/`; POST `/a
 
 - [ ] **Step 4: Pins green, live geometry verification, full suite**
 
-Run the pin, then verify RENDERED geometry in the same Playwright session at two viewport sizes (1280x800 and 2400x1300): the `.dm-shell` bottom edge lands within ~24px of the viewport bottom at both sizes; the composer row (`.thread-col` bottom child) is inside the viewport; at 2400 wide the `.app` box is 1720px wide and centered; the journal view's readable column did NOT widen (measure a `.entry` row's width unchanged vs the 1220 build if quick, else assert it is < 900px). Record numbers + screenshots in the report. Then full suite.
+Run the pin, then verify RENDERED geometry in the same Playwright session at two viewport sizes (1280x800 and 2400x1300): the `.dm-shell` bottom edge fills to just above the `.idstrip` footer, which must stay fully inside the viewport (AMENDED after the first run: the offset folds in the idstrip's height — it is the always-visible identity fingerprint strip, and the original 106px offset pushed it below the fold); the composer row (`.thread-col` bottom child) is inside the viewport; at 2400 wide the `.app` box is 1720px wide and centered; the journal view keeps its pre-widen readable width (AMENDED after the first run caught it inheriting the shell cap and stretching 952->1452px: the journal container gains its own max-width restoring ~952px entries, with the chipbar/dayheads centering alongside). Record numbers + screenshots in the report. Then full suite.
 
 - [ ] **Step 5: Commit**
 

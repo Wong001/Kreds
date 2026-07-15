@@ -51,10 +51,15 @@ behavior; `70vh`/`640px` caps die.
 
 ### 2. App width (CSS only)
 
-`.app { max-width: 1220px }` -> `1720px`. Nothing else moves — inner
-views keep their own centering caps, so long-line readability is
-preserved. Verify Messages actually consumes the width (the `.dm-shell`
-grid's `minmax(0,1fr)` column should absorb it).
+`.app { max-width: 1220px }` -> `1720px`. Inner views keep their own
+centering caps so long-line readability is preserved — AMENDED during
+build: the journal view had NO cap of its own (it inherited `.app`'s and
+stretched 952->1452px, caught by Task 1's live geometry), so it gains an
+explicit readable cap restoring its pre-widen width. AMENDED: the chat
+height offset also folds in the `.idstrip` identity footer's height —
+the always-visible fingerprint strip must not fall below the fold.
+Verify Messages actually consumes the width (the `.dm-shell` grid's
+`minmax(0,1fr)` column should absorb it).
 
 ### 3. Corner resize grip (chrome JS + Api bridge)
 
