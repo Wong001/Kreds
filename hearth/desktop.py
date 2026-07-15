@@ -435,10 +435,10 @@ def _show_error_window(webview_module, message: str) -> None:
 # bootstrap attempts + 5s gap) plus AV-scan overhead on freshly written
 # binaries -- was 120, which a legitimately slow post-update cold bootstrap
 # overran, landing in the "always fails after an update" pattern.
-# 0.3.12: the spawn-retry window (30s window + 5s gap + 2x5s bounded reap
-# waits alongside the unchanged 2x90s bootstrap budget = 225s worst case)
-# consumed most of 240's headroom. Raised to 300 to restore the >=60s
-# AV-scan margin over the full worst-case retry budget.
+# 0.3.12: the spawn-retry window (30s window + 2x5s gaps + 2x5s bounded
+# reap waits alongside the unchanged 2x90s bootstrap budget = 230s worst
+# case) consumed most of 240's headroom. Raised to 300 to restore the
+# >=60s AV-scan margin over the full worst-case retry budget.
 READY_TIMEOUT_TOR = 300.0
 READY_TIMEOUT_PLAIN = 25.0
 
@@ -553,7 +553,7 @@ def _watch_ready(t: threading.Thread, holder: dict, port: int, window,
     _log_error(data_dir, reason + ("\n" + detail if detail else ""))
     if "error" not in holder:
         holder["error"] = reason    # flips the loading page to failed
-    # Past the (240s) tor-exceeding timeout the node is not legitimately
+    # Past the (300s) tor-exceeding timeout the node is not legitimately
     # mid-bootstrap; a "failed" screen over a live, syncing node is
     # dishonest, so tear it down (restores the pre-window-first semantics).
     _signal_shutdown(holder)

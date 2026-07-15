@@ -188,14 +188,17 @@ def test_spawn_window_plus_bootstrap_budget_fits_ready_wait():
     # C's spawn window + the unchanged 2x bootstrap budget must fit the
     # shell's ready-wait WITH the margin the 0.3.11 fix established for
     # AV-scan overhead on fresh binaries (the reason 120 originally
-    # failed). Deterministic worst case: full spawn window + the gap
-    # after the first timeout attempt + two bootstrap timeouts + two
-    # bounded reap waits.
+    # failed). Deterministic worst case: full spawn window + TWO gaps
+    # (the window bounds when a retry may be SCHEDULED, so the last
+    # in-window spawn-exit still sleeps a full gap after passing the
+    # check, and another gap follows the first timeout attempt) + two
+    # bootstrap timeouts + two bounded reap waits.
     from hearth.tor import TorProcess
     REAP_WAIT = 5.0                      # tor.py start()'s except path
-    worst = (TorProcess._SPAWN_RETRY_WINDOW + TorProcess._SPAWN_RETRY_GAP
+    worst = (TorProcess._SPAWN_RETRY_WINDOW
+             + 2 * TorProcess._SPAWN_RETRY_GAP
              + 2 * 90.0 + 2 * REAP_WAIT)
-    assert worst == 225.0                # conscious-edit pin (30+5+180+10)
+    assert worst == 230.0                # conscious-edit pin (30+10+180+10)
     assert desktop.READY_TIMEOUT_TOR - worst >= 60.0   # AV-overhead margin
 
 
