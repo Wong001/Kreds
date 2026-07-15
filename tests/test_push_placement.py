@@ -7,6 +7,7 @@ import tempfile
 import pytest
 
 from hearth.node import HearthNode
+from tests.test_imagegate import png_bytes
 
 
 def clip(seconds=1):
@@ -90,9 +91,9 @@ def test_row_cap_400s(tmp_path):
 def test_ungroup_top_inserts_members(tmp_path):
     n = _node(tmp_path)
     p1 = n.compose_post("one", scope="kreds", placement="profile",
-                        photos=[b"\x89PNG fake"])
+                        photos=[png_bytes(8, 8)])
     p2 = n.compose_post("two", scope="kreds", placement="profile",
-                        photos=[b"\x89PNG fake"])
+                        photos=[png_bytes(8, 8)])
     solo = _post(n, "solo")                  # occupies the top
     aid = n.set_album([p1, p2])
     n.set_album([], album_id=aid)            # ungroup
@@ -135,7 +136,7 @@ def test_autoplace_skips_shadowed_album(tmp_path):
     first) so the test can't pass by accident on publish/ingest order."""
     n = _node(tmp_path)
     p1 = n.compose_post("shared", scope="kreds", placement="profile",
-                        photos=[b"\x89PNG fake"])
+                        photos=[png_bytes(8, 8)])
     big_id = "b" * 64
     small_id = "a" * 64
     n.set_album([p1], album_id=big_id)              # minted first, larger id
@@ -164,13 +165,13 @@ def test_grow_pinned_album_leaves_wall_undisturbed(tmp_path):
     n = _node(tmp_path)
     other = _post(n, "other")                       # a block elsewhere
     p1 = n.compose_post("one", scope="kreds", placement="profile",
-                        photos=[b"\x89PNG fake"])
+                        photos=[png_bytes(8, 8)])
     aid = n.set_album([p1])                         # album inherits p1's pin
     n.set_block_pin(other, 0, 0, 4, 1)
     n.set_block_pin(aid, 0, 3, 2, 2)                # known geometry, off-top
     before = n.store.profile_layout(n.identity_pub)["pins"]
     new = n.compose_post("", scope="kreds", placement="profile",
-                         photos=[b"\x89PNG fake"], auto_place=False)
+                         photos=[png_bytes(8, 8)], auto_place=False)
     assert _pins(n) == before                       # compose alone: no touch
     n.set_album([p1, new], album_id=aid)            # grow
     lay = n.store.profile_layout(n.identity_pub)

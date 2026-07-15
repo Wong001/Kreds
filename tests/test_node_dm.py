@@ -3,6 +3,7 @@ import json
 import pytest
 
 from hearth.node import HearthNode
+from tests.test_imagegate import animated_gif_bytes
 
 
 def befriend_with_enckeys(a: HearthNode, b: HearthNode):
@@ -29,7 +30,7 @@ def test_dm_roundtrip_with_photo(tmp_path):
     wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
     freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
     befriend_with_enckeys(wong, freja)
-    photo = b"\x89PNG-hemmeligt-billede"
+    photo = animated_gif_bytes()            # byte-identity is the point below
     mid = wong.compose_dm(freja.identity_pub, "kun til dig", [photo])
     # the stored blob is ciphertext, not the photo
     ref = wong.store.get_message(mid)
@@ -116,7 +117,7 @@ def test_dm_photo_survives_blob_gc(tmp_path):
     wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
     freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
     befriend_with_enckeys(wong, freja)
-    photo = b"\x89PNG-must-survive-gc"
+    photo = animated_gif_bytes()            # byte-identity is the point below
     mid = wong.compose_dm(freja.identity_pub, "photo dm", [photo])
     thread = wong.dm_thread(freja.identity_pub)
     ref = thread[0]["blobs"][0]

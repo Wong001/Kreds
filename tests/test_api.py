@@ -2,8 +2,7 @@ from fastapi.testclient import TestClient
 
 from hearth.api import build_app
 from hearth.node import HearthNode
-
-PNG = b"\x89PNG\r\n\x1a\nfakepixels"
+from tests.test_imagegate import animated_gif_bytes
 
 
 def client(tmp_path):
@@ -23,9 +22,10 @@ def test_state_and_index(tmp_path):
 
 def test_post_feed_blob_delete_cycle(tmp_path):
     c, _ = client(tmp_path)
+    gif = animated_gif_bytes()              # byte-identity is the point below
     r = c.post("/api/post",
                data={"text": "hello", "scope": "kreds", "expires_seconds": ""},
-               files=[("photos", ("p.png", PNG, "image/png"))])
+               files=[("photos", ("p.gif", gif, "image/gif"))])
     assert r.status_code == 200
     mid = r.json()["msg_id"]
     feed = c.get("/api/feed").json()
@@ -33,7 +33,7 @@ def test_post_feed_blob_delete_cycle(tmp_path):
     assert feed[0]["scope"] == "kreds"
     blob = c.get(f"/api/post-blob/{mid}/{feed[0]['blobs'][0]}")
     assert blob.status_code == 200
-    assert blob.content == PNG
+    assert blob.content == gif
     assert c.post("/api/delete", json={"msg_id": mid}).status_code == 200
     assert c.get("/api/feed").json() == []
 

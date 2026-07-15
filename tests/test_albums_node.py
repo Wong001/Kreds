@@ -2,11 +2,11 @@
 import pytest
 
 from hearth.node import HearthNode
+from tests.test_imagegate import png_bytes
 
-# Fake PNG magic bytes -- compose_post never decodes photo bytes (unlike
-# compose_story's transcode gate), so any bytes work; reuses the exact
-# literal test_block_pins.py's photo test passes to `photos=`.
-PNG = b"\x89PNG fake"
+# A real (tiny) PNG -- compose_post now runs photos through the photo gate
+# (transcode_photo), which rejects non-image bytes.
+PNG = png_bytes(8, 8)
 
 
 def _node(tmp_path):

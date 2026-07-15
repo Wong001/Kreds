@@ -2,8 +2,7 @@ from fastapi.testclient import TestClient
 
 from hearth.api import build_app
 from hearth.node import HearthNode
-
-PNG = b"\x89PNG\r\n\x1a\nfakepixels"
+from tests.test_imagegate import animated_gif_bytes
 
 
 def client(tmp_path):
@@ -62,18 +61,19 @@ def test_ring_endpoint_rejects_unknown_identity(tmp_path):
 
 def test_post_blob_decrypts_photo(tmp_path):
     c, node = client(tmp_path)
+    gif = animated_gif_bytes()              # byte-identity is the point below
     r = c.post("/api/post", data={"text": "pic", "scope": "kreds"},
-               files=[("photos", ("p.png", PNG, "image/png"))])
+               files=[("photos", ("p.gif", gif, "image/gif"))])
     assert r.status_code == 200
     mid = r.json()["msg_id"]
     feed = c.get("/api/feed").json()
     h = feed[0]["blobs"][0]
     blob = c.get(f"/api/post-blob/{mid}/{h}")
     assert blob.status_code == 200
-    assert blob.content == PNG
-    # the raw store blob is ciphertext, not the plaintext PNG
+    assert blob.content == gif
+    # the raw store blob is ciphertext, not the plaintext GIF
     raw = c.get(f"/api/blob/{h}")
-    assert raw.content != PNG
+    assert raw.content != gif
 
 
 def test_post_blob_unknown_returns_404(tmp_path):

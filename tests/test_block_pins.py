@@ -96,8 +96,9 @@ def test_profile_view_annotates_pin_and_span(tmp_path):
 def test_profile_view_legacy_sizes_map_to_default_spans(tmp_path):
     n = _node(tmp_path)
     t = n.compose_post("text", scope="kreds", placement="profile")
+    from tests.test_imagegate import png_bytes
     ph = n.compose_post("pic", scope="kreds", placement="profile",
-                        photos=[b"\x89PNG fake"])
+                        photos=[png_bytes(8, 8)])
     n.set_block_size(t, "small")     # legacy Phase-A size
     # dynamic placement (spec 2026-07-14): creation auto-pins now, so the
     # never-pinned/never-spanned legacy fallback this test targets can no

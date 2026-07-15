@@ -5,6 +5,7 @@ import asyncio
 
 from hearth.node import HearthNode
 from hearth.sync import SyncService
+from tests.test_imagegate import animated_gif_bytes
 
 
 def test_three_node_story(tmp_path):
@@ -43,7 +44,7 @@ async def _story(tmp_path):
     await sh.sync_with(wa)
 
     # 1. Wong posts a photo; it reaches Freja over real sockets.
-    photo = b"\x89PNG-canal-sunset"
+    photo = animated_gif_bytes()            # byte-identity is the point below
     p1 = wong.compose_post("aftensol over kanalen", photos=[photo])
     assert await sw.sync_with(fa)
     feed = freja.feed()

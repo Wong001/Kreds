@@ -14,6 +14,7 @@ import asyncio
 
 from hearth.node import HearthNode
 from hearth.sync import SyncService
+from tests.test_imagegate import png_bytes
 
 
 def befriend(a, b):
@@ -40,7 +41,8 @@ def test_friend_gets_grid_record_and_it_survives_reorder(tmp_path):
         await sa.sync_with(ba)                     # exchange enckeys
 
         multi = a.compose_post("gallery", scope="kreds", placement="profile",
-                               photos=[b"\x89PNG one", b"\x89PNG two"])
+                               photos=[png_bytes(8, 8, (200, 80, 80)),
+                                      png_bytes(8, 8, (80, 200, 80))])
         other = a.compose_post("solo", scope="kreds", placement="profile")
         a.set_block_grid(multi, "cols3")
         await sa.sync_with(ba)

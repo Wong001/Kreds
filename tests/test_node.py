@@ -17,8 +17,9 @@ def test_uninitialized_dir_raises(tmp_path):
 
 
 def test_compose_feed_delete_with_photo(tmp_path):
+    from tests.test_imagegate import animated_gif_bytes
     n = HearthNode.create(tmp_path / "n", "Wong", "phone")
-    photo = b"\x89PNG fake bytes"
+    photo = animated_gif_bytes()            # byte-identity is the point below
     mid = n.compose_post("hello hearth", photos=[photo])
     feed = n.feed()
     assert len(feed) == 1 and feed[0]["mine"] is True
@@ -93,3 +94,50 @@ def test_revoke_device(tmp_path):
     devices = {d["device_pub"]: d for d in n.devices()}
     assert devices[tablet.device_pub]["revoked"] is True
     assert devices[n.device.device_pub]["this_device"] is True
+
+
+def test_compose_post_gates_photos(tmp_path):
+    import io as _io
+    from PIL import Image as _Image
+    from tests.test_imagegate import noise_jpeg_bytes
+
+    n = HearthNode.create(tmp_path / "n", "Wong", "phone")
+    big = noise_jpeg_bytes(4000, 3000)
+    assert len(big) > 5 * 1024 * 1024
+    mid = n.compose_post("beach", photos=[big])
+    feed = n.feed()
+    ref = feed[0]["blobs"][0]
+    plain = n.post_blob(mid, ref)
+    assert plain != big                        # gate re-encoded
+    img = _Image.open(_io.BytesIO(plain))
+    assert img.format == "JPEG" and max(img.size) <= 2560
+
+
+def test_compose_post_gif_survives_byte_identical(tmp_path):
+    from tests.test_imagegate import animated_gif_bytes
+    n = HearthNode.create(tmp_path / "n", "Wong", "phone")
+    gif = animated_gif_bytes()
+    mid = n.compose_post("loop", photos=[gif])
+    ref = n.feed()[0]["blobs"][0]
+    assert n.post_blob(mid, ref) == gif
+
+
+def test_compose_post_rejects_junk_photo_bytes(tmp_path):
+    n = HearthNode.create(tmp_path / "n", "Wong", "phone")
+    with pytest.raises(ValueError, match="not an image"):
+        n.compose_post("x", photos=[b"not-pixels"])
+
+
+def test_compose_dm_gates_photos(tmp_path):
+    from tests.test_imagegate import noise_jpeg_bytes
+    from tests.test_node_dm import befriend_with_enckeys
+
+    a = HearthNode.create(tmp_path / "a", "Wong", "wong-phone")
+    b = HearthNode.create(tmp_path / "b", "Freja", "freja-phone")
+    befriend_with_enckeys(a, b)
+    big = noise_jpeg_bytes(4000, 3000)
+    mid = a.compose_dm(b.identity_pub, "pic", photos=[big])
+    thread = a.dm_thread(b.identity_pub)
+    ref = thread[-1]["blobs"][0]
+    plain = a.dm_blob(mid, ref)
+    assert plain is not None and plain != big and len(plain) < len(big)

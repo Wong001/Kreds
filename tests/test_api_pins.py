@@ -5,11 +5,11 @@ from fastapi.testclient import TestClient
 
 from hearth.api import build_app
 from hearth.node import HearthNode
+from tests.test_imagegate import png_bytes
 
-# Same fake-PNG idiom as test_api_scoped_posts.py/test_api.py's photo-upload
-# tests -- compose_post never decodes the bytes, only the magic prefix
-# matters for /api/blob's sniffer.
-PNG = b"\x89PNG\r\n\x1a\nfakepixels"
+# A real (tiny) PNG -- compose_post now runs photos through the photo gate
+# (transcode_photo), which rejects non-image bytes.
+PNG = png_bytes(8, 8)
 
 
 @pytest.fixture

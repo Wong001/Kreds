@@ -16,7 +16,7 @@ from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
 from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        EnrollmentCert, IdentityCeremony, PROTOCOL,
                        canonical, _sig_ok)
-from .imagegate import AVATAR_MAX, BANNER_MAX, transcode
+from .imagegate import AVATAR_MAX, BANNER_MAX, transcode, transcode_photo
 from .videogate import STORY_IMAGE_MAX, transcode_video
 from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_POST,
@@ -520,7 +520,8 @@ class HearthNode:
             self._cache_message_key(mid, key)
             has_media = True
         else:
-            refs = [self.store.put_blob(encrypt_blob(key, p)) for p in photos]
+            gated = [transcode_photo(p) for p in photos]   # raises ValueError
+            refs = [self.store.put_blob(encrypt_blob(key, p)) for p in gated]
             nonce, ct = encrypt_body(key, {"text": text, "blobs": refs}, aad)
             wraps = wrap_key(key, pubs, aad)
             mid = self._publish(make_post(self.device, scope, nonce, ct, wraps,
@@ -1562,7 +1563,8 @@ class HearthNode:
                       if expires_seconds is not None else None)
         aad = dm_aad(self.identity_pub, to_identity, created_at)
         key = new_content_key()
-        refs = [self.store.put_blob(encrypt_blob(key, p)) for p in photos]
+        gated = [transcode_photo(p) for p in photos]       # raises ValueError
+        refs = [self.store.put_blob(encrypt_blob(key, p)) for p in gated]
         nonce, ct = encrypt_body(key, {"text": text, "blobs": refs}, aad)
         wraps = wrap_key(key, pubs, aad)
         mid = self._publish(make_dm(self.device, to_identity, nonce, ct,

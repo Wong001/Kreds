@@ -3,6 +3,7 @@ import pytest
 
 from hearth.messages import ACCENTS
 from hearth.node import HearthNode
+from tests.test_imagegate import png_bytes
 
 
 def _node(tmp_path):
@@ -45,7 +46,7 @@ def test_validation(tmp_path):
     n = _node(tmp_path)
     t = _text_post(n)
     ph = n.compose_post("pic", scope="kreds", placement="profile",
-                        photos=[b"\x89PNG fake"])
+                        photos=[png_bytes(8, 8)])
     with pytest.raises(ValueError):
         n.set_block_text(t, h="diagonal")
     with pytest.raises(ValueError):
@@ -57,7 +58,7 @@ def test_validation(tmp_path):
     aid = None
     # album refusal: build a real album, then try to style it
     p1 = n.compose_post("a", scope="kreds", placement="profile",
-                        photos=[b"\x89PNG fake"])
+                        photos=[png_bytes(8, 8)])
     aid = n.set_album([p1])
     with pytest.raises(ValueError):
         n.set_block_text(aid, h="center")
@@ -67,7 +68,7 @@ def test_carry_forward_everywhere(tmp_path):
     n = _node(tmp_path)
     t = _text_post(n)
     ph = n.compose_post("pic", scope="kreds", placement="profile",
-                        photos=[b"\x89PNG fake"])
+                        photos=[png_bytes(8, 8)])
     n.set_block_text(t, size="xl")
     n.set_block_pin(t, 0, 0, 2, 1)
     # dynamic placement (spec 2026-07-14): creation auto-pins now, so

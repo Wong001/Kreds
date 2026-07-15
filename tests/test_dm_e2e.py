@@ -7,6 +7,7 @@ from pathlib import Path
 from hearth.identity import DeviceKeys, DeviceView
 from hearth.node import HearthNode
 from hearth.sync import SyncService
+from tests.test_imagegate import animated_gif_bytes
 
 
 def test_dm_e2e_story(tmp_path):
@@ -54,7 +55,7 @@ async def _story(tmp_path):
 
     # Freja's phone goes offline. Wong DMs her (text + photo).
     await svcs[freja][0].stop()
-    photo = b"\x89PNG-aftensmad"
+    photo = animated_gif_bytes()            # byte-identity is the point below
     mid = wong.compose_dm(freja.identity_pub, "kommer du til middag?", [photo])
     await svcs[wong][0].sync_with(ha)             # lands on Freja's home node
     assert freja_home.store.get_message(mid) is not None

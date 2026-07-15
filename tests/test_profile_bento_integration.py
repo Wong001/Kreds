@@ -15,6 +15,7 @@ import asyncio
 
 from hearth.node import HearthNode
 from hearth.sync import SyncService
+from tests.test_imagegate import png_bytes
 
 
 def befriend(a, b):
@@ -42,7 +43,8 @@ def test_friend_gets_bento_size_records_surviving_reorder_and_grid_change(tmp_pa
 
         one = a.compose_post("one", scope="kreds", placement="profile")
         two = a.compose_post("two", scope="kreds", placement="profile",
-                             photos=[b"\x89PNG one", b"\x89PNG two"])
+                             photos=[png_bytes(8, 8, (200, 80, 80)),
+                                    png_bytes(8, 8, (80, 200, 80))])
         three = a.compose_post("three", scope="kreds", placement="profile")
         a.set_block_size(one, "wide")
         a.set_block_size(two, "small")

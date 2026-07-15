@@ -2,8 +2,7 @@ from fastapi.testclient import TestClient
 
 from hearth.api import build_app
 from hearth.node import HearthNode
-
-PNG = b"\x89PNG\r\n\x1a\nfake"
+from tests.test_imagegate import animated_gif_bytes
 
 
 def pair_friends(tmp_path):
@@ -21,10 +20,11 @@ def pair_friends(tmp_path):
 
 def test_dm_send_and_thread_over_api(tmp_path):
     wong, freja = pair_friends(tmp_path)
+    gif = animated_gif_bytes()              # byte-identity is the point below
     cw = TestClient(build_app(wong))
     r = cw.post("/api/dm", data={"to": freja.identity_pub,
                                  "text": "hej", "expires_seconds": ""},
-                files=[("photos", ("p.png", PNG, "image/png"))])
+                files=[("photos", ("p.gif", gif, "image/gif"))])
     assert r.status_code == 200
     mid = r.json()["msg_id"]
     # carry to freja and read via her API
@@ -39,7 +39,7 @@ def test_dm_send_and_thread_over_api(tmp_path):
     # signed message, not referenced blob bytes -- see test_node_dm.py)
     freja.store.put_blob(wong.store.get_blob(thread[0]["blobs"][0]))
     blob = cf.get(f"/api/dm-blob/{mid}/{thread[0]['blobs'][0]}")
-    assert blob.status_code == 200 and blob.content == PNG
+    assert blob.status_code == 200 and blob.content == gif
     convs = cf.get("/api/conversations").json()
     assert convs[0]["identity_pub"] == wong.identity_pub
 

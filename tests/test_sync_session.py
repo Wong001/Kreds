@@ -2,6 +2,7 @@ import asyncio
 
 from hearth.node import HearthNode
 from hearth.sync import SyncService
+from tests.test_imagegate import animated_gif_bytes
 
 
 def befriend(a: HearthNode, b: HearthNode):
@@ -28,7 +29,7 @@ def test_posts_and_blobs_propagate_between_friends(tmp_path):
         for n in (wong, freja):
             n.ensure_enckey()
         await sw.sync_with(fa)                  # exchange enc keys first
-        photo = b"\x89PNG-fake-sunset"
+        photo = animated_gif_bytes()         # byte-identity is the point below
         wong.compose_post("hej Freja", photos=[photo])
         assert await sw.sync_with(fa) is True
         feed = freja.feed()
