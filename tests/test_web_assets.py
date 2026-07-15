@@ -1465,3 +1465,17 @@ def test_block_gear_hover_revealed_outside_arrange():
     # rule and loses the cascade - the compound selector wins on specificity
     # (same precedent as .pact.del).
     assert ".settings-opt.settings-del" in css
+
+
+def test_scope_tag_small_ringless_bottom_right():
+    # Spec 2026-07-15: the Inner/Kreds badge sheds its pill ring, shrinks,
+    # and moves to the block's bottom-right (freed by the delete button's
+    # departure). Arrange hides it - the resize handle owns that corner.
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    base = _css_rule(css, ".block-scope")          # base rule must come FIRST in the file
+    assert "9px" in base and "border" not in base and "padding" not in base
+    pos = _css_rule(css, ".block .block-scope")
+    assert "bottom" in pos and "right" in pos
+    assert "top" not in pos and "left" not in pos
+    hide = _css_rule(css, ".block.arranging .block-scope")
+    assert "display: none" in hide
