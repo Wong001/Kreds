@@ -572,9 +572,6 @@ body.desktop .desktop-only-panel { display: block; }
 .text-italic .block-text-body { font-style: italic; }
 /* self-only overlays sit on the cell, not under it (fixed block heights) */
 .block .block-scope { position: absolute; top: 6px; left: 6px; z-index: 2; }
-/* bottom-left, not bottom-right: Task 6's .block-resize corner handle
-   claims bottom-right on pinned blocks and the two must not collide. */
-.block .del { position: absolute; bottom: 6px; left: 6px; right: auto; z-index: 2; }
 /* Add photos (Slice C): bottom-center so it never collides with .del
    (bottom-left) or .block-resize's corner handle (bottom-right). */
 .block-add { position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%);
@@ -606,6 +603,15 @@ body.desktop .desktop-only-panel { display: block; }
   border: 1px solid var(--line-2); background: var(--surface); color: var(--ink-2);
   font-size: 13px; line-height: 1; cursor: pointer; }
 .block-settings-btn:hover { color: var(--ink); border-color: var(--me); }
+/* Gear outside Arrange (spec 2026-07-15): hover-revealed on fine
+   pointers so the wall stays clean; always visible where hover doesn't
+   exist; Arrange keeps it permanent. */
+.block .block-settings-btn { opacity: 0; transition: opacity .15s; }
+.block:hover .block-settings-btn, .block:focus-within .block-settings-btn,
+.block.arranging .block-settings-btn { opacity: 1; }
+@media (pointer: coarse) { .block .block-settings-btn { opacity: 1; } }
+.settings-del { color: var(--red); }
+.settings-del:hover { background: var(--red-soft); }
 /* Arrange-mode collage affordances (Task 6): the dragged block stays put in
    the DOM (no more reorder-by-reparenting) and just dims - the ghost below
    previews the cell target instead. */

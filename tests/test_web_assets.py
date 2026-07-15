@@ -1437,3 +1437,24 @@ def test_banner_crop_control_wired():
     assert "backgroundPosition" in page and "banner_pos" in page
     rule = _css_rule(css, ".banner-crop-preview")
     assert "cover" in rule and "ns-resize" in rule
+
+
+def test_delete_everywhere_rehomed_into_block_settings():
+    # Spec 2026-07-15: the always-visible per-block delete button leaves
+    # the wall face; the settings modal owns it now. Journal entries keep
+    # their inline delete; albums keep the ungroup-first rule.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    rb = _js_fn_body(js, "renderBlock")
+    assert "Delete everywhere" not in rb
+    assert "block-settings-btn" in rb              # gear on every own block
+    obs = _js_fn_body(js, "openBlockSettings")
+    assert "Delete everywhere" in obs and "deleteEverywhere" in obs
+    assert "Delete everywhere" in _js_fn_body(js, "buildEntry")
+
+
+def test_block_gear_hover_revealed_outside_arrange():
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    rule = _css_rule(css, ".block .block-settings-btn")
+    assert "opacity: 0" in rule
+    assert ".block:hover .block-settings-btn" in css
+    assert "pointer: coarse" in css                # touch always shows it

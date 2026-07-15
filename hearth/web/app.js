@@ -558,18 +558,16 @@ function renderBlock(p) {
       const badge = el("span", "block-scope", p.scope === "inner" ? "Inner" : "Kreds");
       block.append(badge);
     }
-    // No one-tap "Delete everywhere" on an album: ungroup first, then
-    // delete the standalone post (v1 honest limit - see Ungroup in the
-    // settings modal).
-    if (!p.album) {
-      const del = el("button", "pact del", "Delete everywhere");
-      del.onclick = async () => {
-        if (!await deleteEverywhere(p.msg_id)) return;
-        await refresh();
-        if (currentView() === "profile" && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
-      };
-      block.append(del);
-    }
+    // Gear (spec 2026-07-15): the settings modal's entry point, now on
+    // every own block OUTSIDE Arrange too - with the inline delete gone,
+    // the modal is the only delete path, so it can't stay Arrange-gated.
+    // CSS hover-reveals it on fine pointers; coarse pointers always see it.
+    const cog = el("button", "block-settings-btn");
+    cog.innerHTML = ICONS.cog;
+    cog.type = "button";
+    cog.setAttribute("aria-label", "Block settings");
+    cog.onclick = () => openBlockSettings(p, block, cog);
+    block.append(cog);
     // blockPhotoItems() doesn't itself discriminate media type - a video
     // post's own blob would otherwise satisfy .length > 0 too, so exclude
     // it explicitly (video posts are never album-eligible either way).
@@ -600,16 +598,6 @@ function renderBlock(p) {
     // itself as its opener, since there's no more specific control to
     // credit for a whole-block tap.
     block.tabIndex = -1;
-    // Keyboard-focusable affordance (a11y fix): tap-to-open has no keyboard
-    // path, so give the modal a real <button> entry point too. The
-    // pointerdown handler below already bails on "button, a, select, video"
-    // targets, so this doesn't get mistaken for a drag start.
-    const cog = el("button", "block-settings-btn");
-    cog.innerHTML = ICONS.cog;
-    cog.type = "button";
-    cog.setAttribute("aria-label", "Block settings");
-    cog.onclick = () => openBlockSettings(p, block, cog);   // remembers the gear as the opener (#5a)
-    block.append(cog);
     if (p.pin) {
       const rz = el("div", "block-resize");
       rz.setAttribute("aria-hidden", "true");   // modal presets are the a11y path
@@ -1056,6 +1044,23 @@ function openBlockSettings(p, block, opener, focusSel) {
       await reopenAfterAction(null);
     };
     body.append(ungroup);
+  }
+
+  // Delete (spec 2026-07-15): re-homed from the block face. Albums keep
+  // the ungroup-first rule - no one-tap delete on a folded deck.
+  if (!p.album) {
+    const grp = el("div", "settings-group");
+    grp.append(el("div", "settings-label", "Delete"));
+    const del = el("button", "settings-opt settings-del", "Delete everywhere");
+    del.type = "button";
+    del.onclick = async () => {
+      if (!await deleteEverywhere(p.msg_id)) return;
+      closeBlockSettings();                       // the block is gone
+      await refresh();
+      if (currentView() === "profile" && CURRENT_PROFILE) openProfile(CURRENT_PROFILE);
+    };
+    grp.append(del);
+    body.append(grp);
   }
 
   document.getElementById("block-settings").classList.remove("hidden");
