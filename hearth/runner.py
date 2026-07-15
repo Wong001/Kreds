@@ -23,7 +23,8 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
                    status=None):
     # Display-only startup progress for the desktop shell. Stage names are
     # a contract with desktop.py's loading page and app.js: starting,
-    # tor-binary, tor-bootstrap, onion-publish, serving, ready, failed.
+    # tor-binary, tor-bootstrap, tor-waiting, onion-publish, serving, ready,
+    # failed.
     status = status or (lambda stage, pct=None: None)
     status("starting")
     node = HearthNode(data_dir)
@@ -44,7 +45,8 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
                 # the finally still stops own_tor (cancelling start leaves
                 # its _proc set, so stop() can terminate it).
                 start_task = asyncio.ensure_future(own_tor.start(
-                    status=lambda pct: status("tor-bootstrap", pct)))
+                    status=lambda pct: status("tor-bootstrap", pct),
+                    waiting=lambda: status("tor-waiting")))
                 waiters = {start_task}
                 sd_task = (asyncio.ensure_future(shutdown.wait())
                            if shutdown is not None else None)

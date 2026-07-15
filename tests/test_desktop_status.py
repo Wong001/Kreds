@@ -153,6 +153,8 @@ def test_loading_html_polls_status_and_maps_stages():
     # pinned on Api.get_startup_status above -- not in the page itself)
     assert "failed" in html
     assert html.isascii()
+    assert "Waiting for a previous Kreds to finish closing..." in html
+    assert "tor-waiting" in html
 
 
 def test_notify_already_running_copy_covers_startup_window(monkeypatch):

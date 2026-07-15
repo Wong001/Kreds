@@ -2,7 +2,8 @@
 `status(stage, pct=None)` threads through so the desktop shell can show live
 progress. Display-only - the default no-op must leave every existing caller
 untouched. Stage names are a contract shared with desktop.py and app.js:
-starting, tor-binary, tor-bootstrap, onion-publish, serving, ready, failed.
+starting, tor-binary, tor-bootstrap, tor-waiting, onion-publish, serving,
+ready, failed.
 """
 import asyncio
 import socket
@@ -51,7 +52,8 @@ class _FakeTorProcess:
         self.control_port = 19051
         self.cookie_path = data_dir / "control_auth_cookie"
 
-    async def start(self, bootstrap_timeout: float = 90.0, status=None):
+    async def start(self, bootstrap_timeout: float = 90.0, status=None,
+                    waiting=None):
         if status is not None:
             status(50)
             status(100)
@@ -116,7 +118,8 @@ def test_run_node_quit_during_tor_bootstrap_returns_and_stops_tor(
             self.control_port = 19051
             self.cookie_path = data_dir / "control_auth_cookie"
 
-        async def start(self, bootstrap_timeout: float = 90.0, status=None):
+        async def start(self, bootstrap_timeout: float = 90.0, status=None,
+                        waiting=None):
             if status is not None:
                 status(10)
             await asyncio.Event().wait()          # never bootstraps
@@ -137,6 +140,45 @@ def test_run_node_quit_during_tor_bootstrap_returns_and_stops_tor(
 
     asyncio.run(scenario())
     assert _BlockingTor.stopped                    # own_tor was stopped
+
+
+class _WaitingFakeTorProcess(_FakeTorProcess):
+    async def start(self, bootstrap_timeout: float = 90.0, status=None,
+                    waiting=None):
+        if waiting is not None:
+            waiting()                       # one spawn-exit retry happened
+        await super().start(bootstrap_timeout, status)
+
+
+def test_tor_waiting_stage_surfaces(tmp_path, monkeypatch):
+    node_dir = tmp_path / "n"
+    HearthNode.create(node_dir, "Test Person", "test-device")
+    events = []
+
+    def status(stage, pct=None):
+        events.append(stage)
+
+    async def fake_publish(control_port, cookie_path, port, key_blob):
+        return "fakesvcid", None
+
+    async def scenario():
+        monkeypatch.setattr(runner, "ensure_tor_binary", lambda: "tor")
+        monkeypatch.setattr(runner, "TorProcess", _WaitingFakeTorProcess)
+        monkeypatch.setattr(runner, "publish_onion", fake_publish)
+        shutdown = asyncio.Event()
+        task = asyncio.create_task(runner.run_node(
+            node_dir, gossip_port=0, http_port=_free_port(), tor=True,
+            shutdown=shutdown, status=status))
+        for _ in range(200):
+            if "ready" in events:
+                break
+            await asyncio.sleep(0.05)
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    asyncio.run(scenario())
+    assert "tor-waiting" in events
+    assert events.index("tor-waiting") < events.index("ready")
 
 
 def test_run_serve_forwards_status_to_run_node(tmp_path, monkeypatch):

@@ -1406,6 +1406,8 @@ def test_onboarding_poll_never_gives_up():
     assert "Connecting to Tor" in body
     assert "pywebview?.api?.get_startup_status?." in body  # optional-chained:
     # a plain browser (dev) has no bridge and must keep the text fallback
+    assert "tor-waiting" in body
+    assert "Waiting for a previous Kreds to finish closing..." in body
 
 
 def test_composer_note_reflects_wall_wrap_grants():

@@ -2349,6 +2349,8 @@ async function pollForFullApp(statusEl) {
         const s = await window.pywebview?.api?.get_startup_status?.();
         if (s && s.stage === "tor-bootstrap" && s.pct != null)
           msg = "Connecting to Tor - " + s.pct + "%";
+        else if (s && s.stage === "tor-waiting")
+          msg = "Waiting for a previous Kreds to finish closing...";
         else if (s && s.stage === "failed")
           msg = "Startup hit a problem - see app.log in the Kreds data folder.";
       } catch (e) { /* bridge absent (plain browser): keep the fallback text */ }

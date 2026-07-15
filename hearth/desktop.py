@@ -484,6 +484,7 @@ _LOADING_HTML = """<!DOCTYPE html>
   }
   var COPY = { "starting": "Starting Kreds...",
                "tor-binary": "Starting Kreds...",
+               "tor-waiting": "Waiting for a previous Kreds to finish closing...",
                "onion-publish": "Publishing your address...",
                "serving": "Almost there...",
                "ready": "Almost there..." };
