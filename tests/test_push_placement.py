@@ -126,10 +126,25 @@ def test_row_cap_400s(tmp_path):
         n.set_block_pin(a, 0, 501, 1, 1)    # beyond MAX_LAYOUT rows
 
 
-def test_ungroup_first_fits_members_newest_first(tmp_path):
+def test_ungroup_first_fits_members_newest_first(tmp_path, monkeypatch):
     # Ungroup follows creation's first-fit rule (spec 2026-07-15):
     # members are restored newest-first so the newest claims the highest
     # open slot, and nothing already placed ever moves.
+    #
+    # Same flake class as test_auto_place_unplaced_single_publish below:
+    # p1/p2 need DISTINGUISHABLE created_at values for "newest" to be
+    # well-defined, but two back-to-back real time.time() calls can land
+    # on the identical reading depending on machine speed (that test pins
+    # an identical value to test the tie-break; this one needs the
+    # opposite - a guaranteed-strictly-increasing clock - since it is
+    # asserting the non-tied ordering). Pinned deterministically rather
+    # than left to hope real wall-clock resolution separates the two
+    # compose_post calls.
+    counter = [1_700_000_000.0]
+    def fake_time():
+        counter[0] += 1.0
+        return counter[0]
+    monkeypatch.setattr("hearth.node.time.time", fake_time)
     n = _node(tmp_path)
     p1 = n.compose_post("one", scope="kreds", placement="profile",
                         photos=[png_bytes(8, 8)])            # (0,0) 2x2

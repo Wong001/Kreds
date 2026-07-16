@@ -339,6 +339,7 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
             "revoked": node.revoked,
             "accent": (node.store.profile(node.identity_pub) or {}).get(
                 "accent", "#2743d6"),
+            "update_status": node.update_status,
         }
 
     @app.get("/api/feed")

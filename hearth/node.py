@@ -1,6 +1,7 @@
 """HearthNode - one device's daemon state: keys + store + change events."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from . import applock, invitecodec
+from . import applock, invitecodec, update
 from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
                       encrypt_body, new_content_key, open_content_key,
                       post_aad, seal_content_key, unwrap_key, wrap_key)
@@ -28,6 +29,12 @@ from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
+
+# Auto-update check cadence (0.3.15): first check this long after the
+# gossip loop starts, then every this many seconds thereafter. See
+# HearthNode.maybe_check_update.
+UPDATE_CHECK_STARTUP_DELAY = 60.0
+UPDATE_CHECK_INTERVAL = 6 * 3600
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -108,6 +115,11 @@ class HearthNode:
         # SyncService wraps this node (or in tests that never wire one
         # up), in which case delivery is a no-op until a later gossip
         # round retries.
+        self.web_dir = None       # set by runner; used by the auto-update check
+        self.update_status = {"available": False, "kind": None,
+                              "version": None}
+        self._update_started_at = None   # monotonic of first tick
+        self._update_last_check = None    # monotonic of last check()
         self._dial = None
         # Set by SyncService.__init__ to its own deliver_friend_add(address,
         # response_json) bound method: lets add_friend_via_invite (below)
@@ -472,6 +484,31 @@ class HearthNode:
         idle_minutes = settings.get("idle_minutes", 0)
         if idle_minutes > 0 and now - self.last_activity > idle_minutes * 60:
             self.lock()
+
+    async def maybe_check_update(self, now_monotonic: float) -> None:
+        """Cadence-gated auto-update check (0.3.15): first check
+        UPDATE_CHECK_STARTUP_DELAY after the loop starts, then every
+        UPDATE_CHECK_INTERVAL. Runs the UNCHANGED update.check() off the
+        event loop; on a status CHANGE, notify() pushes it to the UI over
+        /ws. Best-effort - check() never raises; None means no banner."""
+        if self._update_started_at is None:
+            self._update_started_at = now_monotonic
+        if now_monotonic - self._update_started_at < UPDATE_CHECK_STARTUP_DELAY:
+            return
+        if (self._update_last_check is not None
+                and now_monotonic - self._update_last_check < UPDATE_CHECK_INTERVAL):
+            return
+        self._update_last_check = now_monotonic
+        info = await asyncio.to_thread(update.check, web_dir=self.web_dir)
+        if info and info.get("core_available"):
+            new = {"available": True, "kind": "core", "version": info["version"]}
+        elif info and info.get("web_available"):
+            new = {"available": True, "kind": "web", "version": info["version"]}
+        else:
+            new = {"available": False, "kind": None, "version": None}
+        if new != self.update_status:
+            self.update_status = new
+            self.notify()
 
     def _save_keys(self):
         if self.applock_enabled:

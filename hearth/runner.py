@@ -28,6 +28,7 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
     status = status or (lambda stage, pct=None: None)
     status("starting")
     node = HearthNode(data_dir)
+    node.web_dir = web_dir
     own_tor = None
     sync = None
     try:

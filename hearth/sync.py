@@ -246,6 +246,7 @@ class SyncService:
         now = now or time.monotonic
         self.node.maintain_enckey()
         self.node.maintain_wrap_grants()
+        await self.node.maybe_check_update(now())
         for peer in self.node.store.list_peers():
             addr = peer["address"]
             if _is_onion(addr):
