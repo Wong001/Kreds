@@ -842,19 +842,35 @@ def test_updates_ui_wired_into_me_strip():
 
 
 def test_updates_ui_apply_reload_vs_restart_paths():
-    # Task 2 (0.3.15): the reload/restart decision now lives in the shared
-    # applyUpdateNow helper (reused by the update banner), not inline in
-    # renderUpdateSettings - see test_update_banner_present_and_wired for
-    # the no-duplicated-logic guard.
+    # Task 2 fix (review findings, 0.3.15): applyUpdateNow owns only the
+    # unambiguous web reload path - it returns the parsed apply result and
+    # leaves out.restart_required to each caller, since the banner
+    # ("Restart to update") and the Settings panel ("Apply update") make
+    # different promises to the user about when a restart happens.
     js = (WEB / "app.js").read_text(encoding="utf-8")
     helper = _js_fn_body(js, "applyUpdateNow")
-    # web hot-swap -> reload
+    # web hot-swap -> reload, still owned by the shared helper
     assert "location.reload()" in helper
     assert "out.reload" in helper
-    # core staged -> restart notice, not a reload
+    # restart_required is returned by the helper, not actioned by it
     assert "restart_required" in helper
-    assert "restart Kreds" in helper
-    assert "applyUpdateNow" in _js_fn_body(js, "renderUpdateSettings")
+    assert "return out" in helper
+
+    # Banner: "Restart to update" is a promise to restart on this click -
+    # it restarts immediately once the apply stages.
+    banner = _js_fn_body(js, "renderUpdateBanner")
+    assert "applyUpdateNow" in banner
+    assert "restart_required" in banner
+    assert "api.restart" in banner
+
+    # Settings: "Apply update" is not a promise to restart - it must not
+    # restart silently. It renders a user-clicked "Restart now" button
+    # instead (the pre-fix UX), reusing the same api.restart idiom.
+    settings = _js_fn_body(js, "renderUpdateSettings")
+    assert "applyUpdateNow" in settings
+    assert "restart_required" in settings
+    assert "Restart now" in settings          # restored user-clicked affordance
+    assert "restart Kreds" in settings        # plain-browser text fallback
 
 
 def test_updates_ui_check_button_keyboard_accessible():

@@ -2875,29 +2875,26 @@ async function renderDesktopSettings() {
 
 // Shared by the Settings panel (renderUpdateSettings) and the auto-update
 // banner (renderUpdateBanner, Task 2, 0.3.15): POST the existing apply
-// endpoint, then reload (web hot-swap) or restart (core, desktop only).
-// errEl receives any failure text - callers own their own button
-// disable/enable around this call.
+// endpoint, then reload (web hot-swap - unambiguous, always immediate).
+// A staged core update (restart_required) is NOT actioned here: the two
+// callers' buttons make different promises to the user ("Restart to
+// update" on the banner vs. "Apply update" in Settings), so each caller
+// decides its own restart timing off the returned result (review finding,
+// 0.3.15). errEl receives any failure text - callers own their own button
+// disable/enable around this call. Returns the parsed apply result, or
+// null/undefined on a fetch failure.
 async function applyUpdateNow(errEl) {
   let out;
   try {
     const r = await fetch("/api/update/apply", {method: "POST"});
-    if (!r.ok) { if (errEl) errEl.textContent = "Couldn't apply update: " + await r.text(); return; }
+    if (!r.ok) { if (errEl) errEl.textContent = "Couldn't apply update: " + await r.text(); return null; }
     out = await r.json();
   } catch (e) {
     if (errEl) errEl.textContent = "Couldn't apply update: " + e.message;
-    return;
+    return null;
   }
-  if (out.reload) { location.reload(); return; }
-  if (out.restart_required) {
-    // window.pywebview.api.restart (Task 3, hearth/desktop.py) only
-    // exists in the desktop shell -- a plain browser (dev/demo) falls
-    // back to the text-only notice, since there's no launcher to
-    // relaunch there.
-    const api = window.pywebview && window.pywebview.api;
-    if (api && api.restart) { api.restart(); }
-    else if (errEl) { errEl.textContent = "Downloaded - restart Kreds to finish."; }
-  }
+  if (out.reload) { location.reload(); return out; }
+  return out;   // restart_required is the caller's call
 }
 
 // Signed in-app updates (Task 3, mirrors renderApplockSettings/
@@ -2945,13 +2942,33 @@ async function renderUpdateSettings() {
     const applyBtn = el("button", "btn-accent", "Apply update");
     applyBtn.type = "button";
     const applyErr = el("div", "hint");
-    // Fetch + reload/restart decision is the shared applyUpdateNow helper
-    // (Task 2) - also used by renderUpdateBanner. Only this button's own
-    // disable/enable + status text stays local to the panel.
+    // Fetch + reload logic is the shared applyUpdateNow helper (Task 2) -
+    // also used by renderUpdateBanner. But THIS button says "Apply
+    // update", not "Restart" - so a staged core update must not restart
+    // silently on this click (review finding, 0.3.15). Render a
+    // user-clicked "Restart now" affordance instead, same as before the
+    // helper existed, and let the user pick their own restart timing.
     applyBtn.onclick = async () => {
       applyBtn.disabled = true;
       applyErr.textContent = "";
-      await applyUpdateNow(applyErr);
+      const out = await applyUpdateNow(applyErr);
+      if (out && out.restart_required) {
+        // window.pywebview.api.restart (Task 3, hearth/desktop.py) only
+        // exists in the desktop shell -- a plain browser (dev/demo) falls
+        // back to the text-only notice, since there's no launcher to
+        // relaunch there.
+        const api = window.pywebview && window.pywebview.api;
+        if (api && api.restart) {
+          const restartBtn = el("button", "btn-accent", "Restart now");
+          restartBtn.type = "button";
+          restartBtn.onclick = () => api.restart();
+          applyErr.replaceChildren(
+            el("span", "", "Downloaded - "), restartBtn,
+            el("span", "", " to finish."));
+        } else {
+          applyErr.textContent = "Downloaded - restart Kreds to finish.";
+        }
+      }
       applyBtn.disabled = false;
     };
     result.append(verLine, ...(notes ? [notes] : []), applyBtn, applyErr);
@@ -2979,7 +2996,19 @@ function renderUpdateBanner() {
     s.kind === "core" ? "Restart to update" : "Update now");
   act.type = "button";
   const err = el("span", "ub-err", "");
-  act.onclick = () => { act.disabled = true; applyUpdateNow(err); };
+  // The banner's core button literally says "Restart to update" - one
+  // click means restart, unlike the Settings panel's "Apply update"
+  // (review finding, 0.3.15): restart here as soon as the apply stages,
+  // no separate confirmation step.
+  act.onclick = async () => {
+    act.disabled = true;
+    const out = await applyUpdateNow(err);
+    if (out && out.restart_required) {
+      const api = window.pywebview && window.pywebview.api;
+      if (api && api.restart) { api.restart(); }
+      else { err.textContent = "Downloaded - restart Kreds to finish."; }
+    }
+  };
   const x = el("button", "ub-x", "✕");   // dismiss (returns next push)
   x.type = "button";
   x.setAttribute("aria-label", "Dismiss");
