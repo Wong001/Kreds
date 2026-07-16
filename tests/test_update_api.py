@@ -124,6 +124,71 @@ def test_apply_web_swaps_the_actually_served_dir(tmp_path, monkeypatch):
     assert (served / "VERSION").read_text().strip() == "9.9.9"
 
 
+# ---------------------------------------------------------------------------
+# Whole-branch review, Finding 1 -- update_status must be CLEARED after a
+# successful web apply. Otherwise: a web update applies -> location.reload()
+# -> the fresh client fetches /api/state, which still reports the stale
+# {"available": True, "kind": "web"} (only maybe_check_update's own tick,
+# up to UPDATE_CHECK_INTERVAL away, ever rewrites update_status) -> the
+# just-updated client re-shows "A Kreds update is ready" -> a click re-checks,
+# gets None (version now current), 400s "no update available", and the
+# banner button is left dead. The staged-CORE branch is deliberately NOT
+# touched: a core update restarts the process, whose own first post-restart
+# check clears update_status naturally, and the banner honestly still
+# "applies" (restart pending) until then.
+# ---------------------------------------------------------------------------
+
+class _FakeQueue:
+    """Stands in for the asyncio.Queue node.notify() pushes to -- just
+    counts puts, no event loop required."""
+    def __init__(self):
+        self.puts = 0
+
+    def put_nowait(self, item):
+        self.puts += 1
+
+
+def test_apply_web_success_clears_update_status_and_notifies(tmp_path, monkeypatch):
+    url, pub = _feed(tmp_path, "9.9.9")
+    monkeypatch.setattr(update, "RELEASE_PUBKEY", pub)
+    monkeypatch.setattr(update.check, "__defaults__", (url, None))
+    served = tmp_path / "served"; served.mkdir(); (served / "index.html").write_text("OLD")
+    client, node = _client(tmp_path, served)
+    # Simulate the stale status maybe_check_update left behind from its
+    # last tick, still sitting there when the apply comes in.
+    node.update_status = {"available": True, "kind": "web", "version": "9.9.9"}
+    q = _FakeQueue()
+    node.subscribers.add(q)
+
+    r = client.post("/api/update/apply")
+
+    assert r.status_code == 200
+    assert r.json() == {"applied": "web", "reload": True}
+    assert node.update_status == {"available": False, "kind": None,
+                                  "version": None}
+    assert q.puts >= 1        # notify() pushed the cleared status out over /ws
+
+
+def test_apply_core_stage_does_not_clear_update_status(tmp_path, monkeypatch):
+    # Contrast case: the staged-core branch must NOT clear update_status --
+    # the process restarts into the new version, whose own first check
+    # clears it naturally; clearing it here would make the banner vanish
+    # for the (possibly long) window before that restart actually happens.
+    url, pub = _feed(tmp_path, "9.9.9", include_web=False, include_core=True)
+    monkeypatch.setattr(update, "RELEASE_PUBKEY", pub)
+    monkeypatch.setattr(update.check, "__defaults__", (url, None))
+    served = tmp_path / "served"; served.mkdir(); (served / "index.html").write_text("OLD")
+    client, node = _client(tmp_path, served)
+    node.update_status = {"available": True, "kind": "core", "version": "9.9.9"}
+
+    r = client.post("/api/update/apply")
+
+    assert r.status_code == 200
+    assert r.json() == {"staged": "core", "restart_required": True}
+    assert node.update_status == {"available": True, "kind": "core",
+                                  "version": "9.9.9"}
+
+
 def test_apply_core_only_stages_and_reports_restart_required(tmp_path, monkeypatch):
     url, pub = _feed(tmp_path, "9.9.9", include_web=False, include_core=True)
     monkeypatch.setattr(update, "RELEASE_PUBKEY", pub)

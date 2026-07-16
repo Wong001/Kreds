@@ -14,6 +14,7 @@ from .identity import (
     canonical, _sig_ok,
 )
 from .messages import MAX_BLOB_BYTES, ONION_SYNC_INTERVAL, blob_hash
+from .tor import onion_host
 from .transport import MAX_FRAME, TcpTransport, read_frame, write_frame
 
 # Bound on the pre-auth friend-add handshake reads (whole-branch review,
@@ -254,12 +255,10 @@ class SyncService:
         # sync -- identity-keying here would have skipped dialing it and
         # silently broken home-node catch-up. An onion host is unique per
         # device, so only a row pointing at OUR OWN onion is our self-row.
-        own_host = (self.node.store.get_meta("gossip_addr")
-                   or "").rsplit(":", 1)[0]
+        own_host = onion_host(self.node.store.get_meta("gossip_addr"))
         for peer in self.node.store.list_peers():
             addr = peer["address"]
-            if (own_host.endswith(".onion")
-                    and addr.rsplit(":", 1)[0] == own_host):
+            if own_host and onion_host(addr) == own_host:
                 continue                 # never dial our own onion
             if _is_onion(addr):
                 t = now()

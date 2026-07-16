@@ -1675,3 +1675,17 @@ def test_update_banner_present_and_wired():
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert "nwse" not in _css_rule(css, "#update-banner")   # it's a bar, sanity
     assert _css_rule(css, "#update-banner")                 # rule exists
+
+
+def test_update_banner_reenables_action_button_when_apply_does_not_navigate():
+    # Whole-branch review, Finding 2 (rides along with Finding 1): the
+    # banner's action button set act.disabled = true on click but was only
+    # ever re-enabled on the NEXT refresh() rebuild -- so an apply that
+    # fails (400, or a network error) left a permanently dead button until
+    # the poller happened to re-render. Once the apply call returns without
+    # actually navigating the page away (no web reload, no core restart),
+    # the button must be re-enabled so the user can retry.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    banner = _js_fn_body(js, "renderUpdateBanner")
+    assert "act.disabled = true" in banner
+    assert "act.disabled = false" in banner

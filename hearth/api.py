@@ -226,6 +226,18 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
                     return {"staged": "core", "restart_required": True}
                 elif info["web_available"]:
                     await asyncio.to_thread(update.apply_web, info, wd)
+                    # Whole-branch review, Finding 1: clear the stale
+                    # available/kind/version left by maybe_check_update's
+                    # last tick (up to UPDATE_CHECK_INTERVAL away) -- else
+                    # the client that just reload()s still sees the OLD
+                    # /api/state's update_status and re-shows "update
+                    # ready" for a version it's already running. Do NOT
+                    # do this on the staged-core branch above: that one
+                    # restarts the process, whose own first post-restart
+                    # check clears update_status naturally.
+                    node.update_status = {"available": False, "kind": None,
+                                          "version": None}
+                    node.notify()
                     return {"applied": "web", "reload": True}
                 else:
                     raise HTTPException(400, "no update available")

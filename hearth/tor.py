@@ -41,6 +41,19 @@ TOR_DOWNLOAD_TIMEOUT = 60.0
 ONION_VIRTUAL_PORT = 9997
 
 
+def onion_host(addr: Optional[str]) -> Optional[str]:
+    """The .onion host part of a "host:port" address, or None if addr is
+    missing or not an onion address. Shared by runner.py's _drain_self_peers
+    and sync.py's _gossip_round (whole-branch review, Finding 3) -- both
+    independently derived "is this row our own onion service" from a stored
+    gossip_addr/peer address the same way; this is the one place that
+    logic lives now."""
+    if not addr:
+        return None
+    host = addr.rsplit(":", 1)[0]
+    return host if host.endswith(".onion") else None
+
+
 def tor_app_dir() -> Path:
     override = os.environ.get("LOOP_TOR_DIR")
     base = Path(override) if override else (

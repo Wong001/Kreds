@@ -3003,11 +3003,19 @@ function renderUpdateBanner() {
   act.onclick = async () => {
     act.disabled = true;
     const out = await applyUpdateNow(err);
+    let navigating = false;    // page reload (web) or app restart (core)
     if (out && out.restart_required) {
       const api = window.pywebview && window.pywebview.api;
-      if (api && api.restart) { api.restart(); }
+      if (api && api.restart) { api.restart(); navigating = true; }
       else { err.textContent = "Downloaded - restart Kreds to finish."; }
     }
+    // Finding 2 (whole-branch review): a failed/errored apply (out falsy),
+    // or a staged core update with no pywebview restart bridge to call,
+    // never navigates away -- re-enable the button so the user can retry
+    // instead of it staying dead until the next refresh() rebuild. A
+    // successful web apply already reload()s inside applyUpdateNow, so
+    // this line is moot there (the page is gone).
+    if (!navigating && !(out && out.reload)) { act.disabled = false; }
   };
   const x = el("button", "ub-x", "✕");   // dismiss (returns next push)
   x.type = "button";

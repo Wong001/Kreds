@@ -11,7 +11,8 @@ from .api import build_app
 from .node import HearthNode
 from .sync import SyncService
 from .transport import TorTransport
-from .tor import ONION_VIRTUAL_PORT, TorProcess, ensure_tor_binary, publish_onion
+from .tor import (ONION_VIRTUAL_PORT, TorProcess, ensure_tor_binary,
+                  onion_host, publish_onion)
 
 
 def _drain_self_peers(node):
@@ -31,14 +32,11 @@ def _drain_self_peers(node):
     # republishes the onion. Fine: the onion key is stable across restarts,
     # so the host part is correct even if the persisted port is stale -- and
     # a stale port is exactly what we're draining.
-    own = node.store.get_meta("gossip_addr")
-    if not own:
-        return
-    own_host = own.rsplit(":", 1)[0]
-    if not own_host.endswith(".onion"):
-        return    # dev/TCP: no persistent self-onion row to drain
+    own_host = onion_host(node.store.get_meta("gossip_addr"))
+    if not own_host:
+        return    # no persisted onion (missing, or dev/TCP): nothing to drain
     for pe in node.store.list_peers():
-        if pe["address"].rsplit(":", 1)[0] == own_host:
+        if onion_host(pe["address"]) == own_host:
             node.store.remove_peer(pe["address"])
 
 
