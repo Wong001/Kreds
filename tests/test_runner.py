@@ -62,3 +62,39 @@ def test_run_serve_raises_if_bootstrap_server_exits_before_ready(tmp_path, monke
             await runner.run_serve(tmp_path / "n", gossip_port=0, http_port=0)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+
+
+def test_run_serve_shutdown_is_bounded_with_open_ws(tmp_path):
+    # Bug 2 (0.3.14): the /ws handler blocks forever in await q.get();
+    # without a bounded graceful shutdown uvicorn waits on it and quit
+    # hangs (tor orphaned). With timeout_graceful_shutdown set, an open
+    # /ws cannot hold shutdown past a few seconds.
+    import asyncio, time
+    import websockets
+    from hearth.node import HearthNode
+
+    async def scenario():
+        node_dir = tmp_path / "n"
+        HearthNode.create(node_dir, "Wong", "wong-phone")   # enrolled: skip bootstrap
+        port = _free_port()
+        shutdown = asyncio.Event()
+        task = asyncio.create_task(run_serve(node_dir, 0, port, shutdown=shutdown))
+        # wait for the full node app to answer
+        import httpx
+        async with httpx.AsyncClient() as c:
+            for _ in range(80):
+                try:
+                    if (await c.get(f"http://127.0.0.1:{port}/api/state")).status_code == 200:
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.1)
+        # hold a /ws open (the real handler parks in await q.get())
+        ws = await websockets.connect(f"ws://127.0.0.1:{port}/ws")
+        shutdown.set()
+        t0 = time.monotonic()
+        await asyncio.wait_for(task, timeout=10)     # must return, not hang
+        assert time.monotonic() - t0 < 8             # bounded (~3s graceful)
+        await ws.close()
+
+    asyncio.run(scenario())

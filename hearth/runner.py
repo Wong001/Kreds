@@ -87,9 +87,12 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
             port = await sync.start("127.0.0.1", gossip_port)
             node.store.set_meta("gossip_addr", f"127.0.0.1:{port}")
         status("serving")
+        # bound graceful shutdown: the /ws handler parks in await q.get() and
+        # never self-exits, so an unbounded shutdown hangs quit and orphans
+        # tor (0.3.14).
         server = uvicorn.Server(uvicorn.Config(
             build_app(node, web_dir=web_dir), host="127.0.0.1", port=http_port,
-            log_level="warning"))
+            log_level="warning", timeout_graceful_shutdown=3))
         watcher = None
         if shutdown is not None:
             async def _watch():
@@ -154,7 +157,8 @@ async def run_serve(data_dir, gossip_port: int, http_port: int,
         ready = asyncio.Event()
         app = build_bootstrap_app(data_dir, ready.set, web_dir=web_dir)
         server = uvicorn.Server(uvicorn.Config(
-            app, host="127.0.0.1", port=http_port, log_level="warning"))
+            app, host="127.0.0.1", port=http_port, log_level="warning",
+            timeout_graceful_shutdown=3))
         task = asyncio.create_task(server.serve())
         ready_task = asyncio.create_task(ready.wait())
         # Whole-branch review, MINOR #6: awaiting ONLY ready.wait() hangs
