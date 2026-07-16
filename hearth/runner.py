@@ -27,6 +27,10 @@ def _drain_self_peers(node):
     the sibling's my_addr as a peer under our shared identity_pub so the
     two devices sync (see test_three_nodes.py's home-node catch-up).
     Onion host is unique per device; identity is shared across a pair."""
+    # Reads the PERSISTED gossip_addr (from a prior run), before this run
+    # republishes the onion. Fine: the onion key is stable across restarts,
+    # so the host part is correct even if the persisted port is stale -- and
+    # a stale port is exactly what we're draining.
     own = node.store.get_meta("gossip_addr")
     if not own:
         return
