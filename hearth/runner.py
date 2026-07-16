@@ -11,7 +11,7 @@ from .api import build_app
 from .node import HearthNode
 from .sync import SyncService
 from .transport import TorTransport
-from .tor import TorProcess, ensure_tor_binary, publish_onion
+from .tor import ONION_VIRTUAL_PORT, TorProcess, ensure_tor_binary, publish_onion
 
 
 async def run_node(data_dir, gossip_port: int, http_port: int,
@@ -75,11 +75,12 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
                 status("onion-publish")
                 service_id, blob = await publish_onion(
                     tor_process.control_port, tor_process.cookie_path,
-                    gossip_port, node.onion_key)
+                    ONION_VIRTUAL_PORT, gossip_port, node.onion_key)
                 if blob and blob != node.onion_key:
                     node.save_onion_key(blob)
                 node.store.set_meta(
-                    "gossip_addr", f"{service_id}.onion:{gossip_port}")
+                    "gossip_addr",
+                    f"{service_id}.onion:{ONION_VIRTUAL_PORT}")
             # else: the caller already published (detached) and set gossip_addr
         else:
             sync = SyncService(node)

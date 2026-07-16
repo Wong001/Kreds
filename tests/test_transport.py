@@ -2,7 +2,9 @@ import asyncio
 
 import pytest
 
-from hearth.transport import MAX_FRAME, TcpTransport, read_frame, write_frame
+from hearth.tor import ONION_VIRTUAL_PORT
+from hearth.transport import (MAX_FRAME, TcpTransport, TorTransport,
+                              read_frame, write_frame)
 
 
 def test_frame_roundtrip_over_real_socket():
@@ -41,3 +43,42 @@ def test_oversized_frame_rejected():
             await write_frame(W(), {"x": "a" * (MAX_FRAME + 1)})
 
     asyncio.run(scenario())
+
+
+def test_onion_dial_normalizes_to_fixed_port(monkeypatch):
+    # A stale stored port in an .onion address must be ignored -- the dial
+    # always targets ONION_VIRTUAL_PORT, so peers deadlocked on old random
+    # ports recover once both ends are on 0.3.14 (no data migration).
+    seen = {}
+
+    async def fake_socks(socks_host, socks_port, host, port, timeout=30.0):
+        seen["host"] = host
+        seen["port"] = port
+        return (object(), object())            # (reader, writer) placeholder
+
+    monkeypatch.setattr("hearth.transport.socks_connect", fake_socks)
+    t = TorTransport(socks_port=9050)
+
+    async def scenario():
+        await t.connect("abcdefghij.onion:1117")   # stale port 1117
+
+    asyncio.run(scenario())
+    assert seen["host"] == "abcdefghij.onion"
+    assert seen["port"] == ONION_VIRTUAL_PORT       # normalized, not 1117
+
+
+def test_tcp_dial_keeps_its_real_port(monkeypatch):
+    seen = {}
+
+    async def fake_open(host, port):
+        seen["host"] = host
+        seen["port"] = port
+        return (object(), object())
+
+    monkeypatch.setattr("hearth.transport.asyncio.open_connection", fake_open)
+    t = TorTransport(socks_port=9050)
+
+    async def scenario():
+        await t.connect("127.0.0.1:22299")          # dev TCP, unchanged
+    asyncio.run(scenario())
+    assert seen == {"host": "127.0.0.1", "port": 22299}

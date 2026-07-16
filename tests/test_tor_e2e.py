@@ -14,7 +14,8 @@ def test_two_nodes_gossip_over_onions(tmp_path):
     from hearth.node import HearthNode
     from hearth.sync import SyncService
     from hearth.transport import TorTransport
-    from hearth.tor import TorProcess, ensure_tor_binary, publish_onion
+    from hearth.tor import (ONION_VIRTUAL_PORT, TorProcess,
+                            ensure_tor_binary, publish_onion)
 
     async def scenario():
         exe = ensure_tor_binary()
@@ -32,11 +33,13 @@ def test_two_nodes_gossip_over_onions(tmp_path):
             wp = await sw.start("127.0.0.1", 0)
             fp = await sf.start("127.0.0.1", 0)
             wid, wblob = await publish_onion(tor.control_port,
-                                             tor.cookie_path, wp, None)
+                                             tor.cookie_path,
+                                             ONION_VIRTUAL_PORT, wp, None)
             fid, fblob = await publish_onion(tor.control_port,
-                                             tor.cookie_path, fp, None)
+                                             tor.cookie_path,
+                                             ONION_VIRTUAL_PORT, fp, None)
             wong.save_onion_key(wblob); freja.save_onion_key(fblob)
-            faddr = f"{fid}.onion:{fp}"
+            faddr = f"{fid}.onion:{ONION_VIRTUAL_PORT}"
             wong.compose_post("hej over tor")
             # onion may take up to ~a minute to become reachable
             for _ in range(30):

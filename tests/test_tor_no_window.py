@@ -310,3 +310,29 @@ def test_bootstrap_timeout_budget_still_two_attempts(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="tor failed to bootstrap"):
         asyncio.run(scenario())
     assert calls["n"] == 2                  # timeout budget unchanged
+
+
+def test_publish_onion_uses_fixed_virtual_port(monkeypatch, tmp_path):
+    # Bug 1 (0.3.14): the onion VIRTUAL port is fixed so a node's dialable
+    # address never churns across restarts; the TARGET is the ephemeral
+    # local bind port (they now differ).
+    import asyncio
+    captured = {}
+
+    async def fake_control(control_port, cookie_path, command):
+        captured["cmd"] = command
+        return ["250-ServiceID=abcdef", "250 OK"]
+
+    monkeypatch.setattr(tor, "_control_command", fake_control)
+
+    async def scenario():
+        sid, blob = await tor.publish_onion(
+            9051, tmp_path / "cookie", tor.ONION_VIRTUAL_PORT, 54321,
+            key_blob="KEY")
+        return sid
+
+    sid = asyncio.run(scenario())
+    assert sid == "abcdef"
+    assert tor.ONION_VIRTUAL_PORT == 9997
+    # virtual (public) 9997 -> target (local bind) 54321
+    assert "Port=9997,127.0.0.1:54321" in captured["cmd"]

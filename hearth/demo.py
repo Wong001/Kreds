@@ -9,7 +9,7 @@ from pathlib import Path
 from .node import HearthNode
 from .runner import run_node
 from .sync import SyncService
-from .tor import TorProcess, ensure_tor_binary, publish_onion
+from .tor import ONION_VIRTUAL_PORT, TorProcess, ensure_tor_binary, publish_onion
 
 CAST = [
     ("run/wong-phone", 7101, 7201),
@@ -97,10 +97,11 @@ async def _seed_onions(shared):
     for data_dir, gp, _ in CAST:
         n = HearthNode(data_dir)
         sid, blob = await publish_onion(shared.control_port,
-                                        shared.cookie_path, gp, n.onion_key)
+                                        shared.cookie_path,
+                                        ONION_VIRTUAL_PORT, gp, n.onion_key)
         if blob and blob != n.onion_key:
             n.save_onion_key(blob)
-        onion = f"{sid}.onion:{gp}"
+        onion = f"{sid}.onion:{ONION_VIRTUAL_PORT}"
         addr_map[f"127.0.0.1:{gp}"] = onion
         n.store.set_meta("gossip_addr", onion)
         n.close()

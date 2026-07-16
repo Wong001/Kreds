@@ -70,7 +70,7 @@ def test_tor_status_sequence(tmp_path, monkeypatch):
     def status(stage, pct=None):
         events.append((stage, pct))
 
-    async def fake_publish(control_port, cookie_path, port, key_blob):
+    async def fake_publish(control_port, cookie_path, virtual_port, target_port, key_blob):
         return "fakesvcid", None
 
     async def scenario():
@@ -158,7 +158,7 @@ def test_tor_waiting_stage_surfaces(tmp_path, monkeypatch):
     def status(stage, pct=None):
         events.append(stage)
 
-    async def fake_publish(control_port, cookie_path, port, key_blob):
+    async def fake_publish(control_port, cookie_path, virtual_port, target_port, key_blob):
         return "fakesvcid", None
 
     async def scenario():

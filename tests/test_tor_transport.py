@@ -1,6 +1,7 @@
 import asyncio
 import struct
 
+from hearth.tor import ONION_VIRTUAL_PORT
 from hearth.transport import TorTransport
 
 
@@ -24,8 +25,10 @@ def test_onion_address_dials_via_socks():
         seen = []
         server, sport = await _fake_socks(seen)
         t = TorTransport(socks_port=sport)
+        # 15001 is a stale/arbitrary stored port; the dial must normalize to
+        # the fixed ONION_VIRTUAL_PORT regardless (0.3.14 dial normalization).
         reader, writer = await t.connect("abc.onion:15001")
-        assert seen == [("abc.onion", 15001)]
+        assert seen == [("abc.onion", ONION_VIRTUAL_PORT)]
         writer.close(); server.close()
     asyncio.run(scenario())
 

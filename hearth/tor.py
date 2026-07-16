@@ -31,6 +31,15 @@ TOR_SHA256 = "5f91e9426bf641dfe539dc28029088c72bed0b1d8f1c79104a0f89273cb3ebe1" 
 # (captive portal, filtering network) hangs the first run forever.
 TOR_DOWNLOAD_TIMEOUT = 60.0
 
+# The onion service's VIRTUAL port is fixed forever so a node's dialable
+# address never changes across restarts. Onion virtual ports are per-
+# service namespaced (every Kreds node can use 9997, like every site uses
+# :443), and the local TARGET port stays ephemeral. Prior bug (<=0.3.13):
+# virtual == a fresh _free_port() each launch, so a coordinated restart
+# rotated every node's port at once -> all cached peer addresses stale in
+# both directions -> permanent sync deadlock.
+ONION_VIRTUAL_PORT = 9997
+
 
 def tor_app_dir() -> Path:
     override = os.environ.get("LOOP_TOR_DIR")
@@ -301,13 +310,16 @@ async def _control_command(control_port: int, cookie_path: Path,
 
 
 async def publish_onion(control_port: int, cookie_path: Path,
-                        local_port: int, key_blob=None):
+                        virtual_port: int, target_port: int,
+                        key_blob=None):
     key_spec = key_blob if key_blob else "NEW:ED25519-V3"
     # Flags=Detach: without it, Tor removes an ephemeral onion the moment the
     # control connection that created it closes -- and _control_command closes
     # per call, so a non-detached service would die the instant this returns.
+    # virtual_port is the FIXED public port peers dial; target_port is the
+    # ephemeral local gossip listener the onion maps onto.
     cmd = (f"ADD_ONION {key_spec} Flags=Detach "
-           f"Port={local_port},127.0.0.1:{local_port}")
+           f"Port={virtual_port},127.0.0.1:{target_port}")
     reply_lines = await _control_command(control_port, cookie_path, cmd)
     fields = _parse_control_reply(reply_lines)
     service_id = fields.get("ServiceID")

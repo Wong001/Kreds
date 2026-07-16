@@ -9,6 +9,7 @@ import json
 import struct
 
 from .socks import socks_connect
+from .tor import ONION_VIRTUAL_PORT
 
 MAX_FRAME = 16 * 1024 * 1024
 
@@ -50,10 +51,15 @@ class TorTransport:
     async def connect(self, address: str):
         host, port = address.rsplit(":", 1)
         if host.endswith(".onion"):
-            # Spike measured onion dials up to 43s; socks_connect's 30s
-            # default would spuriously fail tail-latency first dials.
+            # Always dial the FIXED virtual port, ignoring the port in the
+            # stored address: pre-0.3.14 peers advertised a random per-
+            # launch port, so a cached address's port is unreliable. Once
+            # both ends are on 0.3.14 every onion listens at
+            # ONION_VIRTUAL_PORT, so this recovers stale-port deadlocks
+            # without a destructive peer-address migration.
             return await socks_connect("127.0.0.1", self.socks_port,
-                                       host, int(port), timeout=60.0)
+                                       host, ONION_VIRTUAL_PORT,
+                                       timeout=60.0)
         return await asyncio.open_connection(host, int(port))
 
     async def serve(self, host: str, port: int, handler):
