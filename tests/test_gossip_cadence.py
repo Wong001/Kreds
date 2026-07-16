@@ -15,8 +15,9 @@ def test_onion_peer_skipped_until_interval(tmp_path, monkeypatch):
     from hearth import messages
     monkeypatch.setattr(messages, "ONION_SYNC_INTERVAL", 45.0)
     node = HearthNode.create(tmp_path / "n", "Wong", "phone")
-    node.store.add_peer("abc.onion:15001", node.identity_pub)
-    node.store.add_peer("127.0.0.1:7999", node.identity_pub)
+    peer_identity = "12" * 32              # a peer, not self -- see the
+    node.store.add_peer("abc.onion:15001", peer_identity)  # self-skip guard
+    node.store.add_peer("127.0.0.1:7999", peer_identity)   # in _gossip_round
     svc = SyncService(node)
     dialed = []
 
@@ -108,3 +109,39 @@ def test_different_onion_host_same_identity_both_kept(tmp_path):
     addrs = {p["address"] for p in node.store.list_peers()
              if p["identity_pub"] == friend}
     assert addrs == {"hosta.onion:9997", "hostb.onion:9997"}   # both preserved
+
+
+def test_self_peer_row_drained_and_not_dialed(tmp_path):
+    # 0.3.14 outage residual: pairing left the node's OWN address stored as
+    # a peer; post-fix it dialed itself over Tor every cycle. A node never
+    # peers with itself - drain it on startup and never dial a self row.
+    from hearth.node import HearthNode
+    n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    n.store.add_peer("selfonion.onion:9997", n.identity_pub)   # stale self row
+    n.store.add_peer("friend.onion:9997", "ff" * 32)           # a real peer
+    from hearth.runner import _drain_self_peers
+    _drain_self_peers(n)
+    addrs = [p["address"] for p in n.store.list_peers()]
+    assert "selfonion.onion:9997" not in addrs      # self drained
+    assert "friend.onion:9997" in addrs             # real peer kept
+
+
+def test_gossip_round_never_dials_self_peer(tmp_path):
+    # Belt-and-suspenders (sync.py _gossip_round): even if a self-identity
+    # peer row reappears (e.g. echoed back via a peer's HAVE merge), the
+    # gossip loop's peer-dial loop must skip it and never dial ourselves.
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    node.store.add_peer("selfonion.onion:9997", node.identity_pub)
+    node.store.add_peer("friend.onion:9997", "ff" * 32)
+    svc = SyncService(node)
+    dialed = []
+
+    async def fake_sync_with(addr):
+        dialed.append(addr)
+        return False
+    svc.sync_with = fake_sync_with
+
+    asyncio.run(svc._gossip_round())
+
+    assert "selfonion.onion:9997" not in dialed     # self never dialed
+    assert "friend.onion:9997" in dialed            # real peer still dialed

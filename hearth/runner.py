@@ -14,6 +14,14 @@ from .transport import TorTransport
 from .tor import ONION_VIRTUAL_PORT, TorProcess, ensure_tor_binary, publish_onion
 
 
+def _drain_self_peers(node):
+    """A node never peers with itself. Pairing stored my_addr as a peer;
+    the 0.3.14 outage residual left a stale self-onion row that post-fix
+    dialed itself over Tor every cycle. Drop every self-identity peer row
+    at startup so it stops (and stops circulating in HAVE)."""
+    node.store.remove_peer_identity(node.identity_pub)
+
+
 async def run_node(data_dir, gossip_port: int, http_port: int,
                    interval: float = 3.0, tor: bool = False,
                    tor_process: "TorProcess | None" = None,
@@ -28,6 +36,7 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
     status = status or (lambda stage, pct=None: None)
     status("starting")
     node = HearthNode(data_dir)
+    _drain_self_peers(node)
     node.web_dir = web_dir
     own_tor = None
     sync = None

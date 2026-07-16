@@ -248,6 +248,8 @@ class SyncService:
         self.node.maintain_wrap_grants()
         await self.node.maybe_check_update(now())
         for peer in self.node.store.list_peers():
+            if peer.get("identity_pub") == self.node.identity_pub:
+                continue                 # never dial ourselves
             addr = peer["address"]
             if _is_onion(addr):
                 t = now()
