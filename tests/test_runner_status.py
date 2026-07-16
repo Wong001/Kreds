@@ -181,6 +181,55 @@ def test_tor_waiting_stage_surfaces(tmp_path, monkeypatch):
     assert events.index("tor-waiting") < events.index("ready")
 
 
+def test_sync_stop_hang_does_not_orphan_tor(tmp_path, monkeypatch):
+    # Final review, Finding 2: sync.stop() awaits Server.wait_closed(),
+    # which on 3.12 blocks until in-flight connection handlers finish.
+    # _session's post-hello reads are unbounded, so a peer that stalls
+    # mid-session parks the inbound handler forever -- sync.stop() hangs,
+    # own_tor.stop() never runs, and tor is orphaned (the exact symptom
+    # 0.3.14 claims to fix). run_node's finally must bound sync.stop() so
+    # a stalled in-flight session can never prevent tor's graceful stop.
+    node_dir = tmp_path / "n"
+    HearthNode.create(node_dir, "Test Person", "test-device")
+    events = []
+
+    def status(stage, pct=None):
+        events.append(stage)
+
+    async def fake_publish(control_port, cookie_path, virtual_port, target_port, key_blob):
+        return "fakesvcid", None
+
+    async def hanging_stop(self):
+        await asyncio.Event().wait()   # never returns: simulates a parked
+                                       # in-flight session handler
+
+    class _TrackingTorProcess(_FakeTorProcess):
+        stopped = []
+
+        async def stop(self):
+            _TrackingTorProcess.stopped.append(True)
+            await super().stop()
+
+    async def scenario():
+        monkeypatch.setattr(runner, "ensure_tor_binary", lambda: "tor")
+        monkeypatch.setattr(runner, "TorProcess", _TrackingTorProcess)
+        monkeypatch.setattr(runner, "publish_onion", fake_publish)
+        monkeypatch.setattr(runner.SyncService, "stop", hanging_stop)
+        shutdown = asyncio.Event()
+        task = asyncio.create_task(runner.run_node(
+            node_dir, gossip_port=0, http_port=_free_port(), tor=True,
+            shutdown=shutdown, status=status))
+        for _ in range(200):
+            if "ready" in events:
+                break
+            await asyncio.sleep(0.05)
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=10)   # must return, not hang
+
+    asyncio.run(scenario())
+    assert _TrackingTorProcess.stopped   # own_tor.stop() still ran
+
+
 def test_run_serve_forwards_status_to_run_node(tmp_path, monkeypatch):
     """Enrolled dir: run_serve skips the bootstrap phase and must hand the
     status callback straight to run_node."""

@@ -92,16 +92,34 @@ def _merge_peer_address(store, ident, addr):
     """Onion-preferred peer store: an onion address is always kept; a
     non-onion address is stored only if we hold no onion address for that
     identity yet. Never let a plain-TCP address shadow a known onion one --
-    that would route a Tor peer's gossip over the clearnet."""
+    that would route a Tor peer's gossip over the clearnet.
+
+    Onion eviction is HOST-keyed, not identity-keyed (final review, Finding
+    1): TorTransport.connect (0.3.14) normalizes every .onion dial to the
+    fixed ONION_VIRTUAL_PORT regardless of the stored port, so a same-host
+    row at an old port is always a stale duplicate of the same node (an
+    onion host uniquely identifies one service) and must be drained -- pre-
+    0.3.14 stale-port rows would otherwise both dial the same live service:
+    redundant full gossip sessions every round, a stale self-row syncing
+    with itself over Tor, and the stale row propagating family-wide via
+    HAVE/pairing. A single identity CAN legitimately own multiple different
+    onion hosts across devices, so those must not be collapsed -- only
+    same-host, different-port rows are evicted."""
     if _is_onion(addr):
+        host = addr.rsplit(":", 1)[0]
         # Evict any non-onion rows for this identity: otherwise the
         # gossip loop keeps dialing the stale clearnet address every
         # round, and the have-frame (built from list_peers()) would
         # keep propagating a non-onion address for a peer with a known
         # onion -- exactly what this guardrail exists to prevent.
         for pe in store.list_peers():
-            if pe.get("identity_pub") == ident and not _is_onion(pe["address"]):
-                store.remove_peer(pe["address"])
+            pa = pe["address"]
+            if pe.get("identity_pub") != ident:
+                continue
+            if not _is_onion(pa):
+                store.remove_peer(pa)
+            elif pa != addr and pa.rsplit(":", 1)[0] == host:
+                store.remove_peer(pa)          # stale same-host, old port
         store.add_peer(addr, ident)
         return
     known = [pe["address"] for pe in store.list_peers()

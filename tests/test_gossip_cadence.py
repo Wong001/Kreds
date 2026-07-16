@@ -75,3 +75,36 @@ def test_guardrail_onion_always_stored(tmp_path):
     addrs = {p["address"] for p in node.store.list_peers()
              if p["identity_pub"] == friend}
     assert addrs == {"xyz.onion:7000"}   # TCP row evicted, only onion remains
+
+
+def test_stale_same_host_onion_port_evicted_on_merge(tmp_path):
+    # Final review, Finding 1: TorTransport.connect (0.3.14) normalizes
+    # every .onion dial to the fixed ONION_VIRTUAL_PORT, so a stale
+    # pre-0.3.14 row (same host, old port) now dials the SAME live
+    # service as the fresh row -- redundant full gossip sessions every
+    # round, a stale self-row syncing with itself over Tor, and the
+    # stale row propagating family-wide via HAVE/pairing. Merging the
+    # fresh-port row must drain the stale same-host row, not duplicate it.
+    node = HearthNode.create(tmp_path / "n", "Wong", "phone")
+    friend = "dd" * 32
+    node.store.add_identity(friend)
+    _merge_peer_address(node.store, friend, "host.onion:1117")  # stale pre-0.3.14 port
+    _merge_peer_address(node.store, friend, "host.onion:9997")  # fresh normalized port
+    addrs = {p["address"] for p in node.store.list_peers()
+             if p["identity_pub"] == friend}
+    assert addrs == {"host.onion:9997"}   # stale-port row drained, no duplicate
+
+
+def test_different_onion_host_same_identity_both_kept(tmp_path):
+    # Host-keyed, not identity-keyed: one identity can legitimately own
+    # multiple DIFFERENT onion hosts across devices (e.g. phone + desktop).
+    # Those must both survive -- only a same-host, different-port row is a
+    # stale duplicate of the same node.
+    node = HearthNode.create(tmp_path / "n", "Wong", "phone")
+    friend = "ee" * 32
+    node.store.add_identity(friend)
+    _merge_peer_address(node.store, friend, "hosta.onion:9997")
+    _merge_peer_address(node.store, friend, "hostb.onion:9997")
+    addrs = {p["address"] for p in node.store.list_peers()
+             if p["identity_pub"] == friend}
+    assert addrs == {"hosta.onion:9997", "hostb.onion:9997"}   # both preserved

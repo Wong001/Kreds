@@ -120,7 +120,19 @@ async def run_node(data_dir, gossip_port: int, http_port: int,
                     pass
     finally:
         if sync is not None:
-            await sync.stop()
+            # Bounded (final review, Finding 2): sync.stop() awaits
+            # Server.wait_closed(), which on 3.12 blocks until in-flight
+            # connection handlers finish. _session's post-hello reads are
+            # unbounded, so a peer that stalls mid-session parks the
+            # inbound handler forever -- an unbounded sync.stop() here
+            # would then hang and own_tor.stop() below would never run,
+            # orphaning tor (the exact symptom 0.3.14 fixes via the
+            # neighbouring uvicorn-shutdown bound). A stalled in-flight
+            # session must not block tor's graceful stop.
+            try:
+                await asyncio.wait_for(sync.stop(), timeout=5.0)
+            except Exception:
+                pass
         if own_tor is not None:
             await own_tor.stop()
 
