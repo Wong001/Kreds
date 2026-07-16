@@ -829,7 +829,10 @@ def test_updates_ui_wired_into_app():
     assert "/api/update/apply" in js
     render = _js_fn_body(js, "renderUpdateSettings")
     assert "/api/update/check" in render
-    assert "/api/update/apply" in render
+    # Task 2 (0.3.15): the apply fetch itself moved into the shared
+    # applyUpdateNow helper (reused by the update banner) - the panel just
+    # calls it, rather than duplicating the fetch+decision inline.
+    assert "applyUpdateNow" in render
 
 
 def test_updates_ui_wired_into_me_strip():
@@ -839,14 +842,19 @@ def test_updates_ui_wired_into_me_strip():
 
 
 def test_updates_ui_apply_reload_vs_restart_paths():
+    # Task 2 (0.3.15): the reload/restart decision now lives in the shared
+    # applyUpdateNow helper (reused by the update banner), not inline in
+    # renderUpdateSettings - see test_update_banner_present_and_wired for
+    # the no-duplicated-logic guard.
     js = (WEB / "app.js").read_text(encoding="utf-8")
-    render = _js_fn_body(js, "renderUpdateSettings")
+    helper = _js_fn_body(js, "applyUpdateNow")
     # web hot-swap -> reload
-    assert "location.reload()" in render
-    assert "out.reload" in render or "info.reload" in render or "reload" in render
+    assert "location.reload()" in helper
+    assert "out.reload" in helper
     # core staged -> restart notice, not a reload
-    assert "restart_required" in render
-    assert "restart Kreds" in render
+    assert "restart_required" in helper
+    assert "restart Kreds" in helper
+    assert "applyUpdateNow" in _js_fn_body(js, "renderUpdateSettings")
 
 
 def test_updates_ui_check_button_keyboard_accessible():
@@ -1623,3 +1631,31 @@ def test_resize_grip_desktop_only_and_wired():
     rule = _css_rule(css, "#win-resize")
     assert "nwse-resize" in rule
     assert "display: none" in rule                # hidden until JS reveals
+
+
+# ---------------------------------------------------------------------
+# In-app update banner + shared apply helper (Task 2, 0.3.15): a
+# dismissible top banner renders from STATE.update_status (Task 1) and
+# applies via the existing POST /api/update/apply - notify + one-click
+# only, never automatic. The fetch+decision is a shared applyUpdateNow
+# helper reused by both the banner and the existing Settings > Updates
+# panel, so the reload/restart logic isn't duplicated.
+# ---------------------------------------------------------------------
+
+def test_update_banner_present_and_wired():
+    # Auto-update nudge (0.3.15): a dismissible top banner renders from
+    # STATE.update_status and applies via the existing endpoint.
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="update-banner"' in html
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    body = _js_fn_body(js, "renderUpdateBanner")
+    assert "update_status" in body
+    assert "Restart to update" in body        # core copy
+    assert "Update now" in body               # web copy
+    assert "renderUpdateBanner" in _js_fn_body(js, "refresh")   # called each refresh
+    # shared apply helper reused by banner + settings (no duplicated restart logic)
+    assert "applyUpdateNow" in _js_fn_body(js, "renderUpdateBanner")
+    assert "applyUpdateNow" in _js_fn_body(js, "renderUpdateSettings")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "nwse" not in _css_rule(css, "#update-banner")   # it's a bar, sanity
+    assert _css_rule(css, "#update-banner")                 # rule exists

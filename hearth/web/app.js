@@ -31,6 +31,8 @@ let CURRENT_PROFILE_ACCENT = null;
 let ARRANGING = false;        // self-only Wall Arrange mode (Up/Down controls shown)
 let BLOCK_SETTINGS_OPENER = null;   // #5: element to return focus to when the block-settings modal closes
 let NEEDS_WIZARD = false;   // set by boot() when onboarding_done is false; Task 3's bootData() consumes it
+let UPDATE_BANNER_DISMISSED = false;   // session-only; returns next status push (Task 2, 0.3.15)
+let LAST_SEEN_UPDATE_VERSION = null;   // re-nudge when update_status.version changes past a dismiss
 
 async function j(url, opts) {
   const r = await fetch(url, opts);
@@ -2871,13 +2873,41 @@ async function renderDesktopSettings() {
   panel.append(el("div", "lbl", "When you close the window"), sel, err);
 }
 
+// Shared by the Settings panel (renderUpdateSettings) and the auto-update
+// banner (renderUpdateBanner, Task 2, 0.3.15): POST the existing apply
+// endpoint, then reload (web hot-swap) or restart (core, desktop only).
+// errEl receives any failure text - callers own their own button
+// disable/enable around this call.
+async function applyUpdateNow(errEl) {
+  let out;
+  try {
+    const r = await fetch("/api/update/apply", {method: "POST"});
+    if (!r.ok) { if (errEl) errEl.textContent = "Couldn't apply update: " + await r.text(); return; }
+    out = await r.json();
+  } catch (e) {
+    if (errEl) errEl.textContent = "Couldn't apply update: " + e.message;
+    return;
+  }
+  if (out.reload) { location.reload(); return; }
+  if (out.restart_required) {
+    // window.pywebview.api.restart (Task 3, hearth/desktop.py) only
+    // exists in the desktop shell -- a plain browser (dev/demo) falls
+    // back to the text-only notice, since there's no launcher to
+    // relaunch there.
+    const api = window.pywebview && window.pywebview.api;
+    if (api && api.restart) { api.restart(); }
+    else if (errEl) { errEl.textContent = "Downloaded - restart Kreds to finish."; }
+  }
+}
+
 // Signed in-app updates (Task 3, mirrors renderApplockSettings/
 // renderDesktopSettings' rebuild-wholesale pattern): a manual "Check for
 // updates" button against GET /api/update/check, and - only once one's
-// available - an Apply button against POST /api/update/apply. A web
-// hot-swap reloads the page; a staged core update just needs a restart,
-// so it stays put and tells the user instead. No auto-check loop (Phase
-// 2a is manual-only per spec).
+// available - an Apply button against POST /api/update/apply (via the
+// shared applyUpdateNow helper above, Task 2). A web hot-swap reloads the
+// page; a staged core update just needs a restart, so it stays put and
+// tells the user instead. No auto-check loop (Phase 2a is manual-only
+// per spec).
 async function renderUpdateSettings() {
   const panel = document.getElementById("update-settings");
   if (!panel) return;
@@ -2915,47 +2945,47 @@ async function renderUpdateSettings() {
     const applyBtn = el("button", "btn-accent", "Apply update");
     applyBtn.type = "button";
     const applyErr = el("div", "hint");
+    // Fetch + reload/restart decision is the shared applyUpdateNow helper
+    // (Task 2) - also used by renderUpdateBanner. Only this button's own
+    // disable/enable + status text stays local to the panel.
     applyBtn.onclick = async () => {
       applyBtn.disabled = true;
       applyErr.textContent = "";
-      let out;
-      try {
-        const r = await fetch("/api/update/apply", {method: "POST"});
-        if (!r.ok) { applyErr.textContent = "Couldn't apply update: " + await r.text();
-          applyBtn.disabled = false; return; }
-        out = await r.json();
-      } catch (e) {
-        applyErr.textContent = "Couldn't apply update: " + e.message;
-        applyBtn.disabled = false;
-        return;
-      }
-      if (out.reload) {
-        alert("Updated - reloading");
-        location.reload();
-        return;
-      }
-      if (out.restart_required) {
-        // window.pywebview.api.restart (Task 3, hearth/desktop.py) only
-        // exists in the desktop shell -- a plain browser (dev/demo) falls
-        // back to the text-only notice, since there's no launcher to
-        // relaunch there.
-        const api = window.pywebview && window.pywebview.api;
-        if (api && api.restart) {
-          applyErr.textContent = "";
-          const restartBtn = el("button", "btn-accent", "Restart now");
-          restartBtn.type = "button";
-          restartBtn.onclick = () => api.restart();
-          applyErr.replaceChildren(
-            el("span", "", "Downloaded - "), restartBtn,
-            el("span", "", " to finish."));
-        } else {
-          applyErr.textContent = "Downloaded - restart Kreds to finish.";
-        }
-      }
+      await applyUpdateNow(applyErr);
       applyBtn.disabled = false;
     };
     result.append(verLine, ...(notes ? [notes] : []), applyBtn, applyErr);
   };
+}
+
+// Auto-update nudge (Task 2, 0.3.15): a dismissible top banner rendered
+// from STATE.update_status (Task 1's node-side auto-check), called every
+// refresh(). Notify + one-click apply ONLY - it never applies on its own.
+// Dismiss is session-only: refresh() resets UPDATE_BANNER_DISMISSED when
+// a genuinely new version shows up, so a fresh update re-nudges even if
+// an earlier one was dismissed.
+function renderUpdateBanner() {
+  const bar = document.getElementById("update-banner");
+  if (!bar) return;
+  const s = (STATE && STATE.update_status) || {available: false};
+  if (!s.available || UPDATE_BANNER_DISMISSED) {
+    bar.classList.add("hidden");
+    bar.replaceChildren();
+    return;
+  }
+  bar.replaceChildren();
+  const msg = el("span", "ub-msg", "A Kreds update is ready");
+  const act = el("button", "ub-act",
+    s.kind === "core" ? "Restart to update" : "Update now");
+  act.type = "button";
+  const err = el("span", "ub-err", "");
+  act.onclick = () => { act.disabled = true; applyUpdateNow(err); };
+  const x = el("button", "ub-x", "✕");   // dismiss (returns next push)
+  x.type = "button";
+  x.setAttribute("aria-label", "Dismiss");
+  x.onclick = () => { UPDATE_BANNER_DISMISSED = true; renderUpdateBanner(); };
+  bar.append(msg, act, err, x);
+  bar.classList.remove("hidden");
 }
 
 const ACCENTS = ["#2743d6","#c0563b","#3e7c55","#8a5cd0","#17191e",
@@ -3658,6 +3688,13 @@ async function refresh() {
   // fetch background" from the call site. Every refresh() - WS-driven or
   // user-triggered - fetches the same way.
   STATE = await j("/api/state");
+  // re-nudge on a genuinely new version even if a prior banner was dismissed
+  if (STATE.update_status && STATE.update_status.available
+      && STATE.update_status.version !== LAST_SEEN_UPDATE_VERSION) {
+    UPDATE_BANNER_DISMISSED = false;
+    LAST_SEEN_UPDATE_VERSION = STATE.update_status.version;
+  }
+  renderUpdateBanner();
   if (STATE.revoked) {
     document.getElementById("app").classList.add("hidden");
     document.getElementById("revoked-banner").classList.remove("hidden");

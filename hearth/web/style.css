@@ -148,6 +148,22 @@ body.desktop .desktop-only-panel { display: block; }
      scrollport; .app itself never scrolls - the page does). */
   overflow: clip; box-shadow: var(--shadow); position: relative;
   display: flex; flex-direction: column; }
+/* Auto-update nudge (0.3.15): slim top bar, first child of #app so it spans
+   the shell above the nav. --accent-soft isn't a defined token here, so this
+   falls back to --surface (matches the nav's own background). */
+#update-banner { display: flex; align-items: center; gap: 12px;
+  padding: 8px 16px; background: var(--accent-soft, var(--surface));
+  border-bottom: 1px solid var(--line); font-size: 13px; }
+#update-banner.hidden { display: none; }
+#update-banner .ub-msg { color: var(--ink); }
+#update-banner .ub-act { margin-left: auto; border: 1px solid var(--line-2);
+  background: var(--surface); color: var(--ink); border-radius: 99px;
+  padding: 4px 12px; font-size: 12.5px; cursor: pointer; }
+#update-banner .ub-act:hover { border-color: var(--ink-2); }
+#update-banner .ub-err { color: var(--ink-2); font-size: 12px; }
+#update-banner .ub-x { border: 0; background: transparent; color: var(--ink-2);
+  font-size: 13px; cursor: pointer; padding: 2px 6px; }
+
 .appnav { display: flex; align-items: center; gap: 10px; padding: 12px 20px;
   background: var(--surface); border-bottom: 1px solid var(--line);
   position: sticky; top: var(--chrome-h, 0px); z-index: 15; }

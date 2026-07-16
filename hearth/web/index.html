@@ -39,6 +39,11 @@
      browser's OS frame already resizes). -->
 <div id="win-resize" aria-hidden="true" title="Resize"></div>
 <div class="app" id="app">
+  <!-- Auto-update nudge (0.3.15): a dismissible top banner, rendered from
+       STATE.update_status by renderUpdateBanner() (app.js), called every
+       refresh(). First child so it spans the full app width, above the
+       nav/view container - notify + one-click apply only, never automatic. -->
+  <div id="update-banner" class="hidden" role="status"></div>
   <nav class="appnav">
     <svg class="mark" viewBox="0 0 100 100" aria-hidden="true">
       <path class="arc" d="M 58.32 10.88 A 40 40 0 0 1 88.04 62.36"/>
