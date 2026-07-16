@@ -247,10 +247,20 @@ class SyncService:
         self.node.maintain_enckey()
         self.node.maintain_wrap_grants()
         await self.node.maybe_check_update(now())
+        # Host-keyed self-skip, not identity-keyed (review finding, same
+        # commit): a paired sibling device (e.g. home node) shares our
+        # identity_pub but runs its OWN onion service, and pair_install
+        # deliberately seeds that sibling address as a peer so the two
+        # sync -- identity-keying here would have skipped dialing it and
+        # silently broken home-node catch-up. An onion host is unique per
+        # device, so only a row pointing at OUR OWN onion is our self-row.
+        own_host = (self.node.store.get_meta("gossip_addr")
+                   or "").rsplit(":", 1)[0]
         for peer in self.node.store.list_peers():
-            if peer.get("identity_pub") == self.node.identity_pub:
-                continue                 # never dial ourselves
             addr = peer["address"]
+            if (own_host.endswith(".onion")
+                    and addr.rsplit(":", 1)[0] == own_host):
+                continue                 # never dial our own onion
             if _is_onion(addr):
                 t = now()
                 last = self._last_onion_sync.get(addr, 0.0)

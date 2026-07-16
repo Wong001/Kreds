@@ -15,11 +15,27 @@ from .tor import ONION_VIRTUAL_PORT, TorProcess, ensure_tor_binary, publish_onio
 
 
 def _drain_self_peers(node):
-    """A node never peers with itself. Pairing stored my_addr as a peer;
-    the 0.3.14 outage residual left a stale self-onion row that post-fix
-    dialed itself over Tor every cycle. Drop every self-identity peer row
-    at startup so it stops (and stops circulating in HAVE)."""
-    node.store.remove_peer_identity(node.identity_pub)
+    """A node never peers with itself. Drop peer rows pointing at THIS
+    node's own onion service, matched by onion HOST (unique per device) so
+    a sibling device that shares our identity but runs a DIFFERENT onion
+    is preserved (home-node multi-device sync). The stale self-row from
+    the 0.3.14 outage is our own onion host on a dead port.
+
+    Review finding (identity-keyed version, same commit as this fix):
+    keying on identity_pub instead of onion host would ALSO delete a
+    paired sibling device's address -- pair_install deliberately seeds
+    the sibling's my_addr as a peer under our shared identity_pub so the
+    two devices sync (see test_three_nodes.py's home-node catch-up).
+    Onion host is unique per device; identity is shared across a pair."""
+    own = node.store.get_meta("gossip_addr")
+    if not own:
+        return
+    own_host = own.rsplit(":", 1)[0]
+    if not own_host.endswith(".onion"):
+        return    # dev/TCP: no persistent self-onion row to drain
+    for pe in node.store.list_peers():
+        if pe["address"].rsplit(":", 1)[0] == own_host:
+            node.store.remove_peer(pe["address"])
 
 
 async def run_node(data_dir, gossip_port: int, http_port: int,

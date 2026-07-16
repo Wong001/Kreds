@@ -111,28 +111,49 @@ def test_different_onion_host_same_identity_both_kept(tmp_path):
     assert addrs == {"hosta.onion:9997", "hostb.onion:9997"}   # both preserved
 
 
-def test_self_peer_row_drained_and_not_dialed(tmp_path):
-    # 0.3.14 outage residual: pairing left the node's OWN address stored as
-    # a peer; post-fix it dialed itself over Tor every cycle. A node never
-    # peers with itself - drain it on startup and never dial a self row.
+def test_self_onion_row_drained_sibling_and_friend_preserved(tmp_path):
+    # 0.3.14 outage residual: the node's own onion service got stored as a
+    # peer row under a now-dead port; post-fix it dialed itself over Tor
+    # every cycle. Host-keyed, NOT identity-keyed (review finding on the
+    # first attempt at this fix): a paired sibling device (e.g. phone +
+    # home node) SHARES one identity_pub -- pair_install deliberately
+    # seeds the sibling's own address as a peer under that shared identity
+    # so the two sync (home-node catch-up, see test_three_nodes.py).
+    # Keying the drain on identity_pub would delete that legitimate
+    # sibling row too. An onion host is unique per device, so only a row
+    # pointing at OUR OWN onion host is actually a self-row.
+    #
+    # This test fails against an identity-keyed _drain_self_peers: it
+    # would drop the sibling row along with the real stale self row.
     from hearth.node import HearthNode
     n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
-    n.store.add_peer("selfonion.onion:9997", n.identity_pub)   # stale self row
-    n.store.add_peer("friend.onion:9997", "ff" * 32)           # a real peer
+    n.store.set_meta("gossip_addr", "ownhost.onion:9997")     # current publish
+    n.store.add_peer("ownhost.onion:1117", n.identity_pub)    # stale self row (dead port)
+    n.store.add_peer("sibling.onion:9997", n.identity_pub)    # paired home node
+    n.store.add_peer("friend.onion:9997", "ff" * 32)          # a real friend
     from hearth.runner import _drain_self_peers
     _drain_self_peers(n)
     addrs = [p["address"] for p in n.store.list_peers()]
-    assert "selfonion.onion:9997" not in addrs      # self drained
-    assert "friend.onion:9997" in addrs             # real peer kept
+    assert "ownhost.onion:1117" not in addrs        # stale self row drained
+    assert "sibling.onion:9997" in addrs            # sibling preserved
+    assert "friend.onion:9997" in addrs             # real friend kept
 
 
-def test_gossip_round_never_dials_self_peer(tmp_path):
-    # Belt-and-suspenders (sync.py _gossip_round): even if a self-identity
-    # peer row reappears (e.g. echoed back via a peer's HAVE merge), the
-    # gossip loop's peer-dial loop must skip it and never dial ourselves.
+def test_gossip_round_skips_own_onion_dials_sibling_and_friend(tmp_path):
+    # Belt-and-suspenders (sync.py _gossip_round): even if a row pointing
+    # at our own onion host reappears (e.g. echoed back via a peer's HAVE
+    # merge), the gossip loop's dial loop must skip it -- keyed on onion
+    # HOST, not identity, for the same reason as the drain above: a paired
+    # sibling device shares our identity_pub but runs a DIFFERENT onion,
+    # and must still be dialed for home-node sync to work.
+    #
+    # This test fails against an identity-keyed self-skip guard: it would
+    # also skip dialing the sibling row.
     node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
-    node.store.add_peer("selfonion.onion:9997", node.identity_pub)
-    node.store.add_peer("friend.onion:9997", "ff" * 32)
+    node.store.set_meta("gossip_addr", "ownhost.onion:9997")
+    node.store.add_peer("ownhost.onion:1117", node.identity_pub)  # stale self row
+    node.store.add_peer("sibling.onion:9997", node.identity_pub)  # paired home node
+    node.store.add_peer("friend.onion:9997", "ff" * 32)           # a real friend
     svc = SyncService(node)
     dialed = []
 
@@ -143,5 +164,6 @@ def test_gossip_round_never_dials_self_peer(tmp_path):
 
     asyncio.run(svc._gossip_round())
 
-    assert "selfonion.onion:9997" not in dialed     # self never dialed
-    assert "friend.onion:9997" in dialed            # real peer still dialed
+    assert "ownhost.onion:1117" not in dialed       # our own onion never dialed
+    assert "sibling.onion:9997" in dialed           # sibling still dialed
+    assert "friend.onion:9997" in dialed            # real friend still dialed
