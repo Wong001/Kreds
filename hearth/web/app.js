@@ -382,31 +382,53 @@ function blockPhotoItems(p) {
   return (p.blobs || []).map(h => ({m: p.msg_id, h}));
 }
 
-// Stacked deck (Slice C): the top photo fills the cells; stacked edges +
-// a count badge say "there's more"; arrows/swipe flip through, and a tap
-// (outside Arrange) opens the lightbox at the current photo. No photo is
-// ever hidden - the 3rd, 5th, 12th are one swipe away at any size.
+// Stacked deck (Slice C, chrome per sketch 2026-07-18): the top photo
+// fills the cells; stacked edges + bottom-center dots say "there's
+// more"; invisible left/right tap zones or a swipe flip through, and a
+// center tap (outside Arrange) opens the lightbox at the current photo.
+// No photo is ever hidden - the 3rd, 5th, 12th are one swipe away at
+// any size.
 function renderDeck(p, items) {
   const deck = el("div", "block-deck");
   let i = 0;
   const img = document.createElement("img");
   img.alt = ""; img.draggable = false; img.style.cursor = "zoom-in";
   img.tabIndex = -1;
-  const badge = el("span", "deck-count");
-  const prev = el("button", "deck-nav deck-prev");
-  prev.type = "button"; prev.textContent = "‹";
+  // dots are position-only chrome - the zone buttons + lightbox carry
+  // the accessible semantics, so the row is aria-hidden.
+  const dots = el("div", "deck-dots");
+  dots.setAttribute("aria-hidden", "true");
+  items.forEach(() => dots.append(el("span", "deck-dot")));
+  // Invisible tap zones, the arrow pills' successors: real <button>s so
+  // the keyboard path survives (CSS keeps them transparent and draws a
+  // :focus-visible ring) and so Arrange's whole-block pointerdown bails
+  // out for them like any control - though Arrange also display:nones
+  // them, keeping the full deck a drag surface there.
+  const prev = el("button", "deck-tap deck-tap-prev");
+  prev.type = "button";
   prev.setAttribute("aria-label", "Previous photo");
-  const next = el("button", "deck-nav deck-next");
-  next.type = "button"; next.textContent = "›";
+  const next = el("button", "deck-tap deck-tap-next");
+  next.type = "button";
   next.setAttribute("aria-label", "Next photo");
   const show = () => {
     img.src = "/api/post-blob/" + items[i].m + "/" + items[i].h;
-    badge.textContent = (i + 1) + "/" + items.length;
-    prev.disabled = i === 0;
-    next.disabled = i === items.length - 1;
+    [...dots.children].forEach((d, k) =>
+      d.classList.toggle("active", k === i));
   };
-  prev.onclick = (e) => { e.stopPropagation(); if (i > 0) { i--; show(); } };
-  next.onclick = (e) => { e.stopPropagation(); if (i < items.length - 1) { i++; show(); } };
+  // At either end a zone is a no-op (no wrap), matching the old disabled
+  // arrow. `swiped` check: a mouse swipe's trailing click lands on
+  // whatever sits under the pointer - over a zone it must not ALSO flip
+  // (the same double-fire the lightbox tap below guards against).
+  prev.onclick = (e) => {
+    e.stopPropagation();
+    if (swiped) { swiped = false; return; }
+    if (i > 0) { i--; show(); }
+  };
+  next.onclick = (e) => {
+    e.stopPropagation();
+    if (swiped) { swiped = false; return; }
+    if (i < items.length - 1) { i++; show(); }
+  };
   // a mouse swipe's trailing click must not open the lightbox - pointer
   // events precede the click, so `swiped` is set in time to suppress it.
   img.onclick = () => {
@@ -431,7 +453,7 @@ function renderDeck(p, items) {
       else if (dx > 0 && i > 0) { i--; show(); }
     }
   });
-  deck.append(img, badge, prev, next);
+  deck.append(img, dots, prev, next);
   show();
   return deck;
 }
@@ -578,10 +600,13 @@ function renderBlock(p) {
       const badge = el("span", "block-scope", p.scope === "inner" ? "Inner" : "Kreds");
       block.append(badge);
     }
-    // Gear (spec 2026-07-15): the settings modal's entry point, now on
-    // every own block OUTSIDE Arrange too - with the inline delete gone,
-    // the modal is the only delete path, so it can't stay Arrange-gated.
-    // CSS hover-reveals it on fine pointers; coarse pointers always see it.
+  }
+  if (ARRANGING && p.mine) {
+    // Editing chrome lives HERE, not on the resting wall (sketch
+    // 2026-07-18, superseding 2026-07-15's always-present gear): outside
+    // Arrange an own block renders exactly as a friend sees it (plus the
+    // scope tag). The delete path survives the re-gating - Arrange's
+    // tap-to-open below and this gear both reach the settings modal.
     const cog = el("button", "block-settings-btn");
     cog.innerHTML = ICONS.cog;
     cog.type = "button";
@@ -608,8 +633,6 @@ function renderBlock(p) {
       add.append(addInput);
       block.append(add);
     }
-  }
-  if (ARRANGING && p.mine) {
     block.classList.add("arranging");
     block.style.touchAction = "none";
     // #5(a): tabindex="-1" makes the block a valid programmatic focus

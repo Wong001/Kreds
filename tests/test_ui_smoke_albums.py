@@ -1,8 +1,10 @@
 """UI_E2E=1-gated live browser smoke for the collage Slice C albums
-feature: post 3 photos via the composer -> a swipeable .block-deck badge
-"1/3" -> arrow-flip to "3/3" -> a tap (not in Arrange) opens the lightbox
-at "3 / 3", Escape closes it -> the '+' Add-photos control grows the deck
-in place to "/4" and mints a 2-member album -> Arrange -> gear ->
+feature: post 3 photos via the composer -> a swipeable .block-deck with 3
+bottom-center dots (sketch 2026-07-18: dots + invisible tap zones replaced
+the "n/N" badge + arrow pills) -> tap-zone-flip to the last photo -> a
+center tap (not in Arrange) opens the lightbox at "3 / 3", Escape closes
+it -> Arrange (the '+' Add-photos control is Arrange-only now) -> '+'
+grows the deck in place to 4 dots and mints a 2-member album -> gear ->
 Ungroup restores two standalone blocks and empties the album. Rewritten
 for dynamic placement (spec 2026-07-14): a new wall post lands PINNED at
 the top immediately - there is no tray - so this smoke drives Arrange
@@ -24,6 +26,13 @@ pytestmark = pytest.mark.skipif(
 
 from hearth.messages import ACCENTS
 from tests.test_ui_smoke_seen_badge import LiveNode, befriend
+
+
+def _active_dot(page, scope_sel):
+    """Index of the .active dot within scope_sel's .deck-dots row."""
+    return page.evaluate(
+        "sel => [...document.querySelectorAll(sel + ' .deck-dot')]"
+        ".findIndex(d => d.classList.contains('active'))", scope_sel)
 
 
 def _pngs(tmp_path, n, start=0):
@@ -72,7 +81,10 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             # block on the wall at this point.
             orig_id = page.locator("#profile-wall .block").first \
                 .get_attribute("data-msg-id")
-            assert deck.locator(".deck-count").inner_text() == "1/3"
+            # dots, not a counter (sketch 2026-07-18): one per photo,
+            # first active.
+            assert deck.locator(".deck-dot").count() == 3
+            assert _active_dot(page, ".block-deck") == 0
 
             lay = a.node.store.profile_layout(a.node.identity_pub)
             pin_before = lay["pins"][orig_id]
@@ -116,12 +128,13 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
                 "deck stacked edge does NOT paint outside .block - "
                 "ancestor overflow:hidden clips it")
 
-            # arrow-flip to the last photo
-            deck.locator(".deck-next").click()
-            deck.locator(".deck-next").click()
-            assert deck.locator(".deck-count").inner_text() == "3/3"
+            # invisible right-zone taps flip to the last photo
+            deck.locator(".deck-tap-next").click()
+            deck.locator(".deck-tap-next").click()
+            assert _active_dot(page, ".block-deck") == 2
 
-            # tap the photo (NOT in Arrange) -> lightbox opens at 3 / 3
+            # center-tap the photo (NOT in Arrange; the middle strip is
+            # outside both tap zones) -> lightbox opens at 3 / 3
             deck.locator("img").click()
             page.wait_for_selector("#lightbox")
             assert page.locator("#lightbox-count").inner_text() == "3 / 3"
@@ -148,14 +161,20 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             page.wait_for_selector(".fchip")     # app booted (same as the goto)
             page.click('.navlinks button[data-view="me"]')
             page.wait_for_selector("#profile-wall .block-deck", timeout=8000)
+            # '+' is Arrange-only now (sketch 2026-07-18) - enter Arrange
+            # to reach it. Arrange survives addPhotosToBlock's in-place
+            # openProfile re-render (same profile), so the gear leg below
+            # needs no second Arrange click.
+            page.click("#profile-arrange")
+            page.wait_for_selector("#profile-wall .block-add input",
+                                   state="attached")
             page.set_input_files(
                 ".block-add input", _pngs(tmp_path, 1, start=3))
+            # dots grow to 4 (hidden while arranging, but present in DOM)
             page.wait_for_function(
-                "document.querySelector('#profile-wall .deck-count') && "
-                "document.querySelector('#profile-wall .deck-count')"
-                ".innerText.endsWith('/4')",
+                "document.querySelectorAll('#profile-wall .deck-dot')"
+                ".length === 4",
                 timeout=8000)
-            assert page.locator("#profile-wall .deck-count").inner_text() == "1/4"
 
             albums = a.node.store.albums(a.node.identity_pub)
             assert len(albums) == 1
@@ -171,8 +190,7 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             assert new_id_now not in lay["pins"]          # deck content, never a block
             assert new_id_now not in lay["spans"]
 
-            # Arrange -> gear on the deck -> Ungroup
-            page.click("#profile-arrange")
+            # still in Arrange -> gear on the deck -> Ungroup
             page.wait_for_selector(f'[data-msg-id="{album_id}"] .block-settings-btn')
             page.click(f'[data-msg-id="{album_id}"] .block-settings-btn')
             page.click("text=Ungroup")
@@ -190,8 +208,7 @@ def test_album_deck_flip_lightbox_grow_ungroup(tmp_path):
             assert page.locator("#profile-wall .block").count() == 2
             assert page.locator("#profile-wall-flow .block").count() == 0
             assert page.locator(".block-deck").count() == 1
-            assert page.locator(
-                ".block-deck .deck-count").inner_text() == "1/3"
+            assert page.locator(".block-deck .deck-dot").count() == 3
             assert page.locator(".block-photo").count() == 1
 
             # restored-newest-first-fit (spec 2026-07-15): the wall was

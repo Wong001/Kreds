@@ -1360,7 +1360,22 @@ def test_wall_deck_wired():
     assert "items[i].m" in lb or "items[i].h" in lb
     # a mouse swipe's trailing click must not also open the lightbox
     # (pointerup precedes click - review-traced fix)
-    assert "swiped" in _js_fn_body(js, "renderDeck")
+    rd = _js_fn_body(js, "renderDeck")
+    assert "swiped" in rd
+    # Sketch 2026-07-18: the arrow pills + "n/N" badge left the wall deck.
+    # Invisible tap zones (real buttons - keyboard path) flip photos;
+    # bottom-center dots track position. The composer preview's own
+    # .deck-count photo-count badge stays - only the wall usage is gone.
+    assert "deck-tap-prev" in rd and "deck-tap-next" in rd
+    assert "deck-dots" in rd and "deck-count" not in rd
+    assert "deck-nav" not in js
+    assert ".deck-tap" in css and ".deck-dot" in css
+    assert ".deck-nav" not in css and ".block-deck .deck-count" not in css
+    # both flavors of deck chrome step aside in Arrange: zones would eat
+    # the drag surface (buttons bail out of the block's pointerdown), and
+    # the dots' bottom-center spot belongs to the "+" pill there.
+    assert ".block.arranging .deck-tap" in css
+    assert ".block.arranging .deck-dots" in css
     deck_rule = _css_rule(css, ".block-deck")
     assert "z-index: 0" in deck_rule       # the Slice-B stacking lesson
     assert ".block-deck::before" in css
@@ -1465,7 +1480,7 @@ def test_delete_everywhere_rehomed_into_block_settings():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     rb = _js_fn_body(js, "renderBlock")
     assert "Delete everywhere" not in rb
-    assert "block-settings-btn" in rb              # gear on every own block
+    assert "block-settings-btn" in rb              # gear (Arrange-only since 2026-07-18)
     obs = _js_fn_body(js, "openBlockSettings")
     assert "Delete everywhere" in obs and "deleteEverywhere" in obs
     # Review fix: the doomed gear is dropped as opener BEFORE the close so
@@ -1474,12 +1489,22 @@ def test_delete_everywhere_rehomed_into_block_settings():
     assert "Delete everywhere" in _js_fn_body(js, "buildEntry")
 
 
-def test_block_gear_hover_revealed_outside_arrange():
+def test_block_chrome_arrange_only():
+    # Sketch 2026-07-18: outside Arrange an own wall block is clean
+    # viewing chrome - the gear and the "+" exist only inside the
+    # ARRANGING && p.mine branch, and the 2026-07-15 hover-reveal CSS
+    # went with the always-present gear. (Supersedes the "gear on every
+    # own block outside Arrange" decision; the delete path survives via
+    # Arrange's tap-to-open and the Arrange-mode gear, both reaching the
+    # settings modal.)
+    js = (WEB / "app.js").read_text(encoding="utf-8")
     css = (WEB / "style.css").read_text(encoding="utf-8")
-    rule = _css_rule(css, ".block .block-settings-btn")
-    assert "opacity: 0" in rule
-    assert ".block:hover .block-settings-btn" in css
-    assert "pointer: coarse" in css                # touch always shows it
+    rb = _js_fn_body(js, "renderBlock")
+    arranging_idx = rb.index("if (ARRANGING && p.mine)")
+    assert rb.index('el("button", "block-settings-btn"') > arranging_idx
+    assert rb.index('el("label", "block-add"') > arranging_idx
+    assert ".block:hover .block-settings-btn" not in css   # hover-reveal gone
+    assert "opacity: 0" not in _css_rule(css, ".block-settings-btn")
     # Review fix: bare .settings-del ties with the later .settings-opt color
     # rule and loses the cascade - the compound selector wins on specificity
     # (same precedent as .pact.del).

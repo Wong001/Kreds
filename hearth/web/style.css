@@ -579,16 +579,32 @@ button.eavatar img { width: 100%; height: 100%; border-radius: 50%;
   border: 1px solid var(--line); z-index: -1; }
 .block-deck::before { transform: rotate(2deg) translate(4px, 2px); }
 .block-deck::after { transform: rotate(-1.6deg) translate(-3px, 3px); }
-/* base .deck-count already sets position/top/right (line ~445) - only
-   z-index needs adding for the wall variant's stacking context */
-.block-deck .deck-count { z-index: 2; }
-.deck-nav { position: absolute; top: 50%; transform: translateY(-50%);
-  z-index: 2; width: 28px; height: 28px; border-radius: 50%;
-  border: none; background: color-mix(in srgb, var(--ink) 55%, transparent);
-  color: var(--paper); font-size: 18px; line-height: 1; cursor: pointer; }
-.deck-nav:disabled { opacity: .25; cursor: default; }
-.deck-prev { left: 8px; }
-.deck-next { right: 8px; }
+/* Invisible tap zones (sketch 2026-07-18), the arrow pills' successors:
+   left/right ~35% of the deck flips photos, the middle strip stays the
+   lightbox tap. Fully transparent - :focus-visible restores a visible
+   ring for the keyboard path. Hidden in Arrange so the whole block
+   remains a drag surface (buttons bail out of the block's drag
+   pointerdown, so left visible they'd eat 70% of it). */
+.deck-tap { position: absolute; top: 0; bottom: 0; width: 35%; z-index: 2;
+  border: none; background: transparent; padding: 0; cursor: pointer;
+  border-radius: 12px; }
+.deck-tap-prev { left: 0; }
+.deck-tap-next { right: 0; }
+.deck-tap:focus-visible { outline: 2px solid var(--me); outline-offset: -4px; }
+.block.arranging .deck-tap { display: none; }
+/* Dots (sketch 2026-07-18), the wall deck's "n/N" badge's successor
+   (the composer preview keeps its own .deck-count photo count):
+   bottom-center over the photo, paper-on-image with a faint ink ring so
+   they read on light photos in both themes. Hidden in Arrange - the "+"
+   pill owns bottom-center there. */
+.deck-dots { position: absolute; bottom: 8px; left: 50%;
+  transform: translateX(-50%); display: flex; gap: 5px; z-index: 2;
+  pointer-events: none; max-width: 90%; }
+.deck-dot { width: 6px; height: 6px; border-radius: 50%; flex: none;
+  background: color-mix(in srgb, var(--paper) 60%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ink) 25%, transparent); }
+.deck-dot.active { background: var(--paper); }
+.block.arranging .deck-dots { display: none; }
 /* text scales to its width-span: 4-wide is a headliner, 1x1 a note.
    Overflow ellipsis rather than cell growth (spec 2026-07-13): a long post
    in a fixed-height pinned block clips with a fading/ellipsis cutoff
@@ -653,8 +669,9 @@ button.eavatar img { width: 100%; height: 100%; border-radius: 50%;
    bottom-right there. */
 .block .block-scope { position: absolute; bottom: 6px; right: 6px; z-index: 2; }
 .block.arranging .block-scope { display: none; }
-/* Add photos (Slice C): bottom-center, clear of the scope tag (bottom-right)
-   and .block-resize's corner handle (bottom-right, Arrange only). */
+/* Add photos (Slice C; Arrange-only since sketch 2026-07-18):
+   bottom-center - the deck dots yield that spot in Arrange - clear of
+   .block-resize's corner handle (bottom-right). */
 .block-add { position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%);
   z-index: 2; width: 26px; height: 26px; border-radius: 50%; display: grid;
   place-items: center; background: color-mix(in srgb, var(--ink) 55%, transparent);
@@ -679,13 +696,10 @@ button.eavatar img { width: 100%; height: 100%; border-radius: 50%;
   border: 1px solid var(--line-2); background: var(--surface); color: var(--ink-2);
   font-size: 13px; line-height: 1; cursor: pointer; }
 .block-settings-btn:hover { color: var(--ink); border-color: var(--me); }
-/* Gear outside Arrange (spec 2026-07-15): hover-revealed on fine
-   pointers so the wall stays clean; always visible where hover doesn't
-   exist; Arrange keeps it permanent. */
-.block .block-settings-btn { opacity: 0; transition: opacity .15s; }
-.block:hover .block-settings-btn, .block:focus-within .block-settings-btn,
-.block.arranging .block-settings-btn { opacity: 1; }
-@media (pointer: coarse) { .block .block-settings-btn { opacity: 1; } }
+/* Gear is Arrange-only (sketch 2026-07-18, superseding 2026-07-15's
+   hover-reveal-outside-Arrange): renderBlock only creates it inside the
+   ARRANGING branch, so no reveal CSS is needed - where it exists, it's
+   simply visible. */
 .settings-opt.settings-del { color: var(--red); }
 .settings-opt.settings-del:hover { background: var(--red-soft); }
 /* Arrange-mode collage affordances (Task 6): the dragged block stays put in
