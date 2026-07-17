@@ -114,9 +114,10 @@ video_edit = {"start": float_seconds,          # into the source
 
 `transcode_video(data, edit=None)`:
 
-- **No edit → byte-identical to today** (same probe, same reject at
-  >15s source, same single-pass args, poster from frame 1). Every
-  existing caller/test stays valid; old web clients keep working.
+- **No edit → behavior-identical to today** (same probe, same reject
+  at >15s source, same pipeline, poster from frame 1; only the preset
+  rider below changes the emitted bytes). Every existing caller/test
+  stays valid; old web clients keep working.
 - **With edit:**
   - The >15s check applies to the **cut duration**, not the source —
     a 3-minute source with a 12s window is the point. Source duration
@@ -139,6 +140,20 @@ video_edit = {"start": float_seconds,          # into the source
     before decode-heavy work so long sources don't blow the timeout —
     verify with a large-source test during build, bump `_TIMEOUT` only
     if measurement demands it.
+
+Two riders (August, 2026-07-18, from the codec discussion):
+
+- **`-preset veryfast` → `-preset slow`** on BOTH edit and no-edit
+  paths: ~10–15% better quality-per-byte at zero compatibility cost;
+  a ≤15s/720p x264 encode stays a few seconds. (This makes the no-edit
+  path no longer byte-identical — it stays *behavior*-identical: same
+  codec, caps, rejects. Existing tests assert behavior, not bytes.)
+- **`codec` field on video post records** (value `"h264"` for now),
+  additive like `author_avatar` — so future clients can negotiate or
+  fall back per-artifact when the AV1/AV2 ladder is climbed (ladder
+  documented in ROADMAP: H.264 now → AV1 at the chunked-transfer/audio
+  slice → AV2 when hardware decode exists, ~2028+). Old clients ignore
+  unknown fields; no compatibility event for the field itself.
 
 ## Copy fixes (become true statements)
 
