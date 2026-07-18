@@ -675,55 +675,90 @@ def test_malformed_responses_record_body_does_not_crash_feed(tmp_path):
 def test_old_core_refuses_response_kind_and_keeps_reoffering(tmp_path):
     """Mixed-version compat, mirroring tests/test_wrap_grant_messages.py's
     test_unknown_kind_still_refused (the "fallthrough old peers rely on"
-    pin, written for KIND_WRAP_GRANT) plus the messages_not_in offer-set
-    idiom used throughout tests/test_wrap_grants_store.py: an old core
-    that predates KIND_RESPONSE has no branch for it in validate_payload,
-    so it falls through to the exact same "unknown kind" refusal every
-    unrecognized kind gets today. Simulated per the plan's "simplest
-    honest simulation" by mangling a REAL, validly-signed KIND_RESPONSE's
-    kind string to something no branch recognizes ("response-future")
-    rather than monkeypatching the KIND_RESPONSE branch out of
-    validate_payload -- the fallthrough is identical either way, and this
-    needs no crypto workaround because Store.ingest_message runs
-    validate_payload BEFORE signature verification (store.py: the
-    validate_payload call sits above the Verifier() call), so a mangled
-    payload is refused on shape alone, never reaching signature checks.
+    pin, written for KIND_WRAP_GRANT): an old core that predates
+    KIND_RESPONSE has no branch for it in validate_payload, so it falls
+    through to the exact same "unknown kind" refusal every unrecognized
+    kind gets today. Simulated per the plan's "simplest honest
+    simulation" by mangling a REAL, validly-signed KIND_RESPONSE's kind
+    string to something no branch recognizes ("response-future") rather
+    than monkeypatching the KIND_RESPONSE branch out of validate_payload
+    -- the fallthrough is identical either way, and this needs no crypto
+    workaround because Store.ingest_message runs validate_payload BEFORE
+    signature verification (store.py: the validate_payload call sits
+    above the Verifier() call), so a mangled payload is refused on shape
+    alone, never reaching signature checks. The mangled copy keeps the
+    SAME cert/seq/signature as the real message -- only payload (and
+    therefore msg_id) differs -- since a real not-yet-understood kind on
+    the wire would carry a perfectly ordinary per-device seq; only its
+    shape is unrecognized.
 
+    Reviewer fix (2026-07-18): the first version of this test called
+    messages_not_in({}, ...) for its "still offered" check. Empty
+    summaries make EVERY entitled message unconditionally offered no
+    matter what happened, so "rid stays offered" was tautologically true
+    and proved nothing about the refusal actually mattering -- and
+    nothing in that version ever drove a REAL accepted delivery to
+    contrast against. Rebuilt to thread a's REAL summary
+    (store.all_summaries() -- exactly what a real peer hands over during
+    the wire protocol's HAVE phase, see sync.py's `have = {"t": "have",
+    "summary": store.all_summaries(), ...}`) through messages_not_in,
+    alongside a CONTROL response that lands normally in the same round.
     Per wrap_grant's own mixed-version note (ROADMAP item 20 / the
-    2026-07-15-wall-wrap-grants plan Sec.5, "verified at planning time"):
-    a refused seq never enters the old peer's seen-set, so the NEW peer
-    keeps re-offering it every round until the old peer updates -- bounded
-    chatter, not silently dropped, and not a one-shot retry. Checked here
-    by querying messages_not_in twice (two simulated rounds) and
-    confirming the REAL response b actually holds is offered to a both
-    times, since nothing in b's own bookkeeping ever marks a delivery
-    attempt as done -- that only happens via a's own reported summary,
-    and an old a can never report having it."""
+    2026-07-15-wall-wrap-grants plan Sec.5): a refused seq never enters
+    the old peer's summary (validate_payload rejects before
+    load_views/save_views ever run), so it keeps showing up as missing
+    every round -- while a properly-ingested message's seq DOES land in
+    that summary (SeenSet.add takes any not-yet-seen seq, in or out of
+    order -- store.py's SeenSet class, "sparse-above" compaction) and is
+    correctly excluded from every subsequent offer. Both halves are
+    checked together so the exclusion mechanism is proven real, not
+    assumed."""
     a, b = _befriended_pair(tmp_path)
     pid = a.compose_post("post", "kreds")
     _sync(a, b)
     rid = b.compose_response(pid, "comment", "hi from the future")
+    rid2 = b.compose_response(pid, "reaction", "heart")   # control: a real
+                                                          # message landing
+                                                          # for real in the
+                                                          # same round
     real_msg = b.store.get_message(rid)
+    control_msg = b.store.get_message(rid2)
 
     # simulate what an old core's validate_payload sees for a kind it
     # doesn't know about yet: the real envelope, kind mangled
     mangled = dataclasses.replace(
         real_msg, payload={**real_msg.payload, "kind": "response-future"})
+
+    # -- round 1: a (old core) sees the mangled response and the real
+    # control. The mangled one is refused on shape alone, before any
+    # seq/seen-state bookkeeping runs at all -- it leaves NO trace in a's
+    # own summary. The control is an ordinary valid response and lands
+    # for real, updating a's summary exactly as any accepted message
+    # would.
     result = a.store.ingest_message(mangled)
     assert not result.accepted and result.reason == "unknown kind"
     assert a.store.get_message(mangled.msg_id) is None
-    # the real (unmangled) response is untouched by the simulation above
-    # and never separately reached a's store at all
+    # the real (unmangled) response itself is never separately delivered
+    # anywhere in this test -- only its mangled twin was attempted above
     assert a.store.get_message(rid) is None
+    control_result = a.store.ingest_message(control_msg)
+    assert control_result.accepted
 
-    # round 1: b still offers the real response to a
-    offered_round1 = {m.msg_id for m in b.store.messages_not_in(
-        {}, {b.identity_pub}, a.identity_pub)}
-    assert rid in offered_round1
-    # round 2: nothing changed on a's side (old core still refuses it on
-    # ingest), so b keeps re-offering -- the bounded-forever-chatter shape
-    # wrap_grant's mixed-version note describes, confirmed idempotent
-    # rather than a single retry that then gives up
-    offered_round2 = {m.msg_id for m in b.store.messages_not_in(
-        {}, {b.identity_pub}, a.identity_pub)}
-    assert rid in offered_round2
+    # -- round 2: b (the sender) computes its offer set against a's REAL
+    # reported summary, not a stubbed {} that would trivially include
+    # everything regardless of delivery outcome.
+    a_summary = a.store.all_summaries()
+    offered = {m.msg_id for m in b.store.messages_not_in(
+        a_summary, {b.identity_pub}, a.identity_pub)}
+    assert rid in offered           # refused: still missing, still offered
+    assert rid2 not in offered      # control: acked, correctly excluded
+
+    # -- round 3: nothing changed on a's side (old core still can't
+    # ingest the response kind) -- re-querying the identical, unchanged
+    # summary reproduces the same result, the bounded-forever-chatter
+    # shape wrap_grant's mixed-version note describes, not a one-shot
+    # retry that then silently gives up.
+    offered_again = {m.msg_id for m in b.store.messages_not_in(
+        a_summary, {b.identity_pub}, a.identity_pub)}
+    assert rid in offered_again
+    assert rid2 not in offered_again
