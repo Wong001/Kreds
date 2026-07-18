@@ -2151,6 +2151,175 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") { closeCircleOverlay(); }
 });
 
+// ---- Video editor (spec 2026-07-18): trim + crop + cover ------------
+// The client SIMULATES the edit against a local <video> preview and
+// returns PARAMETERS only - the node's videogate executes the real
+// ffmpeg cut. onClose({action, edit}): "done" carries {start, duration,
+// crop|null, poster_t}; "raw" means the engine can't even read metadata
+// (post unedited - the node validates, today's behavior); "cancel"
+// discards the pick.
+const VE_MAX_WINDOW = 15;
+function openVideoEditor(file, existing, onClose) {
+  const ov = el("div"); ov.id = "video-editor";
+  ov.setAttribute("role", "dialog");
+  ov.setAttribute("aria-modal", "true");
+  ov.setAttribute("aria-label", "Edit video");
+  const stage = el("div", "ve-stage");
+  const frame = el("div", "ve-frame");
+  const vid = document.createElement("video");
+  vid.muted = true; vid.playsInline = true;
+  const url = URL.createObjectURL(file);
+  vid.src = url;
+  frame.append(vid); stage.append(frame);
+  const strip = el("div", "ve-strip");
+  const track = el("div", "ve-track");
+  const selWin = el("div", "ve-window");
+  const hL = el("div", "ve-handle ve-h-left");
+  const hR = el("div", "ve-handle ve-h-right");
+  hL.setAttribute("aria-label", "Trim start");
+  hR.setAttribute("aria-label", "Trim end");
+  strip.append(track, selWin, hL, hR);
+  const times = el("div", "ve-times");
+  const chips = el("div", "ve-chips");        // Task 5 fills these
+  const btns = el("div", "ve-btns");
+  const cancelB = el("button", "ve-btn", "Cancel"); cancelB.type = "button";
+  const doneB = el("button", "ve-btn ve-done", "Done"); doneB.type = "button";
+  btns.append(cancelB, doneB);
+  ov.append(stage, strip, times, chips, btns);
+  document.body.append(ov);
+
+  let dur = 0, vw = 0, vh = 0, degraded = false, closed = false;
+  let start = 0, end = 0, coverAbs = 0;               // trim + cover state
+  let aspect = "orig", zoom = 1, cx = 0.5, cy = 0.5;  // crop state (Task 5)
+
+  const fmt = (t) => t.toFixed(1) + "s";
+  const finish = (action, edit) => {
+    if (closed) return;
+    closed = true;
+    URL.revokeObjectURL(url);
+    ov.remove();
+    if (action === "done") onClose({action: "done", edit});
+    else if (action === "raw") onClose({action: "raw"});
+    else onClose({action: "cancel"});
+  };
+  cancelB.onclick = () => finish("cancel");
+  doneB.onclick = () => finish("done", buildEdit());
+  ov.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") finish("cancel");
+  });
+
+  function buildEdit() {
+    return {start: Math.round(start * 1000) / 1000,
+            duration: Math.round((end - start) * 1000) / 1000,
+            crop: cropRect(),                        // null until Task 5
+            poster_t: Math.round((coverAbs - start) * 1000) / 1000};
+  }
+  function cropRect() { return null; }               // replaced in Task 5
+
+  // -- trim geometry: strip x-position <-> time -----------------------
+  const px = (t) => strip.clientWidth * t / dur;
+  const toT = (x) => Math.min(dur, Math.max(0, x / strip.clientWidth * dur));
+  function render() {
+    selWin.style.left = px(start) + "px";
+    selWin.style.width = Math.max(2, px(end) - px(start)) + "px";
+    hL.style.left = px(start) + "px";
+    hR.style.left = px(end) + "px";
+    renderCover();                                    // Task 5 fills in
+    times.textContent = fmt(start) + " - " + fmt(end)
+      + "  (" + fmt(end - start) + " of " + fmt(dur) + ")";
+  }
+  function renderCover() {}                           // replaced in Task 5
+
+  function dragHandle(handle, isLeft) {
+    handle.addEventListener("pointerdown", (ev) => {
+      if (!ev.isPrimary) return;
+      ev.preventDefault();
+      handle.setPointerCapture(ev.pointerId);
+      const move = (e) => {
+        const t = toT(e.clientX - strip.getBoundingClientRect().left);
+        if (isLeft) {
+          start = Math.min(t, end - 0.5);
+          start = Math.max(start, end - VE_MAX_WINDOW);
+        } else {
+          end = Math.max(t, start + 0.5);
+          end = Math.min(end, start + VE_MAX_WINDOW);
+        }
+        coverAbs = Math.min(Math.max(coverAbs, start), end);
+        vid.currentTime = isLeft ? start : Math.max(start, end - 0.1);
+        render();
+      };
+      const up = () => {
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", up);
+        vid.currentTime = start; vid.play();
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", up);
+    });
+  }
+  dragHandle(hL, true);
+  dragHandle(hR, false);
+
+  // loop playback inside the window
+  vid.addEventListener("timeupdate", () => {
+    if (vid.currentTime >= end - 0.03 || vid.currentTime < start - 0.25)
+      vid.currentTime = start;
+  });
+
+  async function buildThumbs() {
+    const tv = document.createElement("video");
+    tv.muted = true; tv.preload = "auto"; tv.src = url;
+    await new Promise((res, rej) => {
+      tv.onloadeddata = res; tv.onerror = rej;
+    });
+    if (!tv.videoWidth) throw new Error("no frames");
+    const N = 8, w = 88,
+          h = Math.max(1, Math.round(w * tv.videoHeight / tv.videoWidth));
+    for (let i = 0; i < N; i++) {
+      tv.currentTime = Math.min(dur - 0.05, (i + 0.5) * dur / N);
+      await new Promise((res) => { tv.onseeked = res; });
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h; c.className = "ve-thumb";
+      c.getContext("2d").drawImage(tv, 0, 0, w, h);
+      track.append(c);
+    }
+  }
+
+  vid.addEventListener("error", () => {
+    // engine can't read the file at all -> today's behavior (raw post)
+    if (!dur) finish("raw");
+  });
+  vid.addEventListener("loadedmetadata", () => {
+    dur = vid.duration; vw = vid.videoWidth; vh = vid.videoHeight;
+    if (!isFinite(dur) || dur <= 0) { finish("raw"); return; }
+    if (existing) {
+      start = Math.min(existing.start, Math.max(0, dur - 0.5));
+      end = Math.min(dur, start + existing.duration);
+      coverAbs = start + Math.min(existing.poster_t, end - start);
+      restoreCrop(existing.crop);                     // Task 5 no-op-safe
+    } else {
+      start = 0; end = Math.min(dur, VE_MAX_WINDOW); coverAbs = 0;
+    }
+    initCrop();                                        // Task 5 fills in
+    render();
+    vid.currentTime = start;
+    vid.play();
+    buildThumbs().catch(() => {
+      // metadata but no decodable frames: slider-only degraded mode -
+      // trim still works blind against the times readout; crop stays
+      // disabled (can't position what you can't see). Spec 2026-07-18.
+      degraded = true;
+      track.classList.add("ve-blank");
+      chips.classList.add("ve-disabled");
+      frame.classList.add("ve-noframes");
+    });
+  });
+  function initCrop() {}                               // replaced in Task 5
+  function restoreCrop() {}                            // replaced in Task 5
+  ov.tabIndex = -1;
+  ov.focus();
+}
+
 // ---------------------------------------------------------------------
 // Stories (unchanged behavior, re-homed into the journal view)
 // ---------------------------------------------------------------------

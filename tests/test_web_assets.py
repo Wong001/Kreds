@@ -1714,3 +1714,19 @@ def test_update_banner_reenables_action_button_when_apply_does_not_navigate():
     banner = _js_fn_body(js, "renderUpdateBanner")
     assert "act.disabled = true" in banner
     assert "act.disabled = false" in banner
+
+
+def test_video_editor_wired():
+    # Spec 2026-07-18: trim+crop+cover editor - client simulates, the
+    # node executes. Core contract pins.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    ve = _js_fn_body(js, "openVideoEditor")
+    assert "VE_MAX_WINDOW" in js and "const VE_MAX_WINDOW = 15" in js
+    for needle in ("ve-stage", "ve-strip", "ve-handle", "ve-window",
+                   "createObjectURL", "revokeObjectURL",
+                   'action: "done"', 'action: "raw"', 'action: "cancel"'):
+        assert needle in ve, needle
+    # the trim loop wraps playback inside the window
+    assert "timeupdate" in ve
+    assert "#video-editor" in css and ".ve-handle" in css

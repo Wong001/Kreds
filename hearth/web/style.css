@@ -1026,3 +1026,44 @@ body.lb-open { overflow: hidden; }   /* lock background scroll behind the lightb
   color: #fff; font-size: 30px; line-height: 1; cursor: pointer; }
 .lb-count { position: absolute; bottom: 20px; left: 0; right: 0; text-align: center;
   color: #fff; font-size: 14px; }
+
+/* Video editor (spec 2026-07-18): fullscreen overlay, story-viewer
+   family. The frame crops via overflow:hidden + absolutely positioned
+   video (Task 5 pans/zooms it); the strip hosts filmstrip thumbs, the
+   trim window, two handles, and the cover marker. */
+#video-editor { position: fixed; inset: 0; z-index: 60;
+  background: color-mix(in srgb, var(--ink) 92%, transparent);
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 14px; padding: 18px; }
+.ve-stage { display: grid; place-items: center; max-width: min(92vw, 720px);
+  width: 100%; }
+.ve-frame { position: relative; overflow: hidden; max-width: 100%;
+  max-height: 52vh; border-radius: 12px; background: #000;
+  aspect-ratio: 16 / 9; }
+.ve-frame video { position: absolute; left: 0; top: 0;
+  width: 100%; height: 100%; object-fit: contain; }
+.ve-frame.ve-noframes::after { content: "No preview for this format - "
+  "trim by time below"; position: absolute; inset: 0; display: grid;
+  place-items: center; color: var(--paper); font-size: 13px;
+  text-align: center; padding: 12px; }
+.ve-strip { position: relative; width: min(92vw, 720px); height: 52px;
+  border-radius: 8px; background: color-mix(in srgb, var(--paper) 12%, transparent);
+  touch-action: none; }
+.ve-track { position: absolute; inset: 0; display: flex; overflow: hidden;
+  border-radius: 8px; }
+.ve-thumb { height: 100%; flex: 1 1 0; min-width: 0; object-fit: cover; }
+.ve-window { position: absolute; top: 0; bottom: 0;
+  border: 2px solid var(--paper); border-radius: 6px; pointer-events: none;
+  box-shadow: 0 0 0 200vmax color-mix(in srgb, var(--ink) 45%, transparent); }
+.ve-handle { position: absolute; top: -6px; bottom: -6px; width: 14px;
+  margin-left: -7px; border-radius: 7px; background: var(--paper);
+  cursor: ew-resize; z-index: 2; }
+.ve-times { color: var(--paper); font-size: 12.5px;
+  font-family: "IBM Plex Mono", monospace; }
+.ve-chips { display: flex; gap: 6px; }
+.ve-chips.ve-disabled { opacity: .35; pointer-events: none; }
+.ve-btns { display: flex; gap: 10px; }
+.ve-btn { border: 1px solid color-mix(in srgb, var(--paper) 45%, transparent);
+  background: transparent; color: var(--paper); font-size: 13.5px;
+  padding: 7px 18px; border-radius: 99px; cursor: pointer; }
+.ve-btn.ve-done { background: var(--paper); color: var(--ink); }
