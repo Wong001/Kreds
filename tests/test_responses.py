@@ -184,6 +184,37 @@ def test_alias_seed_is_not_a_raw_key(tmp_path):
                        b.device.device_pub[:32], b.device.enc_pub[:32])
 
 
+def test_public_alias_seed_never_matches_a_private_one_same_post(tmp_path):
+    """Confirmation-pass Important: alias_seed rides on every entry
+    regardless of public/private, and a public entry already discloses
+    the real identity in the clear. If a responder toggled
+    public_engagement mid-post (private comment, flip the setting,
+    public comment on the SAME post) and both entries shared the
+    deterministic seed, a stranger could match them and retroactively
+    deanonymize the earlier private comment. A public entry must draw a
+    one-off random alias_seed instead -- never the deterministic
+    per-post-per-device one -- so the two never coincide. Two PRIVATE
+    comments on the same post must still share theirs (the fix this
+    guards must not regress the original stability guarantee)."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    r_priv1 = b.compose_response(pid, "comment", "private one")
+    b.store.set_meta("public_engagement", "1")
+    r_pub = b.compose_response(pid, "comment", "now public")
+    b.store.set_meta("public_engagement", "0")
+    r_priv2 = b.compose_response(pid, "comment", "private again")
+    body_priv1 = _decrypt_response_as(a, b.store.get_message(r_priv1))
+    body_pub = _decrypt_response_as(a, b.store.get_message(r_pub))
+    body_priv2 = _decrypt_response_as(a, b.store.get_message(r_priv2))
+    assert body_pub["public"] is True
+    assert body_priv1["public"] is False and body_priv2["public"] is False
+    assert body_pub["alias_seed"] != body_priv1["alias_seed"]
+    assert body_pub["alias_seed"] != body_priv2["alias_seed"]
+    # the two private entries still share the stable per-post seed
+    assert body_priv1["alias_seed"] == body_priv2["alias_seed"]
+
+
 def test_compose_response_on_own_post_wraps_to_self(tmp_path):
     """Own-post responses take the SAME code path (spec: no special
     case) -- author == responder still yields a readable, routable

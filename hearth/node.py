@@ -2239,18 +2239,39 @@ class HearthNode:
         aad = response_aad(self.identity_pub, target_msg_id, created_at)
         nonce, ct = encrypt_body(key, {
             "rkind": rkind, "body": body,
-            # Deterministic per-post-per-device alias (reviewer fix,
-            # whole-branch review): identity.py's derive_alias_seed
-            # HMACs target_msg_id under an HKDF subkey of this device's
-            # signing key, so every response THIS device makes to THIS
-            # post gets the same alias_seed (the spec's "same stranger
-            # reads as the same alias within one post's thread"), while
-            # a different post yields an unlinkable seed. Previously
-            # os.urandom(16).hex() here -- fresh per RESPONSE, not per
-            # post, so two comments on the same post could render as
-            # two different aliases (see derive_alias_seed's docstring
-            # for the full derivation and the multi-device caveat).
-            "alias_seed": self.device.derive_alias_seed(target_msg_id),
+            # Deterministic per-post-per-device alias for PRIVATE
+            # entries only (reviewer fix, whole-branch review):
+            # identity.py's derive_alias_seed HMACs target_msg_id under
+            # an HKDF subkey of this device's signing key, so every
+            # PRIVATE response this device makes to THIS post gets the
+            # same alias_seed (the spec's "same stranger reads as the
+            # same alias within one post's thread"), while a different
+            # post yields an unlinkable seed. Previously
+            # os.urandom(16).hex() unconditionally -- fresh per
+            # RESPONSE, not per post, so two private comments on the
+            # same post could render as two different aliases (see
+            # derive_alias_seed's docstring for the full derivation and
+            # the multi-device caveat).
+            #
+            # Confirmation-pass Important: a PUBLIC entry must NOT
+            # reuse that same deterministic seed. alias_seed rides on
+            # every entry regardless of public/private (see
+            # _rebuild_responses_record), and a public entry already
+            # carries the real identity in the clear -- so if a
+            # responder toggles public_engagement mid-post (private
+            # comment, flip the setting, public comment on the SAME
+            # post), a stranger could match the shared deterministic
+            # seed between the public entry (identity known) and an
+            # earlier/later private entry (identity aliased) and
+            # retroactively deanonymize the private one. A public
+            # entry's alias_seed is only ever a fallback render value
+            # (the client only reads it when the "alias" flag is set --
+            # see app.js's aliasName/aliasColor callers -- which is
+            # never true for a public entry), so a one-off random value
+            # is correct there and deliberately never shares a seed
+            # with any private entry from this device on this post.
+            "alias_seed": (os.urandom(16).hex() if public
+                          else self.device.derive_alias_seed(target_msg_id)),
             "public": public,
             "responder": self.identity_pub, "responder_sig": responder_sig,
             "mutual_box": box, "created_at": created_at}, aad)
