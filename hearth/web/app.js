@@ -4907,6 +4907,20 @@ function wireDesktopChrome() {
 }
 window.addEventListener("pywebviewready", wireDesktopChrome);
 if (window.pywebview) wireDesktopChrome();   // already ready before this script ran
+// Third belt (August's chromeless-launch report, 2026-07-19, diagnosed
+// live via CDP attach to the real shell): on some launches WebView2
+// injects window.pywebview AFTER the boot check above while the
+// pywebviewready event never reaches this listener - the session then
+// runs chromeless (no titlebar, no drag/min/close; the same flaky init
+// crashes outright as 0xCFFFFFFF on worse launches - that half is
+// launcher territory, not fixable here). Poll briefly and wire when the
+// bridge appears; wireDesktopChrome + initResizeGrip are idempotent, so
+// a double-fire with the event is harmless. In a plain browser the poll
+// expires as a no-op.
+const _chromePoll = setInterval(() => {
+  if (window.pywebview) { wireDesktopChrome(); clearInterval(_chromePoll); }
+}, 250);
+setTimeout(() => clearInterval(_chromePoll), 20000);
 
 // Corner resize grip (0.3.13): rebuilds the drag-resize a frameless
 // window loses (no OS borders). Desktop only - the grip stays hidden in

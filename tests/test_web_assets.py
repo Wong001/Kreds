@@ -2176,3 +2176,20 @@ def test_reaction_bar_collapses_to_picker():
         assert sel in css, sel
     # picking a reaction closes the picker (OPEN_RX cleared before POST)
     assert "OPEN_RX = null" in rr
+
+
+def test_desktop_chrome_bridge_poll_fallback():
+    # August's chromeless-launch report (2026-07-19, live-diagnosed via
+    # CDP attach): on some launches WebView2 injects window.pywebview
+    # AFTER the boot-time check while the pywebviewready event never
+    # reaches our listener - the session then runs without any titlebar
+    # (no drag/min/close; the same failed init also crashes outright as
+    # 0xCFFFFFFF on worse launches). A bounded 250ms/20s poll is the
+    # third belt; wireDesktopChrome is idempotent so a double-fire is
+    # harmless, and in a plain browser the poll expires as a no-op.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "_chromePoll" in js
+    idx_wire = js.index('window.addEventListener("pywebviewready"')
+    idx_poll = js.index("_chromePoll")
+    assert idx_wire < idx_poll          # poll is the FALLBACK, wired after both
+    assert "clearInterval(_chromePoll)" in js
