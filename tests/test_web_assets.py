@@ -1777,6 +1777,12 @@ def test_profile_load_render_honesty():
     bi = _js_fn_body(js, "blobImg")
     assert "img-pending" in bi and "onerror" in bi
     assert ".img-pending" in css
+    # Review fix (Critical): .img-pending's shared min-height: 120px bleeds
+    # past a sub-120px mobile deck cell - .block.has-deck is the one
+    # overflow:visible block (polaroid-peek exception), so only the deck's
+    # pending <img> needs the floor neutralized; every other block type
+    # still clips normally.
+    assert re.search(r"min-height:\s*0\b", _css_rule(css, ".block-deck img.img-pending"))
     items = _js_fn_body(js, "blockPhotoItems")
     assert '"t"' in items or "t:" in items          # thumb rides the item
     deck = _js_fn_body(js, "renderDeck")

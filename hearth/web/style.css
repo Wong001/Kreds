@@ -1092,5 +1092,11 @@ body.lb-open { overflow: hidden; }   /* lock background scroll behind the lightb
   animation: img-pending-sheen 1.6s ease-in-out infinite; }
 @keyframes img-pending-sheen {
   from { background-position: 120% 0; } to { background-position: -20% 0; } }
+/* The deck's pending state reuses .img-pending on the LONG-LIVED deck
+   <img> (flip closures hold refs). .block.has-deck is the one
+   overflow:visible block (polaroid edges), so the shared min-height
+   floor would bleed past a sub-120px mobile cell - neutralize it there;
+   the deck img is already width/height:100% sized by its cell. */
+.block-deck img.img-pending { min-height: 0; }
 @media (prefers-reduced-motion: reduce) {
   .img-pending { animation: none; } }
