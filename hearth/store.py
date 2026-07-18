@@ -1042,6 +1042,11 @@ class Store:
                 poster = p.get("poster")
                 if isinstance(poster, str) and poster:
                     refs.add(poster)
+                # thumbs (spec 2026-07-18): same junk-guard as poster --
+                # the query spans KIND_DM whose payload isn't thumb-validated
+                for t in (p.get("thumbs") or []):
+                    if isinstance(t, str) and t:
+                        refs.add(t)
             for (mj,) in self._db.execute(
                     "SELECT msg_json FROM messages WHERE kind=?",
                     (KIND_PROFILE,)):

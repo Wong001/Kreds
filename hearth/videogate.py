@@ -161,5 +161,5 @@ def transcode_video(data: bytes, edit: dict | None = None) -> tuple[bytes, bytes
             raise ValueError("could not extract poster")
         with open(frame, "rb") as f:
             poster_data = f.read()
-        poster = image_transcode(poster_data, STORY_IMAGE_MAX)
+        poster = image_transcode(poster_data, STORY_IMAGE_MAX, fmt="avif")
     return mp4, poster

@@ -37,6 +37,12 @@ def clip(seconds=2):
     return open(p, "rb").read()
 
 
+def gif():
+    buf = io.BytesIO()
+    Image.new("P", (60, 60)).save(buf, format="GIF")
+    return buf.getvalue()
+
+
 def befriend_with_enckeys(a, b):
     # copied idiom (tests/test_node_scoped_posts.py, tests/test_profile_posts.py):
     # mutual friends with enc keys exchanged so posts can be wrapped/unwrapped
@@ -160,3 +166,55 @@ def test_referenced_blobs_tolerates_junk_poster(tmp_path):
     assert isinstance(st.referenced_blobs(), set)
     st.missing_blobs()
     st.gc_blobs()
+
+
+def test_post_thumbs_aligned_and_served(tmp_path):
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    mid = node.compose_post("pics", "kreds", photos=[png(), png()])
+    row = [p for p in node.feed() if p["msg_id"] == mid][0]
+    assert len(row["thumbs"]) == len(row["blobs"]) == 2
+    assert all(t for t in row["thumbs"])
+    th = node.post_blob(mid, row["thumbs"][0])       # same content key
+    assert Image.open(io.BytesIO(th)).format == "AVIF"
+    assert max(Image.open(io.BytesIO(th)).size) <= 640
+    # a hash from ANOTHER post cannot be fetched through this post's id:
+    # the per-post content key fails AEAD auth (the crypto IS the guard)
+    other = node.compose_post("x", "kreds", photos=[png()])
+    orow = [p for p in node.feed() if p["msg_id"] == other][0]
+    assert node.post_blob(mid, orow["blobs"][0]) is None
+
+
+def test_gif_post_gets_null_thumb(tmp_path):
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    mid = node.compose_post("gif", "kreds", photos=[gif()])
+    row = [p for p in node.feed() if p["msg_id"] == mid][0]
+    assert row["thumbs"] == [None]
+
+
+def test_video_post_thumb_of_poster(tmp_path):
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    mid = node.compose_post("v", "kreds", video=clip(2))
+    row = [p for p in node.feed() if p["msg_id"] == mid][0]
+    assert len(row["thumbs"]) == 1 and row["thumbs"][0]
+    th = node.post_blob(mid, row["thumbs"][0])
+    assert Image.open(io.BytesIO(th)).format == "AVIF"
+
+
+def test_referenced_blobs_includes_thumbs(tmp_path):
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    mid = node.compose_post("pics", "kreds", photos=[png()])
+    payload = node.store.get_message(mid).payload
+    refs = node.store.referenced_blobs()
+    assert payload["thumbs"][0] in refs
+    # delete drops thumbs with the post (gc)
+    node.delete_post(mid)
+    node.store.gc_blobs()
+    assert node.store.get_blob(payload["thumbs"][0]) is None
+
+
+def test_story_still_and_video_poster_are_avif(tmp_path):
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    node.compose_story(png(), "")
+    item = [i for g in node.stories_view() for i in g["items"]][0]
+    assert Image.open(io.BytesIO(
+        node.store.get_blob(item["media"]))).format == "AVIF"

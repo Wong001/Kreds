@@ -77,13 +77,15 @@ def make_post(device: DeviceKeys, scope: str, body_nonce: str,
               expires_at: Optional[float] = None,
               placement: str = "journal", media: str = "photo",
               poster: Optional[str] = None,
-              codec: Optional[str] = None) -> SignedMessage:
+              codec: Optional[str] = None,
+              thumbs: Optional[Sequence[Optional[str]]] = None) -> SignedMessage:
     return device.sign_message({
         "kind": KIND_POST, "scope": scope, "body_nonce": body_nonce,
         "body_ct": body_ct, "wraps": wraps, "blobs": list(blob_refs),
         "created_at": _now(created_at), "expires_at": expires_at,
         "placement": placement, "media": media, "poster": poster,
         "codec": codec,
+        "thumbs": list(thumbs) if thumbs is not None else None,
     })
 
 
@@ -235,6 +237,11 @@ def validate_payload(p: dict) -> Tuple[bool, str]:
         blobs = p.get("blobs", [])
         if not isinstance(blobs, list) or not all(_is_hex64(b) for b in blobs):
             return False, "bad blobs"
+        thumbs = p.get("thumbs")
+        if thumbs is not None:
+            if (not isinstance(thumbs, list) or len(thumbs) != len(blobs)
+                    or not all(t is None or _is_hex64(t) for t in thumbs)):
+                return False, "bad thumbs"
         media = p.get("media", "photo")
         if media not in ("photo", "video"):
             return False, "bad media"

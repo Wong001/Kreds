@@ -17,8 +17,8 @@ from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
 from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        EnrollmentCert, IdentityCeremony, PROTOCOL,
                        canonical, _sig_ok)
-from .imagegate import (AVATAR_MAX, BANNER_MAX, is_image_bytes, transcode,
-                        transcode_photo)
+from .imagegate import (AVATAR_MAX, BANNER_MAX, is_image_bytes, photo_thumb,
+                        transcode, transcode_photo)
 from .videogate import STORY_IMAGE_MAX, transcode_video
 from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_POST,
@@ -602,22 +602,38 @@ class HearthNode:
             mp4, poster_png = transcode_video(video, video_edit)
             vref = self.store.put_blob(encrypt_blob(key, mp4))
             pref = self.store.put_blob(encrypt_blob(key, poster_png))
+            try:
+                tref = self.store.put_blob(
+                    encrypt_blob(key, photo_thumb(poster_png)))
+            except ValueError:
+                tref = None
             nonce, ct = encrypt_body(key, {"text": text, "blobs": [vref]}, aad)
             wraps = wrap_key(key, pubs, aad)
             mid = self._publish(make_post(self.device, scope, nonce, ct, wraps,
                                           [vref], created_at, expires_at,
                                           placement=placement, media="video",
-                                          poster=pref, codec="h264"))
+                                          poster=pref, codec="h264",
+                                          thumbs=[tref]))
             self._cache_message_key(mid, key)
             has_media = True
         else:
             gated = [transcode_photo(p) for p in photos]   # raises ValueError
             refs = [self.store.put_blob(encrypt_blob(key, p)) for p in gated]
+            # Tile thumbnails (spec 2026-07-18): same content key, aligned
+            # with blobs; a failed thumb is a null entry, never a failed post.
+            thumbs = []
+            for g in gated:
+                try:
+                    thumbs.append(self.store.put_blob(
+                        encrypt_blob(key, photo_thumb(g))))
+                except ValueError:
+                    thumbs.append(None)
             nonce, ct = encrypt_body(key, {"text": text, "blobs": refs}, aad)
             wraps = wrap_key(key, pubs, aad)
             mid = self._publish(make_post(self.device, scope, nonce, ct, wraps,
                                           refs, created_at, expires_at,
-                                          placement=placement))
+                                          placement=placement,
+                                          thumbs=thumbs if refs else None))
             self._cache_message_key(mid, key)
             has_media = bool(refs)
         if placement == "profile" and auto_place:
@@ -701,7 +717,7 @@ class HearthNode:
             if video_edit is not None:
                 raise ValueError("video_edit given for an image")
             media = self.store.put_blob(
-                transcode(media_bytes, STORY_IMAGE_MAX))
+                transcode(media_bytes, STORY_IMAGE_MAX, fmt="avif"))
             msg = make_story(self.device, "photo", media, poster=None,
                              caption=caption)
         else:
@@ -1272,6 +1288,7 @@ class HearthNode:
             "media": p.get("media", "photo"),
             "poster": p.get("poster"),
             "codec": p.get("codec"),
+            "thumbs": p.get("thumbs"),
         }
 
     def feed(self) -> List[dict]:

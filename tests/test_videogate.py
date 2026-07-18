@@ -46,7 +46,8 @@ def test_transcode_strips_audio_and_returns_poster():
     from PIL import Image
     import io
     im = Image.open(io.BytesIO(poster))
-    assert im.format == "PNG"                        # poster is a PNG
+    assert im.format == "AVIF"           # superseded pin: poster was PNG,
+                                          # now AVIF (spec 2026-07-18 Part 4)
     assert max(im.size) <= 1080
 
 
@@ -103,7 +104,8 @@ def test_odd_height_source_still_transcodes():
     assert len(mp4) > 0
     from PIL import Image
     import io
-    assert Image.open(io.BytesIO(poster)).format == "PNG"
+    # superseded pin: poster was PNG, now AVIF (spec 2026-07-18 Part 4)
+    assert Image.open(io.BytesIO(poster)).format == "AVIF"
 
 
 def _dims(png_bytes):
@@ -179,7 +181,10 @@ def test_edit_poster_t_picks_a_different_frame():
 def test_edit_poster_t_at_window_end_clamps_not_fails():
     mp4, poster = transcode_video(
         _make_clip(6), {"start": 0, "duration": 6, "poster_t": 6})
-    assert poster[:4] == b"\x89PNG"
+    from PIL import Image
+    import io
+    # superseded pin: poster was PNG, now AVIF (spec 2026-07-18 Part 4)
+    assert Image.open(io.BytesIO(poster)).format == "AVIF"
 
 
 def _find_box(buf, start, end, box_type):

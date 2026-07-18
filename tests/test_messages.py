@@ -80,3 +80,19 @@ def test_make_ring_and_validate():
     ok, _ = validate_payload({"kind": "ring", "member": "cc" * 32,
                               "ring": "outer", "created_at": 5.0})
     assert not ok                                        # bad ring
+
+
+def test_post_thumbs_validation():
+    base = {"kind": KIND_POST, "scope": "kreds", "created_at": 1.0,
+            "body_nonce": "ab" * 12, "body_ct": "de", "wraps": {},
+            "blobs": ["a" * 64, "b" * 64]}
+    base["thumbs"] = ["c" * 64, None]     # aligned, null entry ok
+    assert validate_payload(base)[0]
+    base["thumbs"] = ["c" * 64]           # length mismatch
+    assert not validate_payload(base)[0]
+    base["thumbs"] = "junk"               # not a list
+    assert not validate_payload(base)[0]
+    base["thumbs"] = ["zz", None]         # non-hex entry
+    assert not validate_payload(base)[0]
+    del base["thumbs"]                    # absent = old record, fine
+    assert validate_payload(base)[0]
