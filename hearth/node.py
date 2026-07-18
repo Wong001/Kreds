@@ -573,12 +573,14 @@ class HearthNode:
     def compose_post(self, text: str, scope: str = "kreds",
                      photos=(), expires_seconds=None,
                      placement: str = "journal", video=None,
-                     span_w=None, span_h=None,
+                     video_edit=None, span_w=None, span_h=None,
                      auto_place: bool = True) -> str:
         if scope not in ("inner", "kreds"):
             raise ValueError("scope must be inner or kreds")
         if placement not in ("journal", "profile"):
             raise ValueError("placement must be journal or profile")
+        if video_edit is not None and video is None:
+            raise ValueError("video_edit without a video")
         if (span_w is None) != (span_h is None):
             raise ValueError("span_w and span_h must be given together")
         if span_w is not None and not (
@@ -593,14 +595,18 @@ class HearthNode:
         aad = post_aad(self.identity_pub, scope, created_at)
         key = new_content_key()
         if video is not None:
-            mp4, poster_png = transcode_video(video)      # story gate; raises ValueError
+            # video gate (spec 2026-07-18): with a video_edit the gate
+            # cuts/crops/poster-picks; codec stamped for future
+            # negotiation (H.264 -> AV1 -> AV2 ladder, ROADMAP)
+            mp4, poster_png = transcode_video(video, video_edit)
             vref = self.store.put_blob(encrypt_blob(key, mp4))
             pref = self.store.put_blob(encrypt_blob(key, poster_png))
             nonce, ct = encrypt_body(key, {"text": text, "blobs": [vref]}, aad)
             wraps = wrap_key(key, pubs, aad)
             mid = self._publish(make_post(self.device, scope, nonce, ct, wraps,
                                           [vref], created_at, expires_at,
-                                          placement=placement, media="video", poster=pref))
+                                          placement=placement, media="video",
+                                          poster=pref, codec="h264"))
             self._cache_message_key(mid, key)
             has_media = True
         else:
@@ -688,22 +694,25 @@ class HearthNode:
     _IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8", b"GIF8", b"BM",
                     b"II*\x00", b"MM\x00*")   # PNG, JPEG, GIF, BMP, TIFF-LE, TIFF-BE
 
-    def compose_story(self, media_bytes: bytes, caption: str = "") -> str:
+    def compose_story(self, media_bytes: bytes, caption: str = "",
+                     video_edit=None) -> str:
         if len(caption) > MAX_CAPTION:
             raise ValueError("caption too long")
         is_image = (media_bytes[:4] == b"RIFF" and media_bytes[8:12] == b"WEBP") \
             or any(media_bytes.startswith(m) for m in self._IMAGE_MAGIC)
         if is_image:
+            if video_edit is not None:
+                raise ValueError("video_edit given for an image")
             media = self.store.put_blob(
                 transcode(media_bytes, STORY_IMAGE_MAX))
             msg = make_story(self.device, "photo", media, poster=None,
                              caption=caption)
         else:
-            mp4, poster_png = transcode_video(media_bytes)
+            mp4, poster_png = transcode_video(media_bytes, video_edit)
             media = self.store.put_blob(mp4)
             poster = self.store.put_blob(poster_png)
             msg = make_story(self.device, "video", media, poster=poster,
-                             caption=caption)
+                             caption=caption, codec="h264")
         return self._publish(msg)
 
     def stories_view(self):
@@ -1265,6 +1274,7 @@ class HearthNode:
             "placement": p.get("placement", "journal"),
             "media": p.get("media", "photo"),
             "poster": p.get("poster"),
+            "codec": p.get("codec"),
         }
 
     def feed(self) -> List[dict]:

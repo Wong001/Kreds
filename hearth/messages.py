@@ -76,12 +76,14 @@ def make_post(device: DeviceKeys, scope: str, body_nonce: str,
               created_at: Optional[float] = None,
               expires_at: Optional[float] = None,
               placement: str = "journal", media: str = "photo",
-              poster: Optional[str] = None) -> SignedMessage:
+              poster: Optional[str] = None,
+              codec: Optional[str] = None) -> SignedMessage:
     return device.sign_message({
         "kind": KIND_POST, "scope": scope, "body_nonce": body_nonce,
         "body_ct": body_ct, "wraps": wraps, "blobs": list(blob_refs),
         "created_at": _now(created_at), "expires_at": expires_at,
         "placement": placement, "media": media, "poster": poster,
+        "codec": codec,
     })
 
 
@@ -136,12 +138,13 @@ def make_dm(device: DeviceKeys, to_identity: str, body_nonce: str,
 
 def make_story(device: DeviceKeys, media_kind: str, media: str,
                poster: Optional[str] = None, caption: str = "",
+               codec: Optional[str] = None,
                now: Optional[float] = None) -> SignedMessage:
     created = _now(now)
     return device.sign_message({
         "kind": KIND_STORY, "media_kind": media_kind, "media": media,
-        "poster": poster, "caption": caption, "created_at": created,
-        "expires_at": created + STORY_TTL,
+        "poster": poster, "caption": caption, "codec": codec,
+        "created_at": created, "expires_at": created + STORY_TTL,
     })
 
 

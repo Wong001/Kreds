@@ -57,6 +57,24 @@ def test_over_long_caption_rejected(tmp_path):
         n.compose_story(png(), caption="x" * 201)
 
 
+def test_story_video_edit_trims_and_stamps_codec(tmp_path):
+    n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    mid = n.compose_story(clip(25), "",
+                          video_edit={"start": 0, "duration": 6, "poster_t": 2})
+    from hearth.videogate import probe_duration
+    item = [i for g in n.stories_view() for i in g["items"]
+            if i["msg_id"] == mid][0]
+    mp4 = n.store.get_blob(item["media"])
+    assert 5.0 < probe_duration(mp4) < 7.0
+    assert n.store.get_message(mid).payload["codec"] == "h264"
+
+
+def test_story_image_with_video_edit_rejected(tmp_path):
+    n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    with pytest.raises(ValueError):
+        n.compose_story(png(), "", video_edit={"start": 0, "duration": 5})
+
+
 def test_stories_view_includes_friend_and_self_first(tmp_path):
     wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
     freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")

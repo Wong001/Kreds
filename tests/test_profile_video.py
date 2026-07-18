@@ -120,6 +120,29 @@ def test_api_post_video_exceeds_cap_413(tmp_path, monkeypatch):
     assert r.status_code == 413
 
 
+def test_video_edit_trims_wall_post_and_stamps_codec(tmp_path):
+    n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    mid = n.compose_post("cut", scope="kreds", placement="profile",
+                         video=clip(30),
+                         video_edit={"start": 2, "duration": 8, "poster_t": 1})
+    row = next(p for p in n.posts_by(n.identity_pub, placement="profile")
+               if p["msg_id"] == mid)
+    assert row["media"] == "video"
+    assert row["codec"] == "h264"
+    # the stored blob is the CUT artifact: decrypt via post_blob (same
+    # content-key path profile_view/feed rows use) and probe its duration
+    from hearth.videogate import probe_duration
+    mp4 = n.post_blob(mid, row["blobs"][0])
+    assert 7.0 < probe_duration(mp4) < 9.0
+
+
+def test_photo_post_has_no_codec(tmp_path):
+    n = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    mid = n.compose_post("plain text", scope="kreds")
+    row = next(p for p in n.feed() if p["msg_id"] == mid)
+    assert row["codec"] is None
+
+
 def test_referenced_blobs_tolerates_junk_poster(tmp_path):
     """A modified friend client could persist a KIND_DM carrying a junk
     (non-str) `poster` (DM payloads aren't poster-validated on ingest).
