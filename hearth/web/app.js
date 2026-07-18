@@ -441,13 +441,23 @@ function buildEntry(p, opts) {
   // buildEntry call below) but stays read-only - a collapsed count line,
   // no bar/section/composer there - so the compact flag branches here
   // rather than duplicating the whole entry-building function.
-  if (p.responses) {
-    if (compact) {
+  //
+  // T8 live-smoke fix (2026-07-18): the feed branch below ALWAYS calls
+  // renderResponses(), even when p.responses is still null - a fresh
+  // post has no KIND_RESPONSES record until SOMEONE reacts/comments, and
+  // gating the bar on p.responses being truthy meant nobody could ever
+  // be first (a brand-new post rendered no bar, no toggle, at all).
+  // renderResponses() itself normalizes a null p.responses to the empty
+  // shape. The compact rail deliberately keeps the OLD gate - a
+  // zero-count summary line would be noise on every untouched post
+  // there, per spec ("keep the rail exactly as it looks today").
+  if (compact) {
+    if (p.responses) {
       const summary = responsesSummaryLine(p.responses);
       if (summary) body.append(summary);
-    } else {
-      renderResponses(p, body);
     }
+  } else {
+    renderResponses(p, body);
   }
   article.append(avatar, body);
   return article;
@@ -467,6 +477,20 @@ function responsesSummaryLine(r) {
   return el("div", "response-summary", parts.join("  ·  "));
 }
 
+// A fresh post has no KIND_RESPONSES record at all until someone reacts
+// or comments (server-side: feed()/posts_by carry a null "responses"
+// until then) - this is the UI's own stand-in shape for that "nobody
+// has engaged yet" state, so renderResponses can render six zero-count
+// buttons and an empty "Comment" toggle instead of nothing. Frozen and
+// shared (never mutated by renderResponses - reaction clicks/comment
+// posts always go through refresh() for the next real value, never a
+// local write into this object) so one instance safely covers every
+// untouched post on the page.
+const EMPTY_RESPONSES_SHAPE = Object.freeze({
+  reactions: Object.freeze({}), my_reaction: null,
+  comments: Object.freeze([]), can_moderate: false,
+});
+
 // Reaction bar + comment thread for one journal entry (spec 2026-07-18,
 // Task 6) - appended into buildEntry()'s `body` after the eacts row.
 // Everything comment-related is built in THIS function's own scope
@@ -476,7 +500,11 @@ function responsesSummaryLine(r) {
 // innerHTML (see the `el()` helper - its third argument always sets
 // textContent).
 function renderResponses(p, body) {
-  const r = p.responses;
+  // T8 live-smoke fix (2026-07-18): p.responses is null until a
+  // KIND_RESPONSES record exists, which itself requires a prior
+  // response - normalize here so a fresh, never-engaged-with post still
+  // gets the full bar + toggle (someone has to be able to be first).
+  const r = p.responses || EMPTY_RESPONSES_SHAPE;
 
   // -- reaction bar: six fixed buttons (REACTION_GLYPHS' own token
   // order), glyph + count when > 0, `.on` marks my_reaction. Clicking the

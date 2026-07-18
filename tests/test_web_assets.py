@@ -2130,3 +2130,31 @@ def test_comment_composer_clears_before_refresh_not_after():
     clear_idx = rr.index('input.value = ""', submit_start)
     refresh_idx = rr.index("await refresh()", submit_start)
     assert clear_idx < refresh_idx
+
+
+def test_reaction_bar_renders_before_any_engagement_exists():
+    # T8 live-smoke finding (2026-07-18): a fresh post has no
+    # KIND_RESPONSES record until SOMEONE reacts/comments - feed rows
+    # carry p.responses === null until then. buildEntry used to gate the
+    # ENTIRE bar+toggle on `if (p.responses)`, so nobody could ever be
+    # the first to react or comment through the UI. renderResponses now
+    # normalizes a null p.responses to an empty shape instead of bailing.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    rr = _js_fn_body(js, "renderResponses")
+    assert "p.responses ||" in rr           # the normalize itself
+    assert "EMPTY_RESPONSES_SHAPE" in rr
+    # the feed (non-compact) branch of buildEntry calls renderResponses
+    # UNCONDITIONALLY now - no `if (p.responses)` gate around it anymore.
+    # Anchored on "if (compact) {" (not the first "} else {" in the whole
+    # function, which belongs to the earlier mine/not-mine avatar branch).
+    be = _js_fn_body(js, "buildEntry")
+    assert "renderResponses(p, body)" in be
+    compact_branch_start = be.index("if (compact) {")
+    compact_branch = be[compact_branch_start:]
+    else_idx = compact_branch.index("} else {")
+    if_branch = compact_branch[:else_idx]
+    else_branch = compact_branch[else_idx:]
+    # the compact profile-rail branch keeps its OLD gate - a zero-count
+    # summary line on every untouched post would be noise there.
+    assert "if (p.responses)" in if_branch
+    assert re.search(r"\}\s*else\s*\{\s*renderResponses\(p, body\);", else_branch)
