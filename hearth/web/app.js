@@ -2209,6 +2209,7 @@ function openVideoEditor(file, existing, onClose) {
   const finish = (action, edit) => {
     if (closed) return;
     closed = true;
+    window.removeEventListener("resize", onResize);
     URL.revokeObjectURL(url);
     ov.remove();
     if (action === "done") onClose({action: "done", edit});
@@ -2220,6 +2221,11 @@ function openVideoEditor(file, existing, onClose) {
   ov.addEventListener("keydown", (e) => {
     if (e.key === "Escape") finish("cancel");
   });
+  // viewport resize can change frame.clientWidth, which the crop transform
+  // (applyCrop) is computed from - without a refresh here, a stale
+  // width/height would letterbox or misalign the preview after a resize.
+  const onResize = () => applyCrop();
+  window.addEventListener("resize", onResize);
 
   function buildEdit() {
     return {start: Math.round(start * 1000) / 1000,
@@ -2272,6 +2278,13 @@ function openVideoEditor(file, existing, onClose) {
   function initCrop() { setAspect(aspect); }
   function restoreCrop(c) {
     if (!c) { aspect = "orig"; return; }
+    // guard against a degenerate stored rect (non-numeric, or a zero/negative
+    // w/h) - without this, a corrupt existing.crop poisons zoom with NaN,
+    // which then survives (uncorrected) into the next preset click, since
+    // setAspect only resets zoom when switching TO "orig".
+    if (![c.x, c.y, c.w, c.h].every(Number.isFinite) || !(c.w > 0) || !(c.h > 0)) {
+      aspect = "orig"; return;
+    }
     // recover the nearest preset from the rect's real aspect
     const ratio = (c.w * vw) / (c.h * vh);
     let best = "orig", err = Infinity;
@@ -2282,6 +2295,7 @@ function openVideoEditor(file, existing, onClose) {
     aspect = best;
     const baseW = Math.min(1, (ASPECTS[best] * vh) / vw);
     zoom = Math.min(10, Math.max(1, baseW / c.w));
+    if (!Number.isFinite(zoom)) zoom = 1;
     cx = c.x + c.w / 2; cy = c.y + c.h / 2;
   }
 
@@ -2334,7 +2348,7 @@ function openVideoEditor(file, existing, onClose) {
   }
   cover.addEventListener("pointerdown", (ev) => {
     if (!ev.isPrimary) return;
-    ev.preventDefault(); ev.stopPropagation();
+    ev.preventDefault();
     cover.setPointerCapture(ev.pointerId);
     vid.pause();
     const move = (e) => {
@@ -2445,10 +2459,16 @@ function openVideoEditor(file, existing, onClose) {
     if (existing) {
       // floor every restored value - existing comes from a prior save (or,
       // once Task 6 lands, arbitrary stored state) and must not be trusted
-      // to already respect this video's own duration/window bounds.
-      start = Math.min(Math.max(0, existing.start), Math.max(0, dur - 0.5));
-      end = Math.min(dur, start + Math.min(Math.max(existing.duration, 0.5), VE_MAX_WINDOW));
-      coverAbs = start + Math.min(Math.max(existing.poster_t, 0), end - start);
+      // to already respect this video's own duration/window bounds. Fall
+      // back non-finite fields (NaN/undefined/Infinity) to sane defaults
+      // before the clamp math, so a corrupt existing edit can't poison
+      // start/end/coverAbs with NaN.
+      const exStart = Number.isFinite(existing.start) ? existing.start : 0;
+      const exDuration = Number.isFinite(existing.duration) ? existing.duration : VE_MAX_WINDOW;
+      const exPosterT = Number.isFinite(existing.poster_t) ? existing.poster_t : 0;
+      start = Math.min(Math.max(0, exStart), Math.max(0, dur - 0.5));
+      end = Math.min(dur, start + Math.min(Math.max(exDuration, 0.5), VE_MAX_WINDOW));
+      coverAbs = start + Math.min(Math.max(exPosterT, 0), end - start);
       restoreCrop(existing.crop);
     } else {
       start = 0; end = Math.min(dur, VE_MAX_WINDOW); coverAbs = 0;
