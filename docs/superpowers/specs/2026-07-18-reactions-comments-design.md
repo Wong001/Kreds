@@ -132,7 +132,9 @@ record (delete-tag cascade); an expiring post's record carries the same
   chip from the story's media/poster while the story lives; "story
   expired" fallback after the 24h TTL (media blob gone). Reaction-only
   replies render as a large emoji beside the chip (the IG look).
-- No new kinds, no relay, no aliasing (owner-only conversation).
+- No new kinds, no relay, no aliasing — a direct conversation (see
+  Honest limits below for the story_ref correlation caveat this does
+  NOT eliminate).
 
 ## Compatibility
 
@@ -156,6 +158,17 @@ record (delete-tag cascade); an expiring post's record carries the same
 - Mutual-box slot buckets weakly disclose friend-device-count range.
 - Response existence/count metadata rides the same disclosure class as
   the parent post's wraps.
+- Story reactions/replies: `story_ref` rides the plaintext DM envelope,
+  the same disclosure class as the DM's own `to`/`wraps` metadata, never
+  inside the encrypted body — a third party mutually connected to both
+  the reactor and the story owner can correlate which story prompted a
+  given DM (and in practice likely already holds that story's blob via
+  ordinary story gossip anyway). Only the correlation is exposed; the
+  reply's own text/photos stay inside the encrypted DM body. `story_ref`
+  is also shape-validated only (`validate_payload`'s `_valid_story_ref`
+  check) — never resolved against a real story the DM's target actually
+  posted, the same compliant-client precedent as `KIND_DELETE.target`
+  (also never verified to reference a real, existing message).
 
 ## Testing sketch
 

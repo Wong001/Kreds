@@ -3024,27 +3024,15 @@ function openStoryViewer(groups, startIdentity) {
         ov.append(t);
         setTimeout(() => t.remove(), 1400);
       };
-      const sendReply = async (text, advanceOnSuccess) => {
-        if (sending || !text) return;
-        sending = true;
-        const fd = new FormData();
-        fd.append("to", it.identity_pub);
-        fd.append("text", text);
-        fd.append("expires_seconds", "");
-        fd.append("story_ref", JSON.stringify(
-          {story_id: it.msg_id, media_hash: it.media}));
-        const r = await fetch("/api/dm", {method: "POST", body: fd});
-        sending = false;
-        if (r.ok) { flash("Sent"); if (advanceOnSuccess) next(); }
-        else alert("Send failed: " + await r.text());
-      };
       const react = el("div", "sv-react");
-      for (const token of Object.keys(REACTION_GLYPHS)) {
+      const reactBtns = [];
+      const tokens = Object.keys(REACTION_GLYPHS);
+      for (const token of tokens) {
         const btn = el("button", "sv-react-btn", REACTION_GLYPHS[token]);
         btn.type = "button";
         btn.setAttribute("aria-label", "React with " + token);
-        btn.onclick = () => sendReply(REACTION_GLYPHS[token], true);
         react.append(btn);
+        reactBtns.push(btn);
       }
       const replyForm = el("form", "sv-reply-form");
       const input = document.createElement("input");
@@ -3059,12 +3047,59 @@ function openStoryViewer(groups, startIdentity) {
       const sendBtn = el("button", "sv-reply-send", "Send");
       sendBtn.type = "submit";
       replyForm.append(input, sendBtn);
+
+      // Visible feedback while a send is in flight, and the primary
+      // defense against the reaction/reply race (review fix): disabled
+      // controls physically can't be clicked or submitted, so the
+      // `sending` flag below is now a backstop, not the only thing
+      // standing between a rapid double-tap and a second DM.
+      const setBusy = (busy) => {
+        input.disabled = busy;
+        sendBtn.disabled = busy;
+        reactBtns.forEach(b => b.disabled = busy);
+      };
+
+      // Deliberately NOT `async` at the top level (review fix): the guard
+      // check and `sending = true` must run synchronously and hand back a
+      // real boolean before any `await` runs - an `async` function always
+      // returns a (truthy) Promise even when its very first line no-ops,
+      // so the caller could never actually tell "guarded" from "sent",
+      // and cleared the typed reply either way - a reaction in flight
+      // silently ate the draft with no feedback. Returns false only when
+      // guarded (nothing sent, draft left untouched); true means the
+      // request has been kicked off, not that it has succeeded yet.
+      const sendReply = (text, advanceOnSuccess) => {
+        if (sending || !text) return false;
+        sending = true;
+        setBusy(true);
+        (async () => {
+          const fd = new FormData();
+          fd.append("to", it.identity_pub);
+          fd.append("text", text);
+          fd.append("expires_seconds", "");
+          fd.append("story_ref", JSON.stringify(
+            {story_id: it.msg_id, media_hash: it.media}));
+          const r = await fetch("/api/dm", {method: "POST", body: fd});
+          sending = false;
+          setBusy(false);
+          if (r.ok) { flash("Sent"); if (advanceOnSuccess) next(); }
+          else alert("Send failed: " + await r.text());
+        })();
+        return true;
+      };
+
+      reactBtns.forEach((btn, i) => {
+        btn.onclick = () => sendReply(REACTION_GLYPHS[tokens[i]], true);
+      });
       replyForm.onsubmit = (ev) => {
         ev.preventDefault();
         const text = input.value.trim();
         if (!text) return;
-        input.value = "";
-        sendReply(text, false);
+        // Only consume the typed draft once the send has actually been
+        // kicked off (review fix): if a reaction is mid-flight, sendReply
+        // no-ops and returns false, so the draft is left exactly as typed
+        // instead of vanishing with no feedback.
+        if (sendReply(text, false)) input.value = "";
       };
       ov.append(react, replyForm);
     }

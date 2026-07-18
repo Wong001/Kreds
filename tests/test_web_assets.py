@@ -2023,12 +2023,46 @@ def test_story_viewer_reply_guards_against_double_send():
     # Self-review concern: a rapid double-tap on a reaction glyph (or
     # submitting the reply twice) must not fire two DMs. A single
     # `sending` guard, checked synchronously before the await, covers
-    # both controls for one rendering of the overlay.
+    # both controls for one rendering of the overlay. sendReply is a
+    # plain (non-async) function precisely so it can hand back a REAL
+    # boolean synchronously - see test_story_viewer_reply_no_silent_loss
+    # for why that matters.
     js = (WEB / "app.js").read_text(encoding="utf-8")
     sv = _js_fn_body(js, "openStoryViewer")
     assert "let sending = false;" in sv
-    assert "if (sending || !text) return;" in sv
+    assert "if (sending || !text) return false;" in sv
     assert "sending = true;" in sv and "sending = false;" in sv
+    assert "const sendReply = (text, advanceOnSuccess) => {" in sv
+    assert "async function sendReply" not in sv
+
+
+def test_story_viewer_reply_no_silent_loss_on_reaction_race():
+    # Review fix (Important): replyForm.onsubmit used to clear input.value
+    # BEFORE sendReply's guard was even checked - if a reaction was mid-
+    # flight, sendReply silently no-op'd and the typed reply was gone with
+    # zero feedback. Fix: sendReply returns false when guarded, and the
+    # caller only clears the input when it returns true (the send actually
+    # got kicked off) - the draft survives a guarded call intact.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    sv = _js_fn_body(js, "openStoryViewer")
+    assert "return false" in sv                # the guarded-out path
+    assert "if (sendReply(text, false)) input.value = \"\";" in sv
+    # the old unconditional-clear-then-send ordering must be gone
+    assert 'input.value = "";\n        sendReply(text, false);' not in sv
+
+
+def test_story_viewer_controls_disabled_while_sending():
+    # Review fix: disabling the reply input + send button + every reaction
+    # button while a send is in flight is the PRIMARY defense against the
+    # race (disabled controls can't be clicked/submitted at all) - the
+    # `sending` flag is a backstop, not the only guard.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    sv = _js_fn_body(js, "openStoryViewer")
+    assert "const setBusy = (busy) => {" in sv
+    assert "input.disabled = busy;" in sv
+    assert "sendBtn.disabled = busy;" in sv
+    assert "reactBtns.forEach(b => b.disabled = busy);" in sv
+    assert "setBusy(true);" in sv and "setBusy(false);" in sv
 
 
 def test_story_viewer_reply_does_not_trap_keyboard_nav():

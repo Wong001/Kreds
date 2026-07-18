@@ -142,6 +142,12 @@ def make_dm(device: DeviceKeys, to_identity: str, body_nonce: str,
     # thread can render story context above the bubble. Same disclosure
     # class as `codec`/`poster` on posts: plaintext envelope metadata,
     # never inside the encrypted body. Absent/None for an ordinary DM.
+    # Review fix (spec honesty): this is a real, named disclosure, not a
+    # "no relay"/"owner-only" absolute - see the "Honest limits" section
+    # of docs/superpowers/specs/2026-07-18-reactions-comments-design.md
+    # for the correlation caveat (a mutual of both parties can tell which
+    # story a DM was about) and the compliant-client precedent (story_ref
+    # is shape-validated only, never resolved against a real story).
     return device.sign_message({
         "kind": KIND_DM, "to": to_identity, "body_nonce": body_nonce,
         "body_ct": body_ct, "wraps": wraps, "blobs": list(blob_refs),
