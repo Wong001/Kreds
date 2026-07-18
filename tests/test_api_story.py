@@ -128,3 +128,14 @@ def test_post_video_edit_without_video_400(tmp_path):
                data={"text": "hi", "scope": "kreds",
                      "video_edit": '{"start": 0, "duration": 3}'})
     assert r.status_code == 400
+
+
+def test_sniff_labels_avif_not_mp4():
+    # AVIF is ISOBMFF too (same ftyp box at the same offset MP4 uses) --
+    # _sniff must tell them apart by brand, not just by the ftyp box
+    # existing, or every AVIF blob (post photos/thumbs/story stills/video
+    # posters, spec 2026-07-18 Part 4) gets served as video/mp4.
+    from hearth.api import _sniff
+    from hearth.imagegate import transcode_photo
+    assert _sniff(transcode_photo(png())) == "image/avif"
+    assert _sniff(clip(1)) == "video/mp4"

@@ -1043,10 +1043,20 @@ class Store:
                 if isinstance(poster, str) and poster:
                     refs.add(poster)
                 # thumbs (spec 2026-07-18): same junk-guard as poster --
-                # the query spans KIND_DM whose payload isn't thumb-validated
-                for t in (p.get("thumbs") or []):
-                    if isinstance(t, str) and t:
-                        refs.add(t)
+                # the query spans KIND_DM whose payload isn't thumb-
+                # validated. isinstance-check the CONTAINER itself, not
+                # just its elements: a truthy non-list smuggled through an
+                # unvalidated KIND_DM payload (e.g. "thumbs": 1) would
+                # otherwise TypeError on iteration ("or []" only
+                # substitutes on a FALSY value) and brick every sync round
+                # + gc_blobs() -- exactly the failure class this guard
+                # exists to prevent (review finding: the first cut of this
+                # guard still had that hole).
+                thumbs = p.get("thumbs")
+                if isinstance(thumbs, list):
+                    for t in thumbs:
+                        if isinstance(t, str) and t:
+                            refs.add(t)
             for (mj,) in self._db.execute(
                     "SELECT msg_json FROM messages WHERE kind=?",
                     (KIND_PROFILE,)):

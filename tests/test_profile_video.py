@@ -168,6 +168,30 @@ def test_referenced_blobs_tolerates_junk_poster(tmp_path):
     st.gc_blobs()
 
 
+def test_referenced_blobs_tolerates_junk_thumbs(tmp_path):
+    """A modified friend client could persist a KIND_DM carrying a junk,
+    truthy, NON-LIST `thumbs` (DM payloads aren't thumb-validated on
+    ingest -- validate_payload's `dm` branch never looks at `thumbs`, so
+    this signs and ingests cleanly). referenced_blobs()/missing_blobs()
+    must not brick on it (mirrors test_referenced_blobs_tolerates_junk_
+    poster above, for the thumbs guard)."""
+    node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
+    msg = node.device.sign_message({
+        "kind": "dm", "to": "cc" * 32, "body_nonce": "ab" * 12,
+        "body_ct": "de", "wraps": {}, "blobs": [], "created_at": 1.0,
+        "expires_at": None, "thumbs": 1,
+    })
+    result = node.store.ingest_message(msg)
+    assert result.accepted, result.reason
+    # None of these may raise (before the fix, "for t in (p.get('thumbs')
+    # or [])" TypeErrors on the truthy int 1 -- "or []" only substitutes
+    # on a FALSY value):
+    refs = node.store.referenced_blobs()
+    assert isinstance(refs, set)
+    assert 1 not in refs
+    node.store.missing_blobs()
+
+
 def test_post_thumbs_aligned_and_served(tmp_path):
     node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
     mid = node.compose_post("pics", "kreds", photos=[png(), png()])

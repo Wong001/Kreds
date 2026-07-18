@@ -45,6 +45,13 @@ def _sniff(data: bytes) -> str:
         if data.startswith(magic):
             return mime
     if data[4:8] == b"ftyp":
+        # AVIF/AVIS are ISOBMFF too (same ftyp box at the same offset as
+        # MP4) -- the brand code right after ftyp is what tells them
+        # apart. Checked first so post-photo/thumb/story-still/video-
+        # poster AVIF blobs (spec 2026-07-18 Part 4) aren't mislabeled
+        # video/mp4 -- everything else with an ftyp box is still MP4.
+        if data[8:12] in (b"avif", b"avis"):
+            return "image/avif"
         return "video/mp4"
     return "application/octet-stream"
 
