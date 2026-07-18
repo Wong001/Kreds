@@ -39,6 +39,13 @@ let BLOCK_SETTINGS_OPENER = null;   // #5: element to return focus to when the b
 // a same-person re-render (heal, block-settings action, Arrange toggle) does not.
 const DECK_POS = new Map();   // msg_id/album_id -> last flipped-to index
 let LAST_RENDERED_PROFILE = null;
+// Same survives-a-rebuild need as DECK_POS (Task 6): renderJournal()
+// rebuilds every buildEntry() from scratch on each refresh() (WS ticks
+// included) - which posts' comment threads a visitor has opened must not
+// silently re-collapse on that rebuild. Session-only (not localStorage):
+// unlike the settings-section open/closed prefs, there's no expectation
+// this survives a reload, only a live re-render.
+const EXPANDED_COMMENTS = new Set();   // msg_id -> comments section is open
 let NEEDS_WIZARD = false;   // set by boot() when onboarding_done is false; Task 3's bootData() consumes it
 let UPDATE_BANNER_DISMISSED = false;   // session-only; returns next status push (Task 2, 0.3.15)
 let LAST_SEEN_UPDATE_VERSION = null;   // re-nudge when update_status.version changes past a dismiss
@@ -96,6 +103,49 @@ async function deleteEverywhere(msgId) {
 // client always derives it from the identity fingerprint.
 function identityColor(fp) {
   const h = parseInt(fp.slice(0, 6), 16) % 360;
+  return `hsl(${h} 55% 45%)`;
+}
+
+// -- reactions/comments (spec 2026-07-18, Task 6): the six reaction tokens
+// the server accepts (hearth/messages.py REACTION_TOKENS) mapped to their
+// display glyph. The one place both the reaction bar and any future
+// reaction UI read from.
+const REACTION_GLYPHS = {
+  heart: "❤️", laugh: "😂", wow: "😮",
+  sad: "😢", up: "👍", fire: "🔥",
+};
+
+// -- alias identity (Task 6): when a viewer can't resolve a comment's
+// responder (private-by-default engagement, see _post_responses_view's
+// docstring in hearth/node.py), the row carries only `alias_seed` - a
+// 32-hex-char (16-byte) random value the RESPONDER's device generated at
+// comment time, never the real identity. The client renders a stable
+// "Adjective Animal" display name + tinted circle from those bytes, so
+// the SAME alias shows every time this viewer sees that same hidden
+// responder again on this post (the seed doesn't change), without ever
+// learning who they are. Word lists are deliberately small/plain - this
+// is a display label, not an attempt at real anonymity beyond what the
+// crypto in dmcrypt.py already provides.
+const ALIAS_ADJECTIVES = [
+  "Quiet", "Bright", "Gentle", "Bold", "Calm", "Swift", "Kind", "Curious",
+  "Merry", "Steady", "Lucky", "Sunny", "Brave", "Soft", "Sharp", "Wandering",
+];
+const ALIAS_ANIMALS = [
+  "Fox", "Otter", "Heron", "Wren", "Lynx", "Hare", "Finch", "Badger",
+  "Seal", "Crane", "Moth", "Robin", "Deer", "Owl", "Sparrow", "Marten",
+];
+function aliasName(seed) {
+  const a = parseInt(seed.slice(0, 2), 16) % ALIAS_ADJECTIVES.length;
+  const b = parseInt(seed.slice(2, 4), 16) % ALIAS_ANIMALS.length;
+  return ALIAS_ADJECTIVES[a] + " " + ALIAS_ANIMALS[b];
+}
+// Same derivation SHAPE as identityColor above (hash a hex prefix into a
+// hue, fixed saturation/lightness) applied to the alias seed instead of
+// an identity fingerprint - a hidden responder still gets one stable
+// color for this viewer, without that color being tied to anyone's real
+// identity color (a different hex string, so no collision implication).
+function aliasColor(seed) {
+  const h = parseInt(seed.slice(0, 6), 16) % 360;
   return `hsl(${h} 55% 45%)`;
 }
 
@@ -292,7 +342,8 @@ function groupByDay(rows) {
   return groups;
 }
 
-function buildEntry(p) {
+function buildEntry(p, opts) {
+  const compact = !!(opts && opts.compact);
   const color = (p.mine && STATE && STATE.accent)
     ? STATE.accent : identityColor(p.identity_pub);
   const article = el("article", "entry");
@@ -381,8 +432,176 @@ function buildEntry(p) {
     acts.append(del);
     body.append(acts);
   }
+  // Reactions/comments (spec 2026-07-18, Task 6): the full reaction bar +
+  // comment thread lives under each journal FEED entry. The profile
+  // journal rail reuses this SAME buildEntry() (see the rail's own
+  // buildEntry call below) but stays read-only - a collapsed count line,
+  // no bar/section/composer there - so the compact flag branches here
+  // rather than duplicating the whole entry-building function.
+  if (p.responses) {
+    if (compact) {
+      const summary = responsesSummaryLine(p.responses);
+      if (summary) body.append(summary);
+    } else {
+      renderResponses(p, body);
+    }
+  }
   article.append(avatar, body);
   return article;
+}
+
+// Read-only collapsed engagement count for the profile journal rail
+// (spec: no bar, no section, no composer there) - e.g. "💬 3 · ❤️ 5".
+// Returns null when there's nothing to show (no comments and no
+// reactions yet), so buildEntry can skip appending an empty line.
+function responsesSummaryLine(r) {
+  const totalReactions = Object.values(r.reactions)
+    .reduce((sum, n) => sum + n, 0);
+  const parts = [];
+  if (r.comments.length) parts.push("💬 " + r.comments.length);
+  if (totalReactions) parts.push("❤️ " + totalReactions);
+  if (!parts.length) return null;
+  return el("div", "response-summary", parts.join("  ·  "));
+}
+
+// Reaction bar + comment thread for one journal entry (spec 2026-07-18,
+// Task 6) - appended into buildEntry()'s `body` after the eacts row.
+// Everything comment-related is built in THIS function's own scope
+// (including the per-comment row closure below) rather than split into
+// helper functions, so there is exactly one place to audit for the
+// house rule that comment bodies render via textContent, never
+// innerHTML (see the `el()` helper - its third argument always sets
+// textContent).
+function renderResponses(p, body) {
+  const r = p.responses;
+
+  // -- reaction bar: six fixed buttons (REACTION_GLYPHS' own token
+  // order), glyph + count when > 0, `.on` marks my_reaction. Clicking the
+  // active button clears it (token "clear"); clicking any other one
+  // switches to it. Optimistic class flip first, then refresh() re-syncs
+  // counts/my_reaction from the server (same pattern as every other
+  // action button in this file - delete, retract, etc).
+  const bar = el("div", "reaction-bar");
+  for (const token of Object.keys(REACTION_GLYPHS)) {
+    const count = r.reactions[token] || 0;
+    const btn = el("button", "rx" + (r.my_reaction === token ? " on" : ""),
+      REACTION_GLYPHS[token] + (count > 0 ? " " + count : ""));
+    btn.type = "button";
+    btn.setAttribute("aria-label", token + (count ? ", " + count : ""));
+    btn.onclick = async () => {
+      const clearing = btn.classList.contains("on");
+      bar.querySelectorAll(".rx.on").forEach(b => b.classList.remove("on"));
+      if (!clearing) btn.classList.add("on");
+      await j("/api/react", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({msg_id: p.msg_id, token: clearing ? "clear" : token})});
+      await refresh();
+    };
+    bar.append(btn);
+  }
+  body.append(bar);
+
+  // -- comments toggle + section: expanded state survives a refresh()
+  // rebuild via the module-level EXPANDED_COMMENTS set (same need as
+  // DECK_POS above - a heal tick must not silently re-collapse a thread
+  // someone just opened).
+  const n = r.comments.length;
+  const isOpen = EXPANDED_COMMENTS.has(p.msg_id);
+  const toggle = el("button", "comments-toggle", n > 0 ? `Comments (${n})` : "Comment");
+  toggle.type = "button";
+  toggle.setAttribute("aria-expanded", String(isOpen));
+  const section = el("div", "comments" + (isOpen ? "" : " hidden"));
+  toggle.onclick = () => {
+    const nowOpen = !EXPANDED_COMMENTS.has(p.msg_id);
+    if (nowOpen) EXPANDED_COMMENTS.add(p.msg_id); else EXPANDED_COMMENTS.delete(p.msg_id);
+    section.classList.toggle("hidden", !nowOpen);
+    toggle.setAttribute("aria-expanded", String(nowOpen));
+  };
+  body.append(toggle);
+
+  const list = el("div", "comments-list");
+  for (const c of r.comments) {
+    const row = el("div", "comment");
+    // Alias entries (c.alias) must NEVER render anything responder-
+    // derived - no c.name, no c.avatar, no c.responder - only the
+    // deterministic aliasName/aliasColor built from c.alias_seed, which
+    // the server itself never resolves back to an identity.
+    const displayName = c.alias ? aliasName(c.alias_seed) : (c.name || "?");
+    const avColor = c.alias ? aliasColor(c.alias_seed) : identityColor(c.responder || "");
+    const av = el("span", "comment-avatar");
+    av.style.background = avColor;
+    if (!c.alias && c.avatar) {
+      const img = document.createElement("img");
+      img.src = "/api/blob/" + c.avatar;
+      img.alt = "";
+      img.onerror = () => { img.remove(); av.textContent = displayName.slice(0, 1).toUpperCase(); };
+      av.append(img);
+    } else {
+      av.textContent = displayName.slice(0, 1).toUpperCase();
+    }
+    const main = el("div", "comment-main");
+    const line = el("div", "comment-line");
+    line.append(el("span", "comment-name" + (c.alias ? " comment-alias" : ""), displayName));
+    line.append(el("span", "comment-time", new Date(c.created_at * 1000)
+      .toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})));
+    main.append(line, el("p", "comment-body", c.body));
+    row.append(av, main);
+    if (c.mine) {
+      // Own comment: retract (never a moderation action - this is the
+      // author of the COMMENT withdrawing it, regardless of whose post
+      // it's on).
+      const x = el("button", "comment-x", "×");
+      x.type = "button";
+      x.setAttribute("aria-label", "Retract comment");
+      x.onclick = async () => {
+        await j("/api/retract", {method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({msg_id: p.msg_id, created_at: c.created_at})});
+        await refresh();
+      };
+      row.append(x);
+    } else if (r.can_moderate && c.responder) {
+      // Moderation: only the POST's author (can_moderate) may remove
+      // someone else's comment, and only when this entry resolved to a
+      // real responder - an alias entry has no `responder` to moderate
+      // by, per the note in the task brief.
+      const x = el("button", "comment-x", "×");
+      x.type = "button";
+      x.setAttribute("aria-label", "Remove comment");
+      x.onclick = async () => {
+        await j("/api/response-remove", {method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({msg_id: p.msg_id, responder: c.responder, created_at: c.created_at})});
+        await refresh();
+      };
+      row.append(x);
+    }
+    list.append(row);
+  }
+  section.append(list);
+
+  const form = el("form", "comment-composer");
+  const input = document.createElement("input");
+  input.type = "text"; input.maxLength = 500;
+  input.placeholder = "Write a comment...";
+  input.setAttribute("aria-label", "Write a comment");
+  const send = el("button", "", "Send");
+  send.type = "submit";
+  form.append(input, send);
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.disabled = true; send.disabled = true;
+    try {
+      await j("/api/comment", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({msg_id: p.msg_id, text})});
+      EXPANDED_COMMENTS.add(p.msg_id);   // posting a comment implies wanting the thread open
+      await refresh();
+    } finally {
+      input.disabled = false; send.disabled = false;
+    }
+  };
+  section.append(form);
+
+  body.append(section);
 }
 
 // Profile canvas block: a profile post rendered by inferred type - text, or
@@ -1991,7 +2210,7 @@ function renderProfilePage(p) {
     document.getElementById("profile-journal-toggle").setAttribute("aria-expanded", "false");
   }
   if (!p.journal.length) rail.append(el("div", "hint", "No journal posts here."));
-  for (const post of p.journal) rail.append(buildEntry(post));
+  for (const post of p.journal) rail.append(buildEntry(post, {compact: true}));
 }
 
 // Settings page (spec 2026-07-15): the self-only side panels + the
@@ -2909,6 +3128,7 @@ function renderMeStrip() {
   renderApplockSettings();   // self-only App-lock panel (not awaited - independent of the rest)
   renderDesktopSettings();   // self-only, desktop-only close-behavior toggle (Task 3)
   renderUpdateSettings();    // self-only Updates panel (Task 3)
+  renderEngagementSettings();   // self-only comments/reactions privacy toggle (Task 6)
 }
 
 // ---------------------------------------------------------------------
@@ -3414,6 +3634,37 @@ async function renderDesktopSettings() {
     err.textContent = r.ok ? "" : "Couldn't save: " + await r.text();
   };
   panel.append(el("div", "lbl", "When you close the window"), sel, err);
+}
+
+// Engagement privacy (spec 2026-07-18, Task 6): public_engagement is
+// bool (unlike close_behavior's two-way enum above), so this follows
+// renderDesktopSettings' exact read-current/build-control/POST-on-change
+// idiom against the SAME /api/settings endpoint, but with a checkbox +
+// label control (mirrors renderApplockSettings' lock_on_sleep row)
+// instead of a <select>. Off (default) keeps commenters shown as an
+// alias to anyone who isn't already a friend; on shows their real
+// name/avatar there too.
+async function renderEngagementSettings() {
+  const panel = document.getElementById("engagement-settings");
+  if (!panel) return;
+  const cur = (await j("/api/settings")).public_engagement;
+  panel.replaceChildren();
+  const chk = document.createElement("input");
+  chk.type = "checkbox";
+  chk.id = "settings-public-engagement";
+  chk.checked = !!cur;
+  const lbl = document.createElement("label");
+  lbl.htmlFor = "settings-public-engagement";
+  lbl.append(chk, document.createTextNode(
+    " Show my name on comments to people who don't know me"));
+  const err = el("div", "hint");
+  chk.onchange = async () => {
+    const r = await fetch("/api/settings", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({public_engagement: chk.checked})});
+    err.textContent = r.ok ? "" : "Couldn't save: " + await r.text();
+  };
+  panel.append(lbl, err);
 }
 
 // Shared by the Settings panel (renderUpdateSettings) and the auto-update

@@ -189,6 +189,15 @@
           <summary>App-lock</summary>
           <div id="applock-settings"></div>
         </details>
+        <!-- Reactions/comments engagement privacy (spec 2026-07-18, Task 6):
+             default is private-by-default (strangers see an alias on
+             comments); this opts into showing your real name/avatar to
+             people who aren't your friends. Same pattern as sec-desktop's
+             close_behavior toggle (app.js renderEngagementSettings). -->
+        <details class="panel settings-section" id="sec-engagement" open>
+          <summary>Comments &amp; reactions</summary>
+          <div id="engagement-settings"></div>
+        </details>
         <!-- Desktop close-behavior: selfonly by reachability (Settings is
              cog-gated) AND desktop-only - .desktop-only-panel stays
              display:none unless body.desktop (wireDesktopChrome). -->

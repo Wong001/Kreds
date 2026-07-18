@@ -1881,3 +1881,96 @@ def test_dm_photo_compact_and_lightbox():
     assert "items[i].src ||" in lb
     rule = _css_rule(css, ".bubble img.dmpic")
     assert "max-height" in rule
+
+
+# ---------------------------------------------------------------------
+# Reactions + comments UI (spec 2026-07-18, Task 6): reaction bar and
+# comment thread under each journal FEED entry; the profile rail keeps a
+# read-only collapsed count only (no bar/section/composer there, per
+# spec). Consumes Task 5's feed-row `responses` shape and the
+# /api/react, /api/comment, /api/retract, /api/response-remove
+# endpoints + /api/settings' public_engagement field.
+# ---------------------------------------------------------------------
+
+def test_reactions_comments_ui_wired():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    be = _js_fn_body(js, "buildEntry")
+    for needle in ("reaction-bar", "/api/react", "comments-toggle",
+                   "/api/comment", "aliasName"):
+        assert needle in be or needle in js, needle
+    assert "REACTION_GLYPHS" in js and "aliasName" in js
+    for sel in (".reaction-bar", ".rx", ".rx.on", ".comments",
+                ".comment-alias"):
+        assert sel in css, sel
+    # settings toggle present and wired to the API field
+    assert "public_engagement" in js
+    # moderation affordance only on own posts
+    assert "response-remove" in js
+
+
+def test_reaction_glyph_map_and_alias_derivation():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "REACTION_GLYPHS" in js
+    # all six tokens + their glyphs, per the spec's exact map (object-literal
+    # keys are unquoted in the source, per the brief's own literal example)
+    for token in ("heart", "laugh", "wow", "sad", "up", "fire"):
+        assert token in js
+    assert "❤" in js and "\U0001F525" in js   # heart / fire glyphs present verbatim
+    assert "function aliasName" in js
+    assert "function aliasColor" in js
+    # aliasColor reuses identityColor's derivation shape (hsl(hue ...%...%))
+    # applied to the response's alias_seed instead of an identity fingerprint.
+    ident_body = _js_fn_body(js, "identityColor")
+    alias_body = _js_fn_body(js, "aliasColor")
+    assert "hsl(" in ident_body and "hsl(" in alias_body
+    assert "% 360" in ident_body and "% 360" in alias_body
+
+
+def test_render_responses_never_uses_innerhtml_for_comment_body():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    rr = _js_fn_body(js, "renderResponses")
+    assert "innerHTML" not in rr
+    assert "/api/react" in rr and "/api/comment" in rr and "/api/retract" in rr
+
+
+def test_moderation_x_gated_on_can_moderate_and_responder():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    rr = _js_fn_body(js, "renderResponses")
+    assert "can_moderate" in rr
+    assert "responder" in rr
+    assert "/api/response-remove" in rr
+
+
+def test_expanded_comments_state_is_module_level_and_survives_rerender():
+    # A heal/WS-driven refresh() rebuilds every journal entry from scratch
+    # (renderJournal -> buildEntry); which entries' comment threads are
+    # open must not silently collapse on that rebuild - tracked the same
+    # way DECK_POS survives re-renders (module-level, keyed by msg_id).
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "EXPANDED_COMMENTS" in js and "new Set()" in js
+    rr = _js_fn_body(js, "renderResponses")
+    assert "EXPANDED_COMMENTS" in rr
+
+
+def test_profile_rail_responses_are_readonly_no_bar_or_composer():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    be = _js_fn_body(js, "buildEntry")
+    # buildEntry renders the full bar+comments for the feed, but only a
+    # collapsed read-only summary for the compact profile-rail call site.
+    assert "renderResponses" in be
+    assert "responsesSummaryLine" in be
+    assert "compact" in be
+
+
+def test_engagement_settings_toggle_wired_to_public_engagement():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert 'id="engagement-settings"' in html
+    assert "renderEngagementSettings" in js
+    render = _js_fn_body(js, "renderEngagementSettings")
+    assert "/api/settings" in render and "public_engagement" in render
+    # wired into the Settings page's render-everything sweep, like the
+    # other self-only panels (renderApplockSettings/renderDesktopSettings)
+    me_strip = _js_fn_body(js, "renderMeStrip")
+    assert "renderEngagementSettings" in me_strip

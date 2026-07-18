@@ -399,6 +399,48 @@ body.desktop .desktop-only-panel { display: block; }
 button.eavatar img { width: 100%; height: 100%; border-radius: 50%;
   object-fit: cover; display: block; margin: 0; }
 
+/* reactions + comments (spec 2026-07-18, Task 6): renderResponses()
+   appends this under a journal FEED entry's body, right after .eacts.
+   The profile rail's compact buildEntry() call never reaches here - it
+   gets .response-summary instead (below), a plain read-only line. */
+.reaction-bar { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.rx { border: 1px solid var(--line); background: transparent; color: var(--ink-2);
+  font-size: 13px; font-weight: 500; line-height: 1.3; padding: 3px 9px; border-radius: 99px;
+  transition: .15s; }
+.rx:hover { color: var(--ink); border-color: var(--line-2); }
+.rx.on { color: var(--red); border-color: var(--red); background: var(--red-soft); }
+
+.comments-toggle { display: block; margin-top: 6px; border: none; background: transparent;
+  color: var(--ink-2); font-size: 12.5px; font-weight: 500; padding: 2px 0; text-align: left; }
+.comments-toggle:hover { color: var(--ink); }
+.comments { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.comments-list { display: flex; flex-direction: column; gap: 8px; }
+.comment { display: flex; gap: 8px; align-items: flex-start; }
+.comment-avatar { width: 24px; height: 24px; border-radius: 50%; flex: none;
+  display: grid; place-items: center; font-family: var(--disp); font-weight: 600;
+  font-size: 10.5px; color: #fff; overflow: hidden; }
+.comment-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* alias display name: italic marks it as a stand-in, not a verified name -
+   the only visual difference from a resolved name/avatar (same otherwise). */
+.comment-alias { font-style: italic; }
+.comment-main { flex: 1; min-width: 0; }
+.comment-line { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.comment-name { font-weight: 600; font-size: 12.5px; }
+.comment-time { font-family: var(--mono); font-size: 10px; color: var(--ink-2); }
+.comment-body { font-size: 13px; margin-top: 1px; white-space: pre-wrap; word-break: break-word; }
+.comment-x { flex: none; border: none; background: transparent; color: var(--ink-2);
+  font-size: 13px; padding: 2px 6px; border-radius: 6px; }
+.comment-x:hover { color: var(--red); background: var(--red-soft); }
+.comment-composer { display: flex; gap: 6px; margin-top: 8px; }
+.comment-composer input { flex: 1; font-size: 13px; padding: 6px 10px; }
+.comment-composer button { border: none; background: var(--ink); color: var(--paper);
+  font-size: 12.5px; padding: 6px 12px; border-radius: 99px; }
+
+/* Profile journal rail (compact buildEntry): read-only collapsed count,
+   e.g. "comment-glyph 3  ·  heart-glyph 5" - no bar, no section, no
+   composer there (spec: read-only). */
+.response-summary { font-size: 12px; color: var(--ink-2); margin-top: 4px; }
+
 .theend { margin-top: 26px; display: flex; flex-direction: column; align-items: center;
   gap: 8px; padding: 18px 0 6px; text-align: center; }
 .theend .mark { width: 30px; height: 30px; opacity: .85; }
