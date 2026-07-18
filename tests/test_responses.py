@@ -450,3 +450,52 @@ def test_removed_responses_migration_heals_existing_node_db(tmp_path):
     a.remove_response(pid, b.identity_pub, entry_created_at)   # write: must not raise
     body = _decrypt_record_as(a, _responses_record(a, pid))
     assert body["entries"] == []
+
+
+def test_legacy_comment_tombstone_removes_reaction_exact_match(tmp_path):
+    """Reviewer-caught bug (2026-07-18, confirmation pass): a
+    migration-defaulted 'comment'-rkind tombstone (Store.__init__'s
+    ALTER TABLE ... DEFAULT 'comment' backfills any pre-rkind row this
+    way -- there is no way to recover whether such a row was originally
+    a comment or a reaction removal) that actually named a REACTION
+    event was a silent no-op -- the reaction fold branch never
+    consulted removed_exact at all (only reaction_cutoff), and a
+    'comment'-rkind row always lands in removed_exact, never
+    reaction_cutoff. Exercises the real migration path (pre-seed the
+    OLD 3-column table before first boot) AND the specific
+    legacy-tombstone-targets-a-reaction scenario, confirming the fold
+    now honors it as an exact match."""
+    import sqlite3
+
+    data_dir = tmp_path / "a"
+    data_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(data_dir / "hearth.db"))
+    conn.execute(
+        "CREATE TABLE removed_responses("
+        "target TEXT NOT NULL, responder TEXT NOT NULL,"
+        " created_at REAL NOT NULL,"
+        " PRIMARY KEY(target, responder, created_at))")
+    conn.commit()
+    conn.close()
+
+    a = HearthNode.create(data_dir, "A", "a-dev")   # migration runs here
+    b = HearthNode.create(tmp_path / "b", "B", "b-dev")
+    _befriend(a, b)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    b.compose_response(pid, "reaction", "heart")
+    _sync(b, a)
+    a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    reaction = [e for e in body["entries"] if e["rkind"] == "reaction"][0]
+    assert reaction["body"] == "heart"
+
+    # Simulate the legacy tombstone directly: rkind='comment' is exactly
+    # what a pre-migration row would carry after the ALTER's DEFAULT
+    # backfills it (the store has no way to know it was really a
+    # reaction) -- naming THIS reaction's own (responder, created_at).
+    a.store.mark_response_removed(pid, b.identity_pub,
+                                  reaction["created_at"], "comment")
+    a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert not [e for e in body["entries"] if e["rkind"] == "reaction"]

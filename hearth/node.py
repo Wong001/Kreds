@@ -2143,6 +2143,17 @@ class HearthNode:
             if (ev["responder"], str(ev["created_at"])) in retracted:
                 continue          # this entry was retracted by its own author
             if ev["rkind"] == "reaction":
+                # Reviewer-caught legacy-tombstone bug (2026-07-18): a
+                # migration-defaulted 'comment'-rkind tombstone (see the
+                # removed_responses ALTER's DEFAULT 'comment' in
+                # Store.__init__) that actually named a REACTION event
+                # lands in removed_exact, not reaction_cutoff -- without
+                # this check the reaction branch never consulted
+                # removed_exact at all, so that tombstone was a silent
+                # no-op. Honor it here as an exact match before the
+                # cutoff check.
+                if (ev["responder"], ev["created_at"]) in removed_exact:
+                    continue      # legacy/migrated exact-match tombstone
                 cutoff = reaction_cutoff.get(ev["responder"])
                 if cutoff is not None and ev["created_at"] <= cutoff:
                     continue      # moderated away (cutoff also drops older ones)
