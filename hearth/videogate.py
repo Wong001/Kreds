@@ -1,10 +1,11 @@
-"""Video transcode gate: re-encode Story videos to known-good muted MP4.
+"""Video transcode gate: re-encode Story/wall videos to known-good muted MP4.
 
 Mirrors the image gate: decode the upload and re-encode via a bundled
 ffmpeg so viewers only ever render bytes WE produced. Author-side gate
 (a modified peer can still put raw bytes behind a hash, as post photos do,
-served nosniff and never as HTML). Reject over-length/over-size instead of
-trimming, for predictability. Audio is stripped in v1 (muted stories)."""
+served nosniff and never as HTML). With a video_edit (spec 2026-07-18)
+the gate CUTS a <=15s window / crops / picks the poster frame; without
+one, over-length is rejected exactly as before. Audio is stripped."""
 from __future__ import annotations
 
 import os
@@ -63,9 +64,47 @@ def probe_duration(data: bytes) -> float:
     return int(h) * 3600 + int(mm) * 60 + float(ss)
 
 
-def transcode_video(data: bytes) -> tuple[bytes, bytes]:
-    if probe_duration(data) > MAX_VIDEO_SECONDS:
+def validate_video_edit(edit) -> dict:
+    """Normalize a client video_edit (spec 2026-07-18). Raises ValueError.
+
+    {"start": s>=0, "duration": 0<d<=15, "crop": {x,y,w,h} normalized
+    to the DISPLAY-oriented frame (0..1, min 0.1, inside bounds) or
+    None, "poster_t": 0<=t<=duration into the cut}."""
+    if not isinstance(edit, dict):
+        raise ValueError("bad video_edit")
+    try:
+        start = float(edit["start"])
+        duration = float(edit["duration"])
+        poster_t = float(edit.get("poster_t", 0.0))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("bad video_edit")
+    if not (start >= 0.0 and 0.0 < duration <= MAX_VIDEO_SECONDS):
+        raise ValueError("trim window must be within 15 seconds")
+    if not (0.0 <= poster_t <= duration):
+        raise ValueError("cover time is outside the trim window")
+    crop = edit.get("crop")
+    if crop is not None:
+        try:
+            x, y, w, h = (float(crop[k]) for k in ("x", "y", "w", "h"))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("bad crop")
+        # 1e-4 slack: client floats may land at 1.0000001 after math
+        if not (x >= 0.0 and y >= 0.0 and w >= 0.1 and h >= 0.1
+                and x + w <= 1.0 + 1e-4 and y + h <= 1.0 + 1e-4):
+            raise ValueError("bad crop")
+        crop = {"x": x, "y": y, "w": min(w, 1.0 - x), "h": min(h, 1.0 - y)}
+    return {"start": start, "duration": duration,
+            "crop": crop, "poster_t": poster_t}
+
+
+def transcode_video(data: bytes, edit=None) -> tuple[bytes, bytes]:
+    if edit is not None:
+        edit = validate_video_edit(edit)
+    src_dur = probe_duration(data)
+    if edit is None and src_dur > MAX_VIDEO_SECONDS:
         raise ValueError("video longer than 15 seconds")
+    if edit is not None and edit["start"] >= src_dur:
+        raise ValueError("trim window starts past the end of the video")
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "in")
         out = os.path.join(d, "out.mp4")
@@ -77,10 +116,24 @@ def transcode_video(data: bytes) -> tuple[bytes, bytes]:
         # filter parser (raw string), else it reads as a filter separator.
         # Height is forced even (trunc(ih/2)*2) to satisfy yuv420p/libx264.
         vf = f"scale=w=-2:h=min({VIDEO_MAX_DIM}\\,trunc(ih/2)*2)"
-        enc = _run(["-protocol_whitelist", "file", "-i", src, "-vf", vf,
+        cut = []
+        if edit is not None:
+            # -ss/-t BEFORE -i: fast keyframe seek; output is
+            # frame-accurate anyway because we re-encode.
+            cut = ["-ss", f"{edit['start']:.3f}",
+                   "-t", f"{edit['duration']:.3f}"]
+            if edit["crop"] is not None:
+                c = edit["crop"]
+                # iw/ih are the DISPLAY-oriented dims (ffmpeg autorotates
+                # on decode by default - do not pass -noautorotate; the
+                # browser preview the user cropped against agrees).
+                vf = (f"crop=iw*{c['w']:.6f}:ih*{c['h']:.6f}"
+                      f":iw*{c['x']:.6f}:ih*{c['y']:.6f}," + vf)
+        enc = _run(["-protocol_whitelist", "file", *cut, "-i", src,
+                    "-vf", vf,
                     "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
                     "-crf", "28", "-maxrate", "2500k", "-bufsize", "5000k",
-                    "-preset", "veryfast", "-movflags",
+                    "-preset", "slow", "-movflags",
                     "+faststart", "-y", out])
         if enc.returncode != 0 or not os.path.exists(out):
             raise ValueError("could not transcode video")
@@ -88,8 +141,19 @@ def transcode_video(data: bytes) -> tuple[bytes, bytes]:
             mp4 = f.read()
         if len(mp4) > MAX_VIDEO_BYTES:
             raise ValueError("transcoded video exceeds 5 MB")
-        pf = _run(["-protocol_whitelist", "file", "-i", out, "-frames:v", "1",
-                   "-f", "image2", "-y", frame])
+        poster_t = 0.0
+        if edit is not None:
+            # A start near the source end can yield a near-empty cut -
+            # surface that as a trim error, not "not a video".
+            try:
+                out_dur = probe_duration(mp4)
+            except ValueError:
+                raise ValueError("trim window is outside the video")
+            # clamp: the cut may be shorter than requested (source ended)
+            poster_t = min(edit["poster_t"], max(0.0, out_dur - 0.1))
+        seek = ["-ss", f"{poster_t:.3f}"] if poster_t > 0 else []
+        pf = _run(["-protocol_whitelist", "file", *seek, "-i", out,
+                   "-frames:v", "1", "-f", "image2", "-y", frame])
         if pf.returncode != 0 or not os.path.exists(frame):
             raise ValueError("could not extract poster")
         with open(frame, "rb") as f:
