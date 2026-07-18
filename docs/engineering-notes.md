@@ -1478,9 +1478,30 @@ handing a commenter's raw message to strangers who can't verify it.
 author-relay would hand the post's entire audience the commenter's real
 identity key, including strangers who aren't the commenter's friends at
 all - graph discovery through a side door, rejected outright. Every
-response carries a per-post `alias_seed` (fresh per post, deliberately
-unlinkable across posts) that strangers render as a neutral name +
-tinted avatar. Real identity rides alongside as a `mutual_box`: sealed
+response carries a per-post `alias_seed` (deliberately unlinkable
+across posts) that strangers render as a neutral name + tinted avatar.
+**Reviewer fix (whole-branch review):** the original implementation
+drew `alias_seed` fresh via `os.urandom(16).hex()` on every
+`compose_response` call - per RESPONSE, not per POST - so two comments
+from the same responder on the same post could render as two different
+aliases, contradicting the "same stranger reads as the same alias
+within one post's thread" promise above. `identity.py`'s
+`DeviceKeys.derive_alias_seed` now makes it deterministic instead:
+HKDF-SHA256 over this device's raw Ed25519 signing key bytes
+(`device_priv` - device-local, never transmitted, stable for the
+device's lifetime, chosen over the also-device-local `enc_priv`
+specifically because `enc_priv` rotates every `ENC_ROTATION_PERIOD` and
+would have changed the alias mid-thread) with a domain-separated info
+string (`hearth/alias-seed/v1`) produces a dedicated subkey, and
+*that* subkey - never `device_priv` itself - is the HMAC-SHA256 key
+over `target_msg_id`, truncated to the same 32 hex chars the wire
+format already used. Same post -> same HMAC input -> same seed;
+different post -> different input -> unlinkable seed; no one but this
+device can compute it, since only this device holds `device_priv`.
+**Accepted trade-off, stated honestly:** this is device-level
+stability, not identity-level - the same identity commenting from two
+of their own enrolled devices reads as two different aliases on the
+same post. Real identity rides alongside as a `mutual_box`: sealed
 per-recipient slots for the commenter's OWN friends' devices, opened
 only by them. **The near-miss:** the obvious, structurally cheapest way
 to build that box would have been the wrap mechanism already used

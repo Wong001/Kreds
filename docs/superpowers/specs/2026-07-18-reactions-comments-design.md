@@ -27,11 +27,20 @@ commenter. That is graph discovery through a side door and is rejected.
 
 **Private-by-default, two-tier disclosure:**
 
-- Every response carries an **alias**: a random per-post pseudonym seed
-  chosen by the commenter's client, rendered as a neutral name +
-  default avatar tinted from the seed. Stable within one post's thread
-  (the same stranger reads as the same alias there), unlinkable across
-  posts (fresh seed per post).
+- Every response carries an **alias**: a per-post pseudonym seed,
+  deterministically derived by the commenter's client (HMAC-SHA256 of
+  the post's msg_id, keyed on an HKDF subkey of the responding
+  device's own signing key -- never a raw key used directly, never
+  transmitted), rendered as a neutral name + default avatar tinted from
+  the seed. Stable within one post's thread (the same stranger reads
+  as the same alias there), unlinkable across posts (a different
+  msg_id derives an unrelated seed). Honest caveat: this is
+  device-level stability, not identity-level -- the same person
+  commenting from two of their own enrolled devices reads as two
+  different aliases on the same post, an accepted trade-off (reviewer
+  fix, whole-branch review; an earlier build drew alias_seed fresh
+  per-response via os.urandom(), which was only accidentally stable
+  within a post).
 - A **mutual box** rides alongside: the commenter's real identity +
   signature, sealed into per-recipient slots for the commenter's OWN
   friends' devices at comment time. Slots are ANONYMOUS (sealed-box
@@ -69,7 +78,8 @@ commenter. That is graph discovery through a side door and is rejected.
 {kind, target: <post msg_id>, rkind: "comment" | "reaction" | "retract",
  body: <comment text (<= MAX_COMMENT 500) | reaction token |
         retracted entry ref>,
- alias_seed: <random hex>, public: bool,
+ alias_seed: <hex, deterministic per (responder device, target) -- see
+             the alias bullet above>, public: bool,
  mutual_box: [sealed slots] | null (null when public),
  created_at, body encrypted+wrapped to the AUTHOR's devices only}
 ```
