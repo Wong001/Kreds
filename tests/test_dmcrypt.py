@@ -1,9 +1,11 @@
 import os
 
+import pytest
+
 from hearth.dmcrypt import (
     decrypt_blob, decrypt_body, dm_aad, encrypt_blob, encrypt_body,
     gen_enc_keypair, new_content_key, post_aad, seal_content_key,
-    open_content_key, unwrap_key, wrap_key,
+    open_content_key, seal_slots, try_open_slots, unwrap_key, wrap_key,
 )
 
 
@@ -98,3 +100,39 @@ def test_post_aad_binds_author_scope_time():
     assert a != post_aad("bb" * 32, "inner", 100.0)      # author bound
     assert a != post_aad("aa" * 32, "inner", 101.0)      # time bound
     assert isinstance(a, (bytes, bytearray))
+
+
+def test_sealed_slots_friend_opens_stranger_cannot():
+    fpriv, fpub = gen_enc_keypair()
+    spriv, spub = gen_enc_keypair()          # stranger keys, never sealed to
+    slots = seal_slots(b"identity-payload", [fpub])
+    assert try_open_slots(slots, fpriv) == b"identity-payload"
+    assert try_open_slots(slots, spriv) is None
+
+
+def test_sealed_slots_bucket_padding_and_anonymity():
+    pubs = [gen_enc_keypair()[1] for _ in range(3)]
+    slots = seal_slots(b"x", pubs)
+    assert len(slots) == 8                    # 3 real -> 8-bucket
+    # no recipient identifiers anywhere in a slot
+    assert all(set(s.keys()) == {"eph_pub", "nonce", "ct"} for s in slots)
+    pubs17 = [gen_enc_keypair()[1] for _ in range(17)]
+    assert len(seal_slots(b"x", pubs17)) == 32
+    with pytest.raises(ValueError):
+        seal_slots(b"x", [gen_enc_keypair()[1] for _ in range(65)])
+
+
+def test_sealed_slots_dummy_slots_indistinguishable_shape():
+    slots = seal_slots(b"payload", [gen_enc_keypair()[1]])
+    # every slot (real or dummy) has hex fields of plausible length;
+    # a dummy must not be identifiable by shape alone
+    lens = {(len(s["eph_pub"]), len(s["nonce"])) for s in slots}
+    assert lens == {(64, 24)}
+
+
+def test_sealed_slots_empty_recipients():
+    # a responder with zero friends still produces a full dummy bucket
+    slots = seal_slots(b"x", [])
+    assert len(slots) == 8
+    priv, _ = gen_enc_keypair()
+    assert try_open_slots(slots, priv) is None

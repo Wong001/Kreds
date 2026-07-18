@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from typing import Dict, Optional, Tuple
 
 from cryptography.exceptions import InvalidTag
@@ -144,3 +145,71 @@ def open_content_key(storage_key_hex: str, msg_id: str,
             data[:12], data[12:], KEYCACHE_AAD + msg_id.encode())
     except (InvalidTag, ValueError):
         return None
+
+
+MUTUAL_BOX_AAD = b"hearth/mutual-box/v1"
+_SLOT_BUCKETS = (8, 16, 32, 64)
+
+
+def _derive_slot_kek(shared: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                info=b"hearth/mutual-box/v1").derive(shared)
+
+
+def seal_slots(payload: bytes, enc_pubs) -> list:
+    """Anonymous per-recipient slots (spec 2026-07-18, engagement
+    privacy): each real slot is an ephemeral-X25519 + ChaCha20-Poly1305
+    box with NO recipient identifier - recipients trial-open. Padded
+    with byte-random dummy slots to a fixed bucket so the slot count
+    only buckets, never measures, the sender's friend-device count."""
+    real = []
+    for enc_pub in enc_pubs:
+        try:
+            peer = X25519PublicKey.from_public_bytes(bytes.fromhex(enc_pub))
+        except ValueError:
+            continue                      # skip bad keys, like wrap_key
+        eph = X25519PrivateKey.generate()
+        kek = _derive_slot_kek(eph.exchange(peer))
+        nonce = os.urandom(12)
+        real.append({"eph_pub": eph.public_key().public_bytes_raw().hex(),
+                     "nonce": nonce.hex(),
+                     "ct": ChaCha20Poly1305(kek).encrypt(
+                         nonce, payload, MUTUAL_BOX_AAD).hex()})
+    bucket = next((b for b in _SLOT_BUCKETS if b >= len(real)), None)
+    if bucket is None:
+        raise ValueError("too many recipients for a mutual box")
+    ct_len = len(real[0]["ct"]) if real else (len(payload) + 16) * 2
+    while len(real) < bucket:
+        real.append({"eph_pub": os.urandom(32).hex(),
+                     "nonce": os.urandom(12).hex(),
+                     "ct": os.urandom(ct_len // 2).hex()})
+    # Shuffle is cosmetic hardening only (breaks "first N slots are the
+    # real ones" positional leak) - it is NOT the anonymity mechanism.
+    # Anonymity comes from the sealed-box construction itself: slots
+    # carry no recipient identifier and dummies are byte-indistinguishable
+    # from real slots, so trial-opening is the only way to find a match.
+    random.shuffle(real)
+    return real
+
+
+def try_open_slots(slots, enc_priv_hex: str):
+    """Trial-open every slot; the one sealed to this device decrypts,
+    all others (other recipients' and dummies) fail AEAD auth."""
+    try:
+        priv = X25519PrivateKey.from_private_bytes(
+            bytes.fromhex(enc_priv_hex))
+    except ValueError:
+        return None
+    for s in slots:
+        if not isinstance(s, dict):
+            continue
+        try:
+            shared = priv.exchange(X25519PublicKey.from_public_bytes(
+                bytes.fromhex(s["eph_pub"])))
+            kek = _derive_slot_kek(shared)
+            return ChaCha20Poly1305(kek).decrypt(
+                bytes.fromhex(s["nonce"]), bytes.fromhex(s["ct"]),
+                MUTUAL_BOX_AAD)
+        except (InvalidTag, ValueError, KeyError, TypeError):
+            continue
+    return None
