@@ -1,3 +1,4 @@
+import struct
 import subprocess
 
 import imageio_ffmpeg
@@ -183,24 +184,70 @@ def test_edit_poster_t_at_window_end_clamps_not_fails():
     assert poster[:4] == b"\x89PNG"
 
 
+def _find_box(buf, start, end, box_type):
+    """Locate the first child box of box_type in buf[start:end]. Returns
+    (payload_start, box_end) so callers can descend (moov -> trak -> tkhd)
+    or read fields directly."""
+    pos = start
+    while pos < end:
+        size = struct.unpack(">I", buf[pos:pos + 4])[0]
+        btype = bytes(buf[pos + 4:pos + 8])
+        hdr = 8
+        if size == 1:
+            size = struct.unpack(">Q", buf[pos + 8:pos + 16])[0]
+            hdr = 16
+        elif size == 0:
+            size = end - pos
+        if btype == box_type:
+            return pos + hdr, pos + size
+        pos += size
+    raise ValueError(f"no {box_type!r} box in MP4")
+
+
+def _rotate_90_tkhd(data: bytes) -> bytes:
+    """Patch an MP4's tkhd transformation matrix to a 90-degree rotation -
+    container metadata ONLY, no re-encode, no pixel touched. This is what
+    a real phone-recorded portrait clip looks like on disk (landscape
+    pixels + a display-matrix rotation flag), which the ffmpeg CLI on
+    this build cannot author via "-metadata rotate=" (silently ignored,
+    both with -c copy and on re-encode) or "-display_rotation" as an
+    input option (bakes the rotation into the pixels instead of leaving
+    a flag) - box surgery is the only way to get a genuine fixture for
+    the crop-vs-display-orientation mismatch class.
+    tkhd layout (ISO/IEC 14496-12): version/flags(4), then ctime/mtime/
+    duration at 4 bytes each (version 0) or 8 bytes each (version 1),
+    track_id(4), reserved(4), [duration], reserved(8), layer(2),
+    alt_group(2), volume(2), reserved(2) -> matrix(36) -> width(4),
+    height(4). Matrix offset from the tkhd payload start is therefore 40
+    (version 0) or 52 (version 1)."""
+    buf = bytearray(data)
+    moov_payload, moov_end = _find_box(buf, 0, len(buf), b"moov")
+    trak_payload, trak_end = _find_box(buf, moov_payload, moov_end, b"trak")
+    tkhd_payload, tkhd_end = _find_box(buf, trak_payload, trak_end, b"tkhd")
+    version = buf[tkhd_payload]
+    matrix_at = tkhd_payload + (52 if version == 1 else 40)
+    # height is stored right after the matrix, already in 16.16 fixed
+    # point - that raw field IS the "height << 16" the rotated x needs.
+    height_fp = struct.unpack(">I", buf[matrix_at + 36 + 4:matrix_at + 44])[0]
+    # 90-degree matrix, 16.16 (a,b,c,d,x,y) / 2.30 (u,v,w) fixed point:
+    # [0, 1, 0 / -1, 0, 0 / height, 0, 1]
+    buf[matrix_at:matrix_at + 36] = struct.pack(
+        ">iiiiiiiii",
+        0, 0x00010000, 0,
+        -0x00010000, 0, 0,
+        height_fp, 0, 0x40000000)
+    return bytes(buf)
+
+
 def test_rotated_portrait_source_crop_matches_display_frame():
-    # A 640x480 clip re-encoded with -display_rotation 90 DISPLAYS as
-    # 480x640 (portrait). A full-height half-width crop must therefore
-    # come out tall, matching the spec's classic-mismatch pin: crop
-    # coordinates must be interpreted against the display-oriented frame,
-    # not the raw decoded one.
-    # NOTE: "-metadata:s:v:0 rotate=90" + "-c copy" is a no-op on the
-    # bundled ffmpeg 7.x (probed both -c copy and re-encode variants:
-    # neither writes a rotate tag or displaymatrix side data - dims stay
-    # 640x480). -display_rotation on an INPUT re-encode is the only route
-    # this build honors, but it bakes the rotation into the pixels
-    # themselves (probed with -noautorotate: still 480x640, no side data
-    # survives) rather than leaving landscape pixels + a rotation flag.
-    # So this no longer independently pins "-noautorotate would break
-    # this" - it pins that crop math is computed against whatever ffmpeg
-    # reports as iw/ih (the actual display-oriented frame), which is the
-    # observable half of the same contract. Probe below confirms the
-    # source really is portrait before relying on it.
+    # A 640x480 clip with its tkhd matrix patched to a 90-degree rotation
+    # DISPLAYS as 480x640 (portrait) while the coded pixels stay 640x480 -
+    # verified below via ffmpeg's own displaymatrix report, and this is
+    # exactly the mismatch class the spec pins: a full-height half-width
+    # crop must come out tall, proving ffmpeg autorotate stayed on and
+    # crop applies to the display-oriented frame, not the raw one. Unlike
+    # a baked-pixel fixture, THIS one genuinely flips if autorotate is
+    # ever turned off (see test_no_noautorotate_regression below).
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     import tempfile, os, re
     d = tempfile.mkdtemp()
@@ -210,20 +257,35 @@ def test_rotated_portrait_source_crop_matches_display_frame():
                     "testsrc=size=640x480:rate=24:duration=2",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", plain],
                    check=True, capture_output=True)
-    subprocess.run([ff, "-display_rotation", "90", "-i", plain,
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", rot],
-                   check=True, capture_output=True)
+    with open(plain, "rb") as f:
+        rot_bytes = _rotate_90_tkhd(f.read())
+    with open(rot, "wb") as f:
+        f.write(rot_bytes)
     probe = subprocess.run([ff, "-i", rot],
                            capture_output=True, text=True).stderr
-    m = re.search(r"Video:.*?(\d+)x(\d+)", probe)
-    assert m and int(m.group(2)) > int(m.group(1))  # rot IS portrait
-    with open(rot, "rb") as f:
-        src = f.read()
+    # confirm the patched matrix actually landed as real side data before
+    # relying on it (not a WxH guess - the codec tag "avc1 / 0x31637661"
+    # on the same line defeats a naive digit regex)
+    assert re.search(r"displaymatrix|rotation of", probe, re.I)
     mp4, poster = transcode_video(
-        src, {"start": 0, "duration": 2,
-              "crop": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0}})
+        rot_bytes, {"start": 0, "duration": 2,
+                    "crop": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0}})
     w, h = _dims(poster)
     assert h > w                       # portrait crop of a portrait frame
+
+
+def test_no_noautorotate_regression():
+    # Static guard, same regression class as the test above: if ffmpeg's
+    # autorotate is ever disabled here, crop math would read the raw
+    # (pre-rotation) frame instead of the display-oriented one the
+    # browser preview agrees with. Checks the quoted-arg form (as it
+    # would appear in an actual subprocess args list) rather than the
+    # bare substring - the module's own comment explaining NOT to pass
+    # it legitimately contains the bare text "-noautorotate".
+    import hearth.videogate as vg
+    from pathlib import Path
+    src = Path(vg.__file__).read_text(encoding="utf-8")
+    assert '"-noautorotate"' not in src
 
 
 def test_preset_slow_rider_pinned():
