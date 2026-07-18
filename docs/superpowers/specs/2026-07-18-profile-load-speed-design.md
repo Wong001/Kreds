@@ -141,7 +141,9 @@ slice: journal FEED photos get `max-height: min(480px, 60vh)` with
 width free within the column (aspect preserved; landscape effectively
 unaffected). Scoped to `#view-journal` via an `.epic` class set in
 `buildEntry` - the profile journal rail (narrow column, sizing already
-right per August) is untouched, and the class scoping leaves the 0.3.13
+right per August) keeps its sizing untouched; rail photos DO share the
+new click-to-lightbox (buildEntry is common to both surfaces - a
+deliberate, desirable side effect), and the class scoping leaves the 0.3.13
 `.eavatar` specificity fix unchallenged. Journal photos now also open
 the shared fullscreen lightbox (full-res hash), so the cap is never the
 only view of a photo.

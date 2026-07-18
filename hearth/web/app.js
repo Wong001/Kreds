@@ -363,6 +363,7 @@ function buildEntry(p) {
     const im = blobImg(p.msg_id, h, eth[i] || null);
     im.classList.add("epic");
     im.style.cursor = "zoom-in";
+    im.tabIndex = -1;   // scriptable focus target: lightbox close returns focus here
     im.onclick = () => openLightbox(eitems, i, im);
     body.append(im);
   });
