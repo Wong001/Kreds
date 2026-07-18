@@ -6,6 +6,8 @@ carried store-level sync, no real sockets needed) rather than
 test_three_nodes.py's full invite ceremony + live SyncService -- both
 exist in this codebase; this file picks the lighter one since nothing
 here needs real network behavior."""
+import types
+
 import pytest
 
 from hearth.dmcrypt import response_aad, unwrap_key, decrypt_body
@@ -145,3 +147,41 @@ def test_response_never_leaks_to_a_third_friend_via_routing(tmp_path):
     offered_to_a = {m.msg_id for m in b.store.messages_not_in(
         {}, {b.identity_pub}, a.identity_pub)}
     assert rid in offered_to_a
+
+
+def test_cache_message_keys_does_not_crash_on_response_rows(tmp_path):
+    """Reviewer-caught Critical (2026-07-18): store.uncached_message_ids
+    started including KIND_RESPONSE/KIND_RESPONSES (needed so a response's
+    key gets cached on every device, not just the composer's), but
+    node._content_key's old bare `else: # post` assumed any non-DM kind
+    was a post and read p["scope"] -- a response payload has no "scope",
+    so cache_message_keys()'s ~3s gossip-loop sweep KeyError'd on the
+    first response row it saw and (caught by the loop's blanket except)
+    silently starved caching for every uncached id after it, forever.
+    This drives the real sweep end to end on the AUTHOR's node, which
+    never composed the response itself and so must pick up its key
+    purely from the sweep."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    rid = b.compose_response(pid, "comment", "hej")
+    _sync(b, a)                      # response reaches A (untouched by compose)
+    assert rid in a.store.uncached_message_ids(a.identity_pub)
+    a.cache_message_keys()           # must not raise
+    assert a.store.cached_message_key(rid) is not None     # key landed in the cache
+    assert rid not in a.store.uncached_message_ids(a.identity_pub)  # no work left
+
+
+def test_content_key_unknown_kind_is_defensive_not_fatal(tmp_path):
+    """The final `else` in _content_key must return (None, None) for an
+    unrecognized kind rather than raising -- validate_payload already
+    refuses to let a real unknown-kind message be ingested (so this can
+    never happen via real sync), but _content_key is a general helper
+    called from a loop that must never crash on one bad row, so this
+    drives it directly with a minimal duck-typed stand-in rather than
+    trying to smuggle an invalid kind through ingest_message."""
+    a = HearthNode.create(tmp_path / "unk", "A", "a-dev")
+    fake = types.SimpleNamespace(
+        payload={"kind": "mystery", "created_at": 1.0},
+        msg_id="ff" * 32, cert=None)
+    assert a._content_key(fake) == (None, None)

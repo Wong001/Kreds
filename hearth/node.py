@@ -13,8 +13,8 @@ from typing import List, Optional, Sequence
 from . import applock, invitecodec, update
 from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
                       encrypt_body, new_content_key, open_content_key,
-                      post_aad, response_aad, seal_content_key, seal_slots,
-                      unwrap_key, wrap_key)
+                      post_aad, response_aad, responses_aad,
+                      seal_content_key, seal_slots, unwrap_key, wrap_key)
 from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        EnrollmentCert, IdentityCeremony, PROTOCOL,
                        canonical, _sig_ok)
@@ -23,12 +23,13 @@ from .imagegate import (AVATAR_MAX, BANNER_MAX, is_image_bytes, photo_thumb,
 from .videogate import STORY_IMAGE_MAX, transcode_video
 from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_POST,
-                       KIND_RESPONSE, KIND_WRAP_GRANT, MAX_BLOCK_H,
-                       MAX_CAPTION, MAX_COMMENT, MAX_LAYOUT, REACTION_TOKENS,
-                       SIZE_LAYOUTS, TEXT_STYLE_ENUMS, WALL_COLS, is_expired,
-                       make_album, make_delete, make_dm, make_enckey,
-                       make_post, make_profile, make_profile_layout,
-                       make_response, make_ring, make_story, make_wrap_grant)
+                       KIND_RESPONSE, KIND_RESPONSES, KIND_WRAP_GRANT,
+                       MAX_BLOCK_H, MAX_CAPTION, MAX_COMMENT, MAX_LAYOUT,
+                       REACTION_TOKENS, SIZE_LAYOUTS, TEXT_STYLE_ENUMS,
+                       WALL_COLS, is_expired, make_album, make_delete,
+                       make_dm, make_enckey, make_post, make_profile,
+                       make_profile_layout, make_response, make_ring,
+                       make_story, make_wrap_grant)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -1821,6 +1822,8 @@ class HearthNode:
         it under Task 5) - this only needs the read."""
         if rkind not in ("comment", "reaction", "retract"):
             raise ValueError("bad response kind")
+        if not isinstance(body, str):
+            raise ValueError("bad body")
         if rkind == "comment" and not (0 < len(body) <= MAX_COMMENT):
             raise ValueError("comment must be 1-500 characters")
         if rkind == "reaction" and body not in REACTION_TOKENS + ("clear",):
@@ -1893,8 +1896,25 @@ class HearthNode:
         kind = p["kind"]
         if kind == KIND_DM:
             aad = dm_aad(msg.cert.identity_pub, p["to"], p["created_at"])
-        else:                                        # post
+        elif kind == KIND_RESPONSE:
+            aad = response_aad(msg.cert.identity_pub, p["target"],
+                               p["created_at"])
+        elif kind == KIND_RESPONSES:
+            aad = responses_aad(msg.cert.identity_pub, p["target"],
+                                p["created_at"])
+        elif kind == KIND_POST:
             aad = post_aad(msg.cert.identity_pub, p["scope"], p["created_at"])
+        else:
+            # An unhandled kind must starve nothing: cache_message_keys()'s
+            # sweep calls this once per uncached id inside a single loop,
+            # and a raised exception here (e.g. a bare KeyError probing a
+            # field this kind doesn't carry) crashes mid-sweep - silently
+            # starving caching for every id after it, forever (reviewer-
+            # caught Critical, 2026-07-18: this used to be a bare
+            # `else: # post` that KeyError'd on p["scope"] for every
+            # KIND_RESPONSE row once uncached_message_ids started
+            # including them).
+            return None, None
         # 1) local cache: survives enc-key rotation and grace deletion
         sealed = self.store.cached_message_key(msg.msg_id)
         stale_row = False
