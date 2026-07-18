@@ -2065,6 +2065,22 @@ def test_story_viewer_controls_disabled_while_sending():
     assert "setBusy(true);" in sv and "setBusy(false);" in sv
 
 
+def test_story_viewer_reply_resets_busy_state_on_rejected_fetch():
+    # Review fix: a REJECTED fetch (node restarting mid-update is the
+    # realistic case) must not strand `sending`/every disabled control for
+    # the rest of this show() rendering with no feedback - sendReply's
+    # IIFE wraps the fetch in try/catch/finally so sending=false and
+    # setBusy(false) run on every settlement path, not just the r.ok one.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    sv = _js_fn_body(js, "openStoryViewer")
+    assert "try {" in sv and "} catch (e) {" in sv and "} finally {" in sv
+    # the resets live in finally, not only inlined after a bare await
+    finally_block = sv[sv.index("} finally {"):]
+    assert "sending = false;" in finally_block
+    assert "setBusy(false);" in finally_block
+    assert 'alert("Send failed: " + e.message);' in sv
+
+
 def test_story_viewer_reply_does_not_trap_keyboard_nav():
     # The story viewer has no global keydown nav (prev/next are tap/click
     # zones, .sv-left/.sv-right) - so the reply <input> must not gain one

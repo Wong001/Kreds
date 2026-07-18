@@ -3073,17 +3073,29 @@ function openStoryViewer(groups, startIdentity) {
         sending = true;
         setBusy(true);
         (async () => {
-          const fd = new FormData();
-          fd.append("to", it.identity_pub);
-          fd.append("text", text);
-          fd.append("expires_seconds", "");
-          fd.append("story_ref", JSON.stringify(
-            {story_id: it.msg_id, media_hash: it.media}));
-          const r = await fetch("/api/dm", {method: "POST", body: fd});
-          sending = false;
-          setBusy(false);
-          if (r.ok) { flash("Sent"); if (advanceOnSuccess) next(); }
-          else alert("Send failed: " + await r.text());
+          // Review fix: a REJECTED fetch (the realistic case here is the
+          // node restarting mid-update) used to skip straight past the
+          // sending=false/setBusy(false) resets below it - stranding
+          // every control disabled, with no feedback, for the rest of
+          // this show() rendering. try/finally guarantees the resets run
+          // on every settlement path (success, a non-ok response, or a
+          // thrown/rejected fetch alike).
+          try {
+            const fd = new FormData();
+            fd.append("to", it.identity_pub);
+            fd.append("text", text);
+            fd.append("expires_seconds", "");
+            fd.append("story_ref", JSON.stringify(
+              {story_id: it.msg_id, media_hash: it.media}));
+            const r = await fetch("/api/dm", {method: "POST", body: fd});
+            if (r.ok) { flash("Sent"); if (advanceOnSuccess) next(); }
+            else alert("Send failed: " + await r.text());
+          } catch (e) {
+            alert("Send failed: " + e.message);
+          } finally {
+            sending = false;
+            setBusy(false);
+          }
         })();
         return true;
       };
