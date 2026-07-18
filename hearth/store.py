@@ -1079,6 +1079,16 @@ class Store:
                     self._db.execute("SELECT hash FROM blobs")}
             return self.referenced_blobs() - have
 
+    def blob_sizes(self, hashes) -> dict:
+        """{hash: stored byte length} for the hashes we hold (others absent)."""
+        with self._lock:
+            if not hashes:
+                return {}
+            qs = ",".join("?" for _ in hashes)
+            return {h: n for (h, n) in self._db.execute(
+                f"SELECT hash, LENGTH(data) FROM blobs WHERE hash IN ({qs})",
+                list(hashes))}
+
     def gc_blobs(self) -> int:
         with self._lock:
             refs = self.referenced_blobs()

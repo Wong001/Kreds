@@ -629,7 +629,14 @@ class SyncService:
         peer_want = await self._swap(reader, writer, initiator, want)
         give = {}
         give_size = 0
-        for h in peer_want.get("hashes", []):
+        # Smallest-first (spec 2026-07-18): thumbnails, avatars, and small
+        # photos fill round 1; one big video can't starve twenty small
+        # images. Ties keep hash order for determinism. Unknown hashes
+        # sort last and fall out at get_blob's None-check below, same as
+        # before.
+        wanted = peer_want.get("hashes", [])
+        sizes = store.blob_sizes(wanted)
+        for h in sorted(wanted, key=lambda x: (sizes.get(x, 1 << 62), x)):
             data = store.get_blob(h)
             if data is None:
                 continue

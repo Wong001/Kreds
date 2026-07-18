@@ -313,6 +313,79 @@ def test_sync_fetch_refuses_blob_over_cap(tmp_path):
     asyncio.run(scenario())
 
 
+def test_blob_give_is_smallest_first_under_budget(tmp_path, monkeypatch):
+    """Spec 2026-07-18 Part 2: thumbnails/avatars/small photos must land
+    in sync round 1 even when a big blob is also wanted -- one large
+    video can no longer starve twenty small images. Giver (wong) holds
+    one big blob and ten small ones the requester (freja) wants; under a
+    budget that fits all ten smalls but not the big, round 1 must
+    deliver every small and defer the big to round 2.
+
+    The big blob's content is searched until its hash sorts BEFORE every
+    small hash (Step 2 note in the task brief): peer_want's hash list is
+    `sorted(store.missing_blobs())` at the requester, so pre-fix
+    (hash-order) giving processes the big blob FIRST. Because the give
+    loop only enforces the budget once `give` is non-empty, that first
+    (oversized) item is admitted unconditionally and alone blows the
+    budget, so pre-fix giving delivers ONLY the big blob and starves
+    every small -- a deterministic failure, not hash luck.
+    """
+    import hearth.sync as sync_mod
+    from hearth.messages import blob_hash, make_post
+
+    async def scenario():
+        wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
+        freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+        befriend(wong, freja)
+        sw, wa = await started(wong)
+        sf, fa = await started(freja)
+        for n in (wong, freja):
+            n.ensure_enckey()
+        await sw.sync_with(fa)          # registers device views for entitlement
+
+        smalls = [bytes([i]) * 4096 for i in range(10)]
+        small_hashes = [wong.store.put_blob(s) for s in smalls]
+
+        # Find big-blob content whose hash sorts before every small hash,
+        # keeping the total size fixed at 300 KiB (an 8-byte counter
+        # trades off against the filler so length never changes).
+        counter = 0
+        while True:
+            candidate = b"B" * (300 * 1024 - 8) + counter.to_bytes(8, "big")
+            h = blob_hash(candidate)
+            if h < min(small_hashes):
+                big, big_hash = candidate, h
+                break
+            counter += 1
+        assert wong.store.put_blob(big) == big_hash
+
+        hashes = [big_hash] + small_hashes
+
+        # Budget: fits all ten smalls' b64 (~53 KB) but not the big
+        # blob's b64 (300 KiB -> 400 KB).
+        monkeypatch.setattr(sync_mod, "BLOB_GIVE_BUDGET", 100 * 1024)
+
+        wraps = {freja.device.device_pub: {
+            "eph_pub": "00" * 32, "nonce": "00" * 12,
+            "wrapped_key": "00" * 32}}
+        msg = make_post(wong.device, "kreds", body_nonce="ab" * 12,
+                        body_ct="deadbeef", wraps=wraps, blob_refs=hashes)
+        assert wong.store.ingest_message(msg).accepted
+
+        assert await sw.sync_with(fa) is True
+        have_b = {h for h in hashes if freja.store.get_blob(h) is not None}
+        small_hash_set = set(small_hashes)
+        assert small_hash_set <= have_b          # every small arrived round 1
+        assert big_hash not in have_b            # big deferred to round 2
+
+        assert await sw.sync_with(fa) is True
+        assert freja.store.get_blob(big_hash) is not None
+        await sw.stop()
+        await sf.stop()
+
+    asyncio.run(scenario())
+
+
 def test_hanging_dial_is_bounded(tmp_path, monkeypatch):
     async def scenario():
         wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
