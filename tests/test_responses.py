@@ -12,9 +12,9 @@ import types
 import pytest
 
 from hearth.dmcrypt import (encrypt_body, new_content_key, response_aad,
-                            unwrap_key, decrypt_body, wrap_key)
+                            responses_aad, unwrap_key, decrypt_body, wrap_key)
 from hearth.identity import canonical, _sig_ok
-from hearth.messages import KIND_RESPONSE, make_response
+from hearth.messages import KIND_RESPONSE, make_response, make_responses
 from hearth.node import HearthNode
 
 
@@ -596,3 +596,39 @@ def test_feed_row_has_no_responses_key_when_untouched(tmp_path):
     pid = a.compose_post("post with no engagement", "kreds")
     row = [p for p in a.feed() if p["msg_id"] == pid][0]
     assert row["responses"] is None
+
+
+def test_malformed_responses_record_body_does_not_crash_feed(tmp_path):
+    """Reviewer-caught Critical (2026-07-18): decrypt_body's Optional[dict]
+    return type is a hint, not enforced -- json.loads happily returns
+    whatever JSON type the plaintext root actually is. A KIND_RESPONSES
+    record whose encrypted body is a JSON list (not an object) -- a buggy
+    client, or a hostile one skipping the honest process_responses fold --
+    used to reach body.get("entries") on a list, raising an uncaught
+    AttributeError that 500'd feed()/posts_by() for EVERY post, not just
+    the malformed one. Must degrade to responses=None for just this row;
+    a second, healthy post's responses must still assemble normally."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    healthy_pid = a.compose_post("healthy post", "kreds")
+    _sync(a, b)
+    b.compose_response(healthy_pid, "reaction", "heart")
+    _sync(b, a); a.process_responses()
+
+    # Hand-craft the malformed record directly (bypassing make_responses'
+    # normal {"entries": [...]} body) -- exactly what a hostile/buggy
+    # author's own client could publish for one of their own posts.
+    pubs = a._scope_device_pubs("kreds")
+    key = new_content_key()
+    created_at = time.time()
+    aad = responses_aad(a.identity_pub, pid, created_at)
+    nonce, ct = encrypt_body(key, ["not", "a", "dict"], aad)
+    wraps = wrap_key(key, pubs, aad)
+    a._publish(make_responses(a.device, pid, nonce, ct, wraps,
+                              created_at=created_at))
+
+    rows = a.feed()                       # must not raise
+    row = [p for p in rows if p["msg_id"] == pid][0]
+    assert row["responses"] is None
+    healthy_row = [p for p in rows if p["msg_id"] == healthy_pid][0]
+    assert healthy_row["responses"]["reactions"] == {"heart": 1}

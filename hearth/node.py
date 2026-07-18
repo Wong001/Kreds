@@ -1410,7 +1410,22 @@ class HearthNode:
         someone who isn't a mutual friend of THIS viewer, only of the
         post's author), which is expected, not evidence of forgery.
         This is the accessor Task 5's brief asked about; see the task
-        report for the full finding."""
+        report for the full finding.
+
+        Adjudicated boundary (reviewer, 2026-07-18, spec-consistent --
+        documentation only, no behavior change): a public identity UNKNOWN
+        to this viewer carries author-level trust only. A hostile author
+        can still mint a fabricated "public" identity on their OWN posts
+        for a viewer who has never talked to the claimed identity at all
+        (nothing here can refute it) -- but that is exactly the trust a
+        stranger already extends to the author's relay by reading their
+        feed at all, no different from trusting the author not to have
+        doctored the post text itself. The permissive branch is what lets
+        GENUINE public engagement reach strangers (the whole point of the
+        public_engagement toggle); it cannot impersonate an identity the
+        viewer actually KNOWS -- that case hits the `return device_pub in
+        views` branch below instead, and the sig check above this call
+        already guarantees the claimed device_pub really signed the entry."""
         views = self.store.load_views(identity_pub)
         if not views:
             return True
@@ -1464,6 +1479,17 @@ class HearthNode:
         body = decrypt_body(key, rec.payload["body_nonce"],
                             rec.payload["body_ct"], aad)
         if body is None:
+            return None
+        # Reviewer-caught Critical (2026-07-18): decrypt_body's Optional[dict]
+        # return type is a hint, not an enforced one -- json.loads happily
+        # returns whatever JSON type the plaintext root actually is. An
+        # author encrypting a list/str/int as the record body (buggy client,
+        # or a hostile one skipping the honest process_responses fold) used
+        # to reach body.get("entries") on a non-dict, raising an uncaught
+        # AttributeError that took down the ENTIRE feed()/posts_by() call --
+        # one bad record breaking every other row's view. Fail closed here,
+        # same as every other malformed-input branch in this method.
+        if not isinstance(body, dict):
             return None
         entries = body.get("entries")
         if not isinstance(entries, list):
@@ -1524,6 +1550,13 @@ class HearthNode:
             resolved = identity is not None
             mine = resolved and identity == self.identity_pub
             if e["rkind"] == "reaction":
+                # Reviewer note (2026-07-18): this tally comes from the
+                # AUTHOR's own rebuilt record -- a hostile author could
+                # inflate/fabricate counts shown to a stranger viewer (same
+                # author-level-trust boundary as _device_bound above). A
+                # mutual friend's own independent identity verification for
+                # THEIR OWN visible entries is the counterweight, not a fix
+                # for the tally itself; no behavior change here.
                 reactions[e["body"]] = reactions.get(e["body"], 0) + 1
                 if mine:
                     my_reaction = e["body"]
@@ -1558,6 +1591,22 @@ class HearthNode:
         if body is None:
             return None
         ipub = msg.cert.identity_pub
+        # Belt-and-braces beyond _post_responses_view's own internal
+        # fail-closed checks (reviewer-caught Critical, 2026-07-18: a
+        # malformed record body once raised an uncaught AttributeError out
+        # of that method, 500-ing this ENTIRE feed()/posts_by() call and
+        # taking every OTHER post's row down with it). A single bad
+        # KIND_RESPONSES record must never break the whole view, so any
+        # exception _post_responses_view didn't already swallow internally
+        # still degrades to a null "responses" for just this one row
+        # instead of propagating out of here.
+        try:
+            responses = self._post_responses_view(msg, names, avatars)
+        except Exception:
+            logger.warning(
+                "_post_responses_view: skipping responses for %s"
+                " (malformed record)", msg.msg_id, exc_info=True)
+            responses = None
         return {
             "msg_id": msg.msg_id, "identity_pub": ipub,
             "author_name": names.get(ipub, ipub[:8]),
@@ -1571,7 +1620,7 @@ class HearthNode:
             "poster": p.get("poster"),
             "codec": p.get("codec"),
             "thumbs": p.get("thumbs"),
-            "responses": self._post_responses_view(msg, names, avatars),
+            "responses": responses,
         }
 
     def feed(self) -> List[dict]:
