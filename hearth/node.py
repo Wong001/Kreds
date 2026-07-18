@@ -13,7 +13,8 @@ from typing import List, Optional, Sequence
 from . import applock, invitecodec, update
 from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
                       encrypt_body, new_content_key, open_content_key,
-                      post_aad, seal_content_key, unwrap_key, wrap_key)
+                      post_aad, response_aad, seal_content_key, seal_slots,
+                      unwrap_key, wrap_key)
 from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        EnrollmentCert, IdentityCeremony, PROTOCOL,
                        canonical, _sig_ok)
@@ -22,11 +23,12 @@ from .imagegate import (AVATAR_MAX, BANNER_MAX, is_image_bytes, photo_thumb,
 from .videogate import STORY_IMAGE_MAX, transcode_video
 from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_POST,
-                       KIND_WRAP_GRANT, MAX_BLOCK_H, MAX_CAPTION, MAX_LAYOUT,
+                       KIND_RESPONSE, KIND_WRAP_GRANT, MAX_BLOCK_H,
+                       MAX_CAPTION, MAX_COMMENT, MAX_LAYOUT, REACTION_TOKENS,
                        SIZE_LAYOUTS, TEXT_STYLE_ENUMS, WALL_COLS, is_expired,
                        make_album, make_delete, make_dm, make_enckey,
                        make_post, make_profile, make_profile_layout,
-                       make_ring, make_story, make_wrap_grant)
+                       make_response, make_ring, make_story, make_wrap_grant)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -1795,6 +1797,81 @@ class HearthNode:
         wraps = wrap_key(key, pubs, aad)
         mid = self._publish(make_dm(self.device, to_identity, nonce, ct,
                                     wraps, created_at, refs, expires_at))
+        self._cache_message_key(mid, key)
+        return mid
+
+    def compose_response(self, target_msg_id: str, rkind: str,
+                         body: str) -> str:
+        """Respond to a journal post (spec 2026-07-18): comment, reaction,
+        or retract - encrypted to the AUTHOR's devices only (the author
+        relays to the audience via the responses record; Task 4's sweep
+        folds it, own-post responses included - one code path, no special
+        case for responding to yourself). Engagement is private by
+        default: the real identity rides only in the anonymous mutual
+        box (sealed to THIS device's own friends, via seal_slots) unless
+        the public_engagement setting is on, in which case the plaintext
+        `responder` field alone is enough and the box is omitted.
+
+        public_engagement persistence: same mechanism as /api/settings'
+        close_behavior (hearth/api.py:185-195) - store.get_meta/set_meta's
+        generic meta(k, v) table (hearth/store.py). No schema change
+        needed; read directly here as a "1"/absent boolean, matching the
+        onboarding_done convention (hearth/api.py:169). Wiring the HTTP
+        GET/POST side is a later task (the reactions-comments plan lists
+        it under Task 5) - this only needs the read."""
+        if rkind not in ("comment", "reaction", "retract"):
+            raise ValueError("bad response kind")
+        if rkind == "comment" and not (0 < len(body) <= MAX_COMMENT):
+            raise ValueError("comment must be 1-500 characters")
+        if rkind == "reaction" and body not in REACTION_TOKENS + ("clear",):
+            raise ValueError("unknown reaction")
+        msg = self.store.get_message(target_msg_id)
+        if msg is None or msg.payload.get("kind") != KIND_POST \
+                or msg.payload.get("placement", "journal") != "journal":
+            raise ValueError("not a journal post")
+        author = msg.cert.identity_pub
+        author_devs = self.store.enckeys(author)
+        if author == self.identity_pub:
+            author_devs[self.device.device_pub] = self.device.enc_pub
+        if not author_devs:
+            raise ValueError("no reachable devices for the author")
+        created_at = time.time()
+        public = self.store.get_meta("public_engagement") == "1"
+        sig_payload = canonical({"target": target_msg_id, "rkind": rkind,
+                                 "body": body, "created_at": created_at,
+                                 "responder": self.identity_pub})
+        # identity.py's raw-sign/verify pair (Task 1/2's finds, reused
+        # here): DeviceKeys.sign_raw signs arbitrary bytes directly (no
+        # envelope/seq bump, unlike sign_message) - its counterpart is
+        # the module-level _sig_ok(pub, sig, body) verifier.
+        responder_sig = self.device.sign_raw(sig_payload)
+        box = None
+        if not public:
+            # Mutual box audience is THIS node's own friends (the
+            # responder's), never the author's - so the author cannot
+            # use their own friend graph to shrink the anonymity set of
+            # who might be behind the box (self-review point).
+            friend_pubs = []
+            for ident in self.store.known_identities():
+                if ident == self.identity_pub:
+                    continue
+                friend_pubs.extend(self.store.enckeys(ident).values())
+            box = seal_slots(canonical({"identity": self.identity_pub,
+                                        "sig": responder_sig}), friend_pubs)
+        key = new_content_key()
+        aad = response_aad(self.identity_pub, target_msg_id, created_at)
+        nonce, ct = encrypt_body(key, {
+            "rkind": rkind, "body": body,
+            "alias_seed": os.urandom(16).hex(), "public": public,
+            "responder": self.identity_pub, "responder_sig": responder_sig,
+            "mutual_box": box, "created_at": created_at}, aad)
+        wraps = wrap_key(key, author_devs, aad)
+        mine = self.store.enckeys(self.identity_pub)
+        mine[self.device.device_pub] = self.device.enc_pub
+        wraps.update(wrap_key(key, mine, aad))    # self-readable (retract UI)
+        mid = self._publish(make_response(self.device, target_msg_id,
+                                          nonce, ct, wraps,
+                                          created_at=created_at))
         self._cache_message_key(mid, key)
         return mid
 

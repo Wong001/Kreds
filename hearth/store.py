@@ -15,8 +15,8 @@ from .identity import (
 )
 from .messages import (
     KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_ENCKEY, KIND_POST, KIND_PROFILE,
-    KIND_PROFILE_LAYOUT, KIND_RING, KIND_STORY, KIND_WRAP_GRANT,
-    MAX_BLOB_BYTES, blob_hash, validate_payload,
+    KIND_PROFILE_LAYOUT, KIND_RESPONSE, KIND_RESPONSES, KIND_RING,
+    KIND_STORY, KIND_WRAP_GRANT, MAX_BLOB_BYTES, blob_hash, validate_payload,
 )
 
 _SCHEMA = """
@@ -601,6 +601,16 @@ class Store:
                     wr = set(json.loads(mj)["payload"].get("wraps", {}))
                     if peer_identity != ipub and not (peer_devices & wr):
                         continue      # grants route to named devices + author
+                if kind in (KIND_RESPONSE, KIND_RESPONSES):
+                    # Responder -> author only (spec 2026-07-18): a
+                    # response's whole point is that it is NOT broadcast
+                    # to the author's audience, so this mirrors
+                    # KIND_WRAP_GRANT's plain wrap-set gate exactly - no
+                    # grant-union widening exists (or should ever exist)
+                    # for this kind.
+                    wr = set(json.loads(mj)["payload"].get("wraps", {}))
+                    if peer_identity != ipub and not (peer_devices & wr):
+                        continue      # responses route to wrapped devices + author
                 dev = summaries.get(ipub, {}).get(dpub)
                 if dev is not None and SeenSet.summary_has(dev, seq):
                     continue
@@ -756,20 +766,25 @@ class Store:
 
     def uncached_message_ids(self, self_identity: str) -> List[str]:
         """msg_id list, kind-agnostic: DM rows where self is a party, plus
-        post rows authored by self or whose wraps contains one of self's
-        devices -- with no cached key yet."""
+        post/response/responses rows authored by self or whose wraps
+        contains one of self's devices -- with no cached key yet. This is
+        the eager key-cache sweep's candidate list (node.cache_message_
+        keys); KIND_RESPONSE/KIND_RESPONSES ride the same "post-like"
+        branch below as KIND_POST (wraps-only, no separate recipient
+        field) -- the wrap_grants() union is a harmless no-op for them
+        (nothing ever mints a wrap_grant targeting a response)."""
         with self._lock:
             out = []
             for mid, kind, ipub, rcpt, mj in self._db.execute(
                     "SELECT msg_id, kind, identity_pub, recipient, msg_json"
-                    " FROM messages WHERE kind IN (?,?)"
+                    " FROM messages WHERE kind IN (?,?,?,?)"
                     " AND msg_id NOT IN (SELECT msg_id FROM dm_keys)"
                     " AND msg_id NOT IN (SELECT msg_id FROM undecryptable)",
-                    (KIND_DM, KIND_POST)):
+                    (KIND_DM, KIND_POST, KIND_RESPONSE, KIND_RESPONSES)):
                 if kind == KIND_DM:
                     if self_identity in (ipub, rcpt):
                         out.append(mid)
-                else:                                    # post
+                else:                            # post / response / responses
                     if ipub == self_identity:
                         out.append(mid); continue
                     my_devs = set(self.load_views(self_identity).keys())
