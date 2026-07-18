@@ -1117,3 +1117,147 @@ fallback has been built, so the feature is simply unavailable - not
 weaker - on other platforms today. Deferred: a pattern-style credential,
 biometric unlock, true OS-suspend hooks, and syncing lock settings across
 your devices.
+
+## Video editor: trim, crop, cover
+
+A composer video pick - wall/profile post or a Story - no longer either
+takes the raw file as-is or bounces off a hard 15-second reject with an
+apologetic "coming soon." It opens a fullscreen editor
+(`openVideoEditor` in `hearth/web/app.js`) that lets the user choose a
+<=15s window, an aspect crop, and a cover frame, then hands the result
+to the same node-side gate that already existed
+(`hearth/videogate.py`'s `transcode_video`), which now optionally
+executes it in one ffmpeg pass instead of only validating the whole
+file (spec `docs/superpowers/specs/2026-07-18-video-trimmer-design.md`).
+
+**Client simulates, node executes - there is still no server in this
+picture.** Kreds has never had a server component; "processing" a video
+always meant the user's own node, the local Python process the web UI
+already talks to over loopback. The editor doesn't change that
+boundary, it just adds a step in front of it: the modal drives a local
+`<video>` element against the picked File via an object URL, drawing a
+filmstrip by seeking and canvas-capturing frames client-side, and
+everything the user does - dragging the trim handles, panning/zooming
+under an aspect frame, dragging the cover marker - is pure UI state
+(`start`, `end`, `aspect`/`zoom`/`cx`/`cy`, `coverAbs`) that never
+touches a video byte. On Done, `buildEdit()` reduces that state to the
+wire object below, and the ORIGINAL file (not a re-encoded one) uploads
+to the node alongside it - the upload is still local-machine-to-local-
+process, so shipping the whole original is nearly free. The node's
+bundled ffmpeg then does the one real cut/crop/transcode. **The trust
+property this preserves, restated because it's the whole point:** a
+friend's node only ever renders bytes a Kreds videogate produced -
+never the browser's preview, never the original the author picked. The
+editor's live preview, the filmstrip, the crop transform - all of it is
+cosmetic scaffolding for choosing parameters; if the browser's crop math
+and ffmpeg's crop math ever disagreed, the wire format is defined
+against the DISPLAY-oriented frame precisely so they can't (see below).
+
+**Wire format.** One new optional multipart field, identical on
+`/api/post` and `/api/story`:
+
+    video_edit = {"start": float,      # seconds into the source
+                  "duration": float,   # 0 < d <= 15.0
+                  "crop": {"x","y","w","h"} | null,  # normalized 0..1
+                  "poster_t": float}   # seconds into the CUT, 0 <= t <= duration
+
+`crop`, when present, is normalized to the DISPLAY-oriented frame - what
+the user actually saw in the preview - not the raw decoded frame. This
+matters because ffmpeg autorotates on decode by default (reading the
+container's rotation metadata, e.g. a portrait phone clip stored
+sideways with a `tkhd` rotation flag) and so does the browser's
+`<video>` element; as long as neither side is told to skip that step,
+"the frame the user cropped against" and "the frame ffmpeg crops" are
+the same frame. `hearth/videogate.py` calls this out explicitly in a
+comment on the crop-filter construction inside `transcode_video` - never
+pass `-noautorotate` here - and an earlier commit in this slice built a
+genuine rotated-fixture test (real MP4 box surgery on a `tkhd` rotation
+matrix, not a hand-set flag) specifically to catch a regression on this
+exact point, because it's the classic mismatch bug in any
+client-crops/server-cuts design. `validate_video_edit`
+(`hearth/videogate.py`) re-derives and clamps everything server-side
+rather than trusting the client's arithmetic: duration must be `(0,
+15]`, `poster_t` inside `[0, duration]`, crop bounds inside `[0,1]` with
+a `1e-4` slack for client float drift and a 0.1 minimum on each axis - a
+bad shape anywhere is a clean 400, never a silent clamp that posts
+something other than what the user chose.
+
+**Degraded mode is a two-rung ladder, not a single fallback.** The
+editor assumes a `<video>` element that can decode the picked file, but
+two increasingly worse things can go wrong, and each has its own honest
+floor:
+- **Metadata reads, frames don't** (a codec the container header
+  understands but the engine can't paint - most often an unusual codec
+  in a given WebView2/Chromium build). `buildThumbs()` fails, `degraded`
+  flips true: the filmstrip is dropped, the aspect chips are disabled
+  (`ve-disabled` - you can't position a crop you can't see), and trim
+  becomes slider-only against the numeric time readout. The cover
+  marker still works (it only needs a time, not a frame) and defaults
+  to the window start. This is still a real, node-executed edit - just
+  blind on the crop axis.
+- **Metadata itself doesn't read** (the engine can't open the file at
+  all). The `error` event fires before `loadedmetadata` ever does; the
+  editor gives up entirely and calls back `{action: "raw"}` - today's
+  pre-editor behavior: post the file unedited, and let the node's own
+  `transcode_video` (no `edit` argument) validate and reject exactly as
+  it always has (>15s source, not-a-video). Client capability never
+  gates what the node can do; it only gates how much help the UI can
+  give choosing parameters.
+
+Both rungs, plus the "everything works" path, funnel into the same
+`onClose({action, edit})` contract on both call sites (the wall
+composer's video picker and its re-open-to-edit click, and the Story
+"+" tile) - `action` is one of `"done"` / `"raw"` / `"cancel"`, so a
+caller never has to special-case which rung produced the callback.
+
+**The `-preset slow` rider.** Both the edited and un-edited paths now
+encode at `-preset slow` instead of the prior `-preset veryfast` -
+roughly 10-15% better quality-per-byte at the same `-crf 28`/bitrate
+cap, for a few extra seconds on an encode that's already short (<=15s,
+<=720p). This makes the no-edit path no longer byte-identical to
+before, which is fine: the existing tests for that path assert behavior
+(codec, cap, rejects), not exact output bytes, so nothing needed
+touching to keep them honest.
+
+**`codec` field, and the ladder it's for.** Every video post/story
+record now carries `"codec": "h264"` (`node.compose_post` /
+`compose_story`, `hearth/messages.py`'s `make_post`/`make_story`),
+additive like `author_avatar` before it - an old client simply doesn't
+read the field and behaves as before, no compatibility event for the
+field itself. It exists because H.264 is not meant to be the only stop:
+the recorded ladder is H.264 now (universal decode floor, including
+whatever iOS client eventually ships), AV1 once chunked/streamed blob
+transfer lands (by then the decode floor across active clients is
+knowable), AV2 whenever real hardware decode silicon exists (not yet,
+~2028+ by current estimate). Stamping `codec` now means a future
+mixed-codec period - some posts H.264, some AV1 - can be told apart
+per-artifact without guessing from bytes, and the switch itself is a
+`min_core_for_web`-gated event like the 0.3.11 photo-gate change, not a
+protocol break.
+
+**Story raw-upload cap, and the asymmetry it fixes.** `/api/story` used
+to check every upload - photo or video - against the 50 MB image cap
+(`MAX_IMAGE_UPLOAD`), which made no sense for the trimmer's actual use
+case: the whole point of an in-app trim is picking a long, large source
+and cutting it down, not hand-pre-trimming a small file before upload.
+Non-image media on `/api/story` now gets the same 100 MB ceiling
+`/api/post`'s video field already had (`MAX_VIDEO_UPLOAD`,
+`hearth/messages.py`), checked before the gate ever runs (a >100 MB
+source is a clean 413, not a slow rejection after transcoding starts).
+Telling image from video apart now goes through one shared sniff,
+`is_image_bytes` (moved to `hearth/imagegate.py` so both `api.py` and
+`node.py` call the identical function, instead of `node.py` owning the
+only copy and the story endpoint having no way to call it) - the story
+endpoint's cap check and the node's `compose_story` branch can no
+longer disagree about what they're looking at. The gate's own output
+ceiling (`MAX_VIDEO_BYTES`, 5 MB transcoded) and the 15s content cap are
+unchanged by any of this - only the raw upload headroom moved.
+
+Timing sanity (spec requirement, run once at the end of this slice): a
+60-second 1080p `testsrc` source cut to a 15s window (`start=20,
+duration=15, poster_t=5`) transcoded in under a second on this machine,
+against the gate's 60s subprocess timeout - the cut happens via
+`-ss`/`-t` before `-i`, so ffmpeg never decodes the parts of a long
+source outside the window, leaving ample headroom even for sources far
+larger than this test used. `_TIMEOUT` stays at 60; no change was
+needed.
