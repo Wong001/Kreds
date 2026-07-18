@@ -123,6 +123,25 @@ def test_reaction_tokens_frozen():
     assert MAX_COMMENT == 500
 
 
+def test_dm_story_ref_validation():
+    # Task 7 (stories as DMs): story_ref is an additive, optional envelope
+    # field on KIND_DM - absent/None fine; present, it must be a dict with
+    # a non-empty string story_id and a hex64 media_hash. Anything else
+    # rejects the whole DM payload (fail-closed, same idiom as _valid_wraps).
+    base = {"kind": "dm", "to": "bb" * 32, "body_nonce": "0" * 24,
+            "body_ct": "ab", "wraps": {}, "created_at": 1.0,
+            "expires_at": None}
+    assert validate_payload(base)[0]                      # no story_ref: fine
+    base["story_ref"] = {"story_id": "s" * 16, "media_hash": "a" * 64}
+    assert validate_payload(base)[0]
+    for bad in (7, "x", {"story_id": ""}, {"story_id": "s", "media_hash": 9},
+                {"story_id": "s"}):
+        base["story_ref"] = bad
+        assert not validate_payload(base)[0], bad
+    base["story_ref"] = None
+    assert validate_payload(base)[0]
+
+
 def test_make_response_and_make_responses_shape():
     d = _dev()
     from hearth.messages import KIND_RESPONSE, KIND_RESPONSES, validate_payload

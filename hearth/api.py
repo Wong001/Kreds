@@ -65,15 +65,20 @@ def _installed_web_version(wd: Path) -> str:
         return update.CORE_VERSION
 
 
-def _parse_video_edit(raw: str):
-    """Parse the video_edit form field shared by /api/post and /api/story.
-    Blank -> None (no edit). Bad JSON -> 400, same message both callers used."""
+def _parse_json_field(raw: str, name: str):
+    """Parse an optional JSON form field. Blank -> None. Bad JSON -> 400
+    naming the field. Shared by video_edit (/api/post, /api/story) and
+    story_ref (/api/dm, Task 7)."""
     if not raw.strip():
         return None
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        raise HTTPException(400, "bad video_edit")
+        raise HTTPException(400, f"bad {name}")
+
+
+def _parse_video_edit(raw: str):
+    return _parse_json_field(raw, "video_edit")
 
 
 def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
@@ -659,6 +664,7 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
     @app.post("/api/dm")
     async def dm(to: str = Form(...), text: str = Form(""),
                  expires_seconds: str = Form(""),
+                 story_ref: str = Form(default=""),
                  photos: List[UploadFile] = File(default=[])):
         blobs = []
         for up in photos:
@@ -667,7 +673,9 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
                 raise HTTPException(413, "photo exceeds the 50 MB upload cap")
             blobs.append(data)
         expiry = float(expires_seconds) if expires_seconds.strip() else None
-        mid = _400(lambda: node.compose_dm(to, text, blobs, expiry))
+        ref = _parse_json_field(story_ref, "story_ref")
+        mid = _400(lambda: node.compose_dm(to, text, blobs, expiry,
+                                           story_ref=ref))
         return {"msg_id": mid}
 
     @app.get("/api/dm-blob/{msg_id}/{h}")

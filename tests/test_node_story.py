@@ -75,6 +75,59 @@ def test_story_image_with_video_edit_rejected(tmp_path):
         n.compose_story(png(), "", video_edit={"start": 0, "duration": 5})
 
 
+def _sync(a, b):
+    """Hand-carry every message `a` holds (authored by `a`) that `b`
+    hasn't ingested yet - one direction of a gossip round without real
+    sockets (idiom shared with tests/test_responses.py's _sync)."""
+    for m in a.store.messages_not_in({}, {a.identity_pub}, b.identity_pub):
+        b.store.ingest_message(m)
+
+
+def _befriend(a, b):
+    a.store.add_identity(b.identity_pub)
+    b.store.add_identity(a.identity_pub)
+    a.ensure_enckey()
+    b.ensure_enckey()
+    _sync(a, b)          # b learns a's enckey
+    _sync(b, a)          # a learns b's enckey
+
+
+def _befriended_pair(tmp_path):
+    a = HearthNode.create(tmp_path / "a", "A", "a-dev")
+    b = HearthNode.create(tmp_path / "b", "B", "b-dev")
+    _befriend(a, b)
+    return a, b
+
+
+def test_dm_story_ref_round_trip(tmp_path):
+    # Task 7: a story reaction/reply is a plain DM to the story owner,
+    # carrying an additive story_ref - a whole-node round trip (compose
+    # story -> sync -> react via DM -> sync back -> read the thread).
+    a, b = _befriended_pair(tmp_path)
+    sid = a.compose_story(png(), "min story")
+    _sync(a, b)                     # b learns a's story
+    item = [i for g in b.stories_view() for i in g["items"]
+            if i["msg_id"] == sid][0]
+    did = b.compose_dm(a.identity_pub, "\U0001F525", story_ref={
+        "story_id": sid, "media_hash": item["media"]})
+    _sync(b, a)                     # a learns b's reaction DM
+    thread = a.dm_thread(b.identity_pub)
+    assert thread[-1]["msg_id"] == did
+    assert thread[-1]["text"] == "\U0001F525"
+    assert thread[-1]["story_ref"] == {"story_id": sid,
+                                       "media_hash": item["media"]}
+
+
+def test_dm_without_story_ref_carries_none(tmp_path):
+    # Additive field: an ordinary DM (no reaction/reply context) must not
+    # gain a spurious story_ref - dm_thread rows carry None, not a missing
+    # key or an empty dict the client would have to special-case.
+    a, b = _befriended_pair(tmp_path)
+    a.compose_dm(b.identity_pub, "hej")
+    _sync(a, b)
+    assert b.dm_thread(a.identity_pub)[-1]["story_ref"] is None
+
+
 def test_stories_view_includes_friend_and_self_first(tmp_path):
     wong = HearthNode.create(tmp_path / "w", "Wong", "wong-phone")
     freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")

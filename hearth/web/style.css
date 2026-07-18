@@ -904,6 +904,15 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
 .bubble img.dmpic { max-height: 220px; width: auto; display: block; }
 .bubble .bt { font-size: 10px; color: var(--ink-2); margin-top: 3px; }
 .bubble .undec { font-style: italic; color: var(--ink-2); }
+/* Story reaction/reply context chip (Task 7): rendered above the bubble
+   text when a DM carries a story_ref, on both sides of the thread. The
+   story blob's own TTL/GC is the expiry mechanism - onerror -> honest
+   "Story expired" text, never date math. */
+.story-chip { display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+  font-size: 11px; color: var(--ink-2); }
+.story-chip-thumb { width: 28px; height: 36px; object-fit: cover; border-radius: 4px;
+  border: 1px solid var(--line); display: block; }
+.story-chip-expired { font-style: italic; }
 .dm-compose-bar { display: flex; gap: 8px; align-items: center; padding: 12px 14px;
   border-top: 1px solid var(--line); background: var(--surface); }
 .dm-compose-bar textarea { flex: 1; resize: none; }
@@ -1001,11 +1010,32 @@ body.sv-open { overflow: hidden; }
 .sv-who { position: absolute; top: 22px; left: 14px; color: #fff; font-weight: 650; z-index: 2; font-size: 14px; }
 .sv-close { position: absolute; top: 16px; right: 16px; color: #fff; font-size: 26px; cursor: pointer;
   z-index: 3; line-height: 1; }
-.sv-cap { position: absolute; bottom: 40px; left: 0; right: 0; text-align: center; color: #fff;
+.sv-cap { position: absolute; bottom: 110px; left: 0; right: 0; text-align: center; color: #fff;
   font-size: 15px; padding: 0 20px; z-index: 2; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
 .sv-nav { position: absolute; top: 0; bottom: 0; width: 33%; z-index: 1; cursor: pointer; }
 .sv-left { left: 0; }
 .sv-right { right: 0; }
+/* Story reactions/replies (Task 7): a reaction row (REACTION_GLYPHS) + a
+   reply input, shown over another person's story only - both send a
+   plain DM to the owner (see .story-chip near .bubble for the thread
+   side). z-index above .sv-nav so taps land on the controls, not the
+   prev/next zones underneath them. */
+.sv-react { position: absolute; bottom: 62px; left: 0; right: 0; z-index: 2;
+  display: flex; justify-content: center; gap: 10px; padding: 0 20px; }
+.sv-react-btn { background: rgba(0,0,0,.35); border: 1px solid rgba(255,255,255,.4);
+  border-radius: 50%; width: 40px; height: 40px; font-size: 19px; line-height: 1;
+  cursor: pointer; color: #fff; padding: 0; }
+.sv-react-btn:hover { background: rgba(0,0,0,.55); }
+.sv-reply-form { position: absolute; bottom: 14px; left: 20px; right: 20px; z-index: 2;
+  display: flex; gap: 8px; }
+.sv-reply { flex: 1; border-radius: 20px; border: 1px solid rgba(255,255,255,.4);
+  background: rgba(0,0,0,.35); color: #fff; padding: 8px 14px; }
+.sv-reply::placeholder { color: rgba(255,255,255,.7); }
+.sv-reply-send { border-radius: 20px; padding: 8px 16px; background: #fff; color: #000;
+  border: none; cursor: pointer; font-weight: 650; }
+.sv-toast { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  z-index: 4; background: rgba(0,0,0,.75); color: #fff; padding: 8px 16px;
+  border-radius: 20px; font-size: 13px; }
 
 /* ---------- First-run onboarding (Task 2) ---------- */
 #first-run { position: fixed; inset: 0; z-index: 999; display: grid;

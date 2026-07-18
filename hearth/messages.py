@@ -134,11 +134,19 @@ def make_enckey(device: DeviceKeys,
 def make_dm(device: DeviceKeys, to_identity: str, body_nonce: str,
             body_ct: str, wraps: dict, created_at: float,
             blob_refs: Sequence[str] = (),
-            expires_at: Optional[float] = None) -> SignedMessage:
+            expires_at: Optional[float] = None,
+            story_ref: Optional[dict] = None) -> SignedMessage:
+    # story_ref (Task 7, spec 2026-07-18): additive envelope field - a
+    # story reaction/reply is a plain DM to the story owner, with
+    # {"story_id", "media_hash"} riding in the clear alongside `to` so the
+    # thread can render story context above the bubble. Same disclosure
+    # class as `codec`/`poster` on posts: plaintext envelope metadata,
+    # never inside the encrypted body. Absent/None for an ordinary DM.
     return device.sign_message({
         "kind": KIND_DM, "to": to_identity, "body_nonce": body_nonce,
         "body_ct": body_ct, "wraps": wraps, "blobs": list(blob_refs),
         "created_at": created_at, "expires_at": expires_at,
+        "story_ref": story_ref,
     })
 
 
@@ -222,6 +230,23 @@ def _is_hexn(s, n) -> bool:
 
 def _is_hex64(s) -> bool:
     return _is_hexn(s, 64)
+
+
+def _valid_story_ref(sref) -> bool:
+    """Shape guard for KIND_DM's optional story_ref (Task 7): the caller
+    checks the None case itself (absent/None is always fine - only a
+    present value is shape-checked here). story_id is the referenced
+    story's message id (opaque, non-empty string - not a hex64 blob
+    hash); media_hash is a real content-addressed blob hash. Extra keys
+    beyond the two required ones ride through unrejected, same as
+    _valid_wraps' per-entry checks - forward-compatible, fail-closed
+    only on the two fields that matter."""
+    if not isinstance(sref, dict):
+        return False
+    story_id = sref.get("story_id")
+    if not isinstance(story_id, str) or not story_id:
+        return False
+    return _is_hex64(sref.get("media_hash"))
 
 
 def _is_hex_color(s) -> bool:
@@ -336,6 +361,9 @@ def validate_payload(p: dict) -> Tuple[bool, str]:
         exp = p.get("expires_at")
         if exp is not None and not isinstance(exp, (int, float)):
             return False, "bad expires_at"
+        sref = p.get("story_ref")
+        if sref is not None and not _valid_story_ref(sref):
+            return False, "bad story_ref"
         return True, "ok"
     if kind == KIND_STORY:
         if p.get("media_kind") not in ("photo", "video"):

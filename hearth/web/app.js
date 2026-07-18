@@ -2977,7 +2977,9 @@ async function renderStories() {
 function openStoryViewer(groups, startIdentity) {
   const flat = [];
   for (const g of groups)
-    for (const it of g.items) flat.push({...it, name: g.mine ? "You" : g.name});
+    for (const it of g.items) flat.push({...it, name: g.mine ? "You" : g.name,
+                                         identity_pub: g.identity_pub,
+                                         mine: g.mine});
   let idx = flat.findIndex(x =>
     groups.find(g => g.identity_pub === startIdentity).items
       .some(i => i.msg_id === x.msg_id));
@@ -3009,6 +3011,63 @@ function openStoryViewer(groups, startIdentity) {
     const R = el("div", "sv-nav sv-right"); R.onclick = next;
     ov.append(bar, who, x, media, L, R);
     if (cap) ov.append(cap);
+    // Reactions/replies as DMs (Task 7): a plain DM to the story owner,
+    // carrying an additive story_ref so the thread renders context above
+    // the bubble. Only on someone else's story - your own has no owner
+    // to DM. `sending` is scoped to this show() call (a fresh render on
+    // every next()/prev()), so a rapid double-tap on any one control here
+    // can't fire a second DM before the first's fetch resolves.
+    if (!it.mine) {
+      let sending = false;
+      const flash = (msg) => {
+        const t = el("div", "sv-toast", msg);
+        ov.append(t);
+        setTimeout(() => t.remove(), 1400);
+      };
+      const sendReply = async (text, advanceOnSuccess) => {
+        if (sending || !text) return;
+        sending = true;
+        const fd = new FormData();
+        fd.append("to", it.identity_pub);
+        fd.append("text", text);
+        fd.append("expires_seconds", "");
+        fd.append("story_ref", JSON.stringify(
+          {story_id: it.msg_id, media_hash: it.media}));
+        const r = await fetch("/api/dm", {method: "POST", body: fd});
+        sending = false;
+        if (r.ok) { flash("Sent"); if (advanceOnSuccess) next(); }
+        else alert("Send failed: " + await r.text());
+      };
+      const react = el("div", "sv-react");
+      for (const token of Object.keys(REACTION_GLYPHS)) {
+        const btn = el("button", "sv-react-btn", REACTION_GLYPHS[token]);
+        btn.type = "button";
+        btn.setAttribute("aria-label", "React with " + token);
+        btn.onclick = () => sendReply(REACTION_GLYPHS[token], true);
+        react.append(btn);
+      }
+      const replyForm = el("form", "sv-reply-form");
+      const input = document.createElement("input");
+      input.type = "text"; input.className = "sv-reply";
+      input.placeholder = "Reply to story...";
+      input.autocomplete = "off";
+      input.setAttribute("aria-label", "Reply to story");
+      // A reply mid-type must not be silently blown away by the photo
+      // auto-advance timer (show() rebuilds the whole overlay, including
+      // this input, on next()) - typing pauses it for this rendering.
+      input.addEventListener("focus", () => clearTimeout(timer));
+      const sendBtn = el("button", "sv-reply-send", "Send");
+      sendBtn.type = "submit";
+      replyForm.append(input, sendBtn);
+      replyForm.onsubmit = (ev) => {
+        ev.preventDefault();
+        const text = input.value.trim();
+        if (!text) return;
+        input.value = "";
+        sendReply(text, false);
+      };
+      ov.append(react, replyForm);
+    }
   }
   function next() { clearTimeout(timer); idx++; show(); }
   function prev() { clearTimeout(timer); idx = Math.max(0, idx - 1); show(); }
@@ -4385,6 +4444,25 @@ async function openThread(identity, name, keepScroll) {
     if (m.undecryptable) b.append(el("div", "undec",
       "(cannot decrypt on this device)"));
     else {
+      // Story reaction/reply context (Task 7): renders above the bubble
+      // text on both sides of the thread - story_ref rides in the clear
+      // envelope (not the encrypted body), so it's present for sender and
+      // owner alike. The story blob's own TTL/GC is the ONLY expiry
+      // mechanism (no date math here): onerror after that GC just means
+      // the thumbnail is honestly reported gone.
+      if (m.story_ref) {
+        const chip = el("div", "story-chip");
+        const thumb = document.createElement("img");
+        thumb.className = "story-chip-thumb";
+        thumb.src = "/api/blob/" + m.story_ref.media_hash;
+        thumb.alt = "";
+        thumb.onerror = () => {
+          thumb.remove();
+          chip.append(el("span", "story-chip-expired", "Story expired"));
+        };
+        chip.append(thumb);
+        b.append(chip);
+      }
       b.append(el("div", "", m.text || ""));
       // DM photos (August 2026-07-18): compact clickable previews - the
       // shared lightbox is the full-size view. src is precomputed per

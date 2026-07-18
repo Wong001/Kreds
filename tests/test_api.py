@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from hearth.api import build_app
@@ -8,6 +10,22 @@ from tests.test_imagegate import animated_gif_bytes
 def client(tmp_path):
     node = HearthNode.create(tmp_path / "n", "Wong", "wong-phone")
     return TestClient(build_app(node)), node
+
+
+def _pair_friends(tmp_path):
+    """Same hand-carried-sync idiom as tests/test_api_dm.py's pair_friends
+    (duplicated locally per this file's own convention rather than
+    importing across test modules)."""
+    a = HearthNode.create(tmp_path / "a", "A", "a-dev")
+    b = HearthNode.create(tmp_path / "b", "B", "b-dev")
+    a.store.add_identity(b.identity_pub)
+    b.store.add_identity(a.identity_pub)
+    a.ensure_enckey(); b.ensure_enckey()
+    for src, dst in ((a, b), (b, a)):
+        for m in src.store.messages_not_in({}, {src.identity_pub},
+                                           dst.identity_pub):
+            dst.store.ingest_message(m)
+    return a, b
 
 
 def test_state_and_index(tmp_path):
@@ -176,6 +194,61 @@ def test_retract_and_response_remove_endpoints(tmp_path):
     assert r.status_code == 200
     row = [p for p in node.feed() if p["msg_id"] == pid][0]
     assert row["responses"]["comments"] == []
+
+
+# ---------------------------------------------------------------------
+# Stories as DMs (Task 7): a story reaction/reply is a plain POST
+# /api/dm carrying an additive story_ref JSON field, mirroring
+# video_edit's own optional-JSON-form-field idiom (/api/post, /api/story).
+# ---------------------------------------------------------------------
+
+def test_dm_story_ref_over_api(tmp_path):
+    a, b = _pair_friends(tmp_path)
+    sid = a.compose_story(animated_gif_bytes(), "min story")
+    for m in a.store.messages_not_in({}, {a.identity_pub}, b.identity_pub):
+        b.store.ingest_message(m)
+    item = [i for g in b.stories_view() for i in g["items"]
+            if i["msg_id"] == sid][0]
+    cb = TestClient(build_app(b))
+    r = cb.post("/api/dm", data={
+        "to": a.identity_pub, "text": "\U0001F525", "expires_seconds": "",
+        "story_ref": json.dumps({"story_id": sid,
+                                 "media_hash": item["media"]})})
+    assert r.status_code == 200
+    mid = r.json()["msg_id"]
+    for m in b.store.messages_not_in({}, {b.identity_pub}, a.identity_pub):
+        a.store.ingest_message(m)
+    ca = TestClient(build_app(a))
+    thread = ca.get(f"/api/dm/{b.identity_pub}").json()
+    row = [t for t in thread if t["msg_id"] == mid][0]
+    assert row["story_ref"] == {"story_id": sid, "media_hash": item["media"]}
+
+
+def test_dm_bad_story_ref_json_is_400(tmp_path):
+    a, b = _pair_friends(tmp_path)
+    c = TestClient(build_app(a))
+    r = c.post("/api/dm", data={"to": b.identity_pub, "text": "hi",
+                                "expires_seconds": "",
+                                "story_ref": "not json"})
+    assert r.status_code == 400
+
+
+def test_dm_story_ref_shape_rejected_is_400(tmp_path):
+    a, b = _pair_friends(tmp_path)
+    c = TestClient(build_app(a))
+    r = c.post("/api/dm", data={"to": b.identity_pub, "text": "hi",
+                                "expires_seconds": "",
+                                "story_ref": json.dumps({"story_id": "s"})})
+    assert r.status_code == 400
+
+
+def test_dm_without_story_ref_still_works(tmp_path):
+    # Additive field: the plain-DM path (no story_ref at all) is untouched.
+    a, b = _pair_friends(tmp_path)
+    c = TestClient(build_app(a))
+    r = c.post("/api/dm", data={"to": b.identity_pub, "text": "hej",
+                                "expires_seconds": ""})
+    assert r.status_code == 200
 
 
 def test_settings_close_behavior_still_independent_of_public_engagement(tmp_path):

@@ -27,7 +27,8 @@ from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_RESPONSE, KIND_RESPONSES, KIND_WRAP_GRANT,
                        MAX_BLOCK_H, MAX_CAPTION, MAX_COMMENT, MAX_LAYOUT,
                        REACTION_TOKENS, SIZE_LAYOUTS, TEXT_STYLE_ENUMS,
-                       WALL_COLS, _is_hexn, is_expired, make_album,
+                       WALL_COLS, _is_hexn, _valid_story_ref, is_expired,
+                       make_album,
                        make_delete, make_dm, make_enckey, make_post,
                        make_profile, make_profile_layout, make_response,
                        make_responses, make_ring, make_story,
@@ -2104,11 +2105,19 @@ class HearthNode:
         return {**theirs, **mine}
 
     def compose_dm(self, to_identity: str, text: str,
-                   photos=(), expires_seconds=None) -> str:
+                   photos=(), expires_seconds=None,
+                   story_ref: Optional[dict] = None) -> str:
         if to_identity == self.identity_pub:
             raise ValueError("cannot DM yourself")
         if not self.store.is_known(to_identity):
             raise ValueError("recipient is not a friend")
+        # Pre-validate here (mirrors set_profile_layout's own comment on
+        # this exact issue): a bad story_ref must surface as a caught
+        # ValueError -> 400 at the API layer, not reach make_dm/_publish
+        # and get the own-message rejected by ingest's validate_payload
+        # check -> an unhandled RuntimeError -> 500.
+        if story_ref is not None and not _valid_story_ref(story_ref):
+            raise ValueError("bad story_ref")
         pubs = self._dm_device_pubs(to_identity)
         created_at = time.time()
         expires_at = (created_at + expires_seconds
@@ -2120,7 +2129,8 @@ class HearthNode:
         nonce, ct = encrypt_body(key, {"text": text, "blobs": refs}, aad)
         wraps = wrap_key(key, pubs, aad)
         mid = self._publish(make_dm(self.device, to_identity, nonce, ct,
-                                    wraps, created_at, refs, expires_at))
+                                    wraps, created_at, refs, expires_at,
+                                    story_ref=story_ref))
         self._cache_message_key(mid, key)
         return mid
 
@@ -2645,6 +2655,10 @@ class HearthNode:
                 "text": body["text"] if body else None,
                 "blobs": body["blobs"] if body else [],
                 "undecryptable": body is None,
+                # story_ref (Task 7) rides in the clear envelope, not the
+                # encrypted body - visible on both sides of the thread
+                # regardless of decrypt success.
+                "story_ref": msg.payload.get("story_ref"),
             })
         return out
 

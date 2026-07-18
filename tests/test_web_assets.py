@@ -1996,6 +1996,75 @@ def test_refresh_guards_journal_rebuild_against_a_mid_typed_comment():
         assert not re.search(r"if\s*\(!commentDirty\)\s*" + re.escape(always), rf)
 
 
+# ---------------------------------------------------------------------
+# Stories as DMs (Task 7, spec 2026-07-18): a story reaction/reply is a
+# plain DM to the story owner carrying an additive story_ref; the thread
+# renders story context above the bubble. Story expiry is honest - the
+# chip thumbnail's onerror -> "Story expired" is the ENTIRE expiry
+# mechanism (the blob's own TTL/GC), never date math.
+# ---------------------------------------------------------------------
+
+def test_story_viewer_reaction_and_reply_wired():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    sv = _js_fn_body(js, "openStoryViewer")
+    assert "sv-react" in sv and "REACTION_GLYPHS" in sv
+    assert "sv-reply" in sv
+    assert '"/api/dm"' in sv
+    assert "story_ref" in sv
+    # only on someone else's story - reacting/replying to your own would
+    # be a DM to yourself
+    assert "if (!it.mine)" in sv
+    for sel in (".sv-react", ".sv-react-btn", ".sv-reply-form", ".sv-reply"):
+        assert sel in css, sel
+
+
+def test_story_viewer_reply_guards_against_double_send():
+    # Self-review concern: a rapid double-tap on a reaction glyph (or
+    # submitting the reply twice) must not fire two DMs. A single
+    # `sending` guard, checked synchronously before the await, covers
+    # both controls for one rendering of the overlay.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    sv = _js_fn_body(js, "openStoryViewer")
+    assert "let sending = false;" in sv
+    assert "if (sending || !text) return;" in sv
+    assert "sending = true;" in sv and "sending = false;" in sv
+
+
+def test_story_viewer_reply_does_not_trap_keyboard_nav():
+    # The story viewer has no global keydown nav (prev/next are tap/click
+    # zones, .sv-left/.sv-right) - so the reply <input> must not gain one
+    # either, or normal typing (space, arrow keys while editing) would get
+    # hijacked into closing/advancing the story instead of being typed.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    sv = _js_fn_body(js, "openStoryViewer")
+    assert 'addEventListener("keydown"' not in sv
+    # Enter-to-submit relies on the input's native <form> submission, not
+    # a hand-rolled keydown handler on the input itself.
+    assert 'input.type = "text"; input.className = "sv-reply";' in sv
+    assert "replyForm.onsubmit" in sv
+
+
+def test_story_chip_renders_in_thread_with_expiry_fallback():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    ot = _js_fn_body(js, "openThread")
+    assert "m.story_ref" in ot and "story-chip" in ot
+    assert '"/api/blob/" + m.story_ref.media_hash' in ot
+    assert "onerror" in ot
+    assert "Story expired" in ot
+    # rendered above the bubble text - the chip is appended before the
+    # text line, not after (distinct placement from .dmpic photos, which
+    # follow the text)
+    assert ot.index("story-chip") < ot.index('el("div", "", m.text')
+    # and it must render regardless of which side of the thread this is -
+    # not gated on m.from_me
+    chip_block = ot[ot.index("if (m.story_ref)"):ot.index('el("div", "", m.text')]
+    assert "from_me" not in chip_block
+    for sel in (".story-chip", ".story-chip-thumb", ".story-chip-expired"):
+        assert sel in css, sel
+
+
 def test_comment_composer_clears_before_refresh_not_after():
     # Re-review follow-up: refresh()'s own commentDirty guard (above) reads
     # THIS input's live value - leaving the just-sent text in place until
