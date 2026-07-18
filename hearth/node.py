@@ -1917,7 +1917,19 @@ class HearthNode:
         and suspenders), because a single hostile or corrupt response
         must never be able to break the sweep for every other row on the
         same post (the referenced_blobs lesson: one bad element must
-        never brick the whole loop)."""
+        never brick the whole loop).
+
+        Reviewer-caught Critical (2026-07-18): this used to type-check
+        only rkind/created_at and pass everything else (body text,
+        reaction token, alias_seed, mutual_box, public) straight through
+        into the audience-broadcast record. validate_payload never sees
+        any of this -- it is all inside the encrypted body, opaque
+        ciphertext to the envelope -- so a modified client can put
+        ANYTHING here (a 2 MB comment, a dict where a reaction token
+        belongs, junk alias/box shapes) and it ingests just fine. This
+        method is the ONLY gate standing between that and every friend
+        who reads the record, so it now mirrors compose_response's own
+        validation exactly, failing the same return-None way."""
         key, aad = self._content_key(rmsg)
         if key is None:
             return None
@@ -1937,17 +1949,38 @@ class HearthNode:
         rkind = body.get("rkind")
         if rkind not in ("comment", "reaction", "retract"):
             return None
+        raw_body = body.get("body")
+        if not isinstance(raw_body, str):
+            return None
+        if rkind == "comment" and not (0 < len(raw_body) <= MAX_COMMENT):
+            return None
+        if rkind == "reaction" and raw_body not in REACTION_TOKENS + ("clear",):
+            return None
+        # retract: any string is accepted, mirroring compose_response's own
+        # validation (it does not constrain retract's body beyond str).
         created_at = body.get("created_at")
         if not isinstance(created_at, (int, float)):
             return None
+        alias_seed = body.get("alias_seed")
+        if (not isinstance(alias_seed, str) or len(alias_seed) != 32
+                or any(c not in "0123456789abcdef" for c in alias_seed)):
+            return None
+        public = body.get("public")
+        if not isinstance(public, bool):
+            return None
+        mutual_box = body.get("mutual_box")
+        if mutual_box is not None and (
+                not isinstance(mutual_box, list)
+                or not all(isinstance(s, dict) for s in mutual_box)):
+            return None
         return {
             "responder": responder, "device_pub": rmsg.cert.device_pub,
-            "rkind": rkind, "body": body.get("body"),
+            "rkind": rkind, "body": raw_body,
             "created_at": created_at,
-            "alias_seed": body.get("alias_seed"),
-            "public": bool(body.get("public")),
+            "alias_seed": alias_seed,
+            "public": public,
             "responder_sig": body.get("responder_sig"),
-            "mutual_box": body.get("mutual_box"),
+            "mutual_box": mutual_box,
         }
 
     def process_responses(self) -> int:
@@ -2026,7 +2059,26 @@ class HearthNode:
         # risking a float-vs-string type mismatch.
         retracted = {(ev["responder"], str(ev["body"]))
                      for ev in events if ev["rkind"] == "retract"}
-        removed = self.store.removed_response_keys(target)
+
+        # Moderation (reviewer-caught Important, 2026-07-18): a comment
+        # tombstone is exact-match (drop that one entry); a REACTION
+        # tombstone is a per-responder CUTOFF instead -- reactions
+        # latest-wins per responder, so exact-matching only the removed
+        # timestamp would let an OLDER reaction from the same responder
+        # resurface as the new "winner" the moment the current one is
+        # moderated away (see store.removed_response_tombstones' own
+        # docstring). Take the MAX cutoff per responder in case of
+        # multiple reaction moderations over time.
+        removed_exact = set()
+        reaction_cutoff: dict = {}
+        for responder, created_at, rkind in \
+                self.store.removed_response_tombstones(target):
+            if rkind == "reaction":
+                if (responder not in reaction_cutoff
+                        or created_at > reaction_cutoff[responder]):
+                    reaction_cutoff[responder] = created_at
+            else:
+                removed_exact.add((responder, created_at))
 
         comments = []
         reactions: dict = {}     # responder -> winning event so far
@@ -2035,14 +2087,17 @@ class HearthNode:
                 continue
             if (ev["responder"], str(ev["created_at"])) in retracted:
                 continue          # this entry was retracted by its own author
-            if (ev["responder"], ev["created_at"]) in removed:
-                continue          # this entry was moderated away by the author
             if ev["rkind"] == "reaction":
+                cutoff = reaction_cutoff.get(ev["responder"])
+                if cutoff is not None and ev["created_at"] <= cutoff:
+                    continue      # moderated away (cutoff also drops older ones)
                 if ev["body"] == "clear":
                     reactions.pop(ev["responder"], None)
                 else:
                     reactions[ev["responder"]] = ev   # latest-wins per responder
             else:                                      # comment
+                if (ev["responder"], ev["created_at"]) in removed_exact:
+                    continue      # this entry was moderated away by the author
                 comments.append(ev)
 
         entries = []
@@ -2102,9 +2157,38 @@ class HearthNode:
         stance as retraction). Returns the current KIND_RESPONSES
         record's own msg_id (the freshly-republished one in the normal
         case) - falls back to post_id only if no record exists at all
-        (e.g. the post never had any responses to begin with)."""
+        (e.g. the post never had any responses to begin with).
+
+        Reviewer-caught Important (2026-07-18): this had no ownership
+        check at all - any post_id could be moderated regardless of who
+        authored it. Mirrors compose_response's defensive style (a
+        ValueError on the first thing that's wrong, not a silent no-op)."""
+        msg = self.store.get_message(post_id)
+        if (msg is None or msg.payload.get("kind") != KIND_POST
+                or msg.cert.identity_pub != self.identity_pub):
+            raise ValueError("not your own post")
+        created_at = float(created_at)
+        # Determine what the removed entry actually WAS (comment vs.
+        # reaction) from the raw, cryptographically-proven KIND_RESPONSE
+        # rows - never from the (unauthenticated-for-this-purpose)
+        # already-published record - so the fold can apply the right
+        # semantics (exact-match vs. cutoff; see
+        # store.removed_response_tombstones). Falls back to "comment"
+        # (exact-match, the narrower/safer behavior) if no matching raw
+        # response can be found at all.
+        rkind = "comment"
+        for rmsg in self.store.responses_by_target(post_id):
+            if rmsg.cert.identity_pub != responder_identity:
+                continue
+            try:
+                ev = self._response_event(rmsg)
+            except Exception:
+                ev = None
+            if ev is not None and ev["created_at"] == created_at:
+                rkind = ev["rkind"]
+                break
         self.store.mark_response_removed(post_id, responder_identity,
-                                         float(created_at))
+                                         created_at, rkind)
         self.process_responses()
         rec = self.store.responses_record(post_id, self.identity_pub)
         return rec.msg_id if rec is not None else post_id

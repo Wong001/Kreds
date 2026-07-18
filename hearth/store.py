@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS undecryptable(
   msg_id TEXT PRIMARY KEY, since REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS removed_responses(
   target TEXT NOT NULL, responder TEXT NOT NULL, created_at REAL NOT NULL,
-  PRIMARY KEY(target, responder, created_at));
+  rkind TEXT NOT NULL, PRIMARY KEY(target, responder, created_at));
 """
 
 
@@ -626,27 +626,46 @@ class Store:
             return best
 
     def mark_response_removed(self, target: str, responder: str,
-                              created_at: float):
+                              created_at: float, rkind: str):
         """Author-local moderation tombstone (node.remove_response): this
         (target, responder, created_at) entry is dropped from every
         future process_responses fold. NOT a message tombstone -- the
         original KIND_RESPONSE is left completely alone (compliant-
         client honesty, same stance as retraction: the responder's own
         copy is unaffected), only the author's own rebuilt record omits
-        it from here on."""
+        it from here on.
+
+        `rkind` (reviewer-caught Important, 2026-07-18) is what the
+        removed entry itself was: node.process_responses' fold uses it
+        to pick exact-match removal for a comment vs. a per-responder
+        CUTOFF for a reaction -- see removed_response_tombstones' own
+        docstring for why a reaction needs different semantics."""
         with self._lock:
             self._db.execute(
-                "INSERT OR IGNORE INTO removed_responses VALUES(?,?,?)",
-                (target, responder, created_at))
+                "INSERT OR IGNORE INTO removed_responses VALUES(?,?,?,?)",
+                (target, responder, created_at, rkind))
             self._db.commit()
 
-    def removed_response_keys(self, target: str) -> Set[Tuple[str, float]]:
-        """{(responder, created_at)} moderated away for this target by
-        this node's own remove_response calls."""
+    def removed_response_tombstones(self, target: str
+                                    ) -> List[Tuple[str, float, str]]:
+        """[(responder, created_at, rkind)] moderated away for this
+        target by this node's own remove_response calls.
+
+        Reviewer-caught Important (2026-07-18): a comment tombstone means
+        exact-match removal (drop that one entry), but a REACTION
+        tombstone must be read as a CUTOFF, not an exact match --
+        reactions latest-wins per responder, so moderating away someone's
+        current (latest) reaction while only exact-matching it would let
+        an OLDER reaction from that same responder resurface as the new
+        "winner" on the very next sweep (reviewer reproduced this: heart
+        then laugh, moderate laugh, heart comes back). The fold
+        (process_responses) is what turns these rows into a per-responder
+        max-cutoff pass for reactions before folding, using the rkind
+        carried here to tell the two cases apart."""
         with self._lock:
-            return {(r, c) for r, c in self._db.execute(
-                "SELECT responder, created_at FROM removed_responses"
-                " WHERE target=?", (target,))}
+            return [(r, c, k) for r, c, k in self._db.execute(
+                "SELECT responder, created_at, rkind FROM removed_responses"
+                " WHERE target=?", (target,))]
 
     def messages_not_in(self, summaries: dict, entitled: Set[str],
                         peer_identity: str) -> List[SignedMessage]:

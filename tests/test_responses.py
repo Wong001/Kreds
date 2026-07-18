@@ -6,13 +6,15 @@ carried store-level sync, no real sockets needed) rather than
 test_three_nodes.py's full invite ceremony + live SyncService -- both
 exist in this codebase; this file picks the lighter one since nothing
 here needs real network behavior."""
+import time
 import types
 
 import pytest
 
-from hearth.dmcrypt import response_aad, unwrap_key, decrypt_body
+from hearth.dmcrypt import (encrypt_body, new_content_key, response_aad,
+                            unwrap_key, decrypt_body, wrap_key)
 from hearth.identity import canonical, _sig_ok
-from hearth.messages import KIND_RESPONSE
+from hearth.messages import KIND_RESPONSE, make_response
 from hearth.node import HearthNode
 
 
@@ -274,3 +276,128 @@ def test_post_delete_tombstones_record(tmp_path):
     a.delete_post(pid)
     assert _responses_record(a, pid) is None or \
         a.store.get_message(rec.msg_id) is None
+
+
+# -- reviewer follow-up fixes (2026-07-18) ------------------------------------
+
+def _hostile_response(node, target, author_devs, overrides, created_at=None):
+    """Build a KIND_RESPONSE exactly as node's REAL device would sign one
+    (make_response -> device.sign_message, legitimate crypto identity end
+    to end), but with an ATTACKER-CONTROLLED plaintext body -- this is
+    what a modified client sends: a real, validly-signed envelope wrapping
+    hostile decrypted content. validate_payload/ingest_message never see
+    the plaintext (it is opaque ciphertext to them), so this ingests
+    clean; only node._response_event's own body-shape validation can ever
+    catch it."""
+    created_at = created_at if created_at is not None else time.time()
+    body = {
+        "rkind": "comment", "body": "innocuous", "alias_seed": "a" * 32,
+        "public": False, "responder": node.identity_pub,
+        "responder_sig": "deadbeef", "mutual_box": None,
+        "created_at": created_at,
+    }
+    body.update(overrides)
+    key = new_content_key()
+    aad = response_aad(node.identity_pub, target, created_at)
+    nonce, ct = encrypt_body(key, body, aad)
+    wraps = wrap_key(key, author_devs, aad)
+    return make_response(node.device, target, nonce, ct, wraps,
+                         created_at=created_at)
+
+
+def test_hostile_response_content_never_folds(tmp_path):
+    """Critical (reviewer-repro'd): _response_event used to type-check
+    only rkind/created_at -- a hand-crafted oversized comment, a
+    dict-typed reaction body, a malformed alias_seed, or a junk
+    mutual_box all survived verbatim into the audience-broadcast record.
+    Every hostile variant below must ingest fine (envelope-level shape is
+    valid) but never appear in the republished record, and the sweep
+    must never raise."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    author_devs = a.store.enckeys(a.identity_pub)
+    hostile_variants = [
+        {"rkind": "comment", "body": "x" * 5000},          # oversized comment
+        {"rkind": "reaction", "body": {"evil": True}},      # dict body
+        {"rkind": "reaction", "body": "thumbsdown"},        # non-token reaction
+        {"alias_seed": "not-hex!!!!!!!!!!!!!!!!!!!!!!!!"},  # junk alias shape
+        {"alias_seed": "ab" * 10},                          # wrong-length hex
+        {"mutual_box": "not-a-list"},                       # junk box (not a list)
+        {"mutual_box": [1, 2, 3]},                          # list of non-dicts
+        {"public": "yes"},                                  # non-bool public
+    ]
+    t = time.time()
+    for i, overrides in enumerate(hostile_variants):
+        msg = _hostile_response(b, pid, author_devs, overrides,
+                                created_at=t + i)
+        result = b.store.ingest_message(msg)
+        assert result.accepted, overrides   # envelope-level shape is valid
+    _sync(b, a)
+    n = a.process_responses()               # must never raise
+    assert n == 0
+    rec = _responses_record(a, pid)
+    assert rec is None                      # nothing hostile ever folded
+
+    # A legitimate response alongside the hostile batch still folds fine
+    # (fail-closed drops the bad rows, not the whole sweep).
+    b.compose_response(pid, "comment", "a real comment")
+    _sync(b, a)
+    a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert [e["body"] for e in body["entries"]] == ["a real comment"]
+
+
+def test_forged_responder_dropped(tmp_path):
+    """The body-vs-cert identity mismatch guard (already implemented):
+    a response whose body lies about who sent it (claims some OTHER
+    identity_pub as `responder`, while the cryptographic sender is really
+    B) must never fold into the record under either identity."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    author_devs = a.store.enckeys(a.identity_pub)
+    forged = _hostile_response(b, pid, author_devs,
+                               {"responder": a.identity_pub,
+                                "body": "i am forging someone else"})
+    result = b.store.ingest_message(forged)
+    assert result.accepted
+    _sync(b, a)
+    n = a.process_responses()
+    assert n == 0
+    assert _responses_record(a, pid) is None
+
+
+def test_remove_response_requires_own_post(tmp_path):
+    """Important (reviewer): remove_response had no ownership check --
+    an author could be tricked (or a caller could pass the wrong
+    post_id) into moderating a FRIEND-authored post. Must raise, mirroring
+    compose_response's defensive ValueError style."""
+    a, b = _befriended_pair(tmp_path)
+    pid = b.compose_post("b's own post", "kreds")
+    _sync(b, a)
+    with pytest.raises(ValueError):
+        a.remove_response(pid, b.identity_pub, 123.0)
+
+
+def test_reaction_moderation_cutoff_suppresses_older_reaction(tmp_path):
+    """Important (reviewer-repro'd, previously flagged as an unverified
+    judgment call): moderating a responder's LATEST reaction must not let
+    an OLDER reaction from that same responder resurface as the new
+    latest-wins winner. Moderating a reaction is a cutoff -- every
+    reaction from that responder at or before the removed timestamp is
+    suppressed. Comment moderation stays exact-match (proven by
+    test_retract_and_moderation, unchanged)."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    b.compose_response(pid, "reaction", "heart")
+    _sync(b, a); a.process_responses()
+    b.compose_response(pid, "reaction", "laugh")
+    _sync(b, a); a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    laugh = [e for e in body["entries"] if e["rkind"] == "reaction"][0]
+    assert laugh["body"] == "laugh"
+    a.remove_response(pid, b.identity_pub, laugh["created_at"])
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert not [e for e in body["entries"] if e["rkind"] == "reaction"]
