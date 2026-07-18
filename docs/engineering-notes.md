@@ -1439,3 +1439,225 @@ included - confirmed clean across 2 consecutive runs). The three
 (`test_ui_smoke_profile_load.py`, `test_ui_smoke_albums.py`,
 `test_ui_smoke_video_editor.py`) - 4 passed, confirmed clean across 2
 consecutive runs.
+
+## Reactions, comments, and story replies (responses)
+
+Journal posts get a fixed six-reaction bar and a flat comment thread;
+stories get the same six reactions plus a reply, delivered as an
+ordinary DM. Built on the `responses` branch per spec
+`docs/superpowers/specs/2026-07-18-reactions-comments-design.md`
+(amended during the build; see that file for the authoritative wire
+shapes - this section is the durable "why," not a restatement of the
+protocol).
+
+**Why author-relay (the ingest-gate constraint).** `ingest_message`
+refuses messages from unknown identities (`store.py`) - the same gate
+that blocks unfriend-resurrection, load-bearing and deliberately not
+weakened for this slice. A post's audience is the author's friends, not
+the commenter's friends, and those two friend sets are not the same
+people: a commenter's `KIND_RESPONSE` cannot sync directly to the rest
+of the audience, because most of that audience has never verified the
+commenter's identity and would refuse it outright at ingest. The chosen
+shape routes every response through the author's own node instead -
+`store.py`'s routing gate treats `KIND_RESPONSE`/`KIND_RESPONSES` exactly
+like `KIND_WRAP_GRANT`'s plain wrap-set branch (responder -> author's
+devices only, no grant-union widening, ever). The author's node folds
+every response it receives into one re-signed `KIND_RESPONSES` record
+(`node.process_responses`/`_rebuild_responses_record`, mirroring
+`set_album`'s latest-wins-by-fresh-publish idiom exactly, just keyed on
+`target` instead of `album_id`) and republishes it wrapped to the post's
+own audience. One consistent comment section for every viewer,
+verifiable authorship, and moderation for free, because the author's
+node relaying a section IS the author's comment section. Honest cost,
+stated plainly: fan-out waits for the author's node to be online (a
+home node makes this invisible in practice) - one extra hop of latency
+that a direct-broadcast design wouldn't have paid, in exchange for never
+handing a commenter's raw message to strangers who can't verify it.
+
+**Two-tier disclosure - and the near-miss that shaped it.** Naive
+author-relay would hand the post's entire audience the commenter's real
+identity key, including strangers who aren't the commenter's friends at
+all - graph discovery through a side door, rejected outright. Every
+response carries a per-post `alias_seed` (fresh per post, deliberately
+unlinkable across posts) that strangers render as a neutral name +
+tinted avatar. Real identity rides alongside as a `mutual_box`: sealed
+per-recipient slots for the commenter's OWN friends' devices, opened
+only by them. **The near-miss:** the obvious, structurally cheapest way
+to build that box would have been the wrap mechanism already used
+everywhere else in this codebase - DMs, posts, `enckey` announcements,
+`wrap_grant` - one labeled entry per recipient device
+(`{device_pub: wrapped_key}`). Reusing it here would have put every one
+of the commenter's own friends' `device_pub`s in the clear on an entry
+the ENTIRE post audience receives - disclosing the commenter's friend
+graph to strangers, the identical hole this whole design exists to
+close, just aimed at the commenter's graph instead of the author's.
+Rejected for that reason; `dmcrypt.py`'s `seal_slots`/`try_open_slots`
+build genuinely anonymous slots instead - an ephemeral X25519 key per
+slot, HKDF into a per-slot key (`_derive_slot_kek`, domain-separated
+from the AEAD's own `MUTUAL_BOX_AAD` by an intentionally-distinct
+`-kek`-suffixed HKDF info string, so the two mechanisms can never be
+mistaken for coupled), then ChaCha20-Poly1305 - with **no recipient
+identifier anywhere in a slot**. Recipients trial-open every slot with
+their own `enc_priv`; the one sealed to them decrypts, everyone else's
+(including dummy slots) fails AEAD auth and looks identical from the
+outside. Slot counts are padded to fixed buckets (8/16/32/64, dummy
+slots filled with random bytes) so the count only weakly buckets, never
+measures, the commenter's friend-device count - stated as an honest
+residual disclosure, not hidden. **The anonymity property was
+implementation-only until a reviewer pinned it structurally**: dummy-
+slot ciphertext length has to exactly match real-slot ciphertext length
+or the two are trivially distinguishable by size alone; `seal_slots`
+now computes `ct_len` once from a real slot (or a same-shape estimate
+when there are zero real recipients) and pads every dummy to it, proven
+by boundary tests at the 8/64 bucket edges. Shuffling the slot order is
+cosmetic hardening on top (breaks a "first N are real" positional
+tell), not the anonymity mechanism itself.
+
+The **author always sees the real identity** - the response is
+addressed to them, and moderation requires knowing who wrote what. A
+**settings toggle** ("show my name to people who don't know me",
+default OFF, persisted through the same `store.get_meta`/`set_meta`
+mechanism `close_behavior` already uses) flips a response to public: the
+plaintext `responder`/`device_pub` ride openly on the entry and the
+mutual box is omitted entirely, no per-post override in v1.
+
+**Verification split, stated honestly.** Every response is signed by
+the responder over a canonical payload (`identity.py`'s raw sign/verify
+pair, `sign_raw`/`_sig_ok` - arbitrary bytes, no envelope/seq bump, the
+same helpers Tasks 1-8 all reused unchanged) - so once a viewer has a
+real `device_pub` to check it against, authorship is cryptographic, not
+trusted. Mutuals get there two ways: the author resolves every entry
+directly (routing hands the author literally every raw
+`KIND_RESPONSE`, already cert-verified at ingest); a public entry's
+`identity`/`device_pub` are read straight off the entry; a private
+entry's `mutual_box` opens for whichever friend it was sealed to. Either
+way, `_device_bound` (`node.py`) then checks the claimed `device_pub`
+against `store.load_views` - this identity's actually-enrolled devices,
+built automatically the moment any signed message from them is ever
+ingested - because a sig check alone proves nothing: a forger controls
+both sides of it, minting a fresh keypair and signing with the matching
+private half passes verification while proving nothing about whose key
+it is. Strangers who can't resolve any of that see only an
+author-attested alias entry and trust the author's relay - the same
+trust they already place in the author not having doctored the post
+text itself. **The ratified boundary** (adjudicated in review, not a
+new behavior): `_device_bound` is permissive when this viewer has no
+view data at all for the claimed identity, returning `True` rather than
+`False`, because that absence just as often means "this viewer has
+simply never exchanged a message with them" as it means forgery - and
+that permissiveness is exactly what lets genuine public engagement reach
+strangers at all. The consequence, stated plainly: **a hostile author
+can fabricate public identities, or inflate reaction counts, for a
+viewer who has never talked to the claimed identity** (nothing available
+to this viewer can refute it - same author-level trust as the tally
+itself, which is rebuilt from the author's own record). What a hostile
+author **cannot** do is impersonate an identity the viewer actually
+knows: that case hits the `device_pub in views` branch instead, and the
+sig check already guarantees whoever signed the entry really holds that
+key.
+
+**The fold's hostile-input hygiene.** Every decrypted field is
+validated before it is ever republished or rendered - `_valid_response_
+entry` gates each entry inside `_rebuild_responses_record` (a malformed
+entry from a hostile or buggy client is dropped silently, never allowed
+to raise out of the loop and abort every other post's rebuild that
+round), and `_post_responses_view`'s per-viewer render repeats the same
+discipline independently rather than trusting the author's record was
+built honestly. A reviewer-caught Critical here: `decrypt_body`'s return
+type is `Optional[dict]` as a hint, not an enforcement - `json.loads`
+happily returns whatever JSON root a hostile or buggy author's plaintext
+actually contains, and calling `.get("entries")` on a non-dict body used
+to raise an uncaught `AttributeError` that took down the entire
+`feed()`/`posts_by()` call for every OTHER post's row along with it, not
+just the bad one. Fixed with an `isinstance(body, dict)` guard before
+any dict access, matching every other fail-closed branch in the method.
+Mutual-box payloads are bounded too (`MUTUAL_BOX_CT_HEX_MAX`, checked at
+ingest with roughly 6.5x headroom over a real 624-hex slot), and
+comments are capped at `MAX_COMMENT` (500 characters) the same way every
+other user-authored field in this codebase is length-bounded - a
+hostile 2MB comment body or a response whose encrypted payload decrypts
+to a list/string/int instead of the expected object both fail closed
+rather than reaching a renderer or a republish.
+
+**Monotonic per-instance `created_at`.** Windows' `time.time()` has
+roughly 15.6ms granularity, and two `compose_response` calls fired back
+to back - two comments, or a comment immediately followed by its own
+retract - can land inside the same tick with an identical `created_at`.
+Retraction and moderation both key an entry by `(responder,
+created_at)` within `_rebuild_responses_record`'s fold, so a same-tick
+collision meant retracting one comment could silently remove a
+*different* comment from the same responder that happened to land on
+the same timestamp - a real bug the controller reproduced, not a
+theoretical one. Fixed with a strictly-increasing per-instance clock:
+`compose_response` bumps `created_at` a microsecond past
+`self._last_response_ts` whenever the raw clock reading isn't already
+past it. Deliberately not persisted across a restart (`_last_response_
+ts` resets to `0.0` in `__init__`) - a same-tick collision surviving a
+process restart isn't a realistic shape, since the restart itself takes
+far longer than one clock tick, so that residual gap is accepted rather
+than adding on-disk state to close it.
+
+**`removed_responses` PRAGMA+ALTER migration precedent.** The
+moderation-tombstone table needed a new column (`rkind`, to tell a
+reaction tombstone's per-responder cutoff semantics apart from a
+comment tombstone's exact-match semantics) after some installs had
+already created the table under its original shape. `CREATE TABLE IF
+NOT EXISTS` is a no-op against an existing table - it does not add
+columns - so `Store.__init__` now follows it with a `PRAGMA
+table_info(removed_responses)` check and an `ALTER TABLE ... ADD
+COLUMN` only when the column is actually missing, defaulting existing
+rows to `'comment'`. A reviewer caught the sharp edge this default
+creates: a *migrated* legacy tombstone that was actually a reaction
+removal now carries the wrong `rkind`, and the reaction fold's cutoff
+logic never consulted the exact-match set at all - so on an upgraded
+install, that old tombstone was a silent no-op until the fold was
+changed to check `removed_exact` before the cutoff, for both kinds, not
+just comments.
+
+**Stories-as-DMs: simplicity by not building a new mechanism.** Phase B
+(story reactions/replies) is deliberately not the responses protocol at
+all - no new kind, no relay, no aliasing, no mutual box. A story
+reaction or reply is a plain DM to the story owner, with one additive
+field, `story_ref: {story_id, media_hash}`, riding the existing DM
+envelope (`make_dm`/`compose_dm`, `_valid_story_ref` in `messages.py`
+shape-validates it at ingest and nothing more). This is the cheapest
+correct answer available: the DM pipe already has confidentiality,
+delivery, and a UI: it needed one field, not a second protocol surface.
+**The honest correlation caveat**, tightened during the build after an
+initial overclaim in the spec's own draft: `story_ref` rides the
+envelope in the clear, the same disclosure class as a DM's own
+`to`/`wraps` metadata, never inside the encrypted body - so a third
+party mutually connected to both the reactor and the story owner can
+correlate which story prompted a given DM (and in practice likely
+already holds that story's blob anyway, via ordinary story gossip).
+Only the correlation is exposed; the reply's own text/photos stay
+inside the encrypted DM body exactly as any other DM would. `story_ref`
+is shape-validated only, the same compliant-client precedent as
+`KIND_DELETE.target` - never resolved against a real story the named
+target actually posted.
+
+**Honest limits, stated plainly (mirrors the spec's own "Honest
+limits" section):**
+- Comment/reaction fan-out requires the author's own node to be online
+  to fold and republish - a laptop-only author's comment section updates
+  only when they next come online, the same shape as wall wrap-grants.
+- Retraction and moderation are compliant-client behavior, not DRM: a
+  modified client can keep a comment it already received even after its
+  author retracts it, or the post's author moderates it away - the same
+  honesty stance deletion has always taken.
+- Mutual-box slot buckets (8/16/32/64) weakly disclose a friend-device-
+  count range, never an exact count or any recipient identity.
+- A hostile author can fabricate public identities or inflate reaction
+  counts for strangers (the ratified `_device_bound` boundary above);
+  they cannot impersonate an identity a viewer actually knows.
+
+**Verification.** Full suite green (1029 passed, 9 env-gated skips -
+`TOR_E2E` plus eight `UI_E2E` live smokes - confirmed by direct
+execution). All five `UI_E2E`-gated live smokes
+(`test_ui_smoke_responses.py`, `test_ui_smoke_profile_load.py`,
+`test_ui_smoke_albums.py`, `test_ui_smoke_video_editor.py`) - 5 passed;
+`test_ui_smoke_responses.py`'s own three-node leg exercises the true
+mutual-box pipeline in a real browser (Cleo, a third node who is a
+mutual friend of the commenter but not the viewer, structurally cannot
+be author-shortcut into resolving as an alias) alongside the story-reply
+DM landing with its context chip.
