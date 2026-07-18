@@ -49,6 +49,8 @@ let LAST_RENDERED_PROFILE = null;
 // this Set is never pruned - accepted session-bounded tradeoff: it only
 // grows for the lifetime of the page, never past a reload.
 const EXPANDED_COMMENTS = new Set();   // msg_id -> comments section is open
+let OPEN_RX = null;   // msg_id whose reaction picker is expanded (one at a time;
+                      // survives the WS-tick journal rebuilds like EXPANDED_COMMENTS)
 let NEEDS_WIZARD = false;   // set by boot() when onboarding_done is false; Task 3's bootData() consumes it
 let UPDATE_BANNER_DISMISSED = false;   // session-only; returns next status push (Task 2, 0.3.15)
 let LAST_SEEN_UPDATE_VERSION = null;   // re-nudge when update_status.version changes past a dismiss
@@ -243,7 +245,21 @@ const MOON = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" '
   + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
   + 'stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 '
   + 'a7 7 0 0 0 9.8 9.8z"/></svg>';
+// setFixedIcon: the one sanctioned innerHTML write for the fixed ICONS
+// constants below. Lives OUTSIDE renderResponses on purpose - that
+// function's no-innerHTML XSS pin (test_web_assets) stays strict; user
+// content never flows through here.
+function setFixedIcon(node, name) { node.innerHTML = ICONS[name]; }
+
 const ICONS = {
+  addReaction: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    + 'stroke-linejoin="round"><circle cx="11" cy="11" r="8"/>'
+    + '<path d="M8 13a4 4 0 0 0 6 0"/>'
+    + '<line x1="8.5" y1="8.5" x2="8.51" y2="8.5"/>'
+    + '<line x1="13.5" y1="8.5" x2="13.51" y2="8.5"/>'
+    + '<line x1="19" y1="16" x2="19" y2="22"/>'
+    + '<line x1="16" y1="19" x2="22" y2="19"/></svg>',
   attach: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" '
     + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
     + 'stroke-linejoin="round"><path d="M21 8l-9.5 9.5a3.5 3.5 0 0 1-5-5'
@@ -506,13 +522,53 @@ function renderResponses(p, body) {
   // gets the full bar + toggle (someone has to be able to be first).
   const r = p.responses || EMPTY_RESPONSES_SHAPE;
 
-  // -- reaction bar: six fixed buttons (REACTION_GLYPHS' own token
-  // order), glyph + count when > 0, `.on` marks my_reaction. Clicking the
-  // active button clears it (token "clear"); clicking any other one
-  // switches to it. Optimistic class flip first, then refresh() re-syncs
-  // counts/my_reaction from the server (same pattern as every other
-  // action button in this file - delete, retract, etc).
+  // -- reaction bar (August, live demo feedback 2026-07-18): COLLAPSED
+  // by default - nonzero counts as small read-only chips plus ONE
+  // add-reaction icon (shows your own glyph once you've reacted); the
+  // six-glyph picker only expands on click. The always-on row pulled
+  // too much attention from the posts. One picker open at a time:
+  // opening this one sweep-closes every other bar's picker in place,
+  // and OPEN_RX (module-level) keeps the open one open across the WS
+  // re-renders that rebuild the journal.
   const bar = el("div", "reaction-bar");
+  const expanded = OPEN_RX === p.msg_id;
+  const collapsed = el("div", "rx-collapsed" + (expanded ? " hidden" : ""));
+  for (const token of Object.keys(REACTION_GLYPHS)) {
+    const count = r.reactions[token] || 0;
+    if (count > 0)
+      collapsed.append(el("span", "rx-count-chip"
+        + (r.my_reaction === token ? " on" : ""),
+        REACTION_GLYPHS[token] + " " + count));
+  }
+  const openBtn = el("button", "rx-open" + (r.my_reaction ? " on" : ""),
+    r.my_reaction ? REACTION_GLYPHS[r.my_reaction] : "");
+  if (!r.my_reaction) setFixedIcon(openBtn, "addReaction");   // fixed SVG, never user content
+  openBtn.type = "button";
+  openBtn.setAttribute("aria-label", "React");
+  openBtn.setAttribute("aria-expanded", String(expanded));
+  collapsed.append(openBtn);
+  const picker = el("div", "rx-picker" + (expanded ? "" : " hidden"));
+  openBtn.onclick = () => {
+    const opening = picker.classList.contains("hidden");
+    // sweep-close every other bar's picker (one open at a time)
+    document.querySelectorAll(".reaction-bar").forEach(b => {
+      if (b === bar) return;
+      const pk = b.querySelector(".rx-picker");
+      const co = b.querySelector(".rx-collapsed");
+      if (pk) pk.classList.add("hidden");
+      if (co) co.classList.remove("hidden");
+      const ob = b.querySelector(".rx-open");
+      if (ob) ob.setAttribute("aria-expanded", "false");
+    });
+    picker.classList.toggle("hidden", !opening);
+    collapsed.classList.toggle("hidden", opening);
+    openBtn.setAttribute("aria-expanded", String(opening));
+    OPEN_RX = opening ? p.msg_id : null;
+  };
+  // the picker: the six fixed buttons (REACTION_GLYPHS' token order),
+  // glyph + count when > 0, `.on` marks my_reaction. Clicking the active
+  // one clears (token "clear"); any other switches. Optimistic class
+  // flip, picker collapses, then refresh() re-syncs from the server.
   for (const token of Object.keys(REACTION_GLYPHS)) {
     const count = r.reactions[token] || 0;
     const btn = el("button", "rx" + (r.my_reaction === token ? " on" : ""),
@@ -521,14 +577,19 @@ function renderResponses(p, body) {
     btn.setAttribute("aria-label", token + (count ? ", " + count : ""));
     btn.onclick = async () => {
       const clearing = btn.classList.contains("on");
-      bar.querySelectorAll(".rx.on").forEach(b => b.classList.remove("on"));
+      picker.querySelectorAll(".rx.on").forEach(b => b.classList.remove("on"));
       if (!clearing) btn.classList.add("on");
+      OPEN_RX = null;                        // picking closes the picker
+      picker.classList.add("hidden");
+      collapsed.classList.remove("hidden");
+      openBtn.setAttribute("aria-expanded", "false");
       await j("/api/react", {method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({msg_id: p.msg_id, token: clearing ? "clear" : token})});
       await refresh();
     };
-    bar.append(btn);
+    picker.append(btn);
   }
+  bar.append(collapsed, picker);
   body.append(bar);
 
   // -- comments toggle + section: expanded state survives a refresh()

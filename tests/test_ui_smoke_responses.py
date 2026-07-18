@@ -127,14 +127,26 @@ def test_reactions_comments_and_story_reply_live(tmp_path):
             page_c.wait_for_selector(".fchip")
 
             # -- fresh post already carries the T8-fixed empty-state bar --
-            page_b.wait_for_selector(".entry")
-            assert page_b.locator(".entry .rx").count() == 6
-            assert page_b.locator(".entry .rx.on").count() == 0
+            # Collapsed-picker edition (August demo feedback, 2026-07-18):
+            # resting state is the .rx-open icon (no chips on a fresh
+            # post); the six .rx live in a hidden .rx-picker until the
+            # icon is clicked.
+            page_b.wait_for_selector(".entry .rx-open")
+            assert page_b.locator(".entry .rx-count-chip").count() == 0
+            assert page_b.locator(
+                ".entry .rx-picker:not(.hidden)").count() == 0
             assert page_b.locator(".entry .comments-toggle") \
                 .inner_text() == "Comment"
 
-            # -- Bo reacts fire, via the real UI ---------------------------
+            # -- Bo reacts fire, via the real UI: open the picker first ----
+            page_b.locator(".entry .rx-open").first.click()
+            page_b.wait_for_selector(".entry .rx-picker:not(.hidden)")
+            assert page_b.locator(
+                ".entry .rx-picker:not(.hidden) .rx").count() == 6
             page_b.locator('.entry [aria-label="fire"]').click()
+            # picking collapses the picker in place
+            page_b.wait_for_selector(
+                ".entry .rx-picker:not(.hidden)", state="detached")
             # optimistic class flip lands immediately, then the POST +
             # refresh() round-trip settles it (Bo's own feed() call can't
             # show my_reaction=fire yet - that needs Anna's record synced
@@ -166,8 +178,11 @@ def test_reactions_comments_and_story_reply_live(tmp_path):
             a.sync_with(b)
 
             # -- Anna's journal: count + comment with Bo's REAL name -----
-            page_a.wait_for_selector('.entry [aria-label="fire, 1"]',
-                                     timeout=10000)
+            # Collapsed picker: the count shows as a resting chip now, not
+            # the (hidden) picker button's aria-label.
+            page_a.wait_for_selector(
+                f'.entry .rx-count-chip:has-text("{FIRE} 1")',
+                timeout=10000)
             page_a.wait_for_selector(
                 '.entry .comments-toggle:has-text("Comments (1)")',
                 timeout=10000)
@@ -203,8 +218,9 @@ def test_reactions_comments_and_story_reply_live(tmp_path):
             # to a real name here is decrypting Anna's rebuilt record and
             # successfully opening the mutual box with her own enc key.
             a.sync_with(c)   # Cleo's store holds Anna's freshly rebuilt record
-            page_c.wait_for_selector('.entry [aria-label="fire, 1"]',
-                                     timeout=10000)
+            page_c.wait_for_selector(
+                f'.entry .rx-count-chip:has-text("{FIRE} 1")',
+                timeout=10000)
             page_c.click(".entry .comments-toggle")
             page_c.wait_for_selector(".entry .comments:not(.hidden)")
             comment_name_c = page_c.locator(".entry .comment-name").first

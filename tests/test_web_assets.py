@@ -2158,3 +2158,21 @@ def test_reaction_bar_renders_before_any_engagement_exists():
     # summary line on every untouched post would be noise there.
     assert "if (p.responses)" in if_branch
     assert re.search(r"\}\s*else\s*\{\s*renderResponses\(p, body\);", else_branch)
+
+
+def test_reaction_bar_collapses_to_picker():
+    # August (live demo feedback, 2026-07-18): six always-visible reaction
+    # buttons take too much attention - collapsed state is nonzero-count
+    # chips + one add-reaction icon (shows YOUR glyph when reacted);
+    # clicking expands the six-glyph picker; picking (or re-clicking the
+    # icon, or opening another post's picker) collapses it. One picker
+    # open at a time via a module-level OPEN_RX msg_id.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    rr = _js_fn_body(js, "renderResponses")
+    assert "rx-open" in rr and "OPEN_RX" in js
+    assert "rx-count-chip" in rr        # collapsed nonzero counts
+    for sel in (".rx-open", ".rx-count-chip", ".rx-picker"):
+        assert sel in css, sel
+    # picking a reaction closes the picker (OPEN_RX cleared before POST)
+    assert "OPEN_RX = null" in rr

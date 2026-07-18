@@ -404,6 +404,22 @@ button.eavatar img { width: 100%; height: 100%; border-radius: 50%;
    The profile rail's compact buildEntry() call never reaches here - it
    gets .response-summary instead (below), a plain read-only line. */
 .reaction-bar { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+/* Collapsed reaction bar (August, live demo feedback 2026-07-18): the
+   always-visible six-button row pulled attention from posts - resting
+   state is nonzero count chips + one small add-reaction icon (your own
+   glyph once reacted); .rx-picker expands on demand. */
+.rx-collapsed { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.rx-count-chip { font-size: 12px; color: var(--ink-2);
+  border: 1px solid var(--line-2); border-radius: 99px; padding: 2px 8px; }
+.rx-count-chip.on { border-color: var(--me); color: var(--ink); }
+.rx-open { width: 26px; height: 26px; border-radius: 50%; padding: 0;
+  border: 1px solid var(--line-2); background: transparent;
+  color: var(--ink-2); display: grid; place-items: center;
+  cursor: pointer; font-size: 13px; line-height: 1; transition: .15s; }
+.rx-open:hover { color: var(--ink); border-color: var(--ink-2); }
+.rx-open.on { border-color: var(--me); }
+.rx-open svg { display: block; }
+.rx-picker { display: flex; flex-wrap: wrap; gap: 4px; }
 .rx { border: 1px solid var(--line); background: transparent; color: var(--ink-2);
   font-size: 13px; font-weight: 500; line-height: 1.3; padding: 3px 9px; border-radius: 99px;
   transition: .15s; }
