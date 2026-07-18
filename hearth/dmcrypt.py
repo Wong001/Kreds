@@ -152,8 +152,12 @@ _SLOT_BUCKETS = (8, 16, 32, 64)
 
 
 def _derive_slot_kek(shared: bytes) -> bytes:
+    # "-kek" suffix exists purely to keep this HKDF info string visually
+    # distinct from MUTUAL_BOX_AAD (the AEAD associated data) - the two
+    # are independent mechanisms and never needed to differ, but a
+    # shared literal invited misreading them as coupled.
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
-                info=b"hearth/mutual-box/v1").derive(shared)
+                info=b"hearth/mutual-box-kek/v1").derive(shared)
 
 
 def seal_slots(payload: bytes, enc_pubs) -> list:
@@ -195,6 +199,8 @@ def seal_slots(payload: bytes, enc_pubs) -> list:
 def try_open_slots(slots, enc_priv_hex: str):
     """Trial-open every slot; the one sealed to this device decrypts,
     all others (other recipients' and dummies) fail AEAD auth."""
+    if not isinstance(slots, list):
+        return None                       # e.g. JSON null/scalar mutual_box
     try:
         priv = X25519PrivateKey.from_private_bytes(
             bytes.fromhex(enc_priv_hex))

@@ -120,6 +120,11 @@ def test_sealed_slots_bucket_padding_and_anonymity():
     assert len(seal_slots(b"x", pubs17)) == 32
     with pytest.raises(ValueError):
         seal_slots(b"x", [gen_enc_keypair()[1] for _ in range(65)])
+    # bucket boundaries: exact bucket size needs no padding, doesn't raise
+    pubs8 = [gen_enc_keypair()[1] for _ in range(8)]
+    assert len(seal_slots(b"x", pubs8)) == 8
+    pubs64 = [gen_enc_keypair()[1] for _ in range(64)]
+    assert len(seal_slots(b"x", pubs64)) == 64
 
 
 def test_sealed_slots_dummy_slots_indistinguishable_shape():
@@ -128,6 +133,9 @@ def test_sealed_slots_dummy_slots_indistinguishable_shape():
     # a dummy must not be identifiable by shape alone
     lens = {(len(s["eph_pub"]), len(s["nonce"])) for s in slots}
     assert lens == {(64, 24)}
+    # the core anonymity property: ciphertext length is uniform across
+    # every slot (real or dummy) - length alone can't single out a slot
+    assert len({len(s["ct"]) for s in slots}) == 1
 
 
 def test_sealed_slots_empty_recipients():
@@ -136,3 +144,10 @@ def test_sealed_slots_empty_recipients():
     assert len(slots) == 8
     priv, _ = gen_enc_keypair()
     assert try_open_slots(slots, priv) is None
+
+
+def test_try_open_slots_rejects_hostile_container():
+    # a JSON null/scalar mutual_box is the realistic malformed shape
+    priv, _ = gen_enc_keypair()
+    assert try_open_slots(None, priv) is None
+    assert try_open_slots(42, priv) is None
