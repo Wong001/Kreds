@@ -184,14 +184,25 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/settings")
     async def get_settings():
-        return {"close_behavior": node.store.get_meta("close_behavior") or "quit"}
+        return {"close_behavior": node.store.get_meta("close_behavior") or "quit",
+                "public_engagement": node.store.get_meta("public_engagement") == "1"}
 
     @app.post("/api/settings")
     async def set_settings(body: dict = Body(...)):
-        cb = body.get("close_behavior")
-        if cb not in ("quit", "keep"):
-            raise HTTPException(400, "bad close_behavior")
-        node.store.set_meta("close_behavior", cb)
+        # Each field is independently optional (a caller posting only
+        # public_engagement, e.g. the reactions-comments settings toggle,
+        # must not be forced to also resend close_behavior) but still
+        # strictly validated whenever it IS present.
+        if "close_behavior" in body:
+            cb = body["close_behavior"]
+            if cb not in ("quit", "keep"):
+                raise HTTPException(400, "bad close_behavior")
+            node.store.set_meta("close_behavior", cb)
+        if "public_engagement" in body:
+            pe = body["public_engagement"]
+            if not isinstance(pe, bool):
+                raise HTTPException(400, "bad public_engagement")
+            node.store.set_meta("public_engagement", "1" if pe else "0")
         return {"ok": True}
 
     # -- Signed in-app updates (Kreds auto-update, Task 3) ---------------
@@ -495,6 +506,36 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
     @app.post("/api/delete")
     async def delete(body: dict = Body(...)):
         _400(lambda: node.delete_post(body["msg_id"]))
+        return {"ok": True}
+
+    # -- reactions/comments (Task 5) --------------------------------------
+
+    @app.post("/api/react")
+    async def react(body: dict = Body(...)):
+        _400(lambda: node.compose_response(
+            body["msg_id"], "reaction", body["token"]))
+        return {"ok": True}
+
+    @app.post("/api/comment")
+    async def comment(body: dict = Body(...)):
+        _400(lambda: node.compose_response(
+            body["msg_id"], "comment", body["text"]))
+        return {"ok": True}
+
+    @app.post("/api/retract")
+    async def retract(body: dict = Body(...)):
+        _400(lambda: node.compose_response(
+            body["msg_id"], "retract", str(body["created_at"])))
+        return {"ok": True}
+
+    @app.post("/api/response-remove")
+    async def response_remove(body: dict = Body(...)):
+        # Moderation: node.remove_response already raises ValueError
+        # ("not your own post") when this node isn't the post's author --
+        # _400 turns that into the 400 the brief specifies, no separate
+        # ownership check needed here.
+        _400(lambda: node.remove_response(
+            body["msg_id"], body["responder"], body["created_at"]))
         return {"ok": True}
 
     @app.get("/api/profile/{identity_pub}")

@@ -43,6 +43,21 @@ def _befriended_pair(tmp_path):
     return a, b
 
 
+def _triangle_no_bc(tmp_path):
+    """Three nodes: A is friends with both B and C; B and C are NOT
+    friends with each other yet (test_three_nodes.py idiom: plain
+    HearthNode.create per node, hand-carried sync). Exercises a viewer
+    (C) who is a friend of the post's AUTHOR but a total stranger to the
+    RESPONDER (B) -- exactly the case a private mutual-box entry must
+    stay aliased for, until B and C separately befriend each other."""
+    a = HearthNode.create(tmp_path / "a", "A", "a-dev")
+    b = HearthNode.create(tmp_path / "b", "B", "b-dev")
+    c = HearthNode.create(tmp_path / "c", "C", "c-dev")
+    _befriend(a, b)
+    _befriend(a, c)
+    return a, b, c
+
+
 def _decrypt_response_as(node, msg):
     """Decrypt a KIND_RESPONSE row as its recipient would: same envelope-
     unwrap primitives node._content_key uses (unwrap_key + decrypt_body),
@@ -499,3 +514,85 @@ def test_legacy_comment_tombstone_removes_reaction_exact_match(tmp_path):
     a.process_responses()
     body = _decrypt_record_as(a, _responses_record(a, pid))
     assert not [e for e in body["entries"] if e["rkind"] == "reaction"]
+
+
+# -- Task 5: viewer assembly (_post_responses_view via feed()) ---------------
+
+def test_feed_rows_carry_responses(tmp_path):
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    b.compose_response(pid, "reaction", "heart")
+    b.compose_response(pid, "comment", "hej fra B")
+    # _sync(b, a): the raw responses reach A first (mirrors test_author_
+    # sweep_republishes_record's own "response reaches A" comment) so A's
+    # fold has something to fold; _sync(a, b) afterward hands B the
+    # freshly-rebuilt record so b.feed() below can decrypt it.
+    _sync(b, a); a.process_responses(); _sync(a, b)
+    row_a = [p for p in a.feed() if p["msg_id"] == pid][0]
+    assert row_a["responses"]["reactions"] == {"heart": 1}
+    assert row_a["responses"]["comments"][0]["name"]      # author sees real B
+    assert row_a["responses"]["can_moderate"] is True
+    row_b = [p for p in b.feed() if p["msg_id"] == pid][0]
+    assert row_b["responses"]["my_reaction"] == "heart"
+    assert row_b["responses"]["comments"][0]["mine"] is True
+
+
+def test_stranger_sees_alias_mutual_sees_name(tmp_path):
+    # A authors; B and C are A's friends but NOT each other's
+    a, b, c = _triangle_no_bc(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b); _sync(a, c)
+    b.compose_response(pid, "comment", "privat hilsen")
+    # _sync(b, a): B's raw comment reaches A (the author) first, same
+    # direction fix as test_feed_rows_carry_responses above; _sync(a, c)
+    # then hands C (a friend of A, NOT of B) the rebuilt record.
+    _sync(b, a); a.process_responses(); _sync(a, c)
+    row_c = [p for p in c.feed() if p["msg_id"] == pid][0]
+    entry = row_c["responses"]["comments"][0]
+    assert entry["alias"] is True and "name" not in entry or entry.get("name") is None
+    # now with B<->C friends, C resolves the real name
+    _befriend(b, c); _sync(b, c)
+    b2 = b.compose_response(pid, "comment", "nu venner")
+    _sync(b, a); a.process_responses(); _sync(a, c)
+    row_c = [p for p in c.feed() if p["msg_id"] == pid][0]
+    named = [e for e in row_c["responses"]["comments"] if e["body"] == "nu venner"]
+    assert named and named[0]["alias"] is False and named[0]["name"]
+    # the earlier comment legitimately stays aliased for C: it was sealed
+    # to B's friends AT THAT TIME, and C wasn't one of them yet.
+    assert [e for e in row_c["responses"]["comments"]
+           if e["body"] == "privat hilsen"][0]["alias"] is True
+
+
+def test_public_engagement_resolves_even_for_a_stranger_of_the_responder(tmp_path):
+    """public_engagement's whole point (spec 2026-07-18): the responder's
+    real identity should be visible even to a viewer who is a total
+    stranger to THEM (only a friend of the post's author) -- unlike the
+    private/mutual-box default, a public entry must not need C to be
+    B's friend at all. This also exercises _device_bound's permissive-
+    when-no-data-held branch: C has never exchanged a single message
+    with B (they aren't friends), so C's store holds no device_views row
+    for B whatsoever -- the binding check can't refute the claim, so
+    (per its documented v1 bar) it lets the sig-verified identity
+    through rather than aliasing a legitimate public comment."""
+    a, b, c = _triangle_no_bc(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b); _sync(a, c)
+    b.store.set_meta("public_engagement", "1")
+    b.compose_response(pid, "comment", "public hello")
+    _sync(b, a); a.process_responses(); _sync(a, c)
+    row_c = [p for p in c.feed() if p["msg_id"] == pid][0]
+    entry = row_c["responses"]["comments"][0]
+    assert entry["alias"] is False
+    assert entry["responder"] == b.identity_pub
+    # C never synced B's profile (they aren't friends) -- identity
+    # resolution (the thing this test targets) is independent of name
+    # display, which falls back the same way author_name/kreds_list do.
+    assert entry["name"] == b.identity_pub[:8]
+
+
+def test_feed_row_has_no_responses_key_when_untouched(tmp_path):
+    a = HearthNode.create(tmp_path / "a", "A", "a-dev")
+    pid = a.compose_post("post with no engagement", "kreds")
+    row = [p for p in a.feed() if p["msg_id"] == pid][0]
+    assert row["responses"] is None

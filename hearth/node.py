@@ -14,7 +14,8 @@ from . import applock, invitecodec, update
 from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
                       encrypt_body, new_content_key, open_content_key,
                       post_aad, response_aad, responses_aad,
-                      seal_content_key, seal_slots, unwrap_key, wrap_key)
+                      seal_content_key, seal_slots, try_open_slots,
+                      unwrap_key, wrap_key)
 from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        EnrollmentCert, IdentityCeremony, PROTOCOL,
                        canonical, _sig_ok)
@@ -85,6 +86,47 @@ def _valid_mutual_box(mutual_box) -> bool:
                 or len(ct) > MUTUAL_BOX_CT_HEX_MAX
                 or any(c not in "0123456789abcdef" for c in ct)):
             return False
+    return True
+
+
+def _valid_response_entry(e) -> bool:
+    """Per-entry shape check for a decrypted KIND_RESPONSES record
+    (Task 5) -- the record's own envelope is validated (validate_payload,
+    messages.py), but `entries` lives inside the encrypted body, same as
+    a raw KIND_RESPONSE's fields, so it is exactly as opaque to relays
+    and exactly as attacker-shapeable by a hostile/modified AUTHOR client
+    that skips the honest process_responses fold and hand-builds a
+    record directly. This is the ONLY gate standing between that and
+    every viewer who decrypts the record -- mirrors
+    node._response_event's validation (same fields, same fail-closed
+    return-False style) plus the two fields unique to a folded entry:
+    `identity`/`device_pub`, present only when `public` is true."""
+    if not isinstance(e, dict):
+        return False
+    rkind = e.get("rkind")
+    if rkind not in ("comment", "reaction"):
+        return False
+    body = e.get("body")
+    if not isinstance(body, str):
+        return False
+    if rkind == "comment" and not (0 < len(body) <= MAX_COMMENT):
+        return False
+    if rkind == "reaction" and body not in REACTION_TOKENS:
+        return False
+    if not isinstance(e.get("created_at"), (int, float)):
+        return False
+    if not _is_hexn(e.get("alias_seed"), 32):
+        return False
+    public = e.get("public")
+    if not isinstance(public, bool):
+        return False
+    if not _is_hexn(e.get("responder_sig"), 128):
+        return False
+    if not _valid_mutual_box(e.get("mutual_box")):
+        return False
+    if public and not (_is_hexn(e.get("identity"), 64)
+                       and _is_hexn(e.get("device_pub"), 64)):
+        return False
     return True
 
 
@@ -1332,6 +1374,178 @@ class HearthNode:
             self._publish(make_delete(self.device, rec.msg_id))
         return self._publish(make_delete(self.device, target_msg_id))
 
+    @staticmethod
+    def _response_sig_payload(target, rkind, body, created_at, responder):
+        """The exact canonical form compose_response signs with
+        DeviceKeys.sign_raw (identity.py) -- _sig_ok's counterpart, reused
+        here by every viewer to independently reverify a folded entry's
+        responder_sig rather than trusting the author's node not to have
+        forged it (spec 2026-07-18, Task 5)."""
+        return canonical({"target": target, "rkind": rkind, "body": body,
+                          "created_at": created_at, "responder": responder})
+
+    def _device_bound(self, identity_pub: str, device_pub: str) -> bool:
+        """True unless this node can actively DISPROVE that device_pub
+        belongs to identity_pub. store.load_views(identity_pub) is this
+        node's own record of that identity's enrolled devices -- built
+        automatically the moment ANY signed message from them is
+        ingested (identity.py's Verifier.verify_message records a
+        DeviceView for every device it verifies a signature from), so a
+        known friend's real device already has an entry here in
+        practice, with no extra plumbing needed.
+
+        A sig-only check (verifying responder_sig against the claimed
+        device_pub, with no binding check at all) is not enough on its
+        own: an attacker who forges an entry controls BOTH sides of that
+        check -- they can mint a brand-new keypair, put its public half
+        in device_pub, and sign with the matching private half, which
+        verifies perfectly while proving nothing about who that key
+        belongs to. Checking device_pub against the identity's actually-
+        enrolled devices is what catches that -- a fabricated key
+        impersonating a real friend won't be in their view.
+
+        Absence of ANY view data for identity_pub returns True
+        (permissive) rather than False -- this node may simply not have
+        exchanged a message with them yet (e.g. a `public` entry from
+        someone who isn't a mutual friend of THIS viewer, only of the
+        post's author), which is expected, not evidence of forgery.
+        This is the accessor Task 5's brief asked about; see the task
+        report for the full finding."""
+        views = self.store.load_views(identity_pub)
+        if not views:
+            return True
+        return device_pub in views
+
+    def _post_responses_view(self, msg, names, avatars) -> Optional[dict]:
+        """Per-viewer engagement view for one journal post's feed row
+        (spec 2026-07-18, Task 5): reaction tally, this viewer's own
+        current reaction, the comment list, and whether this viewer may
+        moderate (author only). None when the post has no KIND_RESPONSES
+        record yet -- feed()/posts_by rows carry a null "responses"
+        field in that case; the client must tolerate it.
+
+        Per-entry identity resolution, most-authoritative first:
+        1) A raw KIND_RESPONSE THIS node's own store holds for the same
+           target + created_at. Routing (messages_not_in) sends every
+           raw response to the post's AUTHOR only, plus the responder's
+           own devices -- so for the author this resolves EVERY entry
+           directly from the cert-proven (identity, device_pub) pair (no
+           re-verification needed: identity.py's Verifier already proved
+           it at ingest), while for any other viewer it can only ever
+           resolve THEIR OWN entries. That second case matters because
+           compose_response's mutual box deliberately excludes the
+           responder's own devices from its audience (it is sealed to
+           the responder's FRIENDS, see its friend_pubs comment) -- so a
+           responder can never trial-open their own private entry's box,
+           and would otherwise show up as an alias in their own feed.
+        2) A public entry: identity/device_pub ride openly in the clear.
+           Verify responder_sig against device_pub, then _device_bound.
+        3) A private entry: trial-open mutual_box with every enc_priv
+           this device holds (current + retired, same grace-period
+           pattern _content_key's envelope unwrap uses), then the same
+           sig + binding check as (2) on whatever it opens to.
+        Anything none of these resolve stays an alias: the row exposes
+        only alias_seed (the client renders a display name from it
+        locally) -- never identity/device_pub, even implicitly.
+
+        Fail-closed per entry, mirroring _response_event/
+        process_responses: a malformed entry (a hostile/modified author
+        skipping the honest process_responses fold) is dropped silently
+        via _valid_response_entry, never allowed to raise out of the
+        loop or surface into any viewer's row."""
+        target = msg.msg_id
+        author = msg.cert.identity_pub
+        rec = self.store.responses_record(target, author)
+        if rec is None:
+            return None
+        key, aad = self._content_key(rec)
+        if key is None:
+            return None
+        body = decrypt_body(key, rec.payload["body_nonce"],
+                            rec.payload["body_ct"], aad)
+        if body is None:
+            return None
+        entries = body.get("entries")
+        if not isinstance(entries, list):
+            return None
+
+        # Step 1's lookup table -- see the docstring for why this is
+        # every responder's (identity, device_pub) when self is the
+        # author, and only self's own otherwise.
+        raw_by_created_at = {}
+        for rmsg in self.store.responses_by_target(target):
+            try:
+                ev = self._response_event(rmsg)
+            except Exception:
+                ev = None
+            if ev is not None and ev["rkind"] in ("comment", "reaction"):
+                raw_by_created_at[ev["created_at"]] = (
+                    rmsg.cert.identity_pub, rmsg.cert.device_pub)
+
+        reactions: dict = {}
+        comments = []
+        my_reaction = None
+        for e in entries:
+            try:
+                if not _valid_response_entry(e):
+                    continue
+            except Exception:
+                continue
+            identity, device_pub = raw_by_created_at.get(
+                e["created_at"], (None, None))
+            if identity is None and e["public"]:
+                cand_id, cand_dev = e["identity"], e["device_pub"]
+                sig_payload = self._response_sig_payload(
+                    target, e["rkind"], e["body"], e["created_at"], cand_id)
+                if (_sig_ok(cand_dev, e["responder_sig"], sig_payload)
+                        and self._device_bound(cand_id, cand_dev)):
+                    identity = cand_id
+            if identity is None and e.get("mutual_box"):
+                opened = None
+                for priv in self.device.enc_privs():
+                    opened = try_open_slots(e["mutual_box"], priv)
+                    if opened is not None:
+                        break
+                box = None
+                if opened is not None:
+                    try:
+                        box = json.loads(opened)
+                    except (ValueError, UnicodeDecodeError):
+                        box = None
+                if isinstance(box, dict):
+                    cand_id, cand_dev = box.get("identity"), box.get("device_pub")
+                    if _is_hexn(cand_id, 64) and _is_hexn(cand_dev, 64):
+                        sig_payload = self._response_sig_payload(
+                            target, e["rkind"], e["body"], e["created_at"],
+                            cand_id)
+                        if (_sig_ok(cand_dev, e["responder_sig"], sig_payload)
+                                and self._device_bound(cand_id, cand_dev)):
+                            identity = cand_id
+            resolved = identity is not None
+            mine = resolved and identity == self.identity_pub
+            if e["rkind"] == "reaction":
+                reactions[e["body"]] = reactions.get(e["body"], 0) + 1
+                if mine:
+                    my_reaction = e["body"]
+            else:
+                comment = {
+                    "name": (names.get(identity, identity[:8])
+                            if resolved else None),
+                    "avatar": avatars.get(identity) if resolved else None,
+                    "alias": not resolved,
+                    "alias_seed": e["alias_seed"],
+                    "mine": mine,
+                    "body": e["body"],
+                    "created_at": e["created_at"],
+                }
+                if resolved:
+                    comment["responder"] = identity
+                comments.append(comment)
+
+        return {"reactions": reactions, "my_reaction": my_reaction,
+                "comments": comments,
+                "can_moderate": self.identity_pub == author}
+
     def _decrypt_post_row(self, msg, names, now, avatars=None):
         avatars = avatars or {}
         p = msg.payload
@@ -1357,6 +1571,7 @@ class HearthNode:
             "poster": p.get("poster"),
             "codec": p.get("codec"),
             "thumbs": p.get("thumbs"),
+            "responses": self._post_responses_view(msg, names, avatars),
         }
 
     def feed(self) -> List[dict]:

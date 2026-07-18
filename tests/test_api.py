@@ -122,6 +122,72 @@ def test_missing_body_keys_return_400(tmp_path):
     assert c.post("/api/ring", json={}).status_code == 400
 
 
+def test_respond_endpoints_and_settings_toggle(tmp_path):
+    c, node = client(tmp_path)
+    pid = node.compose_post("own post", "kreds")
+    r = c.post("/api/react", json={"msg_id": pid, "token": "fire"})
+    assert r.status_code == 200
+    r = c.post("/api/comment", json={"msg_id": pid, "text": "selvsvar"})
+    assert r.status_code == 200
+    node.process_responses()
+    row = [p for p in node.feed() if p["msg_id"] == pid][0]
+    assert row["responses"]["reactions"] == {"fire": 1}
+    r = c.post("/api/comment", json={"msg_id": pid, "text": "x" * 501})
+    assert r.status_code == 400
+    s = c.get("/api/settings").json()
+    assert s["public_engagement"] is False
+    r = c.post("/api/settings", json={"public_engagement": True})
+    assert r.status_code == 200
+    assert c.get("/api/settings").json()["public_engagement"] is True
+
+
+def test_retract_and_response_remove_endpoints(tmp_path):
+    c, node = client(tmp_path)
+    pid = node.compose_post("own post", "kreds")
+    c.post("/api/comment", json={"msg_id": pid, "text": "first"})
+    node.process_responses()
+    row = [p for p in node.feed() if p["msg_id"] == pid][0]
+    created_at = row["responses"]["comments"][0]["created_at"]
+    r = c.post("/api/retract", json={"msg_id": pid, "created_at": created_at})
+    assert r.status_code == 200
+    node.process_responses()
+    row = [p for p in node.feed() if p["msg_id"] == pid][0]
+    assert row["responses"]["comments"] == []
+
+    # response-remove: 400 when the target post isn't this node's own
+    other = HearthNode.create(tmp_path / "other", "Other", "other-dev")
+    other_pid = other.compose_post("someone else's post", "kreds")
+    for m in other.store.messages_not_in({}, {other.identity_pub},
+                                         node.identity_pub):
+        node.store.ingest_message(m)
+    r = c.post("/api/response-remove",
+               json={"msg_id": other_pid, "responder": node.identity_pub,
+                     "created_at": created_at})
+    assert r.status_code == 400
+
+    # moderating a real own-post entry succeeds
+    c.post("/api/comment", json={"msg_id": pid, "text": "second"})
+    node.process_responses()
+    row = [p for p in node.feed() if p["msg_id"] == pid][0]
+    created_at2 = row["responses"]["comments"][0]["created_at"]
+    r = c.post("/api/response-remove",
+               json={"msg_id": pid, "responder": node.identity_pub,
+                     "created_at": created_at2})
+    assert r.status_code == 200
+    row = [p for p in node.feed() if p["msg_id"] == pid][0]
+    assert row["responses"]["comments"] == []
+
+
+def test_settings_close_behavior_still_independent_of_public_engagement(tmp_path):
+    c, _ = client(tmp_path)
+    assert c.post("/api/settings",
+                  json={"close_behavior": "keep"}).status_code == 200
+    s = c.get("/api/settings").json()
+    assert s["close_behavior"] == "keep" and s["public_engagement"] is False
+    assert c.post("/api/settings",
+                  json={"close_behavior": "bad"}).status_code == 400
+
+
 def test_service_worker_served_at_root(tmp_path):
     # Must be served at the app ROOT: a worker registered from under
     # /static/ can only ever control /static/*, not the whole app.
