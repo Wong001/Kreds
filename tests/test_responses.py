@@ -6,6 +6,7 @@ carried store-level sync, no real sockets needed) rather than
 test_three_nodes.py's full invite ceremony + live SyncService -- both
 exist in this codebase; this file picks the lighter one since nothing
 here needs real network behavior."""
+import dataclasses
 import time
 import types
 
@@ -667,3 +668,62 @@ def test_malformed_responses_record_body_does_not_crash_feed(tmp_path):
     assert row["responses"] is None
     healthy_row = [p for p in rows if p["msg_id"] == healthy_pid][0]
     assert healthy_row["responses"]["reactions"] == {"heart": 1}
+
+
+# -- Task 8: mixed-version / old-core compat ---------------------------------
+
+def test_old_core_refuses_response_kind_and_keeps_reoffering(tmp_path):
+    """Mixed-version compat, mirroring tests/test_wrap_grant_messages.py's
+    test_unknown_kind_still_refused (the "fallthrough old peers rely on"
+    pin, written for KIND_WRAP_GRANT) plus the messages_not_in offer-set
+    idiom used throughout tests/test_wrap_grants_store.py: an old core
+    that predates KIND_RESPONSE has no branch for it in validate_payload,
+    so it falls through to the exact same "unknown kind" refusal every
+    unrecognized kind gets today. Simulated per the plan's "simplest
+    honest simulation" by mangling a REAL, validly-signed KIND_RESPONSE's
+    kind string to something no branch recognizes ("response-future")
+    rather than monkeypatching the KIND_RESPONSE branch out of
+    validate_payload -- the fallthrough is identical either way, and this
+    needs no crypto workaround because Store.ingest_message runs
+    validate_payload BEFORE signature verification (store.py: the
+    validate_payload call sits above the Verifier() call), so a mangled
+    payload is refused on shape alone, never reaching signature checks.
+
+    Per wrap_grant's own mixed-version note (ROADMAP item 20 / the
+    2026-07-15-wall-wrap-grants plan Sec.5, "verified at planning time"):
+    a refused seq never enters the old peer's seen-set, so the NEW peer
+    keeps re-offering it every round until the old peer updates -- bounded
+    chatter, not silently dropped, and not a one-shot retry. Checked here
+    by querying messages_not_in twice (two simulated rounds) and
+    confirming the REAL response b actually holds is offered to a both
+    times, since nothing in b's own bookkeeping ever marks a delivery
+    attempt as done -- that only happens via a's own reported summary,
+    and an old a can never report having it."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    rid = b.compose_response(pid, "comment", "hi from the future")
+    real_msg = b.store.get_message(rid)
+
+    # simulate what an old core's validate_payload sees for a kind it
+    # doesn't know about yet: the real envelope, kind mangled
+    mangled = dataclasses.replace(
+        real_msg, payload={**real_msg.payload, "kind": "response-future"})
+    result = a.store.ingest_message(mangled)
+    assert not result.accepted and result.reason == "unknown kind"
+    assert a.store.get_message(mangled.msg_id) is None
+    # the real (unmangled) response is untouched by the simulation above
+    # and never separately reached a's store at all
+    assert a.store.get_message(rid) is None
+
+    # round 1: b still offers the real response to a
+    offered_round1 = {m.msg_id for m in b.store.messages_not_in(
+        {}, {b.identity_pub}, a.identity_pub)}
+    assert rid in offered_round1
+    # round 2: nothing changed on a's side (old core still refuses it on
+    # ingest), so b keeps re-offering -- the bounded-forever-chatter shape
+    # wrap_grant's mixed-version note describes, confirmed idempotent
+    # rather than a single retry that then gives up
+    offered_round2 = {m.msg_id for m in b.store.messages_not_in(
+        {}, {b.identity_pub}, a.identity_pub)}
+    assert rid in offered_round2
