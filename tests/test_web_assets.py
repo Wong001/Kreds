@@ -1742,6 +1742,9 @@ def test_video_editor_crop_and_cover_wired():
     # pinch: a two-pointer distance path exists
     assert "pointers.size === 2" in ve or "pointers.length === 2" in ve
     assert ".ve-cover" in css and ".ve-chip" in css
+    # cover drag tears down on pointercancel too (45455ab pattern), same as
+    # both trim handles - a bare count catches a missing listener on any one
+    assert ve.count("pointercancel") >= 3   # dragHandle x2 + cover
 
 
 def test_video_editor_composer_integration():

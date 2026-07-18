@@ -2223,6 +2223,10 @@ function openVideoEditor(file, existing, onClose) {
   const btns = el("div", "ve-btns");
   const cancelB = el("button", "ve-btn", "Cancel"); cancelB.type = "button";
   const doneB = el("button", "ve-btn ve-done", "Done"); doneB.type = "button";
+  // disabled until loadedmetadata inits start/end/crop - Done before that
+  // posted the degenerate {start:0,duration:0} and let handles drag state
+  // that hadn't been set up yet.
+  doneB.disabled = true;
   btns.append(cancelB, doneB);
   ov.append(stage, strip, times, chips, btns);
   document.body.append(ov);
@@ -2269,6 +2273,9 @@ function openVideoEditor(file, existing, onClose) {
     if (r == null || !vw || !vh) return null;
     const baseW = Math.min(1, (r * vh) / vw);
     const baseH = Math.min(1, vw / (r * vh));
+    // zoomBy/restoreCrop already cap zoom so neither term below reaches
+    // the floor - these 0.1s are just the validator's own min-crop
+    // backstop (server rejects w/h < 0.1), not the aspect guard itself.
     const w = Math.max(0.1, baseW / zoom);
     const h = Math.max(0.1, baseH / zoom);
     const x = Math.min(Math.max(cx - w / 2, 0), 1 - w);
@@ -2320,7 +2327,10 @@ function openVideoEditor(file, existing, onClose) {
     }
     aspect = best;
     const baseW = Math.min(1, (ASPECTS[best] * vh) / vw);
-    zoom = Math.min(10, Math.max(1, baseW / c.w));
+    const baseH = Math.min(1, vw / (ASPECTS[best] * vh));
+    // same per-axis cap as zoomBy - a stored rect from a since-changed
+    // zoom ceiling must not recover a zoom that would distort the aspect
+    zoom = Math.min(10, baseW * 10, baseH * 10, Math.max(1, baseW / c.w));
     if (!Number.isFinite(zoom)) zoom = 1;
     cx = c.x + c.w / 2; cy = c.y + c.h / 2;
   }
@@ -2358,7 +2368,15 @@ function openVideoEditor(file, existing, onClose) {
   frame.addEventListener("pointerup", dropPointer);
   frame.addEventListener("pointercancel", dropPointer);
   function zoomBy(f) {
-    zoom = Math.min(10, Math.max(1, zoom * f));
+    // cap per-axis, not just at 10x flat: cropRect's independent 0.1 floors
+    // on w and h mean the SHORTER axis of a non-square aspect hits its floor
+    // first, so past that point only the other axis kept shrinking and the
+    // chosen aspect silently distorted. Capping zoom so neither baseW/zoom
+    // nor baseH/zoom can reach the floor keeps the preset honest at max zoom.
+    const r = ASPECTS[aspect];
+    const baseW = (r != null && vw && vh) ? Math.min(1, (r * vh) / vw) : 1;
+    const baseH = (r != null && vw && vh) ? Math.min(1, vw / (r * vh)) : 1;
+    zoom = Math.min(10, baseW * 10, baseH * 10, Math.max(1, zoom * f));
     applyCrop();
   }
   frame.addEventListener("wheel", (e) => {
@@ -2386,9 +2404,18 @@ function openVideoEditor(file, existing, onClose) {
     const up = () => {
       cover.removeEventListener("pointermove", move);
       cover.removeEventListener("pointerup", up);
+      cover.removeEventListener("pointercancel", cancel);
+    };
+    // mirrors dragHandle's cancel (45455ab): without it, an interrupted
+    // drag (e.g. OS gesture takeover) never removes move/up and leaks.
+    const cancel = () => {
+      cover.removeEventListener("pointermove", move);
+      cover.removeEventListener("pointerup", up);
+      cover.removeEventListener("pointercancel", cancel);
     };
     cover.addEventListener("pointermove", move);
     cover.addEventListener("pointerup", up);
+    cover.addEventListener("pointercancel", cancel);
   });
 
   // -- trim geometry: strip x-position <-> time -----------------------
@@ -2414,6 +2441,7 @@ function openVideoEditor(file, existing, onClose) {
         if (isLeft) {
           start = Math.min(t, end - 0.5);
           start = Math.max(start, end - VE_MAX_WINDOW);
+          start = Math.max(0, start);     // sub-0.5s source: end-0.5 goes negative
         } else {
           end = Math.max(t, start + 0.5);
           end = Math.min(end, start + VE_MAX_WINDOW);
@@ -2501,6 +2529,10 @@ function openVideoEditor(file, existing, onClose) {
     }
     initCrop();
     render();
+    doneB.disabled = false;   // state is real now - both happy and
+                              // degraded-rung-1 (buildThumbs still pending)
+                              // paths reach here; metadata-fail path never
+                              // needs Done, it already finished "raw" above
     vid.currentTime = start;
     vid.play();
     buildThumbs().catch(() => {
@@ -2509,6 +2541,10 @@ function openVideoEditor(file, existing, onClose) {
       // trim still works blind against the times readout; crop stays
       // disabled (can't position what you can't see). Spec 2026-07-18.
       degraded = true;
+      setAspect("orig");                     // neutralize crop too - a chip
+                                              // picked before decode failed
+                                              // must not leave a live pan/zoom
+                                              // state the user can't see to fix
       track.replaceChildren();               // drop any partial thumbs
       track.classList.add("ve-blank");
       chips.classList.add("ve-disabled");
@@ -2581,7 +2617,8 @@ async function renderStories() {
         alert("That video is longer than 15 seconds and could not be "
           + "previewed for trimming here. Please shorten it and try again.");
       else if (r.status === 413)
-        alert("That file is too large.");
+        // DRAFT copy - surface the node's own detail instead of a bare cap
+        alert("That file is too large. " + body);
       else alert("Could not post story: " + body);
     } catch (e) {
       alert("Could not post story: " + e.message);
