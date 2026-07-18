@@ -353,8 +353,18 @@ function buildEntry(p) {
   line.append(scope);
   body.append(line, el("p", "etext", p.text));
   const eth = p.thumbs || [];
+  // Journal photos (August 2026-07-18): the .epic class lets the FEED
+  // cap their height (#view-journal-scoped - the profile rail's narrow
+  // column already sizes right and keeps its look); the lightbox is the
+  // full-size view, so the cap never hides pixels for good. blobImg's
+  // pending placeholder drops the class+click - nothing to zoom yet.
+  const eitems = p.blobs.map((h) => ({m: p.msg_id, h}));
   p.blobs.forEach((h, i) => {
-    body.append(blobImg(p.msg_id, h, eth[i] || null));
+    const im = blobImg(p.msg_id, h, eth[i] || null);
+    im.classList.add("epic");
+    im.style.cursor = "zoom-in";
+    im.onclick = () => openLightbox(eitems, i, im);
+    body.append(im);
   });
   if (p.mine) {
     const acts = el("div", "eacts");

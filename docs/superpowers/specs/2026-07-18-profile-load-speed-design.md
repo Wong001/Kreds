@@ -132,3 +132,16 @@ byte count, needed only when a lightbox opens.
 DM thumbnails; retro-thumbnailing old posts; avatar/banner format
 change; blur-up transitions; chunked/streamed blob transfer; sketch
 based have-exchange (separate ROADMAP item); any visual redesign.
+
+## Addendum (approved by August, 2026-07-18): journal feed photo cap
+
+A portrait photo posted to the journal rendered at full natural height
+and ate the page (the feed rule was max-width only). Fix, riding this
+slice: journal FEED photos get `max-height: min(480px, 60vh)` with
+width free within the column (aspect preserved; landscape effectively
+unaffected). Scoped to `#view-journal` via an `.epic` class set in
+`buildEntry` - the profile journal rail (narrow column, sizing already
+right per August) is untouched, and the class scoping leaves the 0.3.13
+`.eavatar` specificity fix unchallenged. Journal photos now also open
+the shared fullscreen lightbox (full-res hash), so the cap is never the
+only view of a photo.

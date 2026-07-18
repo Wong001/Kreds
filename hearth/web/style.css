@@ -1100,3 +1100,10 @@ body.lb-open { overflow: hidden; }   /* lock background scroll behind the lightb
 .block-deck img.img-pending { min-height: 0; }
 @media (prefers-reduced-motion: reduce) {
   .img-pending { animation: none; } }
+/* Journal FEED photo cap (August 2026-07-18): height bounded, width
+   free within the column, aspect preserved - a portrait photo must not
+   eat the page. Scoped to #view-journal so the profile rail (narrow
+   column, already right) is untouched, and class-scoped (.epic, set in
+   buildEntry) rather than a bare img selector so the 0.3.13 .eavatar
+   specificity fix stays unchallenged. Click opens the lightbox. */
+#view-journal .epic { max-height: min(480px, 60vh); width: auto; }

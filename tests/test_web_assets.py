@@ -1844,3 +1844,20 @@ def test_profile_load_render_honesty():
     assert "composerDirty" in rf
     composer = _js_fn_body(js, "profilePostComposer")
     assert 'form.id = "profile-composer-form"' in composer   # the heal loop's hook
+
+
+def test_journal_photo_cap_and_lightbox():
+    # August 2026-07-18: a portrait journal photo must not eat the page -
+    # FEED-scoped height cap (the profile rail's narrow column already
+    # sizes right and stays untouched), width free within the column, and
+    # journal photos open the shared lightbox - the cap must never be the
+    # only view of a photo.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    be = _js_fn_body(js, "buildEntry")
+    assert '"epic"' in be and "openLightbox" in be
+    rule = _css_rule(css, "#view-journal .epic")
+    assert "max-height" in rule and "width: auto" in rule
+    # class-scoped, not a bare img selector: the 0.3.13 .eavatar
+    # specificity fix must stay unchallenged
+    assert "max-height" not in _css_rule(css, ".entry img")
