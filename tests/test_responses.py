@@ -132,6 +132,58 @@ def test_response_body_privacy_fields(tmp_path):
     assert resp_msg.cert.identity_pub == body["responder"]   # cert <-> body agree
 
 
+def test_alias_seed_stable_within_one_post_across_two_comments(tmp_path):
+    """Reviewer fix (whole-branch review, IMPORTANT-1): alias_seed was
+    drawn fresh via os.urandom() on every compose_response call -- per
+    RESPONSE, not per POST -- contradicting the spec/engineering-notes
+    promise that "the same stranger reads as the same alias within one
+    post's thread." identity.py's derive_alias_seed now HMACs
+    target_msg_id under a subkey of this device's signing key, so two
+    comments from the SAME responder on the SAME post must carry the
+    IDENTICAL alias_seed."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    r1 = b.compose_response(pid, "comment", "first")
+    r2 = b.compose_response(pid, "comment", "second")
+    body1 = _decrypt_response_as(a, b.store.get_message(r1))
+    body2 = _decrypt_response_as(a, b.store.get_message(r2))
+    assert body1["alias_seed"] == body2["alias_seed"]
+
+
+def test_alias_seed_differs_across_posts(tmp_path):
+    """Unlinkable across posts (the other half of the spec promise):
+    the same responder commenting on two DIFFERENT posts must get two
+    DIFFERENT alias_seeds -- derive_alias_seed keys on target_msg_id, so
+    a stranger who sees the same alias on two posts would be able to
+    link them, which is exactly what this must prevent."""
+    a, b = _befriended_pair(tmp_path)
+    p1 = a.compose_post("post one", "kreds")
+    p2 = a.compose_post("post two", "kreds")
+    _sync(a, b)
+    r1 = b.compose_response(p1, "comment", "hi")
+    r2 = b.compose_response(p2, "comment", "hi")
+    body1 = _decrypt_response_as(a, b.store.get_message(r1))
+    body2 = _decrypt_response_as(a, b.store.get_message(r2))
+    assert body1["alias_seed"] != body2["alias_seed"]
+
+
+def test_alias_seed_is_not_a_raw_key(tmp_path):
+    """Sanity check on the derivation itself: derive_alias_seed HKDFs a
+    dedicated subkey from device_priv and HMACs with THAT, never using
+    device_priv (or any other raw key) directly as the HMAC key or
+    exposing it verbatim -- the seed must not coincide with this
+    device's own public key material."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    rid = b.compose_response(pid, "comment", "hi")
+    body = _decrypt_response_as(a, b.store.get_message(rid))
+    seed = body["alias_seed"]
+    assert seed not in (b.device.device_pub, b.device.enc_pub,
+                       b.device.device_pub[:32], b.device.enc_pub[:32])
+
+
 def test_compose_response_on_own_post_wraps_to_self(tmp_path):
     """Own-post responses take the SAME code path (spec: no special
     case) -- author == responder still yields a readable, routable

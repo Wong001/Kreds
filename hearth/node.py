@@ -2239,7 +2239,19 @@ class HearthNode:
         aad = response_aad(self.identity_pub, target_msg_id, created_at)
         nonce, ct = encrypt_body(key, {
             "rkind": rkind, "body": body,
-            "alias_seed": os.urandom(16).hex(), "public": public,
+            # Deterministic per-post-per-device alias (reviewer fix,
+            # whole-branch review): identity.py's derive_alias_seed
+            # HMACs target_msg_id under an HKDF subkey of this device's
+            # signing key, so every response THIS device makes to THIS
+            # post gets the same alias_seed (the spec's "same stranger
+            # reads as the same alias within one post's thread"), while
+            # a different post yields an unlinkable seed. Previously
+            # os.urandom(16).hex() here -- fresh per RESPONSE, not per
+            # post, so two comments on the same post could render as
+            # two different aliases (see derive_alias_seed's docstring
+            # for the full derivation and the multi-device caveat).
+            "alias_seed": self.device.derive_alias_seed(target_msg_id),
+            "public": public,
             "responder": self.identity_pub, "responder_sig": responder_sig,
             "mutual_box": box, "created_at": created_at}, aad)
         wraps = wrap_key(key, author_devs, aad)

@@ -1,5 +1,9 @@
+import inspect
+import re
+
 from hearth.identity import DeviceKeys, IdentityCeremony
 from hearth.messages import make_delete, make_dm, make_enckey
+from hearth.node import HearthNode
 from hearth.store import Store
 
 
@@ -190,3 +194,34 @@ def test_unfriend_teardown_clears_undecryptable_for_purged_ids(tmp_path):
     s.unfriend_teardown(phone.identity_pub, freja.identity_pub)
 
     assert s.undecryptable_ids() == set()
+
+
+def test_uncached_message_ids_kinds_all_have_content_key_branches():
+    """Reviewer guard-test (whole-branch review, MINOR): store.py and
+    node.py both carry hand-written comments warning that
+    uncached_message_ids' kind IN-clause and node._content_key's kind
+    dispatch are "two lists [that] must be extended together" -- a kind
+    added to one without the other either starves that kind's caching
+    forever (missing from _content_key's dispatch, falls into its
+    defensive `else: return None, None`, then cache_message_keys()
+    permanently marks it undecryptable) or never gets swept at all
+    (missing from the IN-clause). This pins that invariant at the
+    source level so a future edit to either list trips a test instead
+    of silently drifting: extract the literal kind tuple out of
+    Store.uncached_message_ids' SQL call, then assert every one of
+    those kind names appears in an `== KIND_X` comparison somewhere in
+    HearthNode._content_key's source."""
+    store_src = inspect.getsource(Store.uncached_message_ids)
+    m = re.search(r'\(\s*((?:KIND_\w+\s*,?\s*)+)\)\):', store_src)
+    assert m, "could not find the kind IN(...) params tuple in source"
+    kinds = [k.strip() for k in m.group(1).split(",") if k.strip()]
+    assert kinds == ["KIND_DM", "KIND_POST", "KIND_RESPONSE",
+                     "KIND_RESPONSES"]   # sanity: parsed the right tuple
+
+    content_key_src = inspect.getsource(HearthNode._content_key)
+    for kind_name in kinds:
+        assert re.search(r"kind\s*==\s*" + re.escape(kind_name),
+                         content_key_src), (
+            f"{kind_name} is in uncached_message_ids' IN-clause but has "
+            "no matching branch in _content_key -- the two lists must "
+            "move together")

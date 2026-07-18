@@ -7,6 +7,7 @@ The naive/attack configurations exist only in hearth_d2_spike/.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -318,6 +319,49 @@ class DeviceKeys:
         if self._device_priv is None:
             raise RuntimeError("locked")
         return self._device_priv.sign(data).hex()
+
+    def derive_alias_seed(self, target_msg_id: str) -> str:
+        """Per-post-per-device engagement alias (responses spec
+        2026-07-18; reviewer fix, whole-branch review): the spec and
+        engineering-notes promise "the same stranger reads as the same
+        alias within one post's thread, unlinkable across posts," but
+        the original implementation drew alias_seed fresh via
+        os.urandom() on every compose_response call -- stable within
+        a post only by accident (never, across two comments on the
+        same post). This makes it deterministic instead: keyed on
+        target_msg_id, so every response this device makes to the SAME
+        post yields the SAME alias_seed, and every response to a
+        DIFFERENT post yields an unrelated one.
+
+        Derivation: HKDF-SHA256 over this device's raw Ed25519 signing
+        key bytes (device_priv -- device-local, never transmitted, and
+        stable for the device's lifetime) with a domain-separated info
+        string, producing a dedicated subkey that is then used as the
+        HMAC key -- never the raw private key itself keyed directly
+        into HMAC. device_priv rather than enc_priv on purpose:
+        enc_priv rotates every ENC_ROTATION_PERIOD (see rotate_enc),
+        which would silently change the alias mid-thread if a rotation
+        landed between two comments on the same post; device_priv does
+        not rotate.
+
+        Underivable by anyone else: only this device holds device_priv,
+        so no other party -- not even the author receiving the
+        response, not another of this identity's own devices -- can
+        compute this same seed without it.
+
+        Multi-device nuance (accepted trade-off, see the spec's alias
+        bullet and engineering-notes): this keys on the DEVICE, not the
+        identity. The same identity responding from two enrolled
+        devices gets two different aliases on the same post --
+        device-level stability, not identity-level."""
+        if self._device_priv is None:
+            raise RuntimeError("locked")
+        raw = self._device_priv.private_bytes(
+            Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+        subkey = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                      info=b"hearth/alias-seed/v1").derive(raw)
+        return hmac.new(subkey, target_msg_id.encode(),
+                        hashlib.sha256).hexdigest()[:32]
 
     def rotate_enc(self, now: Optional[float] = None):
         """Retire the current enc keypair and generate a fresh one.
