@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import time
 import zipfile
 from pathlib import Path
@@ -15,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import applock, invitecodec, update
+from .imagegate import is_image_bytes
 from .messages import (_is_hex_color, AVATAR_ALIGNS, AVATAR_SHAPES,
                        AVATAR_SIZES, MAX_BIO, MAX_IMAGE_UPLOAD,
                        MAX_VIDEO_UPLOAD)
@@ -364,6 +366,7 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
                    placement: str = Form("journal"),
                    photos: List[UploadFile] = File(default=[]),
                    video: UploadFile = File(default=None),
+                   video_edit: str = Form(default=""),
                    w: Optional[int] = Form(default=None),
                    h: Optional[int] = Form(default=None),
                    place: str = Form("1")):
@@ -371,12 +374,21 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         # deck grow flow's album-bound photo must not disturb the wall.
         expiry = float(expires_seconds) if expires_seconds.strip() else None
         auto_place = place != "0"
+        edit = None
+        if video_edit.strip():
+            if video is None:
+                raise HTTPException(400, "video_edit without a video")
+            try:
+                edit = json.loads(video_edit)
+            except json.JSONDecodeError:
+                raise HTTPException(400, "bad video_edit")
         if video is not None:
             vbytes = await video.read()
             if len(vbytes) > MAX_VIDEO_UPLOAD:
                 raise HTTPException(413, "video exceeds upload cap")
             mid = _400(lambda: node.compose_post(text, scope, (), expiry,
                                                  placement=placement, video=vbytes,
+                                                 video_edit=edit,
                                                  span_w=w, span_h=h,
                                                  auto_place=auto_place))
             return {"msg_id": mid}
@@ -617,11 +629,24 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         return node.stories_view()
 
     @app.post("/api/story")
-    async def story(media: UploadFile = File(...), caption: str = Form("")):
+    async def story(media: UploadFile = File(...), caption: str = Form(""),
+                    video_edit: str = Form(default="")):
         data = await media.read()
-        if len(data) > MAX_IMAGE_UPLOAD:
-            raise HTTPException(413, "media exceeds the 50 MB upload cap")
-        mid = _400(lambda: node.compose_story(data, caption))
+        # Story raw-cap fix (spec 2026-07-18): video sources get the same
+        # 100 MB headroom as wall-post video - the trimmer's whole point
+        # is a big source; the gossiped artifact stays <=5 MB regardless.
+        if is_image_bytes(data):
+            if len(data) > MAX_IMAGE_UPLOAD:
+                raise HTTPException(413, "media exceeds the 50 MB upload cap")
+        elif len(data) > MAX_VIDEO_UPLOAD:
+            raise HTTPException(413, "video exceeds the 100 MB upload cap")
+        edit = None
+        if video_edit.strip():
+            try:
+                edit = json.loads(video_edit)
+            except json.JSONDecodeError:
+                raise HTTPException(400, "bad video_edit")
+        mid = _400(lambda: node.compose_story(data, caption, video_edit=edit))
         return {"msg_id": mid}
 
     @app.get("/api/kreds")

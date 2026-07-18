@@ -24,6 +24,16 @@ from .messages import MAX_BLOB_BYTES
 AVATAR_MAX = 512
 BANNER_MAX = 1500
 
+# Image magic sniff (moved here from node.py, spec 2026-07-18): shared by
+# compose_story's photo-vs-video fork and /api/story's upload-cap choice.
+_IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8", b"GIF8", b"BM",
+                b"II*\x00", b"MM\x00*")   # PNG, JPEG, GIF, BMP, TIFF-LE/BE
+
+
+def is_image_bytes(data: bytes) -> bool:
+    return (data[:4] == b"RIFF" and data[8:12] == b"WEBP") \
+        or any(data.startswith(m) for m in _IMAGE_MAGIC)
+
 
 def transcode(data: bytes, max_dim: int) -> bytes:
     try:

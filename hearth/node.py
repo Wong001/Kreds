@@ -17,7 +17,8 @@ from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
 from .identity import (DeviceKeys, DeviceView, ENC_ROTATION_PERIOD,
                        EnrollmentCert, IdentityCeremony, PROTOCOL,
                        canonical, _sig_ok)
-from .imagegate import AVATAR_MAX, BANNER_MAX, transcode, transcode_photo
+from .imagegate import (AVATAR_MAX, BANNER_MAX, is_image_bytes, transcode,
+                        transcode_photo)
 from .videogate import STORY_IMAGE_MAX, transcode_video
 from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_ALBUM, KIND_DELETE, KIND_DM, KIND_POST,
@@ -691,15 +692,11 @@ class HearthNode:
                         "ring": ring, "since": since})
         return out
 
-    _IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8", b"GIF8", b"BM",
-                    b"II*\x00", b"MM\x00*")   # PNG, JPEG, GIF, BMP, TIFF-LE, TIFF-BE
-
     def compose_story(self, media_bytes: bytes, caption: str = "",
                      video_edit=None) -> str:
         if len(caption) > MAX_CAPTION:
             raise ValueError("caption too long")
-        is_image = (media_bytes[:4] == b"RIFF" and media_bytes[8:12] == b"WEBP") \
-            or any(media_bytes.startswith(m) for m in self._IMAGE_MAGIC)
+        is_image = is_image_bytes(media_bytes)
         if is_image:
             if video_edit is not None:
                 raise ValueError("video_edit given for an image")
