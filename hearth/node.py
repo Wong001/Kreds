@@ -28,8 +28,8 @@ from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        REACTION_TOKENS, SIZE_LAYOUTS, TEXT_STYLE_ENUMS,
                        WALL_COLS, is_expired, make_album, make_delete,
                        make_dm, make_enckey, make_post, make_profile,
-                       make_profile_layout, make_response, make_ring,
-                       make_story, make_wrap_grant)
+                       make_profile_layout, make_response, make_responses,
+                       make_ring, make_story, make_wrap_grant)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -1271,6 +1271,18 @@ class HearthNode:
     def delete_post(self, target_msg_id: str) -> str:
         if self.store.message_kind(target_msg_id) == KIND_DELETE:
             raise ValueError("cannot delete a delete tag")
+        # Responses-record cascade (Task 4): a rebuilt KIND_RESPONSES
+        # record targeting this post is orphaned content the instant the
+        # post itself is gone - tombstone it too. This has to be done
+        # explicitly here because ingest_message's existing KIND_DELETE
+        # cascade only ever walks target_id for KIND_WRAP_GRANT (the
+        # "wall is a wall" GC); it does not know about KIND_RESPONSES.
+        # Look the record up BEFORE either publish - store.responses_record
+        # only needs target_id, so it works whether the post itself has
+        # been tombstoned yet or not.
+        rec = self.store.responses_record(target_msg_id, self.identity_pub)
+        if rec is not None:
+            self._publish(make_delete(self.device, rec.msg_id))
         return self._publish(make_delete(self.device, target_msg_id))
 
     def _decrypt_post_row(self, msg, names, now, avatars=None):
@@ -1859,7 +1871,16 @@ class HearthNode:
                 if ident == self.identity_pub:
                     continue
                 friend_pubs.extend(self.store.enckeys(ident).values())
+            # device_pub required amendment (Task 4 controller finding):
+            # responder_sig is signed with sign_raw, i.e. by THIS DEVICE's
+            # key, not the identity key - a mutual verifying the box needs
+            # the signing device bound into the disclosure to check
+            # responder_sig against the right public key (identity alone
+            # is not enough; see _sig_ok's callers). Private entries keep
+            # device_pub inside the box (it is graph-identifying, so it
+            # must never ride in the open for a non-public response).
             box = seal_slots(canonical({"identity": self.identity_pub,
+                                        "device_pub": self.device.device_pub,
                                         "sig": responder_sig}), friend_pubs)
         key = new_content_key()
         aad = response_aad(self.identity_pub, target_msg_id, created_at)
@@ -1876,7 +1897,217 @@ class HearthNode:
                                           nonce, ct, wraps,
                                           created_at=created_at))
         self._cache_message_key(mid, key)
+        if author == self.identity_pub:
+            # Own-post response (Task 4): the normal path is the sweep
+            # picking this up on the next sync round/gossip tick, but
+            # reacting/commenting on your OWN post never touches sync (no
+            # peer round is involved) - without this call the record
+            # would silently sit stale until the next unrelated gossip
+            # round happens to run process_responses(). One code path
+            # (compose_response never special-cases author==responder
+            # above), just an immediate rebuild trigger here.
+            self.process_responses()
         return mid
+
+    def _response_event(self, rmsg):
+        """Decode one KIND_RESPONSE message into its fold-ready fields for
+        process_responses, or None on ANY failure. Fail-closed by
+        construction: every exit is a plain `return None`, never a raise
+        -- process_responses' caller wraps this in try/except too (belt
+        and suspenders), because a single hostile or corrupt response
+        must never be able to break the sweep for every other row on the
+        same post (the referenced_blobs lesson: one bad element must
+        never brick the whole loop)."""
+        key, aad = self._content_key(rmsg)
+        if key is None:
+            return None
+        body = decrypt_body(key, rmsg.payload["body_nonce"],
+                            rmsg.payload["body_ct"], aad)
+        if body is None:
+            return None
+        responder = rmsg.cert.identity_pub
+        # Integrity check: body["responder"] is attacker-controlled
+        # plaintext (it lives inside the encrypted body, not the signed
+        # envelope's proven fields) - rmsg.cert.identity_pub is the one
+        # fact ingest_message's Verifier actually proved. A response
+        # whose body lies about who sent it must never be attributed to
+        # the identity it claims (that identity did not write this).
+        if body.get("responder") != responder:
+            return None
+        rkind = body.get("rkind")
+        if rkind not in ("comment", "reaction", "retract"):
+            return None
+        created_at = body.get("created_at")
+        if not isinstance(created_at, (int, float)):
+            return None
+        return {
+            "responder": responder, "device_pub": rmsg.cert.device_pub,
+            "rkind": rkind, "body": body.get("body"),
+            "created_at": created_at,
+            "alias_seed": body.get("alias_seed"),
+            "public": bool(body.get("public")),
+            "responder_sig": body.get("responder_sig"),
+            "mutual_box": body.get("mutual_box"),
+        }
+
+    def process_responses(self) -> int:
+        """Author sweep (spec 2026-07-18, Task 4): rebuild the
+        KIND_RESPONSES record for every own journal post that has at
+        least one KIND_RESPONSE against it. Mirrors
+        maintain_wrap_grants' per-own-post loop shape.
+
+        Latest-wins record keying: mirrors set_album/albums()'s
+        mechanism exactly (find it, per the brief) - set_album never
+        edits or replaces an existing KIND_ALBUM message in place, it
+        just signs and publishes a brand-new one with the same
+        `album_id`; store.albums() is what folds every row down to one
+        winner per album_id, by (created_at, seq, device_pub). This
+        method does the identical thing one level up: it always
+        `make_responses`-and-publishes a FRESH KIND_RESPONSES message
+        (never mutates an old one) keyed on `target` instead of
+        `album_id`, and store.responses_record is the albums()-shaped
+        reader that folds every row for one target down to the current
+        winner. The only wrinkle is idempotence (below) - albums has no
+        analogous guard because set_album is user-triggered per edit,
+        while this sweep runs every ~3s gossip round and must not mint a
+        new record when nothing changed.
+
+        Idempotent: republishes a target only when its freshly-folded
+        entry list differs from the currently-published record's
+        (decrypted) entries - comparing against store.responses_record's
+        winner. Fail-closed per response: an undecryptable/hostile
+        KIND_RESPONSE is skipped (logged), never allowed to raise out of
+        the loop and abort the rest of the sweep - and the same guard
+        wraps each POST's rebuild-and-publish too, so one broken post
+        can't stop the others from getting rebuilt this round.
+
+        Returns the count of targets actually republished this call."""
+        if self.revoked or self.locked or self.device.identity_pub is None:
+            return 0
+        rebuilt = 0
+        for msg in self.store.post_messages(self.identity_pub):
+            p = msg.payload
+            if p.get("placement", "journal") != "journal":
+                continue
+            target = msg.msg_id
+            raw = self.store.responses_by_target(target)
+            if not raw:
+                continue
+            try:
+                if self._rebuild_responses_record(target, p, raw):
+                    rebuilt += 1
+            except Exception:
+                logger.warning(
+                    "process_responses: skipping target %s this round"
+                    " (rebuild failed)", target, exc_info=True)
+        return rebuilt
+
+    def _rebuild_responses_record(self, target: str, post_payload: dict,
+                                  raw_responses) -> bool:
+        events = []
+        for rmsg in raw_responses:
+            try:
+                ev = self._response_event(rmsg)
+            except Exception:
+                ev = None
+                logger.warning(
+                    "process_responses: skipping undecryptable/hostile"
+                    " response %s on target %s", rmsg.msg_id, target,
+                    exc_info=True)
+            if ev is not None:
+                events.append(ev)
+        if not events:
+            return False
+
+        # Retractions name the (responder, created_at) of the entry they
+        # withdraw - body carries created_at AS A STRING (the responder's
+        # client controls the exact text, e.g. str(their_own_float)), so
+        # match on the string form of our own created_at too rather than
+        # risking a float-vs-string type mismatch.
+        retracted = {(ev["responder"], str(ev["body"]))
+                     for ev in events if ev["rkind"] == "retract"}
+        removed = self.store.removed_response_keys(target)
+
+        comments = []
+        reactions: dict = {}     # responder -> winning event so far
+        for ev in events:         # ascending created_at (responses_by_target)
+            if ev["rkind"] == "retract":
+                continue
+            if (ev["responder"], str(ev["created_at"])) in retracted:
+                continue          # this entry was retracted by its own author
+            if (ev["responder"], ev["created_at"]) in removed:
+                continue          # this entry was moderated away by the author
+            if ev["rkind"] == "reaction":
+                if ev["body"] == "clear":
+                    reactions.pop(ev["responder"], None)
+                else:
+                    reactions[ev["responder"]] = ev   # latest-wins per responder
+            else:                                      # comment
+                comments.append(ev)
+
+        entries = []
+        for ev in comments + list(reactions.values()):
+            entry = {"rkind": ev["rkind"], "body": ev["body"],
+                     "created_at": ev["created_at"],
+                     "alias_seed": ev["alias_seed"], "public": ev["public"],
+                     "responder_sig": ev["responder_sig"],
+                     "mutual_box": ev["mutual_box"]}
+            if ev["public"]:
+                # Amendment (Task 4 controller finding): public entries
+                # carry device_pub openly alongside identity - private
+                # entries keep it sealed inside mutual_box instead (see
+                # compose_response's box-payload comment for why it's
+                # needed at all: responder_sig is device-signed).
+                entry["identity"] = ev["responder"]
+                entry["device_pub"] = ev["device_pub"]
+            entries.append(entry)
+
+        prior = self.store.responses_record(target, self.identity_pub)
+        prior_entries = None
+        if prior is not None:
+            try:
+                key, aad = self._content_key(prior)
+                prior_body = (decrypt_body(key, prior.payload["body_nonce"],
+                                           prior.payload["body_ct"], aad)
+                             if key is not None else None)
+                prior_entries = (prior_body.get("entries")
+                                 if prior_body is not None else None)
+            except Exception:
+                prior_entries = None       # unreadable prior row: treat as changed
+        if prior_entries == entries:
+            return False                   # no change: idempotent, do not republish
+
+        pubs = self._scope_device_pubs(post_payload.get("scope", "kreds"))
+        rec_created = time.time()
+        rec_key = new_content_key()
+        rec_aad = responses_aad(self.identity_pub, target, rec_created)
+        nonce, ct = encrypt_body(rec_key, {"entries": entries}, rec_aad)
+        wraps = wrap_key(rec_key, pubs, rec_aad)
+        mid = self._publish(make_responses(
+            self.device, target, nonce, ct, wraps,
+            expires_at=post_payload.get("expires_at"),
+            created_at=rec_created))
+        self._cache_message_key(mid, rec_key)
+        return True
+
+    def remove_response(self, post_id: str, responder_identity: str,
+                        created_at) -> str:
+        """Author moderation (Task 4): drop the (post_id, responder,
+        created_at) entry from the rebuilt record forever, then
+        rebuild+republish immediately (the moderation UI expects the
+        section to reflect the removal right away, not on the next
+        gossip round). NOT a message tombstone - see
+        store.mark_response_removed's docstring for why the original
+        response is left untouched (compliant-client honesty, same
+        stance as retraction). Returns the current KIND_RESPONSES
+        record's own msg_id (the freshly-republished one in the normal
+        case) - falls back to post_id only if no record exists at all
+        (e.g. the post never had any responses to begin with)."""
+        self.store.mark_response_removed(post_id, responder_identity,
+                                         float(created_at))
+        self.process_responses()
+        rec = self.store.responses_record(post_id, self.identity_pub)
+        return rec.msg_id if rec is not None else post_id
 
     def _cache_message_key(self, msg_id: str, key: bytes):
         if self.device.storage_key is None:
@@ -1914,6 +2145,17 @@ class HearthNode:
             # `else: # post` that KeyError'd on p["scope"] for every
             # KIND_RESPONSE row once uncached_message_ids started
             # including them).
+            #
+            # Cross-reference (Task 4): the inverse mistake is just as
+            # real -- adding a kind to store.uncached_message_ids' scan
+            # without adding a matching branch HERE means this `else`
+            # fires for it, returns (None, None), and
+            # cache_message_keys() turns that straight into
+            # mark_undecryptable() -- which then permanently excludes the
+            # id from every future sweep, forever, even though the key
+            # material may have been perfectly recoverable. The two lists
+            # must be extended together (see uncached_message_ids' own
+            # note).
             return None, None
         # 1) local cache: survives enc-key rotation and grace deletion
         sealed = self.store.cached_message_key(msg.msg_id)

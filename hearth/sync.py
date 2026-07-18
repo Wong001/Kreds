@@ -272,6 +272,15 @@ class SyncService:
             self.node.notify()
         self.node.store.prune_superseded_enckeys()
         self.node.store.prune_superseded_wrap_grants()
+        # Author sweep (Task 4, reactions/comments): rebuild+republish the
+        # KIND_RESPONSES record for every own journal post a fresh
+        # KIND_RESPONSE landed against this round. Unguarded like its two
+        # neighbors above (none of the three has its own try/except) -
+        # this whole round is already wrapped by gossip_loop's own
+        # try/except, and process_responses is itself fail-closed per
+        # response internally (a hostile/undecryptable row is skipped,
+        # logged, never raised).
+        self.node.process_responses()
         self.node.cache_message_keys()
 
     async def gossip_loop(self, interval: float = 3.0, now=None):

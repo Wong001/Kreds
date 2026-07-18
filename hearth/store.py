@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS disconnected(
   identity_pub TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS undecryptable(
   msg_id TEXT PRIMARY KEY, since REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS removed_responses(
+  target TEXT NOT NULL, responder TEXT NOT NULL, created_at REAL NOT NULL,
+  PRIMARY KEY(target, responder, created_at));
 """
 
 
@@ -274,8 +277,20 @@ class Store:
             self.save_views(identity, views, commit=False)
 
             kind = msg.payload["kind"]
+            # KIND_RESPONSE/KIND_RESPONSES join the target_id-keyed kinds
+            # here (Task 4, responses record): both carry a `target` (the
+            # post msg_id) and are looked up BY target constantly
+            # (responses_by_target/responses_record) -- storing it in the
+            # indexed column (idx_delete_guard already covers
+            # (kind, target_id, identity_pub)) means those reads hit the
+            # index wrap_grants() already relies on instead of a table
+            # scan filtered in Python. No other branch below reads
+            # `target` except the KIND_WRAP_GRANT-specific tombstone
+            # check, so widening this tuple is side-effect-free for
+            # every other kind.
             target = (msg.payload.get("target")
-                      if kind in (KIND_DELETE, KIND_WRAP_GRANT) else None)
+                      if kind in (KIND_DELETE, KIND_WRAP_GRANT,
+                                 KIND_RESPONSE, KIND_RESPONSES) else None)
             recipient = (msg.payload.get("to")
                          if kind == KIND_DM else None)
             deleted_target = None
@@ -569,6 +584,70 @@ class Store:
                     best_key[aid] = key
             return best
 
+    def responses_by_target(self, target: str) -> List[SignedMessage]:
+        """Every KIND_RESPONSE row addressed at this target (an own
+        journal post), oldest-first with a local-arrival tie-break
+        (rowid) -- same determinism precedent as post_messages/
+        dm_thread's created_at/rowid ordering. node.process_responses
+        folds these into the rebuilt record. target_id is populated for
+        this kind at ingest (see ingest_message) so this query hits the
+        existing (kind, target_id, identity_pub) index
+        (idx_delete_guard) instead of a full table scan filtered in
+        Python -- the same index wrap_grants() already relies on."""
+        with self._lock:
+            return [SignedMessage.from_dict(json.loads(mj)) for (mj,) in
+                    self._db.execute(
+                        "SELECT msg_json FROM messages WHERE kind=?"
+                        " AND target_id=? ORDER BY created_at ASC, rowid ASC",
+                        (KIND_RESPONSE, target))]
+
+    def responses_record(self, target: str,
+                         author_identity: str) -> Optional[SignedMessage]:
+        """Latest-wins KIND_RESPONSES message for (author_identity,
+        target) -- mirrors albums()'s (created_at, seq, device_pub)
+        latest-wins keying exactly, just scoped on `target` instead of
+        `album_id`. Every node.process_responses republish mints a
+        BRAND-NEW signed message (same pattern as set_album minting a
+        fresh make_album row per change, never an in-place mutation of
+        an existing one) -- this reader is what resolves the current
+        winner among however many rows exist for this target, the same
+        role albums() plays for KIND_ALBUM."""
+        with self._lock:
+            best, best_key = None, None
+            for seq, dpub, mj in self._db.execute(
+                    "SELECT seq, device_pub, msg_json FROM messages"
+                    " WHERE kind=? AND target_id=? AND identity_pub=?",
+                    (KIND_RESPONSES, target, author_identity)):
+                p = json.loads(mj)["payload"]
+                key = (p["created_at"], seq, dpub)
+                if best is None or key > best_key:
+                    best = SignedMessage.from_dict(json.loads(mj))
+                    best_key = key
+            return best
+
+    def mark_response_removed(self, target: str, responder: str,
+                              created_at: float):
+        """Author-local moderation tombstone (node.remove_response): this
+        (target, responder, created_at) entry is dropped from every
+        future process_responses fold. NOT a message tombstone -- the
+        original KIND_RESPONSE is left completely alone (compliant-
+        client honesty, same stance as retraction: the responder's own
+        copy is unaffected), only the author's own rebuilt record omits
+        it from here on."""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO removed_responses VALUES(?,?,?)",
+                (target, responder, created_at))
+            self._db.commit()
+
+    def removed_response_keys(self, target: str) -> Set[Tuple[str, float]]:
+        """{(responder, created_at)} moderated away for this target by
+        this node's own remove_response calls."""
+        with self._lock:
+            return {(r, c) for r, c in self._db.execute(
+                "SELECT responder, created_at FROM removed_responses"
+                " WHERE target=?", (target,))}
+
     def messages_not_in(self, summaries: dict, entitled: Set[str],
                         peer_identity: str) -> List[SignedMessage]:
         with self._lock:
@@ -772,7 +851,17 @@ class Store:
         keys); KIND_RESPONSE/KIND_RESPONSES ride the same "post-like"
         branch below as KIND_POST (wraps-only, no separate recipient
         field) -- the wrap_grants() union is a harmless no-op for them
-        (nothing ever mints a wrap_grant targeting a response)."""
+        (nothing ever mints a wrap_grant targeting a response).
+
+        Reviewer cross-reference: adding a kind to this scan's IN(...)
+        list without a matching branch in node._content_key silently
+        marks every one of that kind's messages undecryptable forever --
+        _content_key's defensive final `else` returns (None, None) for
+        any kind it does not recognize, and cache_message_keys()
+        (the only caller of this method) turns that None straight into
+        mark_undecryptable(), which then permanently excludes the id from
+        every future sweep (see _content_key's own note at that `else`).
+        The two lists must be extended together."""
         with self._lock:
             out = []
             for mid, kind, ipub, rcpt, mj in self._db.execute(
@@ -1030,7 +1119,8 @@ class Store:
         with self._lock:
             for table in ("meta", "identities", "device_views", "messages",
                           "tombstones", "blobs", "peers", "dm_keys",
-                          "defriend_outbox", "disconnected", "undecryptable"):
+                          "defriend_outbox", "disconnected", "undecryptable",
+                          "removed_responses"):
                 self._db.execute(f"DELETE FROM {table}")
             self._db.commit()
 

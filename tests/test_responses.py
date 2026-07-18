@@ -185,3 +185,92 @@ def test_content_key_unknown_kind_is_defensive_not_fatal(tmp_path):
         payload={"kind": "mystery", "created_at": 1.0},
         msg_id="ff" * 32, cert=None)
     assert a._content_key(fake) == (None, None)
+
+
+# -- Task 4: author sweep + responses record ---------------------------------
+#
+# _responses_record / _decrypt_record_as: the KIND_RESPONSES analogue of
+# this file's own _decrypt_response_as -- _content_key already handles
+# BOTH KIND_RESPONSE and KIND_RESPONSES (commit 84d8155), so unlike
+# _decrypt_response_as (written before that landed, and left alone here
+# since it still passes and touching it is out of this task's scope)
+# these helpers can just call it directly.
+
+def _responses_record(node, target):
+    """The current (latest-wins) KIND_RESPONSES SignedMessage node holds
+    for `target`, authored by node itself -- store.responses_record's
+    keying (see hearth/store.py) mirrors albums()'s latest-wins fold,
+    just scoped on `target` instead of `album_id`."""
+    return node.store.responses_record(target, node.identity_pub)
+
+
+def _decrypt_record_as(node, msg):
+    key, aad = node._content_key(msg)
+    if key is None:
+        return None
+    return decrypt_body(key, msg.payload["body_nonce"],
+                        msg.payload["body_ct"], aad)
+
+
+def test_author_sweep_republishes_record(tmp_path):
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    b.compose_response(pid, "comment", "fin kommentar")
+    b.compose_response(pid, "reaction", "fire")
+    _sync(b, a)                    # response reaches A; A's sweep runs in-sync-hook
+    a.process_responses()          # idempotent double-call must be safe
+    rec = _responses_record(a, pid)          # helper: find KIND_RESPONSES by target
+    body = _decrypt_record_as(a, rec)
+    kinds = sorted(e["rkind"] for e in body["entries"])
+    assert kinds == ["comment", "reaction"]
+    assert all("identity" not in e for e in body["entries"])   # private default
+
+
+def test_reaction_latest_wins_and_clear(tmp_path):
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    b.compose_response(pid, "reaction", "heart")
+    _sync(b, a); a.process_responses()
+    b.compose_response(pid, "reaction", "laugh")
+    _sync(b, a); a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    reactions = [e for e in body["entries"] if e["rkind"] == "reaction"]
+    assert len(reactions) == 1 and reactions[0]["body"] == "laugh"
+    b.compose_response(pid, "reaction", "clear")
+    _sync(b, a); a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert not [e for e in body["entries"] if e["rkind"] == "reaction"]
+
+
+def test_retract_and_moderation(tmp_path):
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    b.compose_response(pid, "comment", "first")
+    b.compose_response(pid, "comment", "second")
+    _sync(b, a); a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    first = [e for e in body["entries"] if e["body"] == "first"][0]
+    # responder retracts their own first comment
+    b.compose_response(pid, "retract", str(first["created_at"]))
+    _sync(b, a); a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert [e["body"] for e in body["entries"]] == ["second"]
+    # author moderates the second away
+    a.remove_response(pid, b.identity_pub, [e for e in body["entries"]][0]["created_at"])
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert body["entries"] == []
+
+
+def test_post_delete_tombstones_record(tmp_path):
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    b.compose_response(pid, "comment", "hej")
+    _sync(b, a); a.process_responses()
+    rec = _responses_record(a, pid)
+    a.delete_post(pid)
+    assert _responses_record(a, pid) is None or \
+        a.store.get_message(rec.msg_id) is None
