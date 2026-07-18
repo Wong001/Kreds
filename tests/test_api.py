@@ -56,6 +56,23 @@ def test_unknown_blob_404(tmp_path):
     assert c.get("/api/blob/" + "ab" * 32).status_code == 404
 
 
+def test_blob_endpoints_are_cached_immutable(tmp_path):
+    """MINOR (whole-branch review): content-addressed bytes never change
+    under the same hash - cache them, or the heal loop's per-tick profile
+    re-render refetches every visible tile for nothing."""
+    c, _ = client(tmp_path)
+    gif = animated_gif_bytes()
+    r = c.post("/api/post",
+               data={"text": "", "scope": "kreds", "expires_seconds": ""},
+               files=[("photos", ("p.gif", gif, "image/gif"))])
+    mid = r.json()["msg_id"]
+    h = c.get("/api/feed").json()[0]["blobs"][0]
+    for resp in (c.get(f"/api/post-blob/{mid}/{h}"), c.get(f"/api/blob/{h}")):
+        assert resp.headers["cache-control"] == \
+            "private, max-age=31536000, immutable"
+        assert resp.headers["x-content-type-options"] == "nosniff"
+
+
 def test_ws_notified_on_post(tmp_path):
     c, _ = client(tmp_path)
     with c.websocket_connect("/ws") as ws:

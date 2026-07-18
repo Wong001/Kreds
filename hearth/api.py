@@ -485,8 +485,12 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         data = node.post_blob(msg_id, h)
         if data is None:
             raise HTTPException(404, "not found")
+        # MINOR (whole-branch review): content-addressed bytes never change
+        # under the same hash -- cache them, or the heal loop's per-tick
+        # re-render refetches every visible tile for nothing.
         return Response(content=data, media_type=_sniff(data),
-                        headers={"X-Content-Type-Options": "nosniff"})
+                        headers={"X-Content-Type-Options": "nosniff",
+                                 "Cache-Control": "private, max-age=31536000, immutable"})
 
     @app.post("/api/delete")
     async def delete(body: dict = Body(...)):
@@ -544,8 +548,11 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         data = node.store.get_blob(h)
         if data is None:
             raise HTTPException(404, "unknown blob")
+        # MINOR (whole-branch review): same immutable-content-address
+        # reasoning as /api/post-blob above.
         return Response(content=data, media_type=_sniff(data),
-                        headers={"X-Content-Type-Options": "nosniff"})
+                        headers={"X-Content-Type-Options": "nosniff",
+                                 "Cache-Control": "private, max-age=31536000, immutable"})
 
     @app.post("/api/friend/invite")
     async def friend_invite():

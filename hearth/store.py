@@ -1084,10 +1084,23 @@ class Store:
         with self._lock:
             if not hashes:
                 return {}
-            qs = ",".join("?" for _ in hashes)
-            return {h: n for (h, n) in self._db.execute(
-                f"SELECT hash, LENGTH(data) FROM blobs WHERE hash IN ({qs})",
-                list(hashes))}
+            # CRITICAL (whole-branch review): `hashes` is a PEER'S want-list
+            # (sync.py's BLOBS phase), unbounded and untrusted -- a hostile
+            # post with tens of thousands of hex64 refs would build a single
+            # IN(...) with one bound variable per hash, past SQLite's
+            # per-statement variable cap (999 on older builds, 32766 on
+            # modern ones) and raise, killing the session for every honest
+            # peer at the blobs phase. Chunk instead: a hostile-length want
+            # list degrades to a few slow round trips, never an exception.
+            out = {}
+            hashes = list(hashes)
+            for i in range(0, len(hashes), 900):
+                batch = hashes[i:i + 900]
+                qs = ",".join("?" for _ in batch)
+                out.update(self._db.execute(
+                    f"SELECT hash, LENGTH(data) FROM blobs WHERE hash IN ({qs})",
+                    batch))
+            return out
 
     def gc_blobs(self) -> int:
         with self._lock:
