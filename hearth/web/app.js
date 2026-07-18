@@ -2329,8 +2329,9 @@ function openVideoEditor(file, existing, onClose) {
     const baseW = Math.min(1, (ASPECTS[best] * vh) / vw);
     const baseH = Math.min(1, vw / (ASPECTS[best] * vh));
     // same per-axis cap as zoomBy - a stored rect from a since-changed
-    // zoom ceiling must not recover a zoom that would distort the aspect
-    zoom = Math.min(10, baseW * 10, baseH * 10, Math.max(1, baseW / c.w));
+    // zoom ceiling must not recover a zoom that would distort the aspect.
+    // Math.max(1, ...) stays OUTSIDE the cap, same reason as zoomBy.
+    zoom = Math.max(1, Math.min(10, baseW * 10, baseH * 10, baseW / c.w));
     if (!Number.isFinite(zoom)) zoom = 1;
     cx = c.x + c.w / 2; cy = c.y + c.h / 2;
   }
@@ -2376,7 +2377,11 @@ function openVideoEditor(file, existing, onClose) {
     const r = ASPECTS[aspect];
     const baseW = (r != null && vw && vh) ? Math.min(1, (r * vh) / vw) : 1;
     const baseH = (r != null && vw && vh) ? Math.min(1, vw / (r * vh)) : 1;
-    zoom = Math.min(10, baseW * 10, baseH * 10, Math.max(1, zoom * f));
+    // Math.max(1, ...) OUTSIDE the cap: an extreme-aspect source can put
+    // baseW*10 or baseH*10 below 1, and clamping zoom below 1 there would
+    // let the OTHER axis inflate past the frame - cropRect would then emit
+    // an out-of-bounds rect and Done's node-side validate would 400.
+    zoom = Math.max(1, Math.min(10, baseW * 10, baseH * 10, zoom * f));
     applyCrop();
   }
   frame.addEventListener("wheel", (e) => {

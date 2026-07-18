@@ -1743,8 +1743,9 @@ def test_video_editor_crop_and_cover_wired():
     assert "pointers.size === 2" in ve or "pointers.length === 2" in ve
     assert ".ve-cover" in css and ".ve-chip" in css
     # cover drag tears down on pointercancel too (45455ab pattern), same as
-    # both trim handles - a bare count catches a missing listener on any one
-    assert ve.count("pointercancel") >= 3   # dragHandle x2 + cover
+    # both trim handles - the specific listener, not a bare count (the body
+    # already had 4 pointercancel occurrences via dragHandle before this fix)
+    assert 'cover.addEventListener("pointercancel"' in ve
 
 
 def test_video_editor_composer_integration():
