@@ -199,6 +199,17 @@ class HearthNode:
         self.subscribers: set = set()
         self._pending_invites = {}
         self._pending_responses = {}
+        # compose_response's per-instance monotonic clock (controller-
+        # reported flake, 2026-07-18): Windows' time.time() granularity is
+        # ~15.6ms, so two rapid compose_response calls (e.g. two comments
+        # sent back-to-back) can land in the SAME tick and get an
+        # identical created_at. created_at is the key retract/moderation/
+        # reaction-fold all match entries by within one responder, so a
+        # same-tick collision made a retract naming one comment's
+        # created_at silently also remove a different comment that
+        # happened to share it. See compose_response for the bump logic;
+        # 0.0 here just means "no response composed yet this process".
+        self._last_response_ts = 0.0
         # Set by SyncService.__init__ to its own _sync_session(address)
         # bound method: the same outbound-session dialer sync_with wraps
         # for the gossip loop, but returning (success, peer_identity,
@@ -2171,7 +2182,28 @@ class HearthNode:
             author_devs[self.device.device_pub] = self.device.enc_pub
         if not author_devs:
             raise ValueError("no reachable devices for the author")
+        # Strictly-increasing per-instance clock (controller-reported
+        # flake, 2026-07-18): Windows' time.time() granularity is
+        # ~15.6ms, so two compose_response calls fired back-to-back (two
+        # comments, or a comment then its own retract) can land in the
+        # SAME tick and get an identical created_at. created_at is what
+        # retract/moderation/reaction-fold all key entries by WITHIN one
+        # responder (see _rebuild_responses_record), so a same-tick
+        # collision made retracting one comment silently also remove a
+        # different comment from the SAME responder that happened to
+        # land on the same timestamp. Per-device monotonicity is
+        # sufficient -- collisions only matter within one responder, and
+        # every responder's own comments/reactions/retracts all go
+        # through this one method on this one device instance. This does
+        # NOT persist across a restart (_last_response_ts resets to 0.0
+        # in __init__) -- a same-tick collision surviving a process
+        # restart is not a realistic shape (the restart itself takes far
+        # longer than one clock tick), so that residual gap is accepted
+        # rather than adding on-disk state for it.
         created_at = time.time()
+        if created_at <= self._last_response_ts:
+            created_at = self._last_response_ts + 1e-6
+        self._last_response_ts = created_at
         public = self.store.get_meta("public_engagement") == "1"
         sig_payload = canonical({"target": target_msg_id, "rkind": rkind,
                                  "body": body, "created_at": created_at,

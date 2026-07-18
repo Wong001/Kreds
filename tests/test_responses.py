@@ -281,6 +281,41 @@ def test_retract_and_moderation(tmp_path):
     assert body["entries"] == []
 
 
+def test_compose_response_created_at_strictly_increasing_same_tick(
+        tmp_path, monkeypatch):
+    """Controller-reported flake (2026-07-18): Windows' time.time()
+    granularity is ~15.6ms, so two compose_response calls fired
+    back-to-back (e.g. two comments) can land in the exact same tick and
+    get an identical created_at. created_at is what retract/moderation/
+    reaction-fold key entries by within one responder
+    (_rebuild_responses_record), so a same-tick collision made
+    retracting one comment silently wipe a DIFFERENT comment from the
+    same responder that happened to share the timestamp --
+    test_retract_and_moderation flaked exactly this way (controller
+    reproduced fail-then-pass on the same commit). Pins the fix directly
+    with a constant clock: created_at must still come out
+    strictly-increasing, and the retract flow (the exact flake scenario)
+    must come out deterministic."""
+    a, b = _befriended_pair(tmp_path)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    monkeypatch.setattr("hearth.node.time.time", lambda: 1_700_000_000.0)
+    r1 = b.compose_response(pid, "comment", "first")
+    r2 = b.compose_response(pid, "comment", "second")
+    ca1 = b.store.get_message(r1).payload["created_at"]
+    ca2 = b.store.get_message(r2).payload["created_at"]
+    assert ca1 != ca2
+    assert ca2 > ca1          # strictly increasing, not just "different"
+
+    _sync(b, a); a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    first = [e for e in body["entries"] if e["body"] == "first"][0]
+    b.compose_response(pid, "retract", str(first["created_at"]))
+    _sync(b, a); a.process_responses()
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert [e["body"] for e in body["entries"]] == ["second"]
+
+
 def test_post_delete_tombstones_record(tmp_path):
     a, b = _befriended_pair(tmp_path)
     pid = a.compose_post("post", "kreds")
