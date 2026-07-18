@@ -30,6 +30,15 @@ let CURRENT_PROFILE = null;   // identity of the profile page currently shown
 let CURRENT_PROFILE_ACCENT = null;
 let ARRANGING = false;        // self-only Wall Arrange mode (Up/Down controls shown)
 let BLOCK_SETTINGS_OPENER = null;   // #5: element to return focus to when the block-settings modal closes
+// Whole-branch review IMPORTANT #3: a heal/action re-render used to always
+// snap every deck back to photo 0 and re-collapse the mobile journal rail -
+// jarring mid-browse. DECK_POS survives re-renders of the SAME profile;
+// LAST_RENDERED_PROFILE (set only in renderProfilePage, so it also covers
+// openBlockSettings' reopenAfterAction re-render, not just openProfile) is
+// the one signal both fixes gate on: a genuine person-switch prunes/resets,
+// a same-person re-render (heal, block-settings action, Arrange toggle) does not.
+const DECK_POS = new Map();   // msg_id/album_id -> last flipped-to index
+let LAST_RENDERED_PROFILE = null;
 let NEEDS_WIZARD = false;   // set by boot() when onboarding_done is false; Task 3's bootData() consumes it
 let UPDATE_BANNER_DISMISSED = false;   // session-only; returns next status push (Task 2, 0.3.15)
 let LAST_SEEN_UPDATE_VERSION = null;   // re-nudge when update_status.version changes past a dismiss
@@ -381,7 +390,17 @@ function blobImg(msgId, hash, thumbHash) {
   const img = document.createElement("img");
   img.src = "/api/post-blob/" + msgId + "/" + (thumbHash || hash);
   img.alt = "";
+  // IMPORTANT #4 (whole-branch review): a thumb can 404 (still gossiping
+  // in) while the full blob already synced, or vice versa - one retry on
+  // the OTHER hash before giving up, instead of placeholdering on the
+  // thumb's failure alone.
+  let retriedFull = false;
   img.onerror = () => {
+    if (thumbHash && !retriedFull) {
+      retriedFull = true;
+      img.src = "/api/post-blob/" + msgId + "/" + hash;
+      return;
+    }
     const ph = el("div", "img-pending");
     ph.setAttribute("aria-hidden", "true");
     img.replaceWith(ph);
@@ -409,7 +428,11 @@ function blockPhotoItems(p) {
 // any size.
 function renderDeck(p, items) {
   const deck = el("div", "block-deck");
-  let i = 0;
+  // IMPORTANT-3 (whole-branch review): resume wherever this deck was last
+  // flipped to across a same-person re-render (heal/block-settings/Arrange
+  // toggle - see DECK_POS at top), clamped in case the item count shrank
+  // (e.g. an album lost a member).
+  let i = Math.min(DECK_POS.get(p.msg_id) || 0, items.length - 1);
   const img = document.createElement("img");
   img.alt = ""; img.draggable = false; img.style.cursor = "zoom-in";
   img.tabIndex = -1;
@@ -422,7 +445,18 @@ function renderDeck(p, items) {
   // look) on error, and clear the flag on the next successful load (a
   // flip to a synced photo, or the WS-retry re-render building a fresh
   // deck/img anyway) - never a broken glyph, never a swapped-out element.
-  img.onerror = () => img.classList.add("img-pending");
+  // IMPORTANT #4: one retry on the full hash before pending (same reasoning
+  // as blobImg) - `retriedFull` resets every show() so each photo shown
+  // gets its own single retry.
+  let retriedFull = false;
+  img.onerror = () => {
+    if (items[i].t && !retriedFull) {
+      retriedFull = true;
+      img.src = "/api/post-blob/" + items[i].m + "/" + items[i].h;
+      return;
+    }
+    img.classList.add("img-pending");
+  };
   img.onload = () => img.classList.remove("img-pending");
   // dots are position-only chrome - the zone buttons + lightbox carry
   // the accessible semantics, so the row is aria-hidden.
@@ -441,6 +475,8 @@ function renderDeck(p, items) {
   next.type = "button";
   next.setAttribute("aria-label", "Next photo");
   const show = () => {
+    retriedFull = false;
+    DECK_POS.set(p.msg_id, i);   // IMPORTANT-3: remember the flip across re-renders
     img.src = "/api/post-blob/" + items[i].m + "/" + (items[i].t || items[i].h);
     [...dots.children].forEach((d, k) =>
       d.classList.toggle("active", k === i));
@@ -1827,6 +1863,14 @@ function measureWallCell() {
 window.addEventListener("resize", measureWallCell);
 
 function renderProfilePage(p) {
+  // IMPORTANT-3 (whole-branch review): a re-render of the SAME person (heal,
+  // an openBlockSettings reopenAfterAction, the Arrange toggle) must not
+  // reset deck flips or re-collapse the mobile journal rail - only an
+  // actual person-switch does. LAST_RENDERED_PROFILE is set only here so it
+  // covers every renderProfilePage call site, not just openProfile's.
+  const samePerson = p.identity_pub === LAST_RENDERED_PROFILE;
+  if (!samePerson) DECK_POS.clear();   // a new person's decks start fresh, never at A's flip position
+  LAST_RENDERED_PROFILE = p.identity_pub;
   const color = p.accent || identityColor(p.identity_pub);   // owner's chosen accent for all viewers
   CURRENT_PROFILE_ACCENT = color;   // renderWall -> renderBlock reads this for text-style color:"accent"
   const page = document.getElementById("profile-page");
@@ -1928,9 +1972,13 @@ function renderProfilePage(p) {
   const rail = document.getElementById("profile-journal-rail");
   rail.replaceChildren();
   // Reset the mobile disclosure per profile so B's rail isn't pre-expanded
-  // just because A's was opened.
-  rail.classList.remove("open");
-  document.getElementById("profile-journal-toggle").setAttribute("aria-expanded", "false");
+  // just because A's was opened - but NOT on a same-person re-render
+  // (IMPORTANT-3): a heal tick mid-scroll must not collapse a rail the
+  // visitor just opened on THIS profile.
+  if (!samePerson) {
+    rail.classList.remove("open");
+    document.getElementById("profile-journal-toggle").setAttribute("aria-expanded", "false");
+  }
   if (!p.journal.length) rail.append(el("div", "hint", "No journal posts here."));
   for (const post of p.journal) rail.append(buildEntry(post));
 }
@@ -1969,6 +2017,10 @@ wireSettingsSections();
 // exists on the self profile page, and posts with placement=profile.
 function profilePostComposer() {
   const form = el("form", "composer profile-composer");
+  // Stable hook (CRITICAL #1, whole-branch review): refresh()'s heal loop
+  // needs to find THIS composer instance from outside to check dirtiness
+  // before tearing it down mid-draft.
+  form.id = "profile-composer-form";
   const input = document.createElement("input");
   input.type = "text"; input.autocomplete = "off";
   input.placeholder = "Post to your profile…";
@@ -4232,8 +4284,22 @@ async function refresh() {
   // Guards: never re-render mid-Arrange (tears the drag surface from
   // under the pointer) or under the block-settings modal (it holds a
   // reference to its block element). Next tick heals after they close.
+  // CRITICAL #1 (whole-branch review): also never re-render while the
+  // video-editor overlay is open (its onClose closure writes into THIS
+  // composer instance - a re-render swaps in a fresh one, orphaning the
+  // edit) or while the profile composer has an unsaved draft (text typed,
+  // a photo/video picked, or focus still inside it) - a heal tick must not
+  // silently discard what someone is mid-way through writing/attaching.
+  const composerForm = document.getElementById("profile-composer-form");
+  const composerDirty = !!composerForm && (
+    composerForm.querySelector("input[type=text]").value !== ""
+    || [...composerForm.querySelectorAll("input[type=file]")]
+      .some(f => f.files.length > 0)
+    || composerForm.contains(document.activeElement));
   if (currentView() === "profile" && CURRENT_PROFILE && !ARRANGING
-      && document.getElementById("block-settings").classList.contains("hidden"))
+      && document.getElementById("block-settings").classList.contains("hidden")
+      && !document.getElementById("video-editor")
+      && !composerDirty)
     openProfile(CURRENT_PROFILE);
   // Conversations are fetched EVERY cycle now (not just with Messages
   // open): the nav badge lives outside that view. One fetch feeds both

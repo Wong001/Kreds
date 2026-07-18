@@ -1776,6 +1776,10 @@ def test_profile_load_render_honesty():
     assert "function blobImg(" in js
     bi = _js_fn_body(js, "blobImg")
     assert "img-pending" in bi and "onerror" in bi
+    # Review fix (IMPORTANT #4): a thumb 404 retries the FULL hash once
+    # before placeholdering, instead of placeholdering on the thumb's
+    # failure alone.
+    assert "retriedFull" in bi
     assert ".img-pending" in css
     # Review fix (Critical): .img-pending's shared min-height: 120px bleeds
     # past a sub-120px mobile deck cell - .block.has-deck is the one
@@ -1796,8 +1800,24 @@ def test_profile_load_render_honesty():
     # the flag on the next successful load (a flip, or the WS-retry
     # re-render creating a fresh element anyway) - never a broken glyph,
     # never a swapped-out element.
-    assert 'img.onerror = () => img.classList.add("img-pending")' in deck
+    # Review fix (IMPORTANT #4): superseded the old single-step onerror -
+    # one retry on the full hash (per shown index) before the pending class.
+    assert 'img.classList.add("img-pending")' in deck
     assert 'img.onload = () => img.classList.remove("img-pending")' in deck
+    assert "retriedFull" in deck
+    # Review fix (IMPORTANT #3): a deck resumes its last-flipped-to photo
+    # across a same-person re-render instead of always snapping to 0, via a
+    # module-level DECK_POS map keyed by msg_id/album_id.
+    assert "const DECK_POS = new Map();" in js
+    assert "DECK_POS.get(p.msg_id)" in deck
+    assert "DECK_POS.set(p.msg_id, i)" in deck
+    # Review fix (IMPORTANT #3b): the mobile journal rail's open/closed
+    # disclosure also survives a same-person re-render - only an actual
+    # person-switch re-collapses it.
+    rp = _js_fn_body(js, "renderProfilePage")
+    assert "const samePerson = p.identity_pub === LAST_RENDERED_PROFILE;" in rp
+    assert "if (!samePerson) DECK_POS.clear();" in rp
+    assert 'if (!samePerson) {\n    rail.classList.remove("open");' in rp
     lb = _js_fn_body(js, "openLightbox")
     # lightbox is full-res only - a bare substring ".t" false-positives on
     # openLightbox's own pre-existing (untouched) "prev.type =" /
@@ -1814,3 +1834,13 @@ def test_profile_load_render_honesty():
     # brief's proposed classList.contains("hidden") guard matches reality
     # as written, no adaptation needed.
     assert 'document.getElementById("block-settings").classList.contains("hidden")' in rf
+    # Review fix (CRITICAL #1): the heal guard also skips while the video
+    # editor overlay is open (its onClose closure would write into an
+    # orphaned composer instance) or while the profile composer has an
+    # unsaved draft - text typed, a photo/video picked, or focus still
+    # inside it.
+    assert 'document.getElementById("video-editor")' in rf
+    assert 'document.getElementById("profile-composer-form")' in rf
+    assert "composerDirty" in rf
+    composer = _js_fn_body(js, "profilePostComposer")
+    assert 'form.id = "profile-composer-form"' in composer   # the heal loop's hook

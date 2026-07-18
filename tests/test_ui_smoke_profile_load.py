@@ -75,28 +75,31 @@ def test_friend_wall_thumb_first_and_pending(tmp_path):
             page.keyboard.press("Escape")
 
             # pending placeholder: nuke the blob bytes on Bo's store and
-            # re-render - the tile must show .img-pending, never a glyph
+            # re-render - the tile must show .img-pending, never a glyph.
             for h in row["thumbs"] + row["blobs"]:
                 b.node.store._db.execute("DELETE FROM blobs WHERE hash=?",
                                          (h,))
             b.node.store._db.commit()
-            page.reload()
-            # NOT ".fchip" here: the earlier #nav-me click persisted
-            # localStorage hearth_view="me" (openMe(), app.js), so
-            # restoreView() lands this reload straight on Bo's OWN
-            # profile (view "profile", #view-journal - and its chipbar -
-            # stays hidden) rather than the journal. #nav-me is
-            # persistent chrome outside the view-* divs, so it's a
-            # reliable "app booted" signal across any restored view
-            # (same lesson documented in test_ui_smoke_collage.py /
-            # the text-block-styling smoke's own reload comment).
-            page.wait_for_selector("#nav-me")
-            page.click("#nav-me")
-            page.click("#profile-cog")
-            page.wait_for_selector("#friends .friend")
-            page.click(".friend:has-text('Anna')")
-            page.wait_for_selector("#profile-wall .img-pending",
-                                   timeout=8000)
+            # A FRESH page (== a fresh browser context, per Playwright's own
+            # new_page() semantics) rather than page.reload(): the review
+            # fix adding Cache-Control: immutable to /api/post-blob (MINOR
+            # #5, whole-branch review) means THIS SAME page's earlier
+            # successful fetches of these exact hashes (the tile above +
+            # the lightbox open) are now cached for a year - a reload would
+            # serve the stale success from cache and never re-hit the
+            # (now-empty) server, so .img-pending would never appear. An
+            # isolated context has no such cache, so the fetch genuinely
+            # 404s, exactly like a friend whose blob never arrived.
+            page2 = browser.new_page(viewport={"width": 1280, "height": 900})
+            page2.on("pageerror", lambda e: errors.append(str(e)))
+            page2.goto(f"http://127.0.0.1:{b.http_port}/")
+            page2.wait_for_selector(".fchip")
+            page2.click("#nav-me")
+            page2.click("#profile-cog")
+            page2.wait_for_selector("#friends .friend")
+            page2.click(".friend:has-text('Anna')")
+            page2.wait_for_selector("#profile-wall .img-pending",
+                                    timeout=8000)
 
             assert not errors, f"console pageerrors: {errors}"
             browser.close()
