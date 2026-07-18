@@ -1557,13 +1557,22 @@ sig check already guarantees whoever signed the entry really holds that
 key.
 
 **The fold's hostile-input hygiene.** Every decrypted field is
-validated before it is ever republished or rendered - `_valid_response_
-entry` gates each entry inside `_rebuild_responses_record` (a malformed
-entry from a hostile or buggy client is dropped silently, never allowed
-to raise out of the loop and abort every other post's rebuild that
-round), and `_post_responses_view`'s per-viewer render repeats the same
-discipline independently rather than trusting the author's record was
-built honestly. A reviewer-caught Critical here: `decrypt_body`'s return
+validated before it is ever republished or rendered, by two distinct
+gates for two distinct paths. The fold/write path -
+`_rebuild_responses_record`, which builds the author's own
+audience-facing record from raw `KIND_RESPONSE` messages - decodes and
+validates each one through `_response_event` (a malformed or hostile
+raw response fails closed to `None` there and is skipped, never
+allowed to raise out of the loop and abort every other post's rebuild
+that round). The render path - `_post_responses_view`, which reads
+back the entries already inside a (possibly hostile-author-crafted)
+decrypted record body - repeats the same discipline independently via
+`_valid_response_entry`, rather than trusting that the record was
+actually built by the honest fold. Neither gate trusts the other: a
+modified author client could skip `_rebuild_responses_record` entirely
+and hand-craft a record straight into the encrypted body, which is
+exactly the case `_valid_response_entry` exists to catch on the way
+back out. A reviewer-caught Critical here: `decrypt_body`'s return
 type is `Optional[dict]` as a hint, not an enforcement - `json.loads`
 happily returns whatever JSON root a hostile or buggy author's plaintext
 actually contains, and calling `.get("entries")` on a non-dict body used
@@ -1571,8 +1580,10 @@ to raise an uncaught `AttributeError` that took down the entire
 `feed()`/`posts_by()` call for every OTHER post's row along with it, not
 just the bad one. Fixed with an `isinstance(body, dict)` guard before
 any dict access, matching every other fail-closed branch in the method.
-Mutual-box payloads are bounded too (`MUTUAL_BOX_CT_HEX_MAX`, checked at
-ingest with roughly 6.5x headroom over a real 624-hex slot), and
+Mutual-box payloads are bounded too (`MUTUAL_BOX_CT_HEX_MAX`, checked on
+decode - `ingest_message`'s `validate_payload` is envelope-only and
+never sees inside the encrypted body - with roughly 6.5x headroom over
+a real 624-hex slot), and
 comments are capped at `MAX_COMMENT` (500 characters) the same way every
 other user-authored field in this codebase is length-bounded - a
 hostile 2MB comment body or a response whose encrypted payload decrypts
