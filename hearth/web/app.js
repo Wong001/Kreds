@@ -2251,10 +2251,17 @@ function openVideoEditor(file, existing, onClose) {
       const up = () => {
         handle.removeEventListener("pointermove", move);
         handle.removeEventListener("pointerup", up);
+        handle.removeEventListener("pointercancel", cancel);
         vid.currentTime = start; vid.play();
+      };
+      const cancel = () => {
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", up);
+        handle.removeEventListener("pointercancel", cancel);
       };
       handle.addEventListener("pointermove", move);
       handle.addEventListener("pointerup", up);
+      handle.addEventListener("pointercancel", cancel);
     });
   }
   dragHandle(hL, true);
@@ -2276,8 +2283,17 @@ function openVideoEditor(file, existing, onClose) {
     const N = 8, w = 88,
           h = Math.max(1, Math.round(w * tv.videoHeight / tv.videoWidth));
     for (let i = 0; i < N; i++) {
-      tv.currentTime = Math.min(dur - 0.05, (i + 0.5) * dur / N);
-      await new Promise((res) => { tv.onseeked = res; });
+      const t = Math.min(dur - 0.05, (i + 0.5) * dur / N);
+      // race the seek against a decode-error / stall timeout - without this,
+      // a mid-stream decode error after earlier frames succeeded leaves
+      // onseeked never firing and the loop (and degraded-mode fallback)
+      // hung forever.
+      await new Promise((res, rej) => {
+        const to = setTimeout(() => rej(new Error("seek stall")), 4000);
+        tv.onseeked = () => { clearTimeout(to); res(); };
+        tv.onerror = () => { clearTimeout(to); rej(new Error("decode error")); };
+        tv.currentTime = t;
+      });
       const c = document.createElement("canvas");
       c.width = w; c.height = h; c.className = "ve-thumb";
       c.getContext("2d").drawImage(tv, 0, 0, w, h);
@@ -2293,9 +2309,12 @@ function openVideoEditor(file, existing, onClose) {
     dur = vid.duration; vw = vid.videoWidth; vh = vid.videoHeight;
     if (!isFinite(dur) || dur <= 0) { finish("raw"); return; }
     if (existing) {
-      start = Math.min(existing.start, Math.max(0, dur - 0.5));
-      end = Math.min(dur, start + existing.duration);
-      coverAbs = start + Math.min(existing.poster_t, end - start);
+      // floor every restored value - existing comes from a prior save (or,
+      // once Task 6 lands, arbitrary stored state) and must not be trusted
+      // to already respect this video's own duration/window bounds.
+      start = Math.min(Math.max(0, existing.start), Math.max(0, dur - 0.5));
+      end = Math.min(dur, start + Math.min(Math.max(existing.duration, 0.5), VE_MAX_WINDOW));
+      coverAbs = start + Math.min(Math.max(existing.poster_t, 0), end - start);
       restoreCrop(existing.crop);                     // Task 5 no-op-safe
     } else {
       start = 0; end = Math.min(dur, VE_MAX_WINDOW); coverAbs = 0;
@@ -2305,10 +2324,12 @@ function openVideoEditor(file, existing, onClose) {
     vid.currentTime = start;
     vid.play();
     buildThumbs().catch(() => {
-      // metadata but no decodable frames: slider-only degraded mode -
+      // metadata but no decodable frames (or a mid-stream decode failure
+      // after some frames already landed): slider-only degraded mode -
       // trim still works blind against the times readout; crop stays
       // disabled (can't position what you can't see). Spec 2026-07-18.
       degraded = true;
+      track.replaceChildren();               // drop any partial thumbs
       track.classList.add("ve-blank");
       chips.classList.add("ve-disabled");
       frame.classList.add("ve-noframes");
