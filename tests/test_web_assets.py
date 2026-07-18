@@ -1730,3 +1730,15 @@ def test_video_editor_wired():
     # the trim loop wraps playback inside the window
     assert "timeupdate" in ve
     assert "#video-editor" in css and ".ve-handle" in css
+
+
+def test_video_editor_crop_and_cover_wired():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    ve = _js_fn_body(js, "openVideoEditor")
+    for needle in ('"orig"', '"1:1"', '"9:16"', '"16:9"',
+                   "ve-cover", "wheel", "ve-chip"):
+        assert needle in ve, needle
+    # pinch: a two-pointer distance path exists
+    assert "pointers.size === 2" in ve or "pointers.length === 2" in ve
+    assert ".ve-cover" in css and ".ve-chip" in css

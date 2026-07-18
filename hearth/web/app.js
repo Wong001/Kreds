@@ -2179,8 +2179,21 @@ function openVideoEditor(file, existing, onClose) {
   hL.setAttribute("aria-label", "Trim start");
   hR.setAttribute("aria-label", "Trim end");
   strip.append(track, selWin, hL, hR);
+  const cover = el("div", "ve-cover");
+  cover.title = "Cover frame";
+  cover.setAttribute("aria-label", "Cover frame");
+  strip.append(cover);
   const times = el("div", "ve-times");
-  const chips = el("div", "ve-chips");        // Task 5 fills these
+  const chips = el("div", "ve-chips");
+  const ASPECTS = {"orig": null, "1:1": 1, "9:16": 9 / 16, "16:9": 16 / 9};
+  const chipBtns = {};
+  for (const key of Object.keys(ASPECTS)) {
+    const c = el("button", "ve-chip", key === "orig" ? "Original" : key);
+    c.type = "button";
+    c.onclick = () => setAspect(key);
+    chipBtns[key] = c;
+    chips.append(c);
+  }
   const btns = el("div", "ve-btns");
   const cancelB = el("button", "ve-btn", "Cancel"); cancelB.type = "button";
   const doneB = el("button", "ve-btn ve-done", "Done"); doneB.type = "button";
@@ -2190,7 +2203,7 @@ function openVideoEditor(file, existing, onClose) {
 
   let dur = 0, vw = 0, vh = 0, degraded = false, closed = false;
   let start = 0, end = 0, coverAbs = 0;               // trim + cover state
-  let aspect = "orig", zoom = 1, cx = 0.5, cy = 0.5;  // crop state (Task 5)
+  let aspect = "orig", zoom = 1, cx = 0.5, cy = 0.5;  // crop state
 
   const fmt = (t) => t.toFixed(1) + "s";
   const finish = (action, edit) => {
@@ -2211,10 +2224,132 @@ function openVideoEditor(file, existing, onClose) {
   function buildEdit() {
     return {start: Math.round(start * 1000) / 1000,
             duration: Math.round((end - start) * 1000) / 1000,
-            crop: cropRect(),                        // null until Task 5
+            crop: cropRect(),
             poster_t: Math.round((coverAbs - start) * 1000) / 1000};
   }
-  function cropRect() { return null; }               // replaced in Task 5
+  // -- crop model: aspect presets + pan/zoom (spec 2026-07-18). The
+  // crop rect is DERIVED (never stored): largest target-aspect rect in
+  // the display-oriented frame, shrunk by zoom, centered on (cx, cy),
+  // clamped inside. cropRect() is the single source of the wire value
+  // AND the preview transform - they cannot disagree.
+  function cropRect() {
+    const r = ASPECTS[aspect];
+    if (r == null || !vw || !vh) return null;
+    const baseW = Math.min(1, (r * vh) / vw);
+    const baseH = Math.min(1, vw / (r * vh));
+    const w = Math.max(0.1, baseW / zoom);
+    const h = Math.max(0.1, baseH / zoom);
+    const x = Math.min(Math.max(cx - w / 2, 0), 1 - w);
+    const y = Math.min(Math.max(cy - h / 2, 0), 1 - h);
+    return {x: Math.round(x * 1e6) / 1e6, y: Math.round(y * 1e6) / 1e6,
+            w: Math.round(w * 1e6) / 1e6, h: Math.round(h * 1e6) / 1e6};
+  }
+  function applyCrop() {
+    const c = cropRect();
+    if (!c) {
+      frame.style.aspectRatio = (vw || 16) + " / " + (vh || 9);
+      vid.style.cssText = "";
+      return;
+    }
+    frame.style.aspectRatio = (c.w * vw) + " / " + (c.h * vh);
+    const W = frame.clientWidth;
+    const dw = W / c.w;                       // displayed full-video width
+    const dh = dw * vh / vw;
+    vid.style.width = dw + "px";
+    vid.style.height = dh + "px";
+    vid.style.maxWidth = "none"; vid.style.maxHeight = "none";
+    vid.style.objectFit = "fill";
+    vid.style.left = (-c.x * dw) + "px";
+    vid.style.top = (-c.y * dh) + "px";
+  }
+  function setAspect(key) {
+    aspect = key;
+    if (key === "orig") { zoom = 1; cx = 0.5; cy = 0.5; }
+    for (const [k, b] of Object.entries(chipBtns))
+      b.classList.toggle("active", k === aspect);
+    applyCrop();
+  }
+  function initCrop() { setAspect(aspect); }
+  function restoreCrop(c) {
+    if (!c) { aspect = "orig"; return; }
+    // recover the nearest preset from the rect's real aspect
+    const ratio = (c.w * vw) / (c.h * vh);
+    let best = "orig", err = Infinity;
+    for (const [k, r] of Object.entries(ASPECTS)) {
+      if (r == null) continue;
+      if (Math.abs(r - ratio) < err) { err = Math.abs(r - ratio); best = k; }
+    }
+    aspect = best;
+    const baseW = Math.min(1, (ASPECTS[best] * vh) / vw);
+    zoom = Math.min(10, Math.max(1, baseW / c.w));
+    cx = c.x + c.w / 2; cy = c.y + c.h / 2;
+  }
+
+  // pan (single pointer) + pinch (two pointers) + wheel zoom
+  const pointers = new Map();
+  frame.addEventListener("pointerdown", (e) => {
+    if (aspect === "orig" || degraded) return;
+    e.preventDefault();
+    frame.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+  });
+  frame.addEventListener("pointermove", (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    const prev = pointers.get(e.pointerId);
+    const cur = {x: e.clientX, y: e.clientY};
+    if (pointers.size === 2) {
+      const other = [...pointers.entries()]
+        .find(([id]) => id !== e.pointerId)[1];
+      const d0 = Math.hypot(prev.x - other.x, prev.y - other.y);
+      const d1 = Math.hypot(cur.x - other.x, cur.y - other.y);
+      if (d0 > 0) zoomBy(d1 / d0);
+    } else {
+      const c = cropRect();
+      if (c) {
+        const dw = frame.clientWidth / c.w;
+        cx = Math.min(1, Math.max(0, cx - (cur.x - prev.x) / dw));
+        cy = Math.min(1, Math.max(0, cy - (cur.y - prev.y) / (dw * vh / vw)));
+        applyCrop();
+      }
+    }
+    pointers.set(e.pointerId, cur);
+  });
+  const dropPointer = (e) => pointers.delete(e.pointerId);
+  frame.addEventListener("pointerup", dropPointer);
+  frame.addEventListener("pointercancel", dropPointer);
+  function zoomBy(f) {
+    zoom = Math.min(10, Math.max(1, zoom * f));
+    applyCrop();
+  }
+  frame.addEventListener("wheel", (e) => {
+    if (aspect === "orig" || degraded) return;
+    e.preventDefault();
+    zoomBy(e.deltaY < 0 ? 1.08 : 1 / 1.08);
+  }, {passive: false});
+
+  // -- cover marker: draggable within the trim window; seeks the
+  // preview so the user sees the exact poster frame.
+  function renderCover() {
+    cover.style.left = px(coverAbs) + "px";
+  }
+  cover.addEventListener("pointerdown", (ev) => {
+    if (!ev.isPrimary) return;
+    ev.preventDefault(); ev.stopPropagation();
+    cover.setPointerCapture(ev.pointerId);
+    vid.pause();
+    const move = (e) => {
+      const t = toT(e.clientX - strip.getBoundingClientRect().left);
+      coverAbs = Math.min(Math.max(t, start), end);
+      vid.currentTime = coverAbs;
+      renderCover();
+    };
+    const up = () => {
+      cover.removeEventListener("pointermove", move);
+      cover.removeEventListener("pointerup", up);
+    };
+    cover.addEventListener("pointermove", move);
+    cover.addEventListener("pointerup", up);
+  });
 
   // -- trim geometry: strip x-position <-> time -----------------------
   const px = (t) => strip.clientWidth * t / dur;
@@ -2224,11 +2359,10 @@ function openVideoEditor(file, existing, onClose) {
     selWin.style.width = Math.max(2, px(end) - px(start)) + "px";
     hL.style.left = px(start) + "px";
     hR.style.left = px(end) + "px";
-    renderCover();                                    // Task 5 fills in
+    renderCover();
     times.textContent = fmt(start) + " - " + fmt(end)
       + "  (" + fmt(end - start) + " of " + fmt(dur) + ")";
   }
-  function renderCover() {}                           // replaced in Task 5
 
   function dragHandle(handle, isLeft) {
     handle.addEventListener("pointerdown", (ev) => {
@@ -2315,11 +2449,11 @@ function openVideoEditor(file, existing, onClose) {
       start = Math.min(Math.max(0, existing.start), Math.max(0, dur - 0.5));
       end = Math.min(dur, start + Math.min(Math.max(existing.duration, 0.5), VE_MAX_WINDOW));
       coverAbs = start + Math.min(Math.max(existing.poster_t, 0), end - start);
-      restoreCrop(existing.crop);                     // Task 5 no-op-safe
+      restoreCrop(existing.crop);
     } else {
       start = 0; end = Math.min(dur, VE_MAX_WINDOW); coverAbs = 0;
     }
-    initCrop();                                        // Task 5 fills in
+    initCrop();
     render();
     vid.currentTime = start;
     vid.play();
@@ -2335,8 +2469,6 @@ function openVideoEditor(file, existing, onClose) {
       frame.classList.add("ve-noframes");
     });
   });
-  function initCrop() {}                               // replaced in Task 5
-  function restoreCrop() {}                            // replaced in Task 5
   ov.tabIndex = -1;
   ov.focus();
 }
