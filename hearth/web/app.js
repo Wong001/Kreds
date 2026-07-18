@@ -2023,6 +2023,7 @@ function profilePostComposer() {
   }
 
   let objectUrls = [];
+  let videoEdit = null;          // wire params from the editor, or null (raw)
   const dropUrls = () => {
     for (const u of objectUrls) URL.revokeObjectURL(u);
     objectUrls = [];
@@ -2055,8 +2056,23 @@ function profilePostComposer() {
       // WebKit won't paint a frame without an explicit seek.
       v.addEventListener("loadedmetadata", () => { v.currentTime = 0.01; });
       preview.append(v);
-      noteSlot.textContent =
-        videoFile.name + " - will be trimmed to the story rules on post";
+      // editor re-entry: the preview is the edit's handle
+      v.style.cursor = "pointer";
+      v.onclick = () => openVideoEditor(videoFile, videoEdit, (res) => {
+        if (res.action === "cancel") return;     // keep current choices
+        videoEdit = res.action === "done" ? res.edit : null;
+        showPreview();
+      });
+      const parts = [];
+      if (videoEdit) {
+        parts.push("trimmed to " + videoEdit.duration.toFixed(1) + "s");
+        if (videoEdit.crop) parts.push("cropped");
+        if (videoEdit.poster_t > 0) parts.push("cover set");
+      }
+      // DRAFT copy (August may reword; update the asset pin with it)
+      noteSlot.textContent = videoFile.name
+        + (parts.length ? " - " + parts.join(" - ")
+                        : " - tap the preview to trim or crop");
       noteSlot.hidden = false;
     } else if (files.length) {
       const wrap = el("div", files.length > 1 ? "preview-deck" : "preview-photo");
@@ -2077,12 +2093,19 @@ function profilePostComposer() {
     sizePreview();
   };
   photoInput.onchange = () => {
-    if (photoInput.files.length) videoInput.value = "";   // one medium, photos win
+    if (photoInput.files.length) { videoInput.value = ""; videoEdit = null; }   // one medium, photos win
     showPreview();
   };
   videoInput.onchange = () => {
-    if (videoInput.files.length) photoInput.value = "";   // one medium, video wins
-    showPreview();
+    if (!videoInput.files.length) { videoEdit = null; showPreview(); return; }
+    photoInput.value = "";                       // one medium, video wins
+    openVideoEditor(videoInput.files[0], null, (res) => {
+      if (res.action === "cancel") {
+        videoInput.value = ""; videoEdit = null; showPreview(); return;
+      }
+      videoEdit = res.action === "done" ? res.edit : null;
+      showPreview();
+    });
   };
 
   const btn = el("button", "postbtn", "Post to profile"); btn.type = "submit";
@@ -2101,6 +2124,8 @@ function profilePostComposer() {
     const hasMedia = !!videoFile || photoInput.files.length > 0;
     if (videoFile) fd.append("video", videoFile);
     else for (const f of photoInput.files) fd.append("photos", f);
+    if (videoFile && videoEdit)
+      fd.append("video_edit", JSON.stringify(videoEdit));
     // The chosen size rides straight on /api/post now (spec 2026-07-14 -
     // the separate span-seed call is gone): a new post auto-places at the
     // top at these proportions, push-place applied. Text-only posts send
@@ -2111,6 +2136,7 @@ function profilePostComposer() {
     input.value = "";
     photoInput.value = "";
     videoInput.value = "";
+    videoEdit = null;
     clearPreview();
     span = {w: 2, h: 2};
     for (const x of chipBtns) {
@@ -2528,30 +2554,41 @@ async function renderStories() {
   addInput.type = "file"; addInput.accept = "image/*,video/*";
   addInput.style.display = "none";
   const addName = el("div", "story-name", "Your story");
-  addInput.onchange = async () => {
-    if (!addInput.files[0]) return;
-    const isVideo = !addInput.files[0].type.startsWith("image/");
+  addInput.onchange = () => {
+    const file = addInput.files[0];
+    if (!file) return;
+    const isVideo = !file.type.startsWith("image/");
+    if (!isVideo) { uploadStory(file, null); return; }
+    openVideoEditor(file, null, (res) => {
+      if (res.action === "cancel") { addInput.value = ""; return; }
+      uploadStory(file, res.action === "done" ? res.edit : null);
+    });
+  };
+  async function uploadStory(file, edit) {
+    const isVideo = !file.type.startsWith("image/");
     addRing.classList.add("busy");
     addRing.textContent = "";
     addName.textContent = isVideo ? "Processing video..." : "Uploading...";
-    const fd = new FormData(); fd.append("media", addInput.files[0]);
+    const fd = new FormData(); fd.append("media", file);
     fd.append("caption", "");
+    if (edit) fd.append("video_edit", JSON.stringify(edit));
     try {
       const r = await fetch("/api/story", {method: "POST", body: fd});
       if (r.ok) { renderStories(); return; }
       const body = await r.text();
       if (r.status === 400 && /longer than 15/i.test(body))
-        alert("That video is longer than 15 seconds. In-app trimming is "
-          + "coming soon - for now, please shorten it to 15s or less.");
+        // only reachable on the raw/degraded path (no editor preview)
+        alert("That video is longer than 15 seconds and could not be "
+          + "previewed for trimming here. Please shorten it and try again.");
       else if (r.status === 413)
-        alert("That file is too large (50 MB max).");
+        alert("That file is too large.");
       else alert("Could not post story: " + body);
     } catch (e) {
       alert("Could not post story: " + e.message);
     }
     addInput.value = "";
     renderStories();
-  };
+  }
   addRing.onclick = () => addInput.click();
   addTile.append(addRing, addInput, addName);
   strip.append(addTile);

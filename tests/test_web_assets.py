@@ -1742,3 +1742,16 @@ def test_video_editor_crop_and_cover_wired():
     # pinch: a two-pointer distance path exists
     assert "pointers.size === 2" in ve or "pointers.length === 2" in ve
     assert ".ve-cover" in css and ".ve-chip" in css
+
+
+def test_video_editor_composer_integration():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    composer = _js_fn_body(js, "profilePostComposer")
+    assert "openVideoEditor" in composer
+    assert 'fd.append("video_edit"' in composer
+    # the false promise is dead: the note now reflects the edit
+    assert "will be trimmed to the story rules on post" not in js
+    # story composer routes video picks through the editor too
+    assert js.count("openVideoEditor(") >= 3      # def + 2 call sites
+    # "coming soon" promise retired (the editor exists now)
+    assert "In-app trimming is coming soon" not in js
