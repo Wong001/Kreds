@@ -1974,3 +1974,23 @@ def test_engagement_settings_toggle_wired_to_public_engagement():
     # other self-only panels (renderApplockSettings/renderDesktopSettings)
     me_strip = _js_fn_body(js, "renderMeStrip")
     assert "renderEngagementSettings" in me_strip
+
+
+def test_refresh_guards_journal_rebuild_against_a_mid_typed_comment():
+    # Fix-review follow-up (escalated to Critical by the profile
+    # composerDirty precedent, CRITICAL #1): a heal/WS-driven refresh()
+    # tick must not silently wipe out a comment someone is mid-typing,
+    # same as it already protects the profile composer's draft.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    rf = _js_fn_body(js, "refresh")
+    assert "commentDirty" in rf
+    assert ".comment-composer input" in rf
+    assert "activeElement" in rf
+    # only renderJournal() is gated - the guard must not also starve the
+    # other per-tick renders (chipbar/rail/me-strip/stories keep updating
+    # every cycle regardless of a dirty comment draft).
+    assert re.search(r"if\s*\(!commentDirty\)\s*renderJournal\(\)", rf)
+    for always in ("renderChipbar()", "renderCircleRail()", "renderMeStrip()", "renderStories()"):
+        assert always in rf
+        # none of the always-on renders are themselves wrapped in the guard
+        assert not re.search(r"if\s*\(!commentDirty\)\s*" + re.escape(always), rf)

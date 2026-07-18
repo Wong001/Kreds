@@ -45,6 +45,9 @@ let LAST_RENDERED_PROFILE = null;
 // silently re-collapse on that rebuild. Session-only (not localStorage):
 // unlike the settings-section open/closed prefs, there's no expectation
 // this survives a reload, only a live re-render.
+// Unlike DECK_POS (pruned on a genuine person-switch, see renderProfilePage),
+// this Set is never pruned - accepted session-bounded tradeoff: it only
+// grows for the lifetime of the page, never past a reload.
 const EXPANDED_COMMENTS = new Set();   // msg_id -> comments section is open
 let NEEDS_WIZARD = false;   // set by boot() when onboarding_done is false; Task 3's bootData() consumes it
 let UPDATE_BANNER_DISMISSED = false;   // session-only; returns next status push (Task 2, 0.3.15)
@@ -4550,7 +4553,22 @@ async function refresh() {
   FEED = await j("/api/feed");
   KREDS = await j("/api/kreds");
   renderChipbar();
-  renderJournal();
+  // Comment composer dirty-guard (fix-review follow-up, Task 6 - same
+  // standard as CRITICAL #1's composerDirty below): a heal/WS tick must
+  // not silently wipe out a mid-typed comment either. Checked against
+  // the journal AS CURRENTLY RENDERED (this runs before renderJournal()
+  // would rebuild it from scratch) - only renderJournal() is skipped
+  // this tick; renderCircleRail/renderMeStrip/renderStories below still
+  // update every tick as normal. The rebuild resumes the very next tick
+  // once the draft is sent, cleared, or blurred while empty. `visible`
+  // (offsetParent !== null) excludes a stale value left behind in a
+  // collapsed/hidden .comments section - nobody is looking at that
+  // draft right now, unlike the profile composer's always-visible form.
+  const journalEl = document.getElementById("journal");
+  const commentDirty = !!journalEl && [...journalEl.querySelectorAll(".comment-composer input")]
+    .some(inp => inp.offsetParent !== null &&
+      (inp.value !== "" || inp === document.activeElement));
+  if (!commentDirty) renderJournal();
   renderCircleRail();
   renderMeStrip();
   renderStories();
