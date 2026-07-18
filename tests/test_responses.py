@@ -293,7 +293,11 @@ def _hostile_response(node, target, author_devs, overrides, created_at=None):
     body = {
         "rkind": "comment", "body": "innocuous", "alias_seed": "a" * 32,
         "public": False, "responder": node.identity_pub,
-        "responder_sig": "deadbeef", "mutual_box": None,
+        # 128 hex chars: a VALID-shaped (though not cryptographically
+        # real) Ed25519 sig by default, so each hostile_variants override
+        # below isolates exactly one bad field instead of every variant
+        # failing on this one regardless of what it's actually testing.
+        "responder_sig": "a" * 128, "mutual_box": None,
         "created_at": created_at,
     }
     body.update(overrides)
@@ -306,13 +310,14 @@ def _hostile_response(node, target, author_devs, overrides, created_at=None):
 
 
 def test_hostile_response_content_never_folds(tmp_path):
-    """Critical (reviewer-repro'd): _response_event used to type-check
-    only rkind/created_at -- a hand-crafted oversized comment, a
-    dict-typed reaction body, a malformed alias_seed, or a junk
-    mutual_box all survived verbatim into the audience-broadcast record.
-    Every hostile variant below must ingest fine (envelope-level shape is
-    valid) but never appear in the republished record, and the sweep
-    must never raise."""
+    """Critical (reviewer-repro'd, two rounds): _response_event used to
+    type-check only rkind/created_at -- a hand-crafted oversized comment,
+    a dict-typed reaction body, a malformed alias_seed, a junk
+    mutual_box, an oversized responder_sig, or a mutual_box slot with
+    junk (non-eph_pub/nonce/ct) keys all survived verbatim into the
+    audience-broadcast record. Every hostile variant below must ingest
+    fine (envelope-level shape is valid) but never appear in the
+    republished record, and the sweep must never raise."""
     a, b = _befriended_pair(tmp_path)
     pid = a.compose_post("post", "kreds")
     _sync(a, b)
@@ -326,6 +331,11 @@ def test_hostile_response_content_never_folds(tmp_path):
         {"mutual_box": "not-a-list"},                       # junk box (not a list)
         {"mutual_box": [1, 2, 3]},                          # list of non-dicts
         {"public": "yes"},                                  # non-bool public
+        {"responder_sig": "f" * 3_000_000},                 # oversized sig (reviewer repro)
+        {"responder_sig": "short"},                         # wrong-length sig
+        # reviewer's exact repro: a dict slot with junk keys (no
+        # eph_pub/nonce/ct at all) passing a bare isinstance(s, dict) check
+        {"mutual_box": [{"junk": "J" * 2_000_000}]},
     ]
     t = time.time()
     for i, overrides in enumerate(hostile_variants):
@@ -401,3 +411,42 @@ def test_reaction_moderation_cutoff_suppresses_older_reaction(tmp_path):
     a.remove_response(pid, b.identity_pub, laugh["created_at"])
     body = _decrypt_record_as(a, _responses_record(a, pid))
     assert not [e for e in body["entries"] if e["rkind"] == "reaction"]
+
+
+def test_removed_responses_migration_heals_existing_node_db(tmp_path):
+    """CRITICAL (reviewer-repro'd, 2026-07-18) end-to-end through a real
+    HearthNode: see test_store.py's store-level pin for the mechanism.
+    Pre-create A's data dir with the OLD 3-column removed_responses
+    table at the exact path HearthNode.create will open (hearth.db),
+    boot A normally, and confirm process_responses' fold AND
+    remove_response's moderation write path both work against the
+    healed schema -- not just that the migration runs, but that the
+    whole responses feature is usable afterward."""
+    import sqlite3
+
+    data_dir = tmp_path / "a"
+    data_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(data_dir / "hearth.db"))
+    conn.execute(
+        "CREATE TABLE removed_responses("
+        "target TEXT NOT NULL, responder TEXT NOT NULL,"
+        " created_at REAL NOT NULL,"
+        " PRIMARY KEY(target, responder, created_at))")
+    conn.commit()
+    conn.close()
+
+    a = HearthNode.create(data_dir, "A", "a-dev")   # must not raise
+    b = HearthNode.create(tmp_path / "b", "B", "b-dev")
+    _befriend(a, b)
+    pid = a.compose_post("post", "kreds")
+    _sync(a, b)
+    b.compose_response(pid, "reaction", "heart")
+    _sync(b, a)
+    n = a.process_responses()          # fold: must not raise on the healed table
+    assert n == 1
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert body["entries"][0]["body"] == "heart"
+    entry_created_at = body["entries"][0]["created_at"]
+    a.remove_response(pid, b.identity_pub, entry_created_at)   # write: must not raise
+    body = _decrypt_record_as(a, _responses_record(a, pid))
+    assert body["entries"] == []

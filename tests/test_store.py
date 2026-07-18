@@ -36,3 +36,47 @@ def test_blob_sizes_survives_hostile_length_want_list(tmp_path):
     sizes = s.blob_sizes(want)
     assert sizes[h1] == 10 and sizes[h2] == 20 and sizes[h3] == 30
     assert len(sizes) == 3                      # none of the fakes are held
+
+
+def test_removed_responses_migration_adds_rkind_column(tmp_path):
+    """CRITICAL (reviewer-repro'd, 2026-07-18): removed_responses widened
+    from 3 columns to 4 (adding `rkind`, needed so process_responses'
+    fold can tell a moderated comment (exact-match removal) apart from a
+    moderated reaction (per-responder cutoff)) in a commit AFTER the
+    table was first introduced on this branch. CREATE TABLE IF NOT
+    EXISTS is a no-op against an already-existing table, so a DB created
+    before that widening would be stuck on the old 3-column shape
+    forever: every process_responses fold would then raise ("no such
+    column: rkind") on its first target with any moderation history at
+    all, and mark_response_removed's 4-value INSERT would raise
+    uncaught. Pre-create the OLD 3-column shape directly (bypassing
+    Store entirely, the way a real pre-upgrade DB on disk would look),
+    then boot a real Store against that exact file and confirm the
+    migration heals it before either the read or the write path is
+    touched."""
+    import sqlite3
+    from hearth.store import Store
+
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE removed_responses("
+        "target TEXT NOT NULL, responder TEXT NOT NULL,"
+        " created_at REAL NOT NULL,"
+        " PRIMARY KEY(target, responder, created_at))")
+    conn.commit()
+    conn.close()
+
+    s = Store(db_path)   # must not raise; migration runs at __init__
+    cols = {row[1] for row in
+            s._db.execute("PRAGMA table_info(removed_responses)")}
+    assert "rkind" in cols
+
+    # Write path: previously an uncaught OperationalError (4 values into
+    # a 3-column table).
+    s.mark_response_removed("t1", "r1", 100.0, "comment")
+    s.mark_response_removed("t1", "r2", 200.0, "reaction")
+    # Read path: previously an uncaught OperationalError ("no such
+    # column: rkind") on the very first fold that reached it.
+    got = set(s.removed_response_tombstones("t1"))
+    assert got == {("r1", 100.0, "comment"), ("r2", 200.0, "reaction")}

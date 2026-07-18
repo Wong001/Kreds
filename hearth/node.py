@@ -26,10 +26,11 @@ from .messages import (ACCENTS, DEFRIEND_RETRY, DEFRIEND_TTL, GRID_LAYOUTS,
                        KIND_RESPONSE, KIND_RESPONSES, KIND_WRAP_GRANT,
                        MAX_BLOCK_H, MAX_CAPTION, MAX_COMMENT, MAX_LAYOUT,
                        REACTION_TOKENS, SIZE_LAYOUTS, TEXT_STYLE_ENUMS,
-                       WALL_COLS, is_expired, make_album, make_delete,
-                       make_dm, make_enckey, make_post, make_profile,
-                       make_profile_layout, make_response, make_responses,
-                       make_ring, make_story, make_wrap_grant)
+                       WALL_COLS, _is_hexn, is_expired, make_album,
+                       make_delete, make_dm, make_enckey, make_post,
+                       make_profile, make_profile_layout, make_response,
+                       make_responses, make_ring, make_story,
+                       make_wrap_grant)
 from .store import IngestResult, Store
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,52 @@ logger = logging.getLogger(__name__)
 # HearthNode.maybe_check_update.
 UPDATE_CHECK_STARTUP_DELAY = 60.0
 UPDATE_CHECK_INTERVAL = 6 * 3600
+
+# Reviewer-caught Critical (2026-07-18): a mutual_box slot's `ct` field is
+# variable-length (it depends on the sealed payload size), so it cannot be
+# an exact hex-length check like eph_pub/nonce -- but it must still be
+# BOUNDED, or a hostile slot's ct can carry arbitrary megabytes straight
+# into the audience-broadcast record (reviewer reproduced
+# [{"junk": "J"*2_000_000}] passing a bare isinstance(s, dict) check).
+# A real slot's ct (seal_slots, dmcrypt.py) is a ChaCha20-Poly1305
+# encryption of a small canonical JSON payload
+# ({"identity", "device_pub", "sig"}, a few hundred bytes at most) plus a
+# 16-byte tag -- a few hundred hex chars in practice. 4096 hex chars
+# (2048 bytes) is generous headroom, not a measured limit: it exists
+# purely to cap the attack, not to pin the real payload's exact size
+# (which could grow slightly without needing a matching bump here).
+MUTUAL_BOX_CT_HEX_MAX = 4096
+
+
+def _valid_mutual_box(mutual_box) -> bool:
+    """Per-slot shape check (reviewer-caught Critical, 2026-07-18):
+    mirrors messages.py's _valid_wraps per-field style exactly (it
+    validates the structurally identical wrap_key() output) -- each slot
+    must look like what seal_slots (dmcrypt.py) actually produces:
+    eph_pub a 64-hex X25519 public key, nonce a 24-hex ChaCha20-Poly1305
+    nonce, ct a hex string bounded by MUTUAL_BOX_CT_HEX_MAX. None (public
+    responses carry no box) is valid; anything else must be a list of
+    dicts, every one of them well-shaped -- a single malformed slot fails
+    the whole box, since a partially-hostile mutual_box is exactly the
+    kind of "close enough" heuristic hostile input is designed to slip
+    through."""
+    if mutual_box is None:
+        return True
+    if not isinstance(mutual_box, list):
+        return False
+    for s in mutual_box:
+        if not isinstance(s, dict):
+            return False
+        if not _is_hexn(s.get("eph_pub"), 64):
+            return False
+        if not _is_hexn(s.get("nonce"), 24):
+            return False
+        ct = s.get("ct")
+        if (not isinstance(ct, str) or not ct
+                or len(ct) > MUTUAL_BOX_CT_HEX_MAX
+                or any(c not in "0123456789abcdef" for c in ct)):
+            return False
+    return True
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -1968,10 +2015,18 @@ class HearthNode:
         public = body.get("public")
         if not isinstance(public, bool):
             return None
+        # responder_sig (reviewer-caught Critical, 2026-07-18): this used
+        # to ride through with no shape check at all -- reviewer
+        # reproduced a 3 MB sig string surviving verbatim into the
+        # record. sign_raw (identity.py) signs with Ed25519, a fixed
+        # 64-byte signature -> exactly 128 hex chars; anything else can
+        # never be a real signature and must be rejected the same
+        # return-None way as every other field here.
+        responder_sig = body.get("responder_sig")
+        if not _is_hexn(responder_sig, 128):
+            return None
         mutual_box = body.get("mutual_box")
-        if mutual_box is not None and (
-                not isinstance(mutual_box, list)
-                or not all(isinstance(s, dict) for s in mutual_box)):
+        if not _valid_mutual_box(mutual_box):
             return None
         return {
             "responder": responder, "device_pub": rmsg.cert.device_pub,
@@ -1979,7 +2034,7 @@ class HearthNode:
             "created_at": created_at,
             "alias_seed": alias_seed,
             "public": public,
-            "responder_sig": body.get("responder_sig"),
+            "responder_sig": responder_sig,
             "mutual_box": mutual_box,
         }
 

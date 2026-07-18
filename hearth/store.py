@@ -84,6 +84,38 @@ class Store:
                 " next_attempt_at REAL NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        # Migration for a removed_responses table created before the
+        # `rkind` column existed (reviewer-caught Critical, 2026-07-18):
+        # CREATE TABLE IF NOT EXISTS above is a no-op on an
+        # already-existing table, so a pre-widening DB would be stuck on
+        # the old 3-column shape forever -- every process_responses fold
+        # would then raise ("no such column: rkind") on its first target
+        # with any moderation history, and mark_response_removed's
+        # 4-value INSERT would raise uncaught.
+        #
+        # This uses PRAGMA table_info + an explicit membership check
+        # instead of the defriend_outbox migration's try/except-around-
+        # the-ALTER idiom above (this repo's only other additive-column
+        # precedent, per grep -- there is no PRAGMA table_info precedent
+        # anywhere in this codebase yet, so THIS is that precedent now):
+        # the try/except idiom works by treating ANY OperationalError
+        # from the ALTER as "column already there", which is fine when
+        # the ALTER statement itself is simple and unchanging, but gives
+        # no positive confirmation of WHY it failed. Checking table_info
+        # explicitly means the ALTER only ever runs when the column is
+        # genuinely absent, and a real syntax/logic error in the ALTER
+        # itself would surface instead of being silently swallowed.
+        # DEFAULT 'comment' matches remove_response's own fallback (the
+        # narrower, exact-match behavior) for the same reason: a
+        # pre-migration tombstone row predates rkind entirely, so there
+        # is no way to recover whether it was a comment or a reaction --
+        # exact-match is the safe default, never the wider cutoff.
+        cols = {row[1] for row in
+                self._db.execute("PRAGMA table_info(removed_responses)")}
+        if "rkind" not in cols:
+            self._db.execute(
+                "ALTER TABLE removed_responses ADD COLUMN"
+                " rkind TEXT NOT NULL DEFAULT 'comment'")
         self._db.commit()
 
     # -- meta ---------------------------------------------------------------
