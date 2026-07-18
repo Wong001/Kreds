@@ -631,7 +631,17 @@ def launch(data_dir=None):
             _log_error(data_dir, "tray unavailable: " + repr(e))
         # DevTools opt-in: set KREDS_DEVTOOLS=1 to enable right-click -> Inspect
         # in the WebView2 window (for diagnosing rendering). Off by default.
-        webview.start(debug=os.environ.get("KREDS_DEVTOOLS") == "1")
+        #
+        # Persistent web storage (bug 2026-07-18): pywebview defaults to
+        # private_mode=True - an ephemeral WebView2 profile that wiped EVERY
+        # localStorage key on exit (theme choice, DM read watermarks,
+        # journal/story seen state, restored view: the "dark mode resets" and
+        # "read messages show as new" reports were one bug). The profile
+        # lives inside data_dir so wiping Kreds data wipes it too, and the
+        # single-instance lock already prevents concurrent profile use.
+        webview.start(debug=os.environ.get("KREDS_DEVTOOLS") == "1",
+                      private_mode=False,
+                      storage_path=str(data_dir / "webview"))
         # window gone -> ensure the node is asked to stop, then drain fully
         _signal_shutdown(holder)
         _drain_node_thread(t, data_dir)

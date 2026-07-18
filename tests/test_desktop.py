@@ -537,3 +537,22 @@ def test_already_running_notice_mentions_tray():
     from hearth import desktop
     src = inspect.getsource(desktop._notify_already_running)
     assert "system tray" in src
+
+
+def test_webview_storage_persists_across_relaunches():
+    # Bug (August, 2026-07-18): dark mode + DM read-watermarks reset on
+    # every launch. pywebview defaults to private_mode=True, handing
+    # WebView2 an ephemeral profile - EVERY localStorage key (kreds_theme,
+    # kreds_dm_opened:*, kreds_opened:*, kreds_seen, hearth_view) died on
+    # exit. Proven by a double-launch probe over a real 127.0.0.1 origin:
+    # default mode LOST the value, private_mode=False + storage_path
+    # SURVIVED. Source-pin the fix - a real GUI round-trip cannot run in
+    # this suite.
+    import inspect
+    src = inspect.getsource(desktop.launch)
+    assert "private_mode=False" in src
+    assert "storage_path" in src
+    # profile lives INSIDE the app data dir: wiping Kreds data wipes the
+    # web profile with it, and the single-instance lock already prevents
+    # concurrent use of one profile.
+    assert 'data_dir / "webview"' in src
