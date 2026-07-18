@@ -69,7 +69,10 @@ def validate_video_edit(edit) -> dict:
 
     {"start": s>=0, "duration": 0<d<=15, "crop": {x,y,w,h} normalized
     to the DISPLAY-oriented frame (0..1, min 0.1, inside bounds) or
-    None, "poster_t": 0<=t<=duration into the cut}."""
+    None, "poster_t": 0<=t<=duration into the cut}.
+    edit is intentionally unannotated: it accepts anything and raises
+    ValueError itself when it isn't a dict (the type promise lives on
+    transcode_video's signature, which is the public surface)."""
     if not isinstance(edit, dict):
         raise ValueError("bad video_edit")
     try:
@@ -97,7 +100,7 @@ def validate_video_edit(edit) -> dict:
             "crop": crop, "poster_t": poster_t}
 
 
-def transcode_video(data: bytes, edit=None) -> tuple[bytes, bytes]:
+def transcode_video(data: bytes, edit: dict | None = None) -> tuple[bytes, bytes]:
     if edit is not None:
         edit = validate_video_edit(edit)
     src_dur = probe_duration(data)

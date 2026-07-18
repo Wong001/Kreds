@@ -5,7 +5,8 @@ import imageio_ffmpeg
 import pytest
 
 from hearth.videogate import (MAX_VIDEO_BYTES, MAX_VIDEO_SECONDS,
-                              probe_duration, transcode_video)
+                              probe_duration, transcode_video,
+                              validate_video_edit)
 
 
 def _make_clip(seconds, w=640, h=480, with_audio=True):
@@ -103,9 +104,6 @@ def test_odd_height_source_still_transcodes():
     from PIL import Image
     import io
     assert Image.open(io.BytesIO(poster)).format == "PNG"
-
-
-from hearth.videogate import validate_video_edit
 
 
 def _dims(png_bytes):

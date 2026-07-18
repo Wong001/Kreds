@@ -58,6 +58,17 @@ def _installed_web_version(wd: Path) -> str:
         return update.CORE_VERSION
 
 
+def _parse_video_edit(raw: str):
+    """Parse the video_edit form field shared by /api/post and /api/story.
+    Blank -> None (no edit). Bad JSON -> 400, same message both callers used."""
+    if not raw.strip():
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "bad video_edit")
+
+
 def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
     wd = web_dir or WEB_DIR
     app = FastAPI(title="Hearth node")
@@ -374,14 +385,9 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         # deck grow flow's album-bound photo must not disturb the wall.
         expiry = float(expires_seconds) if expires_seconds.strip() else None
         auto_place = place != "0"
-        edit = None
-        if video_edit.strip():
-            if video is None:
-                raise HTTPException(400, "video_edit without a video")
-            try:
-                edit = json.loads(video_edit)
-            except json.JSONDecodeError:
-                raise HTTPException(400, "bad video_edit")
+        if video_edit.strip() and video is None:
+            raise HTTPException(400, "video_edit without a video")
+        edit = _parse_video_edit(video_edit)
         if video is not None:
             vbytes = await video.read()
             if len(vbytes) > MAX_VIDEO_UPLOAD:
@@ -640,12 +646,7 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
                 raise HTTPException(413, "media exceeds the 50 MB upload cap")
         elif len(data) > MAX_VIDEO_UPLOAD:
             raise HTTPException(413, "video exceeds the 100 MB upload cap")
-        edit = None
-        if video_edit.strip():
-            try:
-                edit = json.loads(video_edit)
-            except json.JSONDecodeError:
-                raise HTTPException(400, "bad video_edit")
+        edit = _parse_video_edit(video_edit)
         mid = _400(lambda: node.compose_story(data, caption, video_edit=edit))
         return {"msg_id": mid}
 
