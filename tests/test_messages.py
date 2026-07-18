@@ -3,7 +3,7 @@ import time
 from hearth.identity import DeviceKeys, IdentityCeremony
 from hearth.messages import (
     KIND_POST, KIND_RING, blob_hash, is_expired, make_delete, make_post,
-    make_profile, make_ring, validate_payload,
+    make_profile, make_response, make_responses, make_ring, validate_payload,
 )
 
 
@@ -96,3 +96,45 @@ def test_post_thumbs_validation():
     assert not validate_payload(base)[0]
     del base["thumbs"]                    # absent = old record, fine
     assert validate_payload(base)[0]
+
+
+def test_response_kinds_validate():
+    from hearth.messages import (KIND_RESPONSE, KIND_RESPONSES,
+                                 validate_payload)
+    base = {"kind": KIND_RESPONSE, "target": "m" * 16,
+            "body_nonce": "ab" * 12, "body_ct": "de",
+            "wraps": {}, "created_at": 1.0}
+    assert validate_payload(base)[0]
+    for k, bad in [("target", 7), ("target", ""), ("body_nonce", "zz"),
+                   ("body_ct", ""), ("wraps", "junk")]:
+        p = dict(base); p[k] = bad
+        assert not validate_payload(p)[0], k
+    rec = {"kind": KIND_RESPONSES, "target": "m" * 16,
+           "body_nonce": "ab" * 12, "body_ct": "de", "wraps": {},
+           "expires_at": None, "created_at": 1.0}
+    assert validate_payload(rec)[0]
+    rec["expires_at"] = "soon"
+    assert not validate_payload(rec)[0]
+
+
+def test_reaction_tokens_frozen():
+    from hearth.messages import REACTION_TOKENS, MAX_COMMENT
+    assert REACTION_TOKENS == ("heart", "laugh", "wow", "sad", "up", "fire")
+    assert MAX_COMMENT == 500
+
+
+def test_make_response_and_make_responses_shape():
+    d = _dev()
+    from hearth.messages import KIND_RESPONSE, KIND_RESPONSES, validate_payload
+    m = make_response(d, "m" * 16, body_nonce="ab" * 12, body_ct="de",
+                      wraps={}, created_at=10.0)
+    assert m.payload == {"kind": KIND_RESPONSE, "target": "m" * 16,
+                         "body_nonce": "ab" * 12, "body_ct": "de",
+                         "wraps": {}, "created_at": 10.0}
+    assert validate_payload(m.payload)[0]
+    rm = make_responses(d, "m" * 16, body_nonce="ab" * 12, body_ct="de",
+                        wraps={}, expires_at=20.0, created_at=10.0)
+    assert rm.payload == {"kind": KIND_RESPONSES, "target": "m" * 16,
+                          "body_nonce": "ab" * 12, "body_ct": "de",
+                          "wraps": {}, "expires_at": 20.0, "created_at": 10.0}
+    assert validate_payload(rm.payload)[0]

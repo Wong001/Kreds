@@ -4,8 +4,9 @@ import pytest
 
 from hearth.dmcrypt import (
     decrypt_blob, decrypt_body, dm_aad, encrypt_blob, encrypt_body,
-    gen_enc_keypair, new_content_key, post_aad, seal_content_key,
-    open_content_key, seal_slots, try_open_slots, unwrap_key, wrap_key,
+    gen_enc_keypair, new_content_key, post_aad, response_aad, responses_aad,
+    seal_content_key, open_content_key, seal_slots, try_open_slots,
+    unwrap_key, wrap_key,
 )
 
 
@@ -99,6 +100,23 @@ def test_post_aad_binds_author_scope_time():
     assert a != post_aad("aa" * 32, "kreds", 100.0)      # scope bound
     assert a != post_aad("bb" * 32, "inner", 100.0)      # author bound
     assert a != post_aad("aa" * 32, "inner", 101.0)      # time bound
+    assert isinstance(a, (bytes, bytearray))
+
+
+def test_response_aad_binds_responder_target_time():
+    a = response_aad("aa" * 32, "m" * 16, 100.0)
+    assert a != response_aad("bb" * 32, "m" * 16, 100.0)     # responder bound
+    assert a != response_aad("aa" * 32, "n" * 16, 100.0)     # target bound
+    assert a != response_aad("aa" * 32, "m" * 16, 101.0)     # time bound
+    assert a != responses_aad("aa" * 32, "m" * 16, 100.0)    # type bound
+    assert isinstance(a, (bytes, bytearray))
+
+
+def test_responses_aad_binds_author_target_time():
+    a = responses_aad("aa" * 32, "m" * 16, 100.0)
+    assert a != responses_aad("bb" * 32, "m" * 16, 100.0)    # author bound
+    assert a != responses_aad("aa" * 32, "n" * 16, 100.0)    # target bound
+    assert a != responses_aad("aa" * 32, "m" * 16, 101.0)    # time bound
     assert isinstance(a, (bytes, bytearray))
 
 

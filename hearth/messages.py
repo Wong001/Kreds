@@ -17,6 +17,10 @@ KIND_RING = "ring"
 KIND_PROFILE_LAYOUT = "profile_layout"
 KIND_ALBUM = "album"
 KIND_WRAP_GRANT = "wrap_grant"
+KIND_RESPONSE = "response"
+KIND_RESPONSES = "responses"
+REACTION_TOKENS = ("heart", "laugh", "wow", "sad", "up", "fire")
+MAX_COMMENT = 500
 MAX_LAYOUT = 500
 GRID_LAYOUTS = ("auto", "cols2", "cols3", "hero", "masonry")
 SIZE_LAYOUTS = ("small", "wide", "full")
@@ -181,6 +185,33 @@ def make_wrap_grant(device: DeviceKeys, target_msg_id: str, wraps: dict,
     return device.sign_message({
         "kind": KIND_WRAP_GRANT, "target": target_msg_id, "wraps": wraps,
         "created_at": _now(now),
+    })
+
+
+def make_response(device: DeviceKeys, target: str, body_nonce: str,
+                  body_ct: str, wraps: dict,
+                  created_at: Optional[float] = None) -> SignedMessage:
+    """Responder -> author only (spec 2026-07-18): rkind/body/alias/
+    public/mutual_box all live INSIDE the encrypted body -- the envelope
+    carries just target + crypto fields, invisible to relays."""
+    return device.sign_message({
+        "kind": KIND_RESPONSE, "target": target,
+        "body_nonce": body_nonce, "body_ct": body_ct, "wraps": wraps,
+        "created_at": _now(created_at),
+    })
+
+
+def make_responses(device: DeviceKeys, target: str, body_nonce: str,
+                   body_ct: str, wraps: dict,
+                   expires_at: Optional[float] = None,
+                   created_at: Optional[float] = None) -> SignedMessage:
+    """Author-signed latest-wins record per (author, target): the
+    rebuilt comment/reaction section, re-encrypted to the post's
+    audience (spec 2026-07-18)."""
+    return device.sign_message({
+        "kind": KIND_RESPONSES, "target": target,
+        "body_nonce": body_nonce, "body_ct": body_ct, "wraps": wraps,
+        "expires_at": expires_at, "created_at": _now(created_at),
     })
 
 
@@ -426,6 +457,27 @@ def validate_payload(p: dict) -> Tuple[bool, str]:
             ep = w.get("enc_pub")
             if ep is not None and not _is_hex64(ep):
                 return False, "bad enc_pub"
+        return True, "ok"
+    if kind in (KIND_RESPONSE, KIND_RESPONSES):
+        # Envelope-only shape check (spec 2026-07-18): rkind/body/alias/
+        # public/mutual_box are inside the encrypted body and never
+        # touch validate_payload -- relays only ever see target + crypto
+        # fields here, same disclosure class as KIND_DM/KIND_POST.
+        target = p.get("target")
+        if not isinstance(target, str) or not target:
+            return False, "bad target"
+        if not _is_hexn(p.get("body_nonce"), 24):
+            return False, "bad body_nonce"
+        ct = p.get("body_ct")
+        if (not isinstance(ct, str) or not ct
+                or any(c not in "0123456789abcdef" for c in ct)):
+            return False, "bad body_ct"
+        if not _valid_wraps(p.get("wraps")):
+            return False, "bad wraps"
+        if kind == KIND_RESPONSES:
+            exp = p.get("expires_at")
+            if exp is not None and not isinstance(exp, (int, float)):
+                return False, "bad expires_at"
         return True, "ok"
     return False, "unknown kind"
 

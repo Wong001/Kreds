@@ -48,6 +48,20 @@ def post_aad(author_identity: str, scope: str, created_at: float) -> bytes:
                       "created_at": created_at})
 
 
+def response_aad(responder_identity: str, target: str,
+                 created_at: float) -> bytes:
+    return canonical({"type": "response-aad", "protocol": PROTOCOL,
+                      "from": responder_identity, "target": target,
+                      "created_at": created_at})
+
+
+def responses_aad(author_identity: str, target: str,
+                  created_at: float) -> bytes:
+    return canonical({"type": "responses-aad", "protocol": PROTOCOL,
+                      "from": author_identity, "target": target,
+                      "created_at": created_at})
+
+
 def _derive_kek(shared: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
                 info=b"hearth/dm-wrap/v1").derive(shared)
