@@ -147,3 +147,14 @@ deliberate, desirable side effect), and the class scoping leaves the 0.3.13
 `.eavatar` specificity fix unchallenged. Journal photos now also open
 the shared fullscreen lightbox (full-res hash), so the cap is never the
 only view of a photo.
+
+## Addendum 2 (approved by August, 2026-07-18): DM photo previews
+
+DM chat photos had the same page-eating problem (max-width only). They
+now render as compact previews (`.bubble img.dmpic`: max-height 220px,
+width free within the bubble, aspect preserved, block-stacked) and open
+the shared fullscreen lightbox on click. The lightbox items gained an
+additive per-item `src` override because DM blobs are served from
+/api/dm-blob (per-device DM crypto), not the lightbox's post-blob
+default - post/wall callers are untouched, and the default path still
+never reads a thumb hash.

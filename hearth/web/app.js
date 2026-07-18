@@ -2812,7 +2812,10 @@ function openLightbox(items, index, opener) {
   ov.append(img, prev, next, count, x);
 
   function render() {
-    img.src = "/api/post-blob/" + items[i].m + "/" + items[i].h;
+    // items may carry a precomputed src (DM photos live on /api/dm-blob);
+    // post/wall callers keep the post-blob default.
+    img.src = items[i].src ||
+      ("/api/post-blob/" + items[i].m + "/" + items[i].h);
     count.textContent = (i + 1) + " / " + items.length;
     const multi = items.length > 1;
     prev.style.display = next.style.display = count.style.display = multi ? "" : "none";
@@ -4121,11 +4124,21 @@ async function openThread(identity, name, keepScroll) {
       "(cannot decrypt on this device)"));
     else {
       b.append(el("div", "", m.text || ""));
-      for (const h of m.blobs) {
+      // DM photos (August 2026-07-18): compact clickable previews - the
+      // shared lightbox is the full-size view. src is precomputed per
+      // item because DM blobs live on /api/dm-blob, not the lightbox's
+      // post-blob default.
+      const ditems = m.blobs.map(
+        (bh) => ({src: "/api/dm-blob/" + m.msg_id + "/" + bh}));
+      m.blobs.forEach((h, bi) => {
         const img = document.createElement("img");
         img.src = "/api/dm-blob/" + m.msg_id + "/" + h;
+        img.className = "dmpic";
+        img.style.cursor = "zoom-in";
+        img.tabIndex = -1;   // lightbox close returns focus here
+        img.onclick = () => openLightbox(ditems, bi, img);
         b.append(img);
-      }
+      });
     }
     b.append(el("div", "bt", new Date(m.created_at * 1000).toLocaleString()));
     root.append(b);

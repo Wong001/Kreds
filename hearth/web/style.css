@@ -855,6 +855,11 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
 .bubble.me { margin-left: auto; background: color-mix(in srgb, var(--me) 16%, var(--surface));
   border-color: color-mix(in srgb, var(--me) 30%, var(--line)); }
 .bubble img { max-width: 100%; border-radius: 8px; margin-top: 6px; }
+/* DM photo previews (August 2026-07-18, journal-cap sibling): compact
+   in the bubble, aspect preserved, never page-eating - the lightbox is
+   the full-size view. display:block so stacked photos don't share a
+   line; the base .bubble img max-width still bounds narrow bubbles. */
+.bubble img.dmpic { max-height: 220px; width: auto; display: block; }
 .bubble .bt { font-size: 10px; color: var(--ink-2); margin-top: 3px; }
 .bubble .undec { font-style: italic; color: var(--ink-2); }
 .dm-compose-bar { display: flex; gap: 8px; align-items: center; padding: 12px 14px;

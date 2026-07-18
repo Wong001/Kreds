@@ -1825,7 +1825,10 @@ def test_profile_load_render_honesty():
     # actual intent instead: the src-building line reads only items[i].h,
     # never a thumb fallback.
     assert "items[i].t" not in lb
-    assert 'img.src = "/api/post-blob/" + items[i].m + "/" + items[i].h;' in lb
+    # superseded pin (DM cap, 2026-07-18): the src line gained an
+    # items[i].src override for DM-blob URLs - the intent stands: the
+    # DEFAULT build still reads only the full hash, never a thumb.
+    assert '("/api/post-blob/" + items[i].m + "/" + items[i].h)' in lb
     rf = _js_fn_body(js, "refresh")
     assert "openProfile(CURRENT_PROFILE)" in rf
     assert "ARRANGING" in rf                         # the drag guard
@@ -1861,3 +1864,20 @@ def test_journal_photo_cap_and_lightbox():
     # class-scoped, not a bare img selector: the 0.3.13 .eavatar
     # specificity fix must stay unchallenged
     assert "max-height" not in _css_rule(css, ".entry img")
+
+
+def test_dm_photo_compact_and_lightbox():
+    # August 2026-07-18 (same day as the journal cap): DM photos render as
+    # compact clickable previews; the shared lightbox is the full-size
+    # view. DM blobs are served from /api/dm-blob - the lightbox items
+    # carry a precomputed src (additive: post/wall callers keep the
+    # post-blob default).
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    ot = _js_fn_body(js, "openThread")
+    assert '"dmpic"' in ot and "openLightbox" in ot
+    assert "/api/dm-blob/" in ot
+    lb = _js_fn_body(js, "openLightbox")
+    assert "items[i].src ||" in lb
+    rule = _css_rule(css, ".bubble img.dmpic")
+    assert "max-height" in rule
