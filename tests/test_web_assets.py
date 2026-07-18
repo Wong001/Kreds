@@ -1994,3 +1994,20 @@ def test_refresh_guards_journal_rebuild_against_a_mid_typed_comment():
         assert always in rf
         # none of the always-on renders are themselves wrapped in the guard
         assert not re.search(r"if\s*\(!commentDirty\)\s*" + re.escape(always), rf)
+
+
+def test_comment_composer_clears_before_refresh_not_after():
+    # Re-review follow-up: refresh()'s own commentDirty guard (above) reads
+    # THIS input's live value - leaving the just-sent text in place until
+    # AFTER refresh() would make the guard see a "dirty" draft from inside
+    # its own submit handler onward, freezing renderJournal() forever (the
+    # just-posted comment never appears, and the whole journal silently
+    # stops updating). Order-sensitive index pin, same idiom as
+    # test_whole_branch_review_fixes' closest()/preventDefault/move-def
+    # ordering check.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    rr = _js_fn_body(js, "renderResponses")
+    submit_start = rr.index("form.onsubmit")
+    clear_idx = rr.index('input.value = ""', submit_start)
+    refresh_idx = rr.index("await refresh()", submit_start)
+    assert clear_idx < refresh_idx

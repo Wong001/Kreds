@@ -596,6 +596,14 @@ function renderResponses(p, body) {
     try {
       await j("/api/comment", {method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({msg_id: p.msg_id, text})});
+      // Clear BEFORE refresh() (mirrors profilePostComposer's input.value =
+      // "" before its own re-render, ~line 2454): commentDirty reads this
+      // very input's live value, so leaving the just-sent text in place
+      // would make refresh()'s own guard see a "dirty" draft from inside
+      // this handler onward - the posted comment appears to vanish (the
+      // rebuild never runs to show it) and the WHOLE journal silently
+      // freezes until something else clears the input by hand.
+      input.value = "";
       EXPANDED_COMMENTS.add(p.msg_id);   // posting a comment implies wanting the thread open
       await refresh();
     } finally {
