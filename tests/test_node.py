@@ -110,7 +110,9 @@ def test_compose_post_gates_photos(tmp_path):
     plain = n.post_blob(mid, ref)
     assert plain != big                        # gate re-encoded
     img = _Image.open(_io.BytesIO(plain))
-    assert img.format == "JPEG" and max(img.size) <= 2560
+    # Superseded pin: gate emitted JPEG pre-AVIF ladder (imagegate spec
+    # 2026-07-18 Part 4).
+    assert img.format == "AVIF" and max(img.size) <= 2560
 
 
 def test_compose_post_gif_survives_byte_identical(tmp_path):

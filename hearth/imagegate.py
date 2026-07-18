@@ -35,7 +35,7 @@ def is_image_bytes(data: bytes) -> bool:
         or any(data.startswith(m) for m in _IMAGE_MAGIC)
 
 
-def transcode(data: bytes, max_dim: int) -> bytes:
+def transcode(data: bytes, max_dim: int, fmt: str = "png") -> bytes:
     try:
         img = Image.open(io.BytesIO(data))
         img.load()                       # force decode (raises on truncated)
@@ -55,12 +55,18 @@ def transcode(data: bytes, max_dim: int) -> bytes:
     if max(img.size) > max_dim:
         img.thumbnail((max_dim, max_dim), Image.LANCZOS)
     out = io.BytesIO()
-    img.save(out, format="PNG")
+    if fmt == "avif":
+        # story stills / video posters (spec 2026-07-18 Part 4): ~half the
+        # bytes of PNG at fullscreen sizes; decode is the client Chromium's
+        # native job. speed=6: encode-time sanity on big frames.
+        img.save(out, format="AVIF", quality=60, speed=6)
+    else:
+        img.save(out, format="PNG")
     return out.getvalue()
 
 
 PHOTO_MAX = 2560                       # long edge for post/DM photos
-_PHOTO_QUALITIES = (85, 75, 65, 55)    # JPEG ladder before dimensions halve
+_PHOTO_QUALITIES = (70, 60, 50, 40)    # AVIF ladder before dimensions halve
 PHOTO_CAP = MAX_BLOB_BYTES - 64        # encrypt_blob adds nonce+tag (28 B);
                                        # 64 B margin keeps ciphertext under
                                        # the store's MAX_BLOB_BYTES check
@@ -68,11 +74,12 @@ PHOTO_CAP = MAX_BLOB_BYTES - 64        # encrypt_blob adds nonce+tag (28 B);
 
 def transcode_photo(data: bytes, cap: int = PHOTO_CAP) -> bytes:
     """Post/DM photo gate: orientation baked in, metadata (EXIF/GPS)
-    dropped, downscaled to PHOTO_MAX, recompressed until the result fits
-    `cap` (so the encrypted blob fits MAX_BLOB_BYTES). PNG input stays
-    PNG when the lossless re-encode fits (screenshots stay crisp);
-    everything else lands as JPEG. Animated GIFs pass through raw --
-    animation preserved, cannot be compressed here, over-cap refused."""
+    dropped, downscaled to PHOTO_MAX, AVIF-recompressed down a quality
+    ladder until the result fits `cap` (spec 2026-07-18: ~40-50% smaller
+    than the old JPEG ladder at equal quality; decode is native in every
+    client Chromium and iOS16+/Android12+ for the future mobile floor).
+    Animated GIFs pass through raw -- animation preserved, cannot be
+    compressed here, over-cap refused."""
     if data[:4] == b"GIF8":
         if len(data) > cap:
             raise ValueError("animated GIF exceeds the 10 MB cap - "
@@ -84,17 +91,11 @@ def transcode_photo(data: bytes, cap: int = PHOTO_CAP) -> bytes:
     except (UnidentifiedImageError, OSError, ValueError,
             Image.DecompressionBombError):
         raise ValueError("not an image")
-    src_png = img.format == "PNG"        # .format is lost after transpose
     if getattr(img, "is_animated", False):
         img.seek(0)                      # first frame (animated webp etc.)
     img = ImageOps.exif_transpose(img)   # bake orientation BEFORE exif drops
     if max(img.size) > PHOTO_MAX:
         img.thumbnail((PHOTO_MAX, PHOTO_MAX), Image.LANCZOS)
-    if src_png:
-        out = io.BytesIO()
-        img.save(out, format="PNG")      # re-encode: no source chunks carried
-        if out.tell() <= cap:
-            return out.getvalue()
     rgb = img
     if rgb.mode != "RGB":
         bg = Image.new("RGB", rgb.size, (255, 255, 255))
@@ -104,10 +105,36 @@ def transcode_photo(data: bytes, cap: int = PHOTO_CAP) -> bytes:
     while True:
         for q in _PHOTO_QUALITIES:
             out = io.BytesIO()
-            rgb.save(out, format="JPEG", quality=q, optimize=True)
+            rgb.save(out, format="AVIF", quality=q, speed=6)
             if out.tell() <= cap:
                 return out.getvalue()
         w, h = rgb.size
         if max(w, h) <= 64:              # unreachable for any real photo;
             raise ValueError("image cannot fit the blob cap")
         rgb = rgb.resize((max(1, w // 2), max(1, h // 2)), Image.LANCZOS)
+
+
+THUMB_MAX = 640                        # long edge for wall/journal tiles
+THUMB_QUALITY = 50
+
+
+def photo_thumb(gated: bytes) -> bytes:
+    """Tile-resolution AVIF thumbnail of an already-gated photo (spec
+    2026-07-18 Part 3). Raises ValueError for GIF (tiles keep the
+    animated full blob) and undecodable bytes -- the caller maps a raise
+    to a null thumb entry; a thumbnail must never block a post."""
+    if gated[:4] == b"GIF8":
+        raise ValueError("no thumbs for animated GIFs")
+    try:
+        img = Image.open(io.BytesIO(gated))
+        img.load()
+    except (UnidentifiedImageError, OSError, ValueError,
+            Image.DecompressionBombError):
+        raise ValueError("not an image")
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    if max(img.size) > THUMB_MAX:
+        img.thumbnail((THUMB_MAX, THUMB_MAX), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="AVIF", quality=THUMB_QUALITY, speed=6)
+    return out.getvalue()
