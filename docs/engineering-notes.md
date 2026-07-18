@@ -1261,3 +1261,181 @@ against the gate's 60s subprocess timeout - the cut happens via
 source outside the window, leaving ample headroom even for sources far
 larger than this test used. `_TIMEOUT` stays at 60; no change was
 needed.
+
+## Profile-load speed: render honesty, sync ordering, thumbnails, AVIF
+
+Opening a new friend's profile used to take 1-2 minutes (August's own
+report, 2026-07-18). Spec:
+`docs/superpowers/specs/2026-07-18-profile-load-speed-design.md`, built
+on the `profile-load` branch as one combined slice, four parts, no
+protocol break in any of them except one additive field.
+
+**Three causes, measured in the code, not guessed.**
+1. **Budget/cadence.** `BLOB_GIVE_BUDGET` (`sync.py:49`) is `MAX_FRAME -
+   1 MB` = ~15 MB of base64-encoded blob payload per sync round; after
+   the ~4/3 base64 expansion that's ~11 MB of raw blob bytes per round -
+   the number the spec cites. Onion peers only run that round every
+   `ONION_SYNC_INTERVAL` (`messages.py:63`) = 45 seconds. A photo-heavy
+   backlog bigger than one round's budget necessarily costs multiple
+   45-second waits.
+2. **Give order.** The pre-slice give loop walked the peer's wanted
+   hashes in whatever order they arrived - content-addressed hashes, so
+   effectively random relative to size - with no size-based ordering at
+   all. One 9 MB video sitting anywhere in that order could fill an
+   entire round's budget while twenty avatar/thumbnail-sized blobs waited
+   behind it.
+3. **Sharpest.** The profile page never self-healed. A not-yet-synced
+   image had no `onerror` handler at all, so it rendered as the
+   browser's broken-image glyph; the WS "changed" tick's `refresh()`
+   re-rendered the journal/feed but explicitly skipped a currently-open
+   profile view. A wall that started broken stayed broken until the
+   visitor navigated away and back - a full manual reload was the only
+   thing that actually re-fetched anything.
+
+**Four-layer fix** (spec Parts 1-4; each independently shippable, and
+none of them touches the wire beyond one additive field):
+- **Render honesty (Part 1).** Every post/deck/journal `<img>` now goes
+  through `blobImg()` (`hearth/web/app.js`): its `onerror` swaps the
+  element for a `.img-pending` shimmer div sized to the same cell,
+  instead of a broken glyph, ever. `refresh()` (the WS "changed"
+  handler) now also re-renders the CURRENTLY OPEN profile - guarded off
+  while `ARRANGING` (a re-render would tear the drag surface out from
+  under a live pointer) and while `#block-settings` is open (it holds a
+  live reference to its block element); both states are transient, so
+  the next "changed" tick after either ends heals the wall. The deck
+  viewer (`renderDeck`) deliberately does NOT call `blobImg()` - its
+  `<img>` is one persistent element reused across flips by every
+  prev/next closure, so `blobImg`'s `replaceWith` would tear it out from
+  under them; it gets a narrower `onerror`/`onload` pair that just
+  toggles the `.img-pending` class on that same element instead.
+- **Sync ordering (Part 2).** The give loop (`sync.py:632-639`) now
+  sorts the peer's wanted hashes ascending by locally-held size
+  (`store.blob_sizes()`, one `SELECT hash, LENGTH(data) ... WHERE hash
+  IN (...)`) before filling `BLOB_GIVE_BUDGET`; ties keep hash order for
+  determinism, and hashes we don't hold sort last and fall out at the
+  pre-existing `get_blob() is None` check, same as before. Node-side
+  only, no wire change - an old peer talking to a new one simply
+  receives small blobs first.
+- **Thumbnails (Part 3).** `photo_thumb()` (`hearth/imagegate.py`)
+  downscales an already-gated photo to <=640px long edge and re-encodes
+  AVIF quality 50. `compose_post` calls it once per photo (and once on
+  the video poster for a video post) right after
+  `transcode_photo`/`transcode_video`, storing each thumb through the
+  same `encrypt_blob`+`put_blob` path as its parent blob and appending
+  its hash - or `None` on a `photo_thumb` `ValueError` (GIFs,
+  undecodable bytes) - to a new index-aligned `thumbs` list riding the
+  post payload (`make_post`, additive: `validate_payload` treats a
+  missing `thumbs` as absent, and when present requires a list the same
+  length as `blobs`). Wall/deck/lightbox rendering prefers the thumb
+  hash permanently at tile size; only the lightbox steps up to the full
+  hash.
+- **AVIF for the full-res blob (Part 4).** `transcode_photo`'s quality
+  ladder is now AVIF 70/60/50/40 (was JPEG 85/75/65/55); the old
+  PNG-stays-PNG exemption is gone, so a screenshot posted as PNG now
+  goes through the same ladder as everything else. `transcode()` gained
+  a `fmt` param (`"png"` default, `"avif"` opt-in) so story stills and
+  video posters can switch format without touching avatars/banners,
+  which stay on the PNG-only call, untouched.
+
+**Crypto note, and the spec correction it produced.** A thumb is
+encrypted with the exact same per-post content key as its parent blob
+(`compose_post` calls `encrypt_blob(key, photo_thumb(gated))` with the
+identical `key` used for the post's own photo blobs, then `put_blob`s it
+like any other blob), and `Store.referenced_blobs()` folds `thumbs` into
+the same reference set `blobs`/`poster` already contribute - a thumb
+syncs and gets GC'd exactly on its parent post's lifecycle, no separate
+crypto or lifecycle path to keep in sync. The spec as written said
+`node.post_blob(mid, h)` "must reject hashes not referenced by that
+post, as today" - that is not actually how `post_blob` (`node.py:1925-
+1933`) has ever worked: it fetches whatever blob is at hash `h` from the
+store and decrypts it under the CALLING post's own content key
+(`self._content_key(msg)`), with no check anywhere that `h` appears in
+that post's `blobs`/`thumbs`/`poster` list. There never was a reference
+list to check. What actually refuses a mismatched hash is
+`decrypt_blob`'s AEAD auth-tag check (ChaCha20-Poly1305, `dmcrypt.py`)
+failing under the wrong per-post key and returning `None` - every post's
+content key is independently generated, so a hash belonging to a
+different post's blob decrypts to nothing under this post's key.
+`tests/test_profile_video.py::test_post_thumbs_aligned_and_served` pins
+the corrected claim directly: it fetches another post's own blob hash
+through THIS post's `msg_id` and asserts `None`, with a comment reading
+"the per-post content key fails AEAD auth (the crypto IS the guard)" -
+the actual (and stronger) mechanism, documented instead of a reference
+check that was never implemented.
+
+**Two review-caught fixes worth a permanent record** (both from the same
+review pass, commit `edeb67a`):
+- `referenced_blobs()`'s thumbs guard originally read `for t in
+  (p.get("thumbs") or [])` - `or []` only substitutes on a FALSY value,
+  so a hostile or malformed `KIND_DM` payload (DMs are never
+  thumbs-validated the way posts are) carrying a truthy non-list
+  `"thumbs": 1` would iterate an int and raise `TypeError`, taking down
+  every sync round AND `gc_blobs()` with it - a one-message denial-of-
+  service against any node that ingested it. Fixed by
+  `isinstance(thumbs, list)`-checking the CONTAINER itself before
+  iterating its elements, closing exactly the class of gap the original
+  guard existed to prevent. Pinned by a new store-level test
+  constructing that exact malformed DM payload.
+- `hearth/api.py`'s `_sniff()` mis-served AVIF blobs before this fix:
+  AVIF/AVIS are ISOBMFF containers, so they carry the same `ftyp` box at
+  the same byte offset as MP4 - `_sniff` was labeling every
+  `ftyp`-boxed blob `video/mp4` regardless of brand. It now reads the
+  4-byte brand code right after the box (`data[8:12]`) and returns
+  `image/avif` for `avif`/`avis` before falling through to the MP4 case
+  - otherwise every post-photo/thumb/story-still/video-poster AVIF blob
+  this slice introduces would have been served to the browser mislabeled
+  as a video.
+
+**Compatibility: no gating event, and why that's not a shortcut.** Blobs
+are opaque, hash-addressed bytes to both `store` and `sync` - neither
+ever inspects or interprets blob content, only length and hash.
+Decoding an AVIF blob happens entirely client-side, in whichever
+Chromium the viewer's browser/WebView2 embeds; that decoder already
+exists today (desktop Chromium and WebView2 both decode AVIF natively)
+and the future mobile floor (iOS 16+, Android 12+) covers it too.
+Compare this to the two prior slices that DID need a gating event:
+0.3.11's blob-cap raise (an old-cap peer flatly refuses a bigger blob
+until it updates) and the `wrap_grant` record kind (an old peer's ingest
+gate rejects an unknown `kind` outright). This slice adds neither a
+bigger cap nor a new record kind - `thumbs` is an additive, ignorable
+list field (same pattern as `poster`/`codec` before it), and the blob
+bytes underneath are just bytes. The only thing that actually needs the
+new core is CREATING an AVIF blob in the first place (encoding is
+server/node-side, via the updated `transcode_photo`/`transcode`); an
+old-core peer can already sync, store, and serve any hash a new-core
+peer hands it, whether or not it can produce one itself.
+`min_core_for_web` is untouched by this release.
+
+**Measured numbers (transfer-size sanity check, the spec's honest-math
+claim).** No real camera photos exist in this sandbox, so the check
+gates 5 synthetic images approximating a representative posting mix -
+four photo-like images (smoothed multi-octave noise plus fine grain, the
+spread-spectrum shape of a real photograph, at four phone/camera-
+realistic resolutions from 1200x1600 up to 4032x3024) plus one flat-
+color/sharp-edge PNG "screenshot" (the case the spec calls out as
+AVIF's biggest single win now that PNG-stays-PNG is retired) - through
+both the CURRENT `transcode_photo` (AVIF)/`photo_thumb` pipeline and a
+byte-for-byte reconstruction of the PRE-CHANGE JPEG-ladder
+`transcode_photo` (copied verbatim from this slice's parent commit).
+Results:
+- Total full-blob bytes, OLD JPEG ladder: 1,967,929 B (1921.8 KB)
+- Total full-blob bytes, NEW AVIF ladder: 1,073,291 B (1048.1 KB) - a
+  **45.5% reduction**, inside the spec's ~40-50% estimate
+- Total thumb bytes across the same 5 photos: 59,239 B (57.9 KB),
+  averaging **11.6 KB/thumb** - comfortably under the spec's <=25 KB
+  "typical" ceiling
+
+The screenshot case alone: 10.2 KB old (PNG-stays-PNG kept it lossless)
+vs 3.3 KB new (AVIF ladder) - the single largest relative win in the
+set, matching the spec's called-out case exactly. These numbers
+substantiate the spec's math; they are a sanity check on synthetic
+content, not a controlled photographic benchmark, and are stated as
+such.
+
+Full suite green (963 passed, 8 env-gated skips - `TOR_E2E` plus seven
+`UI_E2E` live smokes, this slice's `test_ui_smoke_profile_load.py`
+included - confirmed clean across 2 consecutive runs). The three
+`UI_E2E`-gated smokes this slice touches
+(`test_ui_smoke_profile_load.py`, `test_ui_smoke_albums.py`,
+`test_ui_smoke_video_editor.py`) - 4 passed, confirmed clean across 2
+consecutive runs.
