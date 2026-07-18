@@ -1233,8 +1233,14 @@ class HearthNode:
                     continue                        # undecryptable/unknown/conflicted
                 if p.get("media") == "video":
                     continue    # hostile/legacy record naming a video post - never fold an mp4 into photos
-                for h in p.get("blobs") or []:
-                    photos.append({"m": mid, "h": h})
+                # Thumb rides each folded photo row (spec 2026-07-18, client
+                # Task 4): index-aligned with the member post's own blobs/
+                # thumbs, same null-safety as _decrypt_post_row's plain
+                # "thumbs" field - an old member with no thumbs just gets t=None.
+                mthumbs = p.get("thumbs") or []
+                for i, h in enumerate(p.get("blobs") or []):
+                    photos.append({"m": mid, "h": h,
+                                   "t": mthumbs[i] if i < len(mthumbs) else None})
                 if newest is None or p["created_at"] > newest:
                     newest = p["created_at"]
                     scope_newest = p.get("scope", "kreds")

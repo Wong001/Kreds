@@ -1759,3 +1759,52 @@ def test_video_editor_composer_integration():
     assert js.count("openVideoEditor(") >= 3      # def + 2 call sites
     # "coming soon" promise retired (the editor exists now)
     assert "In-app trimming is coming soon" not in js
+
+
+# ---------------------------------------------------------------------
+# Profile load speed (Task 4): placeholders instead of broken glyphs,
+# thumb-first tiles, profile self-heal on WS-driven refresh.
+# ---------------------------------------------------------------------
+
+def test_profile_load_render_honesty():
+    # Spec 2026-07-18 Parts 1+3: no broken glyphs (onerror -> .img-pending
+    # placeholder), tiles prefer the thumb hash, lightbox keeps full-res,
+    # and refresh() heals an open profile (guarded: not while arranging /
+    # modal open - a re-render mid-drag would tear the drag surface away).
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "function blobImg(" in js
+    bi = _js_fn_body(js, "blobImg")
+    assert "img-pending" in bi and "onerror" in bi
+    assert ".img-pending" in css
+    items = _js_fn_body(js, "blockPhotoItems")
+    assert '"t"' in items or "t:" in items          # thumb rides the item
+    deck = _js_fn_body(js, "renderDeck")
+    assert "blobImg" in deck or ".t ||" in deck
+    # Deck deviation from blobImg (delegated choice #1): the deck's <img> is
+    # a single long-lived element reused across flips (show() just swaps
+    # its src) - blobImg's replaceWith(placeholder) would tear out the
+    # element every prev/next/show closure in this function still holds a
+    # reference to, breaking the flip. Minimal variant instead: flag the
+    # element itself pending (same .img-pending look) on error, and clear
+    # the flag on the next successful load (a flip, or the WS-retry
+    # re-render creating a fresh element anyway) - never a broken glyph,
+    # never a swapped-out element.
+    assert 'img.onerror = () => img.classList.add("img-pending")' in deck
+    assert 'img.onload = () => img.classList.remove("img-pending")' in deck
+    lb = _js_fn_body(js, "openLightbox")
+    # lightbox is full-res only - a bare substring ".t" false-positives on
+    # openLightbox's own pre-existing (untouched) "prev.type =" /
+    # "next.type =" / "count.textContent" property assignments, so pin the
+    # actual intent instead: the src-building line reads only items[i].h,
+    # never a thumb fallback.
+    assert "items[i].t" not in lb
+    assert 'img.src = "/api/post-blob/" + items[i].m + "/" + items[i].h;' in lb
+    rf = _js_fn_body(js, "refresh")
+    assert "openProfile(CURRENT_PROFILE)" in rf
+    assert "ARRANGING" in rf                         # the drag guard
+    # modal-mechanism finding: #block-settings uses a plain "hidden" class
+    # (closeBlockSettings adds it / openBlockSettings removes it) - the
+    # brief's proposed classList.contains("hidden") guard matches reality
+    # as written, no adaptation needed.
+    assert 'document.getElementById("block-settings").classList.contains("hidden")' in rf

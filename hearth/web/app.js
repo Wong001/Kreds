@@ -343,12 +343,10 @@ function buildEntry(p) {
   scope.append(document.createTextNode(p.scope));
   line.append(scope);
   body.append(line, el("p", "etext", p.text));
-  for (const h of p.blobs) {
-    const img = document.createElement("img");
-    img.src = "/api/post-blob/" + p.msg_id + "/" + h;
-    img.alt = "";
-    body.append(img);
-  }
+  const eth = p.thumbs || [];
+  p.blobs.forEach((h, i) => {
+    body.append(blobImg(p.msg_id, h, eth[i] || null));
+  });
   if (p.mine) {
     const acts = el("div", "eacts");
     const del = el("button", "pact del", "Delete everywhere");
@@ -373,13 +371,34 @@ function buildEntry(p) {
 // helper. The Slice-3b grid layouts are retired - a synced record's grids
 // map is deliberately ignored (spec 2026-07-13 decision 4).
 
+// blobImg (spec 2026-07-18): every post image renders through this -
+// prefers the tile-resolution thumb when the record carries one (old
+// posts don't - full blob, exactly as before), and swaps itself for a
+// neutral .img-pending placeholder instead of the browser's broken-image
+// glyph while the blob hasn't gossiped in yet. The WS "changed" re-render
+// (refresh) replaces the placeholder with a fresh <img> that retries.
+function blobImg(msgId, hash, thumbHash) {
+  const img = document.createElement("img");
+  img.src = "/api/post-blob/" + msgId + "/" + (thumbHash || hash);
+  img.alt = "";
+  img.onerror = () => {
+    const ph = el("div", "img-pending");
+    ph.setAttribute("aria-hidden", "true");
+    img.replaceWith(ph);
+  };
+  return img;
+}
+
 // Uniform photo list for a block: a plain post contributes its own
 // msg_id per blob; an album pseudo-block (server-folded, Slice C) already
 // carries cross-post {m, h} pairs. Either way the deck and lightbox see
-// one shape.
+// one shape. Thumbs ride along index-aligned (null for an old post/member
+// with no thumb) - album rows gain .t server-side, in profile_view's
+// album-fold loop (hearth/node.py).
 function blockPhotoItems(p) {
   if (p.album) return p.photos;
-  return (p.blobs || []).map(h => ({m: p.msg_id, h}));
+  const th = p.thumbs || [];
+  return (p.blobs || []).map((h, i) => ({m: p.msg_id, h, t: th[i] || null}));
 }
 
 // Stacked deck (Slice C, chrome per sketch 2026-07-18): the top photo
@@ -394,6 +413,17 @@ function renderDeck(p, items) {
   const img = document.createElement("img");
   img.alt = ""; img.draggable = false; img.style.cursor = "zoom-in";
   img.tabIndex = -1;
+  // Deck onerror/onload (spec 2026-07-18, delegated choice - deviates from
+  // blobImg): this <img> is a single element reused across flips (show()
+  // just swaps its src) - every prev/next/show closure in this function
+  // holds a reference to it, so blobImg's replaceWith(placeholder) would
+  // tear the element out from under them and break the flip. Minimal
+  // variant instead: flag the element itself pending (same .img-pending
+  // look) on error, and clear the flag on the next successful load (a
+  // flip to a synced photo, or the WS-retry re-render building a fresh
+  // deck/img anyway) - never a broken glyph, never a swapped-out element.
+  img.onerror = () => img.classList.add("img-pending");
+  img.onload = () => img.classList.remove("img-pending");
   // dots are position-only chrome - the zone buttons + lightbox carry
   // the accessible semantics, so the row is aria-hidden.
   const dots = el("div", "deck-dots");
@@ -411,7 +441,7 @@ function renderDeck(p, items) {
   next.type = "button";
   next.setAttribute("aria-label", "Next photo");
   const show = () => {
-    img.src = "/api/post-blob/" + items[i].m + "/" + items[i].h;
+    img.src = "/api/post-blob/" + items[i].m + "/" + (items[i].t || items[i].h);
     [...dots.children].forEach((d, k) =>
       d.classList.toggle("active", k === i));
   };
@@ -555,7 +585,12 @@ function renderBlock(p) {
     const wrap = el("div", "block-video");
     const v = document.createElement("video");
     v.controls = true; v.playsInline = true; v.preload = "metadata";
-    if (p.poster) v.poster = "/api/post-blob/" + p.msg_id + "/" + p.poster;
+    // Thumb-first poster (spec 2026-07-18): a video's thumb is a
+    // tile-resolution frame grab, cheaper than the full poster blob while
+    // it's still gossiping in. Old posts (no thumbs) fall back exactly as
+    // before.
+    if (p.thumbs && p.thumbs[0]) v.poster = "/api/post-blob/" + p.msg_id + "/" + p.thumbs[0];
+    else if (p.poster) v.poster = "/api/post-blob/" + p.msg_id + "/" + p.poster;
     const src = document.createElement("source");
     src.src = "/api/post-blob/" + p.msg_id + "/" + p.blobs[0];
     v.append(src); wrap.append(v); block.append(wrap);
@@ -563,9 +598,7 @@ function renderBlock(p) {
     const items = blockPhotoItems(p);
     if (items.length === 1) {
       const media = el("div", "block-photo");
-      const img = document.createElement("img");
-      img.src = "/api/post-blob/" + items[0].m + "/" + items[0].h;
-      img.alt = "";
+      const img = blobImg(items[0].m, items[0].h, items[0].t);
       // whole-branch review IMPORTANT #3: images are draggable by default,
       // so a real-mouse block drag in Arrange mode would start a native
       // HTML5 image drag instead of our own pointer-drag reorder.
@@ -4194,6 +4227,14 @@ async function refresh() {
   renderCircleRail();
   renderMeStrip();
   renderStories();
+  // Profile self-heal (spec 2026-07-18 Part 1): a friend's wall fills in
+  // as blobs gossip in, instead of staying broken until re-navigation.
+  // Guards: never re-render mid-Arrange (tears the drag surface from
+  // under the pointer) or under the block-settings modal (it holds a
+  // reference to its block element). Next tick heals after they close.
+  if (currentView() === "profile" && CURRENT_PROFILE && !ARRANGING
+      && document.getElementById("block-settings").classList.contains("hidden"))
+    openProfile(CURRENT_PROFILE);
   // Conversations are fetched EVERY cycle now (not just with Messages
   // open): the nav badge lives outside that view. One fetch feeds both
   // the badge and the list.
