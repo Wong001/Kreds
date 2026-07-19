@@ -104,8 +104,13 @@ def build_vectors() -> dict:
 
 def main():
     FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # NO sort_keys here: the canonical_cases' obj payloads are DELIBERATELY
+    # unsorted (the TS canonicalizer must prove it sorts them itself), and a
+    # recursive sort_keys would pre-sort them in the committed file.
+    # build_vectors() uses fixed dict literals, so insertion order is
+    # already deterministic. (Amended per Task 2 review finding.)
     FIXTURE_PATH.write_text(
-        json.dumps(build_vectors(), indent=2, sort_keys=True) + "\n",
+        json.dumps(build_vectors(), indent=2) + "\n",
         encoding="utf-8")
     print("wrote", FIXTURE_PATH)
 
