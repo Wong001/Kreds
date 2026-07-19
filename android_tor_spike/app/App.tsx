@@ -1,24 +1,34 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Button, FlatList, SafeAreaView, StyleSheet, Text, View } from "react-native";
 import {
-  Beat, beatNow, getHistory, isBatteryExempt, onBeat, onState,
-  requestBatteryExemption, startNode, stopNode,
+  Beat, beatNow, getHistory, getSyncStats, isBatteryExempt, onBeat, onState,
+  onSync, requestBatteryExemption, startNode, stopNode, syncNow, SyncStats,
 } from "./modules/tor-manager";
 
 export default function App() {
   const [state, setState] = useState("stopped");
   const [beats, setBeats] = useState<Beat[]>([]);
   const [exempt, setExempt] = useState(true);
+  const [syncStats, setSyncStats] = useState<SyncStats>({ messages: 0, blobs: 0, identities: 0 });
+  const [lastSync, setLastSync] = useState<string>("");
 
   const refresh = useCallback(async () => setBeats(await getHistory()), []);
+  const refreshSyncStats = useCallback(async () => setSyncStats(await getSyncStats()), []);
 
   useEffect(() => {
     setExempt(isBatteryExempt());
     refresh();
+    refreshSyncStats();
     const offState = onState(setState);
     const offBeat = onBeat((b) => setBeats((prev) => [b, ...prev].slice(0, 50)));
-    return () => { offState(); offBeat(); };
-  }, [refresh]);
+    const offSync = onSync((r) => {
+      setSyncStats({ messages: r.messages, blobs: r.blobs, identities: r.identities });
+      setLastSync(r.ok
+        ? `synced: ${r.messages} msgs, ${r.blobs} blobs, ${r.identities} friends`
+        : `sync failed: ${r.reason}`);
+    });
+    return () => { offState(); offBeat(); offSync(); };
+  }, [refresh, refreshSyncStats]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -36,6 +46,14 @@ export default function App() {
         <Button title="Stop node" onPress={stopNode} />
         <Button title="Beat now" onPress={beatNow} />
       </View>
+      <Text style={styles.subtitle}>Content sync</Text>
+      <View style={styles.row}>
+        <Button title="Sync now" onPress={syncNow} />
+      </View>
+      <Text style={styles.state}>
+        messages: {syncStats.messages} / blobs: {syncStats.blobs} / friends: {syncStats.identities}
+      </Text>
+      {!!lastSync && <Text style={lastSync.startsWith("sync failed") ? styles.fail : styles.ok}>{lastSync}</Text>}
       <Text style={styles.subtitle}>Heartbeats ({beats.length})</Text>
       <FlatList
         style={styles.list}

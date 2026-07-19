@@ -100,6 +100,18 @@ object KotlinWire {
         is Boolean -> if (v) "true" else "false"
         is String -> escapeString(v)
         is PyFloat -> pyFloatRepr(v.value)
+        // BB-5 desk-gate finding: a plain (unwrapped) Double reaching here
+        // -- e.g. a real node's high-precision created_at, normalized by
+        // KotlinSync's org.json bridge (unwrap()) to a bare Double rather
+        // than PyFloat, so it stays castable via `as Number` everywhere
+        // else a parsed field is read directly (SignedMessageKt.fromDict's
+        // cert.enrolled_at). Purely additive: dumps() previously had no
+        // Double case at all (threw "unsupported type"), so every caller
+        // that worked before this was already wrapping floats in PyFloat
+        // explicitly -- this only adds support for the previously-rejected
+        // bare-Double case, using the exact same Python-repr-matched
+        // formatting.
+        is Double -> pyFloatRepr(v)
         is Int -> v.toString()
         is Long -> v.toString()
         is List<*> -> "[" + v.joinToString(",") { dumps(it) } + "]"

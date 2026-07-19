@@ -171,7 +171,7 @@ Parse + verify + `msg_id`, gated against vectors generated from the real hearth 
 
 **Interfaces:**
 - Consumes: `KotlinWire` (canonical/PyFloat/verifyRaw/CertDict/toHex), the message-body shape from Global Constraints.
-- Produces `data class SignedMessage(val cert: KotlinWire.CertDict, val seq: Int, val payload: Map<String, Any?>, val signature: String)` with `fun body(): ByteArray`, `fun msgId(): String`, `fun verifyDeviceSignature(): Boolean`, `val kind: String` (`payload["type"] as? String ?: ""`), companion `fun fromDict(d: Map<String, Any?>): SignedMessage`.
+- Produces `data class SignedMessage(val cert: KotlinWire.CertDict, val seq: Int, val payload: Map<String, Any?>, val signature: String)` with `fun body(): ByteArray`, `fun msgId(): String`, `fun verifyDeviceSignature(): Boolean`, `val kind: String` (`payload["kind"] as? String ?: ""` — the payload's kind discriminator is `"kind"`, NOT `"type"`; `"type"` is the signed-envelope field. `KIND_POST="post"`, `KIND_DM="dm"` per hearth/messages.py), companion `fun fromDict(d: Map<String, Any?>): SignedMessage`.
 
 - [ ] **Step 1: Write `make_message_vectors.py`** (deterministic, throwaway keys — output committed to the public repo)
 ```python
@@ -208,18 +208,22 @@ def _msg(seq: int, payload: dict) -> SignedMessage:
 
 def build() -> dict:
     cases = []
+    # Payloads use the REAL field name "kind" (not "type"); "blobs"/"poster"/
+    # "thumbs" are the cleartext blob-ref fields hearth.store.referenced_blobs
+    # reads. Body_ct/scope minimal (BB-2 gates verify/msgId/kind, not the
+    # encrypted-body semantics; the loopback gate proves against real node msgs).
     for seq, payload in [
-        (1, {"type": "post", "text": "hello", "blobs": []}),
-        (2, {"type": "post", "text": "pic", "blobs": ["aa" * 32], "thumbs": ["bb" * 32]}),
-        (3, {"type": "dm", "recipient": IDPUB, "poster": "cc" * 32}),
+        (1, {"kind": "post", "scope": "kreds", "body_ct": "aa", "blobs": []}),
+        (2, {"kind": "post", "scope": "kreds", "body_ct": "bb", "blobs": ["aa" * 32], "thumbs": ["bb" * 32]}),
+        (3, {"kind": "dm", "recipient": IDPUB, "body_ct": "cc", "poster": "cc" * 32}),
     ]:
         m = _msg(seq, payload)
-        cases.append({"dict": m.to_dict(), "msg_id": m.msg_id,
+        cases.append({"dict": m.to_dict(), "msg_id": m.msg_id, "kind": payload["kind"],
                       "body_hex": m.body().hex(), "valid": True})
     # a tampered message (payload changed after signing) -> invalid
-    good = _msg(4, {"type": "post", "text": "orig", "blobs": []})
-    tampered = dict(good.to_dict(), payload={"type": "post", "text": "EVIL", "blobs": []})
-    cases.append({"dict": tampered, "msg_id": None, "body_hex": None, "valid": False})
+    good = _msg(4, {"kind": "post", "scope": "kreds", "body_ct": "orig", "blobs": []})
+    tampered = dict(good.to_dict(), payload={"kind": "post", "scope": "kreds", "body_ct": "EVIL", "blobs": []})
+    cases.append({"dict": tampered, "msg_id": None, "kind": "post", "body_hex": None, "valid": False})
     return {"cases": cases}
 
 
@@ -304,7 +308,11 @@ data class SignedMessage(
     val payload: Map<String, Any?>,
     val signature: String,
 ) {
-    val kind: String get() = payload["type"] as? String ?: ""
+    // The payload's kind discriminator is "kind" (KIND_POST="post",
+    // KIND_DM="dm" per hearth/messages.py), NOT "type" -- "type" is the
+    // signed ENVELOPE field ("message"). Reading "type" here returns "" for
+    // every real message and silently breaks missingBlobs' kind filter.
+    val kind: String get() = payload["kind"] as? String ?: ""
 
     fun body(): ByteArray = KotlinWire.canonical(mapOf(
         "type" to "message", "protocol" to KotlinWire.PROTOCOL,
@@ -461,12 +469,21 @@ class InMemorySyncStore : SyncStore {
     override fun addIdentity(id: String) { identities.add(id) }
 
     override fun ingestMessage(m: SignedMessage): Boolean {
+        // is_known gate (mirrors hearth Store.ingest_message's first check):
+        // accept only from an identity we already know -- own identity is
+        // seeded before sync, friends are added during HAVE. Do NOT
+        // auto-register senders.
+        if (m.cert.identity_pub !in identities) return false
         if (!m.verifyDeviceSignature()) return false
         val id = m.msgId()
-        if (messages.containsKey(id)) return false
+        if (messages.containsKey(id)) return false            // already have this exact message
+        // seq-reuse rejection -- SeenSet's whole purpose (D2 Ambush 2;
+        // hearth Verifier.verify_message: `if not seen.add(seq): reject`).
+        // A device reusing a seq with DIFFERENT content (different msg_id,
+        // so past the dedup above) is rejected here.
+        if (!seen.getOrPut(m.cert.identity_pub to m.cert.device_pub) { SeenSet() }.add(m.seq))
+            return false
         messages[id] = m
-        seen.getOrPut(m.cert.identity_pub to m.cert.device_pub) { SeenSet() }.add(m.seq)
-        identities.add(m.cert.identity_pub)
         return true
     }
 
@@ -597,8 +614,15 @@ object KotlinSync {
             val blobs = readFrame(stream)
             val given = blobs.optJSONObject("blobs") ?: JSONObject()
             for (h in given.keys()) {
-                val data = android.util.Base64.decode(given.getString(h), android.util.Base64.NO_WRAP)
-                store.putBlob(h, data)   // verifies hash internally
+                // Portable base64 (RFC 4648 std alphabet) -- NOT
+                // android.util.Base64 (would break the JVM desk gate) and NOT
+                // java.util.Base64 (API 26+, module minSdk is 24). The node
+                // encodes blobs with Python base64.b64encode (std alphabet).
+                val data = Base64Portable.decode(given.getString(h))
+                // Size bound BEFORE storing (hearth sync.py:661 checks both
+                // size AND hash): a hostile/buggy node must not push a blob
+                // past MAX_BLOB_BYTES. store.putBlob does the hash check.
+                if (data.size <= MAX_BLOB_BYTES) store.putBlob(h, data)
             }
 
             val st = store.stats()

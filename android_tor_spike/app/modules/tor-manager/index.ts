@@ -59,3 +59,14 @@ export function onState(cb: (s: string) => void): () => void {
   const sub = native.addListener("nodeState", (e: { state: string }) => cb(e.state));
   return () => sub.remove();
 }
+
+// -- Brick B.1: foreground-triggered content sync --
+export interface SyncStats { messages: number; blobs: number; identities: number }
+
+export function syncNow(): void { native.syncNow(); }
+export function getSyncStats(): Promise<SyncStats> { return native.getSyncStats(); }
+
+export function onSync(cb: (r: { ok: boolean; messages: number; blobs: number; identities: number; reason?: string }) => void): () => void {
+  const sub = native.addListener("nodeSync", (e: any) => cb(e));
+  return () => sub.remove();
+}
