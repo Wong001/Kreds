@@ -93,16 +93,29 @@ lifecycle designs, on purpose.
 8. Leave it ~1 hour; confirm survival (Motorola OEM killer) + a rough battery read.
 9. If any beat fails: `PullLogs`, share the notification line + `logcat.txt` / `tor.log`.
 
-## [PENDING RUN] Verdict (per DoD)
+## On-device result (2026-07-19, G20)
 
-_Filled after the run:_
-- Background continuity (beats continue backgrounded)? 
-- Doze survival (beat lands under force-idle)? 
-- Process-death recovery (resumes after `am kill`)? 
-- ~1h survival + battery read? 
-- Battery-exemption prompt present + effective? 
+**Core PROVEN.** Foreground `TorNodeService` bootstrapped Tor to 100% on the
+phone (warm re-bootstrap ~5 s, reusing cached consensus; SOCKS on 39050),
+and the native Kotlin heartbeat completed real HELLO/AUTH over a live Tor
+circuit against the home node — **all beats green, latency 1780–3574 ms.**
 
-## [PENDING RUN] Timings + issues
+- **ART float-repr risk RESOLVED.** Green beats mean the cert verified on
+  Android's ART, so `KotlinWire`'s float rendering matches Python on the
+  real runtime (not just the JVM the vector gate runs on). The review's
+  top latent risk did not materialize.
+- **Native heartbeat runs with no JS runtime** — the whole beat path is
+  Kotlin (TorEngine/KotlinHandshake/KotlinWire), as designed for
+  Doze/process-death survival.
 
-_Filled after the run:_ cold vs warm bootstrap, heartbeat latency (from the
-`OK <ms>` rows), and any bug found + fix.
+DoD lifecycle checks:
+- [x] **Background continuity** — survived 4m10s backgrounded, still up, beats continued.
+- [x] **Process-death recovery** — `am kill` bounced off (foreground service resists background reclamation — a positive persistence result); `am crash` killed the process (pid 27459→28074), and `START_STICKY` restarted the service unattended: foreground restored, Tor warm-re-bootstrapped ~4 s, cadence resumed. No intervention.
+- [x] **Doze survival** — deep Doze forced (state IDLE, held through screen-on) 14:02:57; a green beat landed at 14:11 while in deep idle. The foreground service + Doze whitelist kept the network; the native heartbeat completed AUTH over Tor under Doze.
+- [ ] ~1h survival + battery read (passive — leave it running)
+- [x] **Battery-exemption** — granted; app confirmed on the Doze whitelist (`user,eu.kreds.torspike`), which is what exempts the heartbeat from Doze network restrictions.
+
+### Timings observed
+- Cold bootstrap (earlier run): reached 100% normally.
+- Warm re-bootstrap (this run): ~5 s (cached consensus).
+- Heartbeat round-trip (dial + HELLO/AUTH over Tor): 1780–3574 ms.
