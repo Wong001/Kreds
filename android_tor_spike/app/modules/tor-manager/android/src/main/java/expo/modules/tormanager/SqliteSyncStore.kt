@@ -22,6 +22,13 @@ class SqliteSyncStore(context: Context) :
     companion object {
         private const val DB_NAME = "sync_store.db"
         private const val DB_VERSION = 1
+        // Task 3 (B.2): this device's own X25519 enc keypair, keyed enc_priv/enc_pub.
+        // Plaintext at rest -- accepted posture, matches desktop (see EncKeys.kt).
+        // Shared by onCreate (fresh DBs) and onOpen (existing B.1-era DBs --
+        // see onOpen below for why the latter is needed) so the two sites
+        // can't drift out of sync.
+        private const val CREATE_KEYS_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS keys (k TEXT PRIMARY KEY, v TEXT)"
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -41,12 +48,21 @@ class SqliteSyncStore(context: Context) :
         // Backs both the ingestMessage seq-reuse gate and summary()'s fold.
         db.execSQL("CREATE INDEX idx_messages_idp_dp_seq ON messages(identity_pub, device_pub, seq)")
         db.execSQL("CREATE TABLE blobs (hash TEXT PRIMARY KEY, data BLOB NOT NULL)")
-        // Task 3 (B.2): this device's own X25519 enc keypair, keyed enc_priv/enc_pub.
-        // Plaintext at rest -- accepted posture, matches desktop (see EncKeys.kt).
         // IF NOT EXISTS: onUpgrade calls onCreate after dropping the OTHER
         // tables but deliberately preserves this one (see onUpgrade comment) --
         // this must be a no-op when the table already survived an upgrade.
-        db.execSQL("CREATE TABLE IF NOT EXISTS keys (k TEXT PRIMARY KEY, v TEXT)")
+        db.execSQL(CREATE_KEYS_TABLE_SQL)
+    }
+
+    // Field bug (G20, B.2 live run): DB_VERSION was never bumped past 1, so
+    // an existing B.1-era phone DB (created before the `keys` table existed)
+    // never runs onCreate OR onUpgrade -- it just opens straight through,
+    // and every keys-table query fails with "no such table: keys". onOpen
+    // runs on every open regardless of version, so ensure the table here too;
+    // IF NOT EXISTS makes this a no-op on DBs that already have it.
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        db.execSQL(CREATE_KEYS_TABLE_SQL)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
