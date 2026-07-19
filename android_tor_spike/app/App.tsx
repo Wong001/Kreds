@@ -1,72 +1,65 @@
-import React, { useCallback, useState } from "react";
-import { Button, SafeAreaView, StyleSheet, Text } from "react-native";
-// expo-file-system 57 split readAsStringAsync into the /legacy subpath;
-// the classic API (signature unchanged) lives there now.
-import * as FileSystem from "expo-file-system/legacy";
-import * as Crypto from "expo-crypto";
-import { bootstrap, dial, fixtureDir, onProgress } from "./modules/tor-manager";
-import { Fixture, handshake, splitAddr } from "./src/handshake";
-
-function randomHex16(): string {
-  return Array.from(Crypto.getRandomBytes(16))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
+import React, { useCallback, useEffect, useState } from "react";
+import { Button, FlatList, SafeAreaView, StyleSheet, Text, View } from "react-native";
+import {
+  Beat, beatNow, getHistory, isBatteryExempt, onBeat, onState,
+  requestBatteryExemption, startNode, stopNode,
+} from "./modules/tor-manager";
 
 export default function App() {
-  const [stage, setStage] = useState("idle");
-  const [result, setResult] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [state, setState] = useState("stopped");
+  const [beats, setBeats] = useState<Beat[]>([]);
+  const [exempt, setExempt] = useState(true);
 
-  const connect = useCallback(async () => {
-    setBusy(true);
-    setResult("");
-    try {
-      setStage("reading fixture");
-      const raw = await FileSystem.readAsStringAsync(
-        `file://${fixtureDir}/spike_phone_fixture.json`);
-      const fixture = JSON.parse(raw) as Fixture;
+  const refresh = useCallback(async () => setBeats(await getHistory()), []);
 
-      setStage("tor bootstrap 0%");
-      const off = onProgress((p) => setStage(`tor bootstrap ${p}%`));
-      try {
-        await bootstrap();
-      } finally {
-        off();
-      }
-
-      setStage("dialing home node");
-      const [host, port] = splitAddr(fixture.onion_addr);
-      const stream = await dial(host, port);
-
-      setStage("handshake");
-      const r = await handshake(stream, fixture, randomHex16);
-      setStage("done");
-      setResult(
-        r.status === "accepted" ? "CONNECTED to home node over Tor"
-        : r.status === "refused" ? "REFUSED by node"
-        : `FAILED at ${r.stage}: ${r.reason}`);
-    } catch (e) {
-      setStage("done");
-      setResult(`ERROR: ${String(e)}`);
-    } finally {
-      setBusy(false);
-    }
-  }, []);
+  useEffect(() => {
+    setExempt(isBatteryExempt());
+    refresh();
+    const offState = onState(setState);
+    const offBeat = onBeat((b) => setBeats((prev) => [b, ...prev].slice(0, 50)));
+    return () => { offState(); offBeat(); };
+  }, [refresh]);
 
   return (
     <SafeAreaView style={styles.container}>
-      <Text style={styles.title}>Kreds Tor spike</Text>
-      <Button title="Connect" onPress={connect} disabled={busy} />
-      <Text style={styles.stage}>{stage}</Text>
-      <Text style={styles.result}>{result}</Text>
+      <Text style={styles.title}>Kreds node</Text>
+      <Text style={styles.state}>state: {state}</Text>
+      {!exempt && (
+        <View style={styles.warn}>
+          <Text style={styles.warnText}>Battery optimization may kill the node.</Text>
+          <Button title="Exempt Kreds from battery optimization"
+            onPress={() => { requestBatteryExemption(); setTimeout(() => setExempt(isBatteryExempt()), 500); }} />
+        </View>
+      )}
+      <View style={styles.row}>
+        <Button title="Start node" onPress={startNode} />
+        <Button title="Stop node" onPress={stopNode} />
+        <Button title="Beat now" onPress={beatNow} />
+      </View>
+      <Text style={styles.subtitle}>Heartbeats ({beats.length})</Text>
+      <FlatList
+        style={styles.list}
+        data={beats}
+        keyExtractor={(b) => String(b.ts)}
+        renderItem={({ item }) => (
+          <Text style={item.ok ? styles.ok : styles.fail}>
+            {new Date(item.ts).toLocaleTimeString()} {item.ok ? `OK ${item.latencyMs}ms` : `FAIL ${item.reason}`}
+          </Text>
+        )}
+      />
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, alignItems: "center", justifyContent: "center", gap: 16 },
-  title: { fontSize: 20, fontWeight: "600" },
-  stage: { fontSize: 16 },
-  result: { fontSize: 16, fontWeight: "600", paddingHorizontal: 24, textAlign: "center" },
+  container: { flex: 1, padding: 20, gap: 10 },
+  title: { fontSize: 22, fontWeight: "700" },
+  subtitle: { fontSize: 16, fontWeight: "600", marginTop: 8 },
+  state: { fontSize: 16 },
+  row: { flexDirection: "row", gap: 8, flexWrap: "wrap" },
+  list: { flex: 1 },
+  ok: { fontSize: 14, color: "#1a7f37", paddingVertical: 2 },
+  fail: { fontSize: 14, color: "#b00020", paddingVertical: 2 },
+  warn: { backgroundColor: "#fff3cd", padding: 10, borderRadius: 6, gap: 6 },
+  warnText: { fontSize: 14 },
 });
