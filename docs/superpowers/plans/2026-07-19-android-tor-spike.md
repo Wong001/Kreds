@@ -77,10 +77,10 @@ Everything the TS port must reproduce, with the exact Python it mirrors:
 - **cert body** (`hearth/identity.py:95`): `canonical({"type": "enrollment", "protocol": PROTOCOL, "identity_pub": ..., "device_pub": ..., "device_name": ..., "enrolled_at": <float>})` — contains a float; JSON.parse cannot distinguish `1234.0` from `1234`, so the TS side wraps schema-known float fields in a `PyFloat` marker.
 - **session, phone = initiator** (`hearth/sync.py:421-504`; `_swap` at 411: initiator writes then reads):
   1. phone writes HELLO `{"t":"hello","cert":<cert dict>,"nonce":<32-hex>}`
-  2. phone reads node HELLO (same shape); verifies node cert (identity-signed), checks same `identity_pub` as fixture
+  2. phone reads node HELLO (same shape); verifies node cert (identity-signed). No identity-match check here — `_session` has none; the home-identity pin lives in the accepted branch of step 5 (amended per Task 5 finding)
   3. phone writes AUTH `{"t":"auth","sig":sign_device(auth_body(node_nonce))}`
   4. phone reads node AUTH; verifies sig over `auth_body(my_nonce)` with node cert's `device_pub`
-  5. **acceptance probe:** accept/refuse is only observable AFTER the AUTH swap — the node either writes `{"t":"refused"}` or proceeds to REVOCATIONS (where, as responder, it reads before writing). So the phone writes `{"t":"revocations","revs":[]}`, reads one frame: `refused` → REFUSED; `revocations` → ACCEPTED (discard contents, hang up). The spike never reaches DEFRIENDS/HAVE/MESSAGES/BLOBS. The node logs one broken session at its DEFRIENDS read — expected spike noise.
+  5. **acceptance probe (amended per Task 5 finding):** accept/refuse is only observable AFTER the AUTH swap — the node either writes `{"t":"refused"}` immediately and closes, or proceeds to REVOCATIONS (where, as responder, it reads before writing). Write-first races the refusing node's close (RST purges the buffered refused frame on Windows loopback), so the phone issues ONE verdict read up front, grace-waits `PROBE_GRACE_MS` (1500 ms) for an unsolicited refusal, then writes `{"t":"revocations","revs":[]}` and awaits the same pending read: `refused` → REFUSED; `revocations` → ACCEPTED **iff** the node's identity equals the fixture identity (the home-identity pin lives in the accepted branch — a friend's node would also accept this cert). Discard contents, hang up. The spike never reaches DEFRIENDS/HAVE/MESSAGES/BLOBS; the node logs one broken session at its DEFRIENDS read — expected spike noise.
 - **own-identity admission** (`hearth/sync.py:472-483` + `hearth/store.py:149`): `is_known(peer_identity)` is true for the node's own identity (`identities` row with `is_self=1` from `HearthNode.create`), and the revoked-device check is skipped for own-identity peers. **Therefore an `enroll_other` cert that was never published to the node's store authenticates.** Task 5 proves this empirically (the desk node's store never sees the phone device); Task 11 records it as the answer to the spec's open un-enroll question — the fixture is a pure local artifact, deleting it is the cleanup, `revoke_device` optional belt-and-braces.
 - **fixture minting**: `node.device.enroll_other(device_pub_hex, "spike-phone")` (`hearth/identity.py:396`), onion address = `node.store.get_meta("gossip_addr")` = `"<sid>.onion:9997"` (`hearth/runner.py:109-111`). Real profile default dir `%APPDATA%\Kreds` (`hearth/desktop.py:25`); if `applock.json` exists the node boots locked and needs `node.unlock(credential)`.
 
@@ -1030,6 +1030,11 @@ export type HandshakeResult =
   | { status: "refused" }
   | { status: "failed"; stage: string; reason: string };
 
+// Grace window for the acceptance probe's unsolicited-refusal read (see
+// the probe comment below). Loopback refusals land in ~ms; Tor refusals
+// may exceed this and fall through to the write path.
+const PROBE_GRACE_MS = 1500;
+
 function failed(stage: string, reason: string): HandshakeResult {
   return { status: "failed", stage, reason };
 }
@@ -1054,9 +1059,10 @@ export async function handshake(
     if (peerHello.t !== "hello") return failed("hello", `unexpected frame t=${peerHello.t}`);
     const peerCert = peerHello.cert as CertDict;
     if (!verifyCert(peerCert)) return failed("hello", "node cert failed verification");
-    if (peerCert.identity_pub !== fixture.cert.identity_pub) {
-      return failed("hello", "node identity differs from fixture identity");
-    }
+    // NOTE: no identity-match check here -- sync.py's _session has none, and
+    // enforcing it at HELLO would block the node's own refused path from
+    // ever being observed. Identity is pinned in the ACCEPTED branch below.
+    // (Amended per Task 5 implementer finding.)
 
     // -- AUTH (mutual device-key proof, sync.py:451-458) --
     await writeFrame(stream, {
@@ -1070,18 +1076,51 @@ export async function handshake(
     }
 
     // -- acceptance probe --
-    // The node reveals accept/refuse only AFTER the AUTH swap: it either
-    // writes {"t":"refused"} (sync.py:472-483) or proceeds to the
-    // REVOCATIONS phase, where as responder it reads our frame before
-    // writing its own (_swap, sync.py:411). So: send an empty
-    // revocations frame, read one frame, hang up. We discard the node's
+    // The node reveals accept/refuse only AFTER the AUTH swap: on refusal
+    // it writes {"t":"refused"} IMMEDIATELY and closes (sync.py:472-483);
+    // on acceptance it proceeds to the REVOCATIONS phase, where as
+    // responder it READS our frame before writing its own (_swap,
+    // sync.py:411). Ordering matters on our side: writing our revocations
+    // frame first races the refusing node's close -- the TCP RST purges
+    // the buffered refused frame out of our receive buffer (observed on
+    // Windows loopback). So: issue the ONE verdict read up front, grace-
+    // wait briefly for an unsolicited refusal, and only then send our
+    // empty revocations frame -- the same pending read then consumes the
+    // node's revocations reply. The verdict read is created exactly once,
+    // so there is never a concurrent read on the stream. Residual race
+    // (refusal slower than the grace window on a high-latency path)
+    // surfaces as failed/io, never a wrong verdict. We discard the node's
     // revocation list and never reach DEFRIENDS/HAVE/MESSAGES/BLOBS --
-    // the node will log one broken session at its DEFRIENDS read, which
-    // is expected spike noise.
-    await writeFrame(stream, { t: "revocations", revs: [] });
-    const verdict = await readFrame(stream);
+    // the node logs one broken session at its DEFRIENDS read, which is
+    // expected spike noise. (Amended per Task 5 implementer finding.)
+    const verdictPromise = readFrame(stream);
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const grace = new Promise<"timeout">((resolve) => {
+      graceTimer = setTimeout(() => resolve("timeout"), PROBE_GRACE_MS);
+    });
+    let verdict: any;
+    try {
+      const first = await Promise.race([verdictPromise, grace]);
+      if (first === "timeout") {
+        await writeFrame(stream, { t: "revocations", revs: [] });
+        verdict = await verdictPromise;
+      } else {
+        verdict = first;
+      }
+    } finally {
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+    }
     if (verdict.t === "refused") return { status: "refused" };
-    if (verdict.t === "revocations") return { status: "accepted" };
+    if (verdict.t === "revocations") {
+      // Accepted -- but by whom? A FRIEND's node also knows our identity
+      // and would accept this same device cert. The spike must only ever
+      // claim "connected to home node", so the identity pin lives HERE,
+      // in the accepted branch, not at HELLO.
+      if (peerCert.identity_pub !== fixture.cert.identity_pub) {
+        return failed("probe", "accepted by a non-home-node identity");
+      }
+      return { status: "accepted" };
+    }
     return failed("probe", `unexpected frame t=${verdict.t}`);
   } catch (e) {
     return failed("io", String(e));
