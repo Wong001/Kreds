@@ -614,8 +614,15 @@ object KotlinSync {
             val blobs = readFrame(stream)
             val given = blobs.optJSONObject("blobs") ?: JSONObject()
             for (h in given.keys()) {
-                val data = android.util.Base64.decode(given.getString(h), android.util.Base64.NO_WRAP)
-                store.putBlob(h, data)   // verifies hash internally
+                // Portable base64 (RFC 4648 std alphabet) -- NOT
+                // android.util.Base64 (would break the JVM desk gate) and NOT
+                // java.util.Base64 (API 26+, module minSdk is 24). The node
+                // encodes blobs with Python base64.b64encode (std alphabet).
+                val data = Base64Portable.decode(given.getString(h))
+                // Size bound BEFORE storing (hearth sync.py:661 checks both
+                // size AND hash): a hostile/buggy node must not push a blob
+                // past MAX_BLOB_BYTES. store.putBlob does the hash check.
+                if (data.size <= MAX_BLOB_BYTES) store.putBlob(h, data)
             }
 
             val st = store.stats()
