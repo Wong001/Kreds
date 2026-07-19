@@ -283,4 +283,61 @@ class SqliteSyncStore(context: Context) :
             db.endTransaction()
         }
     }
+
+    // org.json -> plain Kotlin bridge (JSONObject -> Map, JSONArray -> List),
+    // same idiom as KotlinSync's private toMap/unwrap (each file keeps its
+    // own copy -- see KotlinSync.kt's comment on why: values are consumed
+    // downstream via Map/List casts -- e.g. KotlinDmcrypt.unwrapKey's
+    // `wrap["eph_pub"] as String` -- which throws on a raw org.json type).
+    private fun jsonToMap(o: JSONObject): Map<String, Any?> =
+        o.keys().asSequence().associateWith { unwrapJson(o.get(it)) }
+
+    private fun unwrapJson(v: Any?): Any? = when (v) {
+        is JSONObject -> jsonToMap(v)
+        is JSONArray -> (0 until v.length()).map { unwrapJson(v.get(it)) }
+        JSONObject.NULL -> null
+        is java.math.BigDecimal -> v.toDouble()
+        else -> v
+    }
+
+    /** Every stored message (Task 5, B.2 DecryptPass) -- payload
+     *  recursively converted from the stored JSON into plain Kotlin
+     *  Map/List so callers can use ordinary casts, exactly like
+     *  InMemorySyncStore's native-Kotlin payloads already allow.
+     *  identity_pub is a real column, not re-parsed from JSON. */
+    override fun allMessages(): List<StoredMsg> {
+        val out = mutableListOf<StoredMsg>()
+        readableDatabase.rawQuery(
+            "SELECT msg_id, identity_pub, kind, msg_json FROM messages", null
+        ).use { c ->
+            while (c.moveToNext()) {
+                val payload = JSONObject(c.getString(3)).optJSONObject("payload") ?: JSONObject()
+                out.add(StoredMsg(c.getString(0), c.getString(2) ?: "", c.getString(1), jsonToMap(payload)))
+            }
+        }
+        return out
+    }
+
+    /** wrap_grant rows targeting msgId, decoded from msg_json (no target_id
+     *  column exists in this schema -- unlike hearth's store.py -- so the
+     *  match is done in application code, same style as missingBlobs()
+     *  above). Returned oldest-to-newest by (created_at, seq) -- see the
+     *  SyncStore interface doc for why callers can fold newest-wins from
+     *  that order. */
+    override fun wrapGrantsFor(msgId: String): List<Map<String, Any?>> {
+        data class Row(val createdAt: Double, val seq: Int, val wraps: Map<String, Any?>)
+        val rows = mutableListOf<Row>()
+        readableDatabase.rawQuery(
+            "SELECT seq, msg_json FROM messages WHERE kind = ?", arrayOf("wrap_grant")
+        ).use { c ->
+            while (c.moveToNext()) {
+                val seq = c.getInt(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
+                if (payload.optString("target") != msgId) continue
+                val wraps = payload.optJSONObject("wraps") ?: continue
+                rows.add(Row(payload.optDouble("created_at", 0.0), seq, jsonToMap(wraps)))
+            }
+        }
+        return rows.sortedWith(compareBy({ it.createdAt }, { it.seq })).map { it.wraps }
+    }
 }
