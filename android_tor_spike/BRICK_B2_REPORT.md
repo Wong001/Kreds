@@ -1,19 +1,19 @@
 # Brick B.2 report — decryption + readable history
 
-**Status: DESK-COMPLETE. ON-DEVICE RUN PENDING (human-driven, August at the
-G20).** B.1 proved the phone pulls its own-identity content ENCRYPTED (253
-msgs / 19 blobs / 3 friends, on hardware). B.2 makes that content READABLE:
-the phone generates + publishes an X25519 enc key, the desktop's new
-`maintain_own_device_grants` sweep backfills wrap_grants for the phone's
-existing own history, and the phone decrypts + displays it. All of this is
-proven at the desk (vector gates, hearth pytest, an extended real-node
-loopback gate). The G20 run itself is **[PENDING RUN]**.
+**Status: PROVEN ON HARDWARE (G20, 2026-07-19).** B.1 proved the phone pulls
+its own-identity content ENCRYPTED (253 msgs / 19 blobs / 3 friends, on
+hardware). B.2 makes that content READABLE — and the run proved it: the
+phone generated + published its X25519 enc key over Tor (sync #1), the
+branch desktop node's `maintain_own_device_grants` sweep minted the backfill
+grants for the real history (wrap_grants 4 -> 21 observed in the live
+store), and sync #2 pulled them — **the feed showed readable plaintext from
+the real posts + sent DMs.** One real field bug was found and fixed during
+the run (the `keys`-table migration gap, commit `20dd825`, below).
 
 Spec: `docs/superpowers/specs/2026-07-19-android-b2-decryption-design.md`
 Plan: `docs/superpowers/plans/2026-07-19-android-b2-decryption.md`
-Branch: `brick-b2-decryption`, base `f7e7571`, **13 commits**
-(`f7e7571..ceaf1a6` = HEAD). NOT merged — awaiting this run + August's merge
-decision.
+Branch: `brick-b2-decryption`, base `f7e7571`, **15 commits**
+(`f7e7571..20dd825` = HEAD). NOT merged — merge is August's decision.
 
 ## What Brick B.2 builds
 
@@ -158,16 +158,56 @@ The two builds from Task 8 are queued but blocked by a Play Protect dialog
 - Any anomalies: timing between the two syncs, missing items, unexpected
   friend content, error strings, empty-state edge cases.
 
+## Field findings from the run (2026-07-19, G20 + live desktop)
+
+1. **FIELD BUG (fixed, commit `20dd825`): `keys` table missing on upgraded
+   installs.** The G20's B.1-era SQLite database predates the B.2 `keys`
+   table; `DB_VERSION` was never bumped, so neither `onCreate` nor
+   `onUpgrade` ran and the first enc-key access failed
+   (`no such table: keys`). Exactly the desk-test blind spot the final
+   review flagged (fresh-DB-only JVM tests, no instrumented coverage).
+   Fixed: `SqliteSyncStore.onOpen` now ensures the table idempotently.
+2. **Run-steps correction: `hearth app` from source runs WITHOUT Tor**
+   (`_tor_enabled()` = packaged-only; deliberate dev fast-path). A
+   source-run desktop for this test must use
+   `python -m hearth serve --dir %APPDATA%\Kreds --http-port <p> --gossip-port <p> --tor`.
+   The phone's timeouts/REP=6 failures during the run were this: no onion
+   was being served behind the (stale) descriptor.
+3. **A passcode-locked node refuses sync sessions by design**
+   (`sync.py:352`, keys are applock-encrypted at rest) — and the refusal
+   frame is purged by Windows RST, so the phone sees a bare EOF
+   (`stream closed at 0/4`). A headless `serve` node starts LOCKED; unlock
+   via the web UI (`http://127.0.0.1:<http-port>`) before syncing. Also
+   duplicate `hearth app` instances from repeated launch attempts fought
+   over the data dir — check for strays when a run misbehaves.
+4. **The two-sync flow held exactly as designed** once the node was
+   unlocked: sync #1 published the enckey (store count 3 -> 4), the sweep
+   minted within seconds (wrap_grants 4 -> 21), sync #2 rendered the feed.
+5. **Post-run note:** the backfill grants persist in the store, and stock
+   hearth's `_scope_device_pubs` auto-wraps NEW content to the published
+   phone key — so the desktop can return to the installed (main) build
+   after the run; the branch was only needed to mint the historical grants.
+
 ## Verdict
 
-**[PENDING RUN]**
+**PROVEN.**
 
-- Feed item count (after sync #2):
-- Spot-check results:
-- Anomalies:
-- DoD checks (feed non-empty / correct / sensible kinds+timestamps /
-  own-only / cold-start hint / sync stats regression):
-- Overall: PROVEN / NOT PROVEN / PARTIAL —
+- Feed: readable plaintext from the real history (posts + sent DMs) after
+  the two-sync flow against the live desktop store.
+- Spot-checks (August): texts correct vs the desktop; kinds/timestamps
+  sensible; own content only — no friend-authored items rendered.
+- Sync stats: intact (B.1 regression check passed). Store-side counts also
+  independently verified read-only during the run (enckey +1, wrap_grants
+  +17 for the phone's coverage).
+- Anomalies: one — the cold-start check behaved partially on the first
+  force-kill+reopen (feed count + one post rendered, DMs not visible;
+  fully correct after a second reopen). Consistent with two known Minors:
+  the Brick A foreground service keeps the process (and the feed cache)
+  alive across swipe-kills, so true cold-start-empty rarely occurs; and the
+  dashboard's two flex:1 lists split the viewport, squeezing the feed when
+  the heartbeat list is populated. Decryption itself never regressed.
+  Ticketed below; not a blocker for this slice.
+- Overall: **PROVEN** — B.2's definition of done met on hardware.
 
 ## Known deferred items / follow-up tickets
 
@@ -192,3 +232,11 @@ From the whole-branch final-review triage (`f7e7571..1de3c08` + fix
   device with an already-published enckey, the first sweep after merge is a
   one-time backfill burst (bounded, and is the intended feature); otherwise
   it's a no-op. Worth knowing before this runs against real accounts.
+- **Feed UI on reopen (from the run's anomaly):** reconcile the cold-start
+  contract with the persistent foreground service (cache survives
+  swipe-kills; decide whether getFeed should decrypt-from-store on cold
+  start instead of returning empty), and stop the two flex:1 lists from
+  squeezing the feed. Cosmetic/UX, B.2d territory.
+- **"Friends" stat label counts the own identity** (phone shows 3 where
+  August has 2 friends — the node's known-identities set includes self).
+  Cosmetic B.1 leftover; relabel or exclude self.
