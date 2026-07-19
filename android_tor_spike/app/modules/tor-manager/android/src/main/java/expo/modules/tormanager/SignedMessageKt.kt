@@ -10,7 +10,11 @@ data class SignedMessage(
     val payload: Map<String, Any?>,
     val signature: String,
 ) {
-    val kind: String get() = payload["type"] as? String ?: ""
+    // The payload's kind discriminator is "kind" (KIND_POST="post",
+    // KIND_DM="dm" per hearth/messages.py), NOT "type" -- "type" is the
+    // signed ENVELOPE field ("message"). Reading "type" here returns "" for
+    // every real message and silently breaks missingBlobs' kind filter.
+    val kind: String get() = payload["kind"] as? String ?: ""
 
     fun body(): ByteArray = KotlinWire.canonical(mapOf(
         "type" to "message", "protocol" to KotlinWire.PROTOCOL,

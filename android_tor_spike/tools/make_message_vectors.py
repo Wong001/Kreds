@@ -6,8 +6,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
 from hearth.identity import (EnrollmentCert, PROTOCOL, SignedMessage, canonical,
                              priv_from_hex, pub_hex, _make_enrollment)
 
@@ -31,18 +29,19 @@ def _msg(seq: int, payload: dict) -> SignedMessage:
 
 def build() -> dict:
     cases = []
+    # Payloads use the REAL field name "kind" (not "type"); "blobs"/"poster"/
+    # "thumbs" are the cleartext blob-ref fields hearth reads.
     for seq, payload in [
-        (1, {"type": "post", "text": "hello", "blobs": []}),
-        (2, {"type": "post", "text": "pic", "blobs": ["aa" * 32], "thumbs": ["bb" * 32]}),
-        (3, {"type": "dm", "recipient": IDPUB, "poster": "cc" * 32}),
+        (1, {"kind": "post", "scope": "kreds", "body_ct": "aa", "blobs": []}),
+        (2, {"kind": "post", "scope": "kreds", "body_ct": "bb", "blobs": ["aa" * 32], "thumbs": ["bb" * 32]}),
+        (3, {"kind": "dm", "recipient": IDPUB, "body_ct": "cc", "poster": "cc" * 32}),
     ]:
         m = _msg(seq, payload)
-        cases.append({"dict": m.to_dict(), "msg_id": m.msg_id,
+        cases.append({"dict": m.to_dict(), "msg_id": m.msg_id, "kind": payload["kind"],
                       "body_hex": m.body().hex(), "valid": True})
-    # a tampered message (payload changed after signing) -> invalid
-    good = _msg(4, {"type": "post", "text": "orig", "blobs": []})
-    tampered = dict(good.to_dict(), payload={"type": "post", "text": "EVIL", "blobs": []})
-    cases.append({"dict": tampered, "msg_id": None, "body_hex": None, "valid": False})
+    good = _msg(4, {"kind": "post", "scope": "kreds", "body_ct": "orig", "blobs": []})
+    tampered = dict(good.to_dict(), payload={"kind": "post", "scope": "kreds", "body_ct": "EVIL", "blobs": []})
+    cases.append({"dict": tampered, "msg_id": None, "kind": "post", "body_hex": None, "valid": False})
     return {"cases": cases}
 
 

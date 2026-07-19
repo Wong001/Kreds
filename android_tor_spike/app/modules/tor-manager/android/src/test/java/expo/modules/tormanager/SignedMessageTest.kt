@@ -3,8 +3,6 @@ package expo.modules.tormanager
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SignedMessageTest {
@@ -30,6 +28,7 @@ class SignedMessageTest {
             val c = cs.getJSONObject(i)
             val m = SignedMessageKt.fromDict(toMap(c.getJSONObject("dict")))
             assertEquals("case $i valid", c.getBoolean("valid"), m.verifyDeviceSignature())
+            assertEquals("case $i kind", c.getString("kind"), m.kind)
             if (!c.isNull("msg_id")) {
                 assertEquals(c.getString("body_hex"), KotlinWire.toHex(m.body()))
                 assertEquals(c.getString("msg_id"), m.msgId())
