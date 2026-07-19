@@ -58,6 +58,26 @@ import java.nio.file.Files
  *      inline wrap to the phone; they predate the enckey) is asserted first
  *      -- every successful decrypt is proven to have come via a backfilled
  *      wrap_grant, not an inline wrap.
+ *   4. phoneReadsFriendContentEndToEnd (Task 4, B.2c) -- the two-node desk
+ *      gate: startNode("two_node") spawns the SAME script with a second,
+ *      real in-process friend node ("Freja") befriended with the desk node
+ *      (sync_loopback_node.py's _seed_friend_and_befriend), already holding
+ *      two kreds wall posts and an OLD DM to the desk node BEFORE this test
+ *      ever connects. Sync 1 pushes the phone's enckey exactly like test 3
+ *      above; node.awaitMaintained() then blocks on the node process's
+ *      Task-4 choreography (_run_phase3): the enckey gossips to the friend
+ *      node, friend's STOCK (untouched) maintain_wrap_grants mints wall
+ *      grants naming the phone, the desk node's maintain_received_dm_grants
+ *      backfills the OLD dm via a RECIPIENT-signed grant, the friend then
+ *      composes a NEW dm that inline-wraps the phone directly (its enckey
+ *      is known by now), and everything gossips back to the desk node. Sync
+ *      2 pulls all of it over the real wire. Assertions: both friend wall
+ *      texts, the OLD dm (via a grant independently verified to be SIGNED
+ *      BY THE OWN IDENTITY -- the recipient-signed backfill, not trusted
+ *      via DecryptPass's own resolution), the NEW dm (independently
+ *      verified INLINE-wrapped, not via any grant), the original B.2
+ *      own-content regression, and author-name resolution to the friend
+ *      node's published profile name ("Freja").
  */
 class SyncLoopbackTest {
 
@@ -138,12 +158,19 @@ class SyncLoopbackTest {
             ".venv/Scripts/python.exe at each level)")
     }
 
-    private fun startNode(): NodeProcess {
+    /** `scenario`: null (every pre-Task-4 call site) reproduces the
+     *  ORIGINAL single-node invocation byte-for-byte (sync_loopback_node.py
+     *  defaults to "solo" with no second arg). "two_node" (Task 4, B.2c)
+     *  passes the opt-in scenario flag that spawns the second, real friend
+     *  node -- see that script's module docstring. */
+    private fun startNode(scenario: String? = null): NodeProcess {
         val repo = findRepoRoot()
         val venvPy = File(repo, ".venv/Scripts/python.exe")
         val script = File(repo, "android_tor_spike/tools/sync_loopback_node.py")
         val tmp = Files.createTempDirectory("syncgate").toFile()
-        val proc = ProcessBuilder(venvPy.absolutePath, script.absolutePath, tmp.absolutePath)
+        val args = mutableListOf(venvPy.absolutePath, script.absolutePath, tmp.absolutePath)
+        if (scenario != null) args.add(scenario)
+        val proc = ProcessBuilder(args)
             .redirectErrorStream(false)
             .start()
         val stdout = BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8))
@@ -271,6 +298,115 @@ class SyncLoopbackTest {
             }
             assertEquals("every seeded post must be covered by a wrap_grant to the phone",
                 posts.size, viaGrant)
+        } finally {
+            node.kill()
+        }
+    }
+
+    @Test fun phoneReadsFriendContentEndToEnd() {
+        val node = startNode(scenario = "two_node")
+        try {
+            val fixture = KotlinHandshake.parseFixture(node.fixtureJson)
+            val phoneDevicePub = fixture.device_pub
+            val ownIdentityPub = fixture.cert.identity_pub
+
+            val store = InMemorySyncStore()
+            store.addIdentity(ownIdentityPub)
+            val (encPriv, encPub) = EncKeys.getOrCreate(store)
+
+            // -- Sync 1: authenticate, push the phone's device-signed
+            // enckey -- the real path (composeEncKey + the generic MESSAGES-
+            // phase ingestion), exactly as in phoneDecryptsRealBackfilledContent
+            // above. This is what the node process's Task-4 choreography
+            // (sync_loopback_node.py's _run_phase3) reacts to.
+            val stream1 = SocketStream("127.0.0.1", node.port)
+            KotlinHandshake.authOnlyOverStream(stream1, fixture)
+            val encKeyMsg = KotlinSync.composeEncKey(
+                fixture, encPub, store.nextSeq(), System.currentTimeMillis() / 1000.0)
+            val res1 = KotlinSync.run(stream1, store, phoneDevicePub, outbound = listOf(encKeyMsg))
+            assertTrue("sync 1 (push enckey): $res1", res1 is SyncResult.Ok)
+
+            // Deterministic handoff (see NodeProcess.awaitMaintained's doc
+            // and sync_loopback_node.py's _run_phase3): blocks until the
+            // enckey has gossiped to the friend node, friend's STOCK
+            // maintain_wrap_grants has minted the wall grants naming the
+            // phone, the desk node's maintain_received_dm_grants has
+            // backfilled the old DM, the friend's new DM has been composed,
+            // and everything has gossiped back to the desk node -- all of
+            // it BEFORE this test opens the second connection below.
+            node.awaitMaintained()
+
+            // -- Sync 2: fresh connection, plain pull -- brings in the
+            // friend's wall posts + wrap_grant, the old DM + the desk
+            // node's recipient-signed grant, and the new (now inline-
+            // wrapped) DM, alongside the original B.2 own-identity content.
+            val stream2 = SocketStream("127.0.0.1", node.port)
+            KotlinHandshake.authOnlyOverStream(stream2, fixture)
+            val res2 = KotlinSync.run(stream2, store, phoneDevicePub)
+            assertTrue("sync 2 (pull friend content): $res2", res2 is SyncResult.Ok)
+
+            val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv, ownIdentityPub)
+            val texts = decrypted.map { it.text }.toSet()
+
+            // Own-content regression: the original B.2 desk posts must
+            // still decrypt alongside the new friend content.
+            val ownTexts = setOf("hello from desk", "second post, still text", "with pic")
+            assertTrue("own B.2 content must still decrypt: $texts", texts.containsAll(ownTexts))
+
+            // Friend wall content, via friend's STOCK, untouched
+            // maintain_wrap_grants -- the "no friend-side-change" claim.
+            assertTrue("friend wall post one must decrypt: $texts",
+                texts.contains("friend wall post one"))
+            assertTrue("friend wall post two must decrypt: $texts",
+                texts.contains("friend wall post two"))
+
+            // New DM: composed by the friend AFTER the phone's enckey was
+            // already known to it, so it inline-wraps the phone directly.
+            // Verified independently of DecryptPass -- not merely that the
+            // text decrypted, but that it decrypted via the INLINE path.
+            assertTrue("new dm from friend must decrypt: $texts", texts.contains("new dm from friend"))
+            val newDmId = decrypted.single { it.text == "new dm from friend" }.msgId
+            val newDmMsg = store.allMessages().single { it.msgId == newDmId }
+            @Suppress("UNCHECKED_CAST")
+            val newDmWraps = newDmMsg.payload["wraps"] as? Map<String, Any?>
+            assertTrue(
+                "new dm from friend must be INLINE-wrapped to the phone " +
+                    "(composed after the phone's enckey was already known)",
+                newDmWraps != null && phoneDevicePub in newDmWraps)
+
+            // Old DM: composed BEFORE the phone's enckey existed anywhere,
+            // so it can only decrypt via a BACKFILLED grant -- precondition
+            // rules out the inline path, mirroring
+            // phoneDecryptsRealBackfilledContent's own precondition check.
+            assertTrue("old dm from friend must decrypt: $texts", texts.contains("old dm from friend"))
+            val oldDmId = decrypted.single { it.text == "old dm from friend" }.msgId
+            val oldDmMsg = store.allMessages().single { it.msgId == oldDmId }
+            @Suppress("UNCHECKED_CAST")
+            val oldDmWraps = oldDmMsg.payload["wraps"] as? Map<String, Any?>
+            assertTrue(
+                "old dm from friend must NOT be inline-wrapped to the phone (it predates the enckey)",
+                oldDmWraps == null || phoneDevicePub !in oldDmWraps)
+            // Independent grant-path check (mirrors
+            // phoneDecryptsRealBackfilledContent's viaGrant check, adapted
+            // for a RECEIVED dm): query wrapGrantsFor with acceptedSigners
+            // restricted to ONLY the own identity (never the friend, who
+            // authored the DM but never grants it) -- proving the covering
+            // grant is the RECIPIENT-signed backfill (hearth's
+            // maintain_received_dm_grants) specifically, independent of
+            // DecryptPass's own (wider) entitlement resolution.
+            val ownSignedGrants = store.wrapGrantsFor(oldDmId, setOf(ownIdentityPub))
+            assertTrue(
+                "old dm's covering grant must be signed by the OWN identity (recipient-signed backfill)",
+                ownSignedGrants.any { phoneDevicePub in it })
+
+            // Author-name resolution (B.2c Task 3): friend-authored content
+            // resolves to the friend node's published profile name, not a
+            // raw-id fallback -- proves the friend's profile message was
+            // itself delivered, not just its content.
+            val friendTexts = setOf("friend wall post one", "friend wall post two", "new dm from friend", "old dm from friend")
+            val friendAuthors = decrypted.filter { it.text in friendTexts }.map { it.author }.toSet()
+            assertEquals("friend-authored content must resolve to Freja's profile name",
+                setOf("Freja"), friendAuthors)
         } finally {
             node.kill()
         }
