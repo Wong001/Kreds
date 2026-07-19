@@ -109,10 +109,14 @@ class TorManagerModule : Module() {
 
         AsyncFunction("send") { id: Int, b64: String ->
             val s = conns[id] ?: throw IllegalArgumentException("no conn $id")
-            s.getOutputStream().apply {
-                write(Base64.decode(b64, Base64.NO_WRAP))
-                flush()
-            }
+            // Must return Unit, NOT the OutputStream: Expo marshals an
+            // AsyncFunction's last expression back to JS, and it cannot
+            // serialize java.net.SocketOutputStream (fails at runtime with
+            // "Unknown type"). apply{} would return the stream; keep the
+            // final expression a Unit-returning call.
+            val out = s.getOutputStream()
+            out.write(Base64.decode(b64, Base64.NO_WRAP))
+            out.flush()
         }.runOnQueue(ioScope)
 
         AsyncFunction("recv") { id: Int, n: Int ->
