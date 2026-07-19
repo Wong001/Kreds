@@ -248,6 +248,7 @@ class SyncService:
         self.node.maintain_enckey()
         self.node.maintain_wrap_grants()
         self.node.maintain_own_device_grants()
+        self.node.maintain_received_dm_grants()
         await self.node.maybe_check_update(now())
         # Host-keyed self-skip, not identity-keyed (review finding, same
         # commit): a paired sibling device (e.g. home node) shares our
