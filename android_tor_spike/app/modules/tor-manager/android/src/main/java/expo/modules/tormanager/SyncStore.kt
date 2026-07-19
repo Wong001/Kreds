@@ -66,14 +66,18 @@ interface SyncStore {
     fun allMessages(): List<StoredMsg>
     /** The `wraps` maps from every stored wrap_grant message whose `target`
      *  equals msgId AND whose SIGNING identity (the grant message's own
-     *  cert.identity_pub) equals authorIdentityPub, ordered OLDEST-TO-NEWEST
-     *  by (created_at, seq) -- mirrors hearth's `store.wrap_grants(target,
-     *  author)` (store.py:773-790) exactly, INCLUDING its author scoping.
-     *  Callers fold left-to-right over the (already author-filtered) result
-     *  to prefer the newest grant for a given device (DecryptPass does
-     *  this).
+     *  cert.identity_pub) is a MEMBER OF acceptedSigners, ordered OLDEST-TO-
+     *  NEWEST by (created_at, seq) -- mirrors hearth's `store.wrap_grants(
+     *  target, author)` (store.py:773-790), generalized from a single
+     *  author to a caller-chosen signer set (B.2c: DecryptPass's entitlement
+     *  rule -- posts accept only the post's author; DMs additionally accept
+     *  the DM's recipient, but ONLY when that recipient is our own identity,
+     *  covering hearth's `maintain_received_dm_grants` recipient-signed
+     *  backfill). Callers fold left-to-right over the (already filtered)
+     *  result to prefer the newest grant for a given device (DecryptPass
+     *  does this).
      *
-     *  The author filter is NOT optional (correcting an earlier version of
+     *  The signer filter is NOT optional (correcting an earlier version of
      *  this comment, which wrongly reasoned it could be skipped because
      *  "the store only holds own content"): B.1's sync does not admit only
      *  own-authored messages -- see allMessages' doc above. A hostile
@@ -84,11 +88,12 @@ interface SyncStore {
      *  over your real (older) own-authored one; unwrapKey would "succeed"
      *  with the wrong key, decryptBody would then fail AEAD auth, and your
      *  own real post would silently vanish from the feed -- a fail-closed
-     *  but real denial-of-render. Requiring `authorIdentityPub` as a
+     *  but real denial-of-render. Requiring `acceptedSigners` as a
      *  parameter (rather than a separate unfiltered accessor) is
-     *  deliberate: it stops a future caller (e.g. B.2c, friends' content)
-     *  from accidentally reintroducing this gap. */
-    fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>>
+     *  deliberate: it stops a caller from accidentally reintroducing this
+     *  gap -- the caller must name every identity it trusts, explicitly,
+     *  every time. */
+    fun wrapGrantsFor(msgId: String, acceptedSigners: Set<String>): List<Map<String, Any?>>
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -167,12 +172,12 @@ class InMemorySyncStore : SyncStore {
     override fun allMessages(): List<StoredMsg> =
         messages.entries.map { (id, m) -> StoredMsg(id, m.kind, m.cert.identity_pub, m.payload) }
 
-    override fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>> {
+    override fun wrapGrantsFor(msgId: String, acceptedSigners: Set<String>): List<Map<String, Any?>> {
         @Suppress("UNCHECKED_CAST")
         return messages.values
             .filter {
                 it.kind == "wrap_grant" && it.payload["target"] == msgId &&
-                    it.cert.identity_pub == authorIdentityPub
+                    it.cert.identity_pub in acceptedSigners
             }
             .sortedWith(compareBy(
                 { (it.payload["created_at"] as? Number)?.toDouble() ?: 0.0 },

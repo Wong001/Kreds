@@ -353,20 +353,32 @@ class SqliteSyncStore(context: Context) :
         return out
     }
 
-    /** wrap_grant rows targeting msgId AND signed by authorIdentityPub,
-     *  decoded from msg_json (no target_id column exists in this schema --
-     *  unlike hearth's store.py -- so the target match is done in
-     *  application code, same style as missingBlobs() above; the author
-     *  match IS a real column, `identity_pub`, filtered directly in SQL).
-     *  Returned oldest-to-newest by (created_at, seq) -- see the SyncStore
-     *  interface doc for why callers can fold newest-wins from that order,
-     *  and why the author filter is load-bearing, not optional. */
-    override fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>> {
+    /** wrap_grant rows targeting msgId AND signed by any identity in
+     *  acceptedSigners, decoded from msg_json (no target_id column exists in
+     *  this schema -- unlike hearth's store.py -- so the target match is
+     *  done in application code, same style as missingBlobs() above; the
+     *  signer match IS a real column, `identity_pub`, filtered directly in
+     *  SQL via `IN (...)`). Returned oldest-to-newest by (created_at, seq) --
+     *  see the SyncStore interface doc for why callers can fold newest-wins
+     *  from that order, and why the signer-set filter is load-bearing, not
+     *  optional (B.2c: DecryptPass passes {author} for posts, {author,
+     *  ownIdentityPub} for a DM addressed to us, else {author}).
+     *
+     *  Empty acceptedSigners returns no rows without ever touching SQL --
+     *  `IN ()` is invalid syntax in SQLite, and DecryptPass's entitlement
+     *  rule never actually produces an empty set (every branch includes at
+     *  least the message's own author), but a caller passing one legitimately
+     *  means "trust nobody", not "trust everybody" (which an unguarded query
+     *  with zero placeholders could otherwise be misread as). */
+    override fun wrapGrantsFor(msgId: String, acceptedSigners: Set<String>): List<Map<String, Any?>> {
+        if (acceptedSigners.isEmpty()) return emptyList()
         data class Row(val createdAt: Double, val seq: Int, val wraps: Map<String, Any?>)
         val rows = mutableListOf<Row>()
+        val placeholders = acceptedSigners.joinToString(",") { "?" }
+        val args = (listOf("wrap_grant") + acceptedSigners).toTypedArray()
         readableDatabase.rawQuery(
-            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
-            arrayOf("wrap_grant", authorIdentityPub)
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub IN ($placeholders)",
+            args
         ).use { c ->
             while (c.moveToNext()) {
                 val seq = c.getInt(0)

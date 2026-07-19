@@ -267,7 +267,7 @@ class SyncLoopbackTest {
             // the one actually exercised, not merely assumed.
             var viaGrant = 0
             for (m in posts) {
-                if (store.wrapGrantsFor(m.msgId, m.identityPub).any { phoneDevicePub in it }) viaGrant++
+                if (store.wrapGrantsFor(m.msgId, setOf(m.identityPub)).any { phoneDevicePub in it }) viaGrant++
             }
             assertEquals("every seeded post must be covered by a wrap_grant to the phone",
                 posts.size, viaGrant)

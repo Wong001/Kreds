@@ -251,19 +251,17 @@ class DecryptPassTest {
         assertEquals("only a foreign-authored grant exists -- must be skipped, not decrypted", 0, out.size)
     }
 
-    @Test fun excludesFriendAuthoredPostEvenWithAValidInlineWrap() {
-        // Reviewer-caught (final whole-branch review): B.2's plan-mandated
-        // Global Constraint is "own-authored content ONLY -- never friends'
-        // content (B.2c)". A real friend graph replicates a friend's OWN
-        // wall posts (and their own wrap_grants/inline wraps) to our synced
-        // store just like our own content does -- run() must not render
-        // them just because a valid wrap to this device happens to exist.
-        // Unlike the wrap_grant author-scoping tests above (which cover a
-        // HOSTILE grant targeting an own-authored post), this test's post
-        // itself is authored by the friend, and its wrap is the REAL,
-        // uncorrupted fixture wrap -- decryptable in every respect -- so a
-        // non-zero result here could only mean the author check was never
-        // reached.
+    @Test fun includesFriendAuthoredPostWithAValidInlineWrap() {
+        // B.2c supersedes this test's former B.2 behavior: B.2's Global
+        // Constraint ("own-authored content ONLY") was that slice's scope
+        // fence, deliberately removed by B.2c's entitlement rule (see the
+        // brief/spec: "friends' content readable"). A friend's own wall
+        // post, inline-wrapped to this device by the friend's OWN signed
+        // payload, must now decrypt -- the inline-wrap path never consulted
+        // wrapGrantsFor/entitlement to begin with (resolveWrap returns the
+        // payload's own `wraps[phoneDevicePub]` immediately), so removing
+        // the own-author-only outer filter is sufficient on its own to
+        // surface this content.
         val c = cases().getJSONObject(0)
         assertEquals("post", c.getString("kind"))
         val store = InMemorySyncStore()
@@ -276,7 +274,184 @@ class DecryptPassTest {
         assertTrue(store.ingestMessage(msg))
 
         val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
-        assertEquals("friend-authored post must be excluded even though the wrap is genuinely valid",
+        assertEquals("friend-authored post with a genuinely valid wrap must now decrypt (B.2c)",
+            1, out.size)
+        assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
+    }
+
+    @Test fun decryptsFriendAuthoredPostViaAuthorSignedGrant() {
+        // Brief behavior (a): friend-authored post + author-signed grant to
+        // the phone -> decrypts. No inline wrap at all here -- the ONLY path
+        // to the content key is a backfilled wrap_grant signed by the
+        // post's own author (a friend, not our own identity), proving the
+        // entitlement rule's post branch (`accepted = setOf(m.identityPub)`)
+        // now admits a friend author, not just an own-authored one.
+        val c = cases().getJSONObject(0)
+        assertEquals("post", c.getString("kind"))
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "a5".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val grantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        val grant = signedMessage(c.getString("author"), 2, grantPayload, "a5".repeat(32))
+        assertTrue(store.ingestMessage(grant))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        assertEquals("friend-authored post via an author-signed grant must decrypt", 1, out.size)
+        assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
+    }
+
+    @Test fun decryptsReceivedFriendDmViaRecipientSignedGrantOnly() {
+        // Brief behavior (b): friend-authored DM addressed to OUR identity,
+        // with the phone's device key reachable ONLY via a wrap_grant SIGNED
+        // BY THE RECIPIENT (our own identity, hearth's
+        // maintain_received_dm_grants backfill) -- proves the DM branch's
+        // recipient-trust half (`setOf(m.identityPub, ownIdentityPub)` when
+        // `to == ownIdentityPub`).
+        val c = cases().getJSONObject(1)
+        assertEquals("dm", c.getString("kind"))
+        val ownIdentityPub = c.getString("to")   // fixture's DM recipient plays "us"
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))   // the friend who sent the DM
+        store.addIdentity(ownIdentityPub)           // our own identity, also known to itself
+
+        // Not wrapped inline to the phone -- only some OTHER device's wrap
+        // rides in the payload, so the recipient-signed grant is the ONLY
+        // path to the content key.
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, dmPayload(c, noInlineWraps), "a6".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val grantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        // Signed by the RECIPIENT (own identity), not the author.
+        val grant = signedMessage(ownIdentityPub, 1, grantPayload, "a7".repeat(32))
+        assertTrue(store.ingestMessage(grant))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub)
+        assertEquals("received DM must decrypt via a recipient-signed grant alone", 1, out.size)
+        assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
+    }
+
+    @Test fun skipsReceivedDmGrantSignedByAHostileThirdIdentity() {
+        // Brief behavior (c), REQUIRED negative: the same received-DM setup
+        // as above, but the "recipient-style" grant is signed by a THIRD
+        // identity -- neither the DM's author NOR its recipient (us). This
+        // must stay untrusted regardless of how genuinely valid the wrap
+        // inside it is (it IS the real fixture wrap) -- trust here must
+        // come purely from the signer's identity, not the wrap's validity.
+        val c = cases().getJSONObject(1)
+        assertEquals("dm", c.getString("kind"))
+        val ownIdentityPub = c.getString("to")
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        store.addIdentity(ownIdentityPub)
+        store.addIdentity(foreignIdentityPub)   // the hostile third identity, also known
+
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, dmPayload(c, noInlineWraps), "a8".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val grantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        // Signed by neither the author nor the recipient.
+        val hostileGrant = signedMessage(foreignIdentityPub, 1, grantPayload, "a9".repeat(32))
+        assertTrue(store.ingestMessage(hostileGrant))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub)
+        assertEquals("a third-identity-signed 'recipient-style' grant must never be trusted",
             0, out.size)
+    }
+
+    @Test fun ownPostAndOwnSentDmStillDecryptTogetherNewestFirst() {
+        // Brief behavior (d)+(e) combined: the B.2 own-content regression
+        // (an own-authored post AND an own-sent DM both still decrypt) PLUS
+        // newest-first ordering across posts, now that the own-author-only
+        // outer filter is gone -- own content must keep working via the
+        // SAME entitlement rule (post: author-only; DM: author-only here
+        // too, since we ARE the author and `to` is some other identity, not
+        // ownIdentityPub -- so the DM branch's recipient-trust half never
+        // even applies to our own outgoing DMs).
+        //
+        // The DM fixture case (index 1) was generated for a DIFFERENT
+        // recipient enc keypair than the post cases (0/2/3) -- a real phone
+        // has exactly one enc key, so a single run() call can only decrypt
+        // messages wrapped to THAT key. Two run() calls (one per enc_priv)
+        // against the SAME store therefore double as their own proof that
+        // an undecryptable-with-this-key message (the DM, when using the
+        // posts' key, and vice versa) is silently skipped rather than
+        // disrupting the other kind's decrypt/ordering.
+        val postCase = cases().getJSONObject(0)
+        val dmCase = cases().getJSONObject(1)
+        val newerPostCase = cases().getJSONObject(3)  // created_at ...100.123456 (newest)
+        val olderPostCase = cases().getJSONObject(2)  // created_at ...900.123456 (oldest)
+        val ownIdentityPub = postCase.getString("author")
+        assertEquals("fixture precondition: dm and post cases share one AUTHOR identity",
+            ownIdentityPub, dmCase.getString("author"))
+        assertEquals("fixture precondition: cases sharing one enc key for a single run() call",
+            postCase.getString("enc_priv"), newerPostCase.getString("enc_priv"))
+        assertEquals(postCase.getString("enc_priv"), olderPostCase.getString("enc_priv"))
+
+        val store = InMemorySyncStore()
+        store.addIdentity(ownIdentityPub)
+
+        // Own post, inline-wrapped (B.2's original decrypt path).
+        val ownPostWraps = mapOf(phoneDevicePub to jsonToMap(postCase.getJSONObject("wrap")))
+        val ownPost = signedMessage(ownIdentityPub, 1, postPayload(postCase, ownPostWraps), "b2".repeat(32))
+        assertTrue(store.ingestMessage(ownPost))
+
+        // Own-sent DM (we are m.identityPub, i.e. the author), backfilled via
+        // an author-signed grant -- B.2's other original decrypt path.
+        val noInlineDmWraps = mapOf(otherDevicePub to jsonToMap(dmCase.getJSONObject("wrap")))
+        val ownDm = signedMessage(ownIdentityPub, 2, dmPayload(dmCase, noInlineDmWraps), "b3".repeat(32))
+        assertTrue(store.ingestMessage(ownDm))
+        val dmGrantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to ownDm.msgId(),
+            "created_at" to dmCase.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(dmCase.getJSONObject("wrap"))),
+        )
+        val dmGrant = signedMessage(ownIdentityPub, 3, dmGrantPayload, "b3".repeat(32))
+        assertTrue(store.ingestMessage(dmGrant))
+
+        // Two more own posts at different createdAt, for the ordering check.
+        val newerWraps = mapOf(phoneDevicePub to jsonToMap(newerPostCase.getJSONObject("wrap")))
+        val newerPost = signedMessage(ownIdentityPub, 4, postPayload(newerPostCase, newerWraps), "b4".repeat(32))
+        assertTrue(store.ingestMessage(newerPost))
+        val olderWraps = mapOf(phoneDevicePub to jsonToMap(olderPostCase.getJSONObject("wrap")))
+        val olderPost = signedMessage(ownIdentityPub, 5, postPayload(olderPostCase, olderWraps), "b5".repeat(32))
+        assertTrue(store.ingestMessage(olderPost))
+
+        // Posts, via the posts' shared enc key: the DM (wrapped under a
+        // DIFFERENT key) must fail AEAD auth and be silently skipped,
+        // leaving exactly the 3 posts, newest-first.
+        val outPosts = DecryptPass.run(store, phoneDevicePub, postCase.getString("enc_priv"), ownIdentityPub)
+        assertEquals(3, outPosts.size)
+        val expectedPostOrder = listOf(
+            newerPostCase.getDouble("created_at"),
+            postCase.getDouble("created_at"),
+            olderPostCase.getDouble("created_at"),
+        )
+        assertEquals(expectedPostOrder, outPosts.map { it.createdAt })
+
+        // The own-sent DM, via ITS OWN enc key: the 3 posts (wrapped under a
+        // different key) fail AEAD auth and are skipped, leaving exactly
+        // the DM.
+        val outDm = DecryptPass.run(store, phoneDevicePub, dmCase.getString("enc_priv"), ownIdentityPub)
+        assertEquals(1, outDm.size)
+        assertEquals("dm", outDm[0].kind)
+        assertEquals(dmCase.getJSONObject("plaintext").getString("text"), outDm[0].text)
     }
 }
