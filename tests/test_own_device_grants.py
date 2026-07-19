@@ -116,12 +116,84 @@ def test_does_not_grant_friends_content(tmp_path):
     assert node.store.wrap_grants(fmid, node.identity_pub) == {}
 
 
-def test_locked_or_revoked_mints_nothing(tmp_path):
+def test_revoked_mints_nothing_and_does_not_raise(tmp_path):
+    # integration leg: the real revocation path (destroys keys + wipes the
+    # store) must leave the sweep a safe no-op, never an exception.
     node = HearthNode.create(tmp_path / "n", "Me", "desk")
     mid = node.compose_post("p")
-    # enroll a device BEFORE revoking so there would be a target to grant to
     _enroll_second_own_device(node)
-    node.enter_revoked_state()          # destroys keys + wipes the store
-    # revoked -> no-op, no exception (the sweep signs, so it must skip)
-    node.maintain_own_device_grants()
+    node.enter_revoked_state()
+    node.maintain_own_device_grants()   # revoked -> returns early, no raise
     assert node.store.wrap_grants(mid, node.identity_pub) == {}
+
+
+def test_guard_skips_when_revoked_or_locked(tmp_path):
+    # guard legs that BITE: on a fully-populated node (own post + an enrolled
+    # target device, i.e. the sweep WOULD mint), flipping revoked or locked
+    # must make it mint nothing. Drop either flag from the guard and the
+    # phone grant gets minted -> these assertions fail. (enter_revoked_state
+    # wipes the store, so it can't test this -- hence the direct flag.)
+    for flag in ("revoked", "locked"):
+        node = HearthNode.create(tmp_path / flag, "Me", "desk")
+        mid = node.compose_post("p")
+        _enroll_second_own_device(node)
+        assert node.store.enckeys(node.identity_pub)  # a target exists
+        setattr(node, flag, True)
+        node.maintain_own_device_grants()
+        assert node.store.wrap_grants(mid, node.identity_pub) == {}, flag
+
+
+def test_fixpoint_dual_sweep_prune_no_churn_and_both_decrypt(tmp_path):
+    """The invariant the Critical was about: maintain_wrap_grants (friends)
+    and maintain_own_device_grants (own satellites) share the (author,
+    target) grant keyspace on a kreds wall post. Run BOTH sweeps in the
+    production order, then both prunes, repeatedly. After round 1 the grant
+    set must be STABLE (no churn), and after EVERY round the friend device
+    AND both satellites must still unwrap+decrypt the post. Without the
+    own-sweep's full-coverage carry-forward the two sweeps strip each
+    other's coverage and this churns / drops decryptability every round."""
+    node = HearthNode.create(tmp_path / "n", "Me", "desk")
+    freja = HearthNode.create(tmp_path / "f", "Freja", "freja-phone")
+    # own kreds WALL post composed BEFORE befriending: freja is NOT inline-
+    # wrapped, so her coverage exists only as a maintain_wrap_grants grant --
+    # exactly the shared-keyspace case.
+    wmid = node.compose_post("min mur", scope="kreds", placement="profile")
+    _befriend_with_enckeys(node, freja)
+    phone1 = _enroll_second_own_device(node)
+    phone2 = _enroll_second_own_device(node)
+
+    def run_round():
+        # mirrors hearth/sync.py:_gossip_round order for this keyspace
+        node.maintain_wrap_grants()
+        node.maintain_own_device_grants()
+        node.store.prune_superseded_enckeys()
+        node.store.prune_superseded_wrap_grants()
+
+    def grant_ids():
+        return {m.msg_id for m in
+                node.store.messages_by_author(node.identity_pub)
+                if m.payload.get("kind") == KIND_WRAP_GRANT}
+
+    def assert_all_decrypt():
+        msg = node.store.get_message(wmid)
+        key, aad = node._content_key(msg)
+        assert key is not None
+        grants = node.store.wrap_grants(wmid, node.identity_pub)
+        for dpub, epriv in ((freja.device.device_pub, freja.device.enc_priv),
+                            (phone1.device_pub, phone1.enc_priv),
+                            (phone2.device_pub, phone2.enc_priv)):
+            assert dpub in grants, dpub
+            k = unwrap_key({dpub: grants[dpub]}, dpub, epriv, aad)
+            assert k == key, dpub
+            body = decrypt_body(k, msg.payload["body_nonce"],
+                                msg.payload["body_ct"], aad)
+            assert body["text"] == "min mur", dpub
+
+    run_round()
+    assert_all_decrypt()
+    ids = grant_ids()
+    assert ids, "round 1 minted no grant at all"
+    for _ in range(3):
+        run_round()
+        assert grant_ids() == ids, "grant set churned after fixpoint"
+        assert_all_decrypt()
