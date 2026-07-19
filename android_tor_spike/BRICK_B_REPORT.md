@@ -1,8 +1,13 @@
 # Brick B.1 report — content-sync transport
 
-**Status: DESK-COMPLETE, on-device run PENDING.** All 8 code tasks are
-implemented and reviewed; the desk loopback gate proves the whole sync port
-against a real node. The remaining step is the human-driven G20 run.
+**Status: PROVEN ON HARDWARE (2026-07-19, G20).** "Sync now" against the
+real home node over Tor pulled **253 messages, 19 blobs, 3 identities**
+(own-identity content), each `SignedMessage` verified and each blob
+hash-checked before storing in the phone's SQLite store. The desk loopback
+gate had already proved the port end-to-end against a real node; the G20 run
+confirms it on real content — including the SQLite `serialize→missingBlobs`
+org.json path (the one seam the desk gate, which used the in-memory store,
+could not cover): 19 blobs pulled cleanly.
 
 Spec: `docs/superpowers/specs/2026-07-19-android-content-sync-brick-b-design.md`
 Plan: `docs/superpowers/plans/2026-07-19-android-content-sync-brick-b.md`
@@ -67,12 +72,17 @@ removed). Your real desktop node holds your real own-identity content, so
 The content is stored encrypted (no rendering yet — that's B.2); the proof
 is non-zero counts matching your desktop's own-identity content.
 
-## [PENDING RUN] Verdict + counts
+## On-device result (2026-07-19, G20)
 
-_Filled after the G20 run:_
-- Did "Sync now" succeed (`synced: N msgs, M blobs, K friends`)?
-- Do the counts match your desktop's own-identity content (roughly)?
-- Any failure stage/reason.
+**`synced: 253 msgs, 19 blobs, 3 friends`** — success on the first tap.
+- 253 own-identity `SignedMessage`s verified (device-signature) and stored;
+  plausible for months of daily Kreds use (every kind the node hands an
+  own-identity device: posts, DMs, reactions, comments, enckeys, wrap-grants).
+- 19 media blobs pulled, hash-verified, stored — confirms the SQLite blob
+  path (the desk gate's one blind spot) works on-device.
+- 3 identities (own + friend list, learned via HAVE own-device trust).
+- Content is stored ENCRYPTED (decryption + rendering = B.2). The proof here
+  is the transport: real content pulled + verified + persisted over Tor.
 
 ## Follow-ups (carried from reviews; whole-branch review = ready-to-merge, tracking only)
 
