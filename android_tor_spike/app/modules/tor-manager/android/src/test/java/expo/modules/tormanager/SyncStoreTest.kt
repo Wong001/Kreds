@@ -72,6 +72,15 @@ class SyncStoreTest {
         assertEquals(3, s.nextSeq())
     }
 
+    @Test fun publishedEncPubRoundTrip() {
+        val s = InMemorySyncStore()
+        assertEquals(null, s.getPublishedEncPub())     // never published yet
+        s.setPublishedEncPub("ab".repeat(32))
+        assertEquals("ab".repeat(32), s.getPublishedEncPub())
+        s.setPublishedEncPub("cd".repeat(32))           // a later publish overwrites, not appends
+        assertEquals("cd".repeat(32), s.getPublishedEncPub())
+    }
+
     @Test fun missingBlobsFromPayload() {
         val s = InMemorySyncStore()
         s.addIdentity(idPub)

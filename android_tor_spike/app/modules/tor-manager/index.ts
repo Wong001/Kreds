@@ -66,7 +66,25 @@ export interface SyncStats { messages: number; blobs: number; identities: number
 export function syncNow(): void { native.syncNow(); }
 export function getSyncStats(): Promise<SyncStats> { return native.getSyncStats(); }
 
-export function onSync(cb: (r: { ok: boolean; messages: number; blobs: number; identities: number; reason?: string }) => void): () => void {
+// -- Brick B.2 (Task 7): decrypted own-authored readable history --
+// Mirrors DecryptPass.Decrypted (Kotlin) -- msg_id/kind/decrypted text/
+// created_at for each own post or DM this device could decrypt (via an
+// inline wrap or a backfilled wrap_grant). Populated by syncNow (re-run
+// after every successful sync); getFeed() just reads that cache -- see
+// TorManagerModule's feedCache doc comment.
+export interface FeedItem { msgId: string; kind: string; text: string; createdAt: number }
+
+export function getFeed(): Promise<FeedItem[]> { return native.getFeed(); }
+
+export function onSync(cb: (r: {
+  ok: boolean; messages: number; blobs: number; identities: number; reason?: string;
+  // Task 7 (B.2): true iff this sync completed successfully and the decrypted
+  // feed cache (getFeed()) was re-run against its result -- false on any
+  // failure path, in which case the feed cache is unchanged from before this
+  // call. Always present (the native side emits it on every nodeSync event,
+  // success or failure); existing callers that don't read it are unaffected.
+  feedUpdated: boolean;
+}) => void): () => void {
   const sub = native.addListener("nodeSync", (e: any) => cb(e));
   return () => sub.remove();
 }

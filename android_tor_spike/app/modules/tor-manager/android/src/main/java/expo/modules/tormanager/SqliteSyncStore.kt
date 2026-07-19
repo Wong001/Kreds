@@ -284,6 +284,19 @@ class SqliteSyncStore(context: Context) :
         }
     }
 
+    /** Backed by the same `keys` table as enc_priv/enc_pub/next_seq, under
+     *  its own row key -- see the SyncStore interface doc on
+     *  getPublishedEncPub/setPublishedEncPub for why this is tracked
+     *  separately from the enc keypair itself. Not transacted (unlike
+     *  setEncKey/nextSeq): it's a single independent row with no paired
+     *  write and no read-then-increment race to protect against. */
+    override fun getPublishedEncPub(): String? = readKey(readableDatabase, "enckey_published")
+
+    override fun setPublishedEncPub(pub: String) {
+        val cv = ContentValues().apply { put("k", "enckey_published"); put("v", pub) }
+        writableDatabase.insertWithOnConflict("keys", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
     // org.json -> plain Kotlin bridge (JSONObject -> Map, JSONArray -> List),
     // same idiom as KotlinSync's private toMap/unwrap (each file keeps its
     // own copy -- see KotlinSync.kt's comment on why: values are consumed

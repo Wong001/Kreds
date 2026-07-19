@@ -34,6 +34,24 @@ interface SyncStore {
      *  would be rejected at the peer's seq-reuse gate -- hearth
      *  identity.py:577, Verifier.verify_message). */
     fun nextSeq(): Int
+    /** The enc_pub (hex) most recently confirmed PUBLISHED to the home node
+     *  (Task 7, B.2) -- i.e. included in an outbound `enckey` message during
+     *  a sync that completed with `SyncResult.Ok` -- or null if this device
+     *  has never successfully published one. Set only via
+     *  `setPublishedEncPub`, after such a sync (see
+     *  `TorManagerModule.syncNow` and `EncKeyPublishGuard`). This is
+     *  DELIBERATELY separate from `getEncKey`/`setEncKey` (the keypair
+     *  itself, Task 3): a device generates its enc keypair once at rest, but
+     *  "have I told the node about THIS pub yet" is a fact about network
+     *  history, not about the key material, and must survive independently
+     *  (e.g. a crash between generating a key and successfully syncing it
+     *  must leave this null so the next sync retries the push). */
+    fun getPublishedEncPub(): String?
+    /** Persists `pub` as the published marker (see `getPublishedEncPub`).
+     *  Callers must only call this AFTER a sync that pushed `pub` as the
+     *  outbound enckey has completed successfully -- never speculatively
+     *  before the push is confirmed accepted. */
+    fun setPublishedEncPub(pub: String)
     /** Every stored message (Task 5, B.2 DecryptPass): unfiltered by kind or
      *  author. NOTE (corrected -- a prior version of this comment claimed
      *  the store only ever holds own-identity content; that is FALSE):
@@ -141,6 +159,10 @@ class InMemorySyncStore : SyncStore {
     override fun setEncKey(priv: String, pub: String) { encKey = priv to pub }
 
     override fun nextSeq(): Int { seqCounter += 1; return seqCounter }
+
+    private var publishedEncPub: String? = null
+    override fun getPublishedEncPub(): String? = publishedEncPub
+    override fun setPublishedEncPub(pub: String) { publishedEncPub = pub }
 
     override fun allMessages(): List<StoredMsg> =
         messages.entries.map { (id, m) -> StoredMsg(id, m.kind, m.cert.identity_pub, m.payload) }
