@@ -41,6 +41,23 @@ import java.nio.file.Files
  *      round trip. Two independent connections to the same node is fine --
  *      hearth/sync.py's _on_conn runs an independent _session per
  *      connection and nothing here mutates state connection 1 depends on.
+ *   3. phoneDecryptsRealBackfilledContent (Task 6, B.2) -- the end-to-end
+ *      decrypt gate: sync 1 authenticates, then runs KotlinSync.run with the
+ *      phone's device-signed enckey as `outbound` (KotlinSync.composeEncKey,
+ *      Task 4), pushing it into the node's real store via the SAME generic
+ *      MESSAGES-phase ingestion every other synced message goes through --
+ *      no script-side injection. node.awaitMaintained() then blocks on the
+ *      node process's "maintained" signal line (sync_loopback_node.py's
+ *      wrapped _on_conn, Task 6) -- a deterministic proof that
+ *      node.maintain_own_device_grants() (Task 2) has ALREADY run against
+ *      the just-ingested enckey before this test opens a second connection,
+ *      rather than racing that timing. Sync 2 (a fresh connection, plain
+ *      pull, no outbound) then pulls the resulting wrap_grants. DecryptPass.
+ *      run (Task 5) is asserted to reproduce the exact seeded plaintexts,
+ *      and -- since the precondition (none of the seeded posts carry an
+ *      inline wrap to the phone; they predate the enckey) is asserted first
+ *      -- every successful decrypt is proven to have come via a backfilled
+ *      wrap_grant, not an inline wrap.
  */
 class SyncLoopbackTest {
 
@@ -65,10 +82,30 @@ class SyncLoopbackTest {
     }
 
     private class NodeProcess(val port: Int, val fixtureJson: String, val expect: JSONObject,
-                               private val proc: Process) {
+                               private val proc: Process, private val stdout: BufferedReader) {
         fun kill() {
             proc.destroy()
             if (!proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) proc.destroyForcibly()
+        }
+
+        /** Task 6 (B.2): blocks until the node process prints its next
+         *  "maintained" signal line -- emitted once per connection, right
+         *  after node.maintain_own_device_grants() has FULLY run for that
+         *  connection (sync_loopback_node.py's wrapped _on_conn). This is
+         *  the deterministic handoff for the two-sync flow: without it,
+         *  opening a second connection immediately after the first one's
+         *  KotlinSync.run() returns would be racing this process's
+         *  server-side maintenance sweep instead of waiting on it. */
+        fun awaitMaintained() {
+            val line = stdout.readLine()
+                ?: throw RuntimeException(
+                    "node process closed stdout before printing a " +
+                    "maintained-signal line")
+            val obj = JSONObject(line)
+            if (obj.optString("event") != "maintained") {
+                throw RuntimeException(
+                    "expected a maintained-signal line, got: $line")
+            }
         }
     }
 
@@ -122,7 +159,7 @@ class SyncLoopbackTest {
         val info = JSONObject(line)
         val fx = info.getJSONObject("fixture")
         val port = info.getInt("port")
-        return NodeProcess(port, fx.toString(), info.getJSONObject("expect"), proc)
+        return NodeProcess(port, fx.toString(), info.getJSONObject("expect"), proc, stdout)
     }
 
     @Test fun authProbeConnectionIsAccepted() {
@@ -157,6 +194,83 @@ class SyncLoopbackTest {
             assertEquals("messages", expect.getInt("messages"), stats.messages)
             assertEquals("blobs", expect.getInt("blobs"), stats.blobs)
             assertEquals("identities", expect.getInt("identities"), stats.identities)
+        } finally {
+            node.kill()
+        }
+    }
+
+    @Test fun phoneDecryptsRealBackfilledContent() {
+        val node = startNode()
+        try {
+            val fixture = KotlinHandshake.parseFixture(node.fixtureJson)
+            val phoneDevicePub = fixture.device_pub
+
+            val store = InMemorySyncStore()
+            store.addIdentity(fixture.cert.identity_pub)
+            val (encPriv, encPub) = EncKeys.getOrCreate(store)
+
+            // -- Sync 1: authenticate, then push the phone's device-signed
+            // enckey message alongside the normal pull. This is the REAL
+            // path (Task 4's outbound + hearth/sync.py's already-generic
+            // MESSAGES-phase ingestion, unmodified) -- not script-side
+            // injection.
+            val stream1 = SocketStream("127.0.0.1", node.port)
+            KotlinHandshake.authOnlyOverStream(stream1, fixture)
+            val encKeyMsg = KotlinSync.composeEncKey(
+                fixture, encPub, store.nextSeq(), System.currentTimeMillis() / 1000.0)
+            val res1 = KotlinSync.run(stream1, store, phoneDevicePub, outbound = listOf(encKeyMsg))
+            assertTrue("sync 1 (push enckey): $res1", res1 is SyncResult.Ok)
+
+            // Deterministic handoff: block until the node process confirms
+            // node.maintain_own_device_grants() has ALREADY run against the
+            // enckey this connection just delivered -- see NodeProcess.
+            // awaitMaintained's doc. Without this, sync 2 below could open
+            // and complete before the node's sweep, and the wrap_grant
+            // assertions further down would be racing server-side timing
+            // instead of testing real behavior.
+            node.awaitMaintained()
+
+            // Precondition (RED-proving if it fails): the seeded posts
+            // predate the phone's enckey, so NONE of them may carry an
+            // inline wrap to this device yet. If this precondition doesn't
+            // hold, the decrypts below could succeed via the inline-wrap
+            // path instead of proving the wrap_grant backfill path -- the
+            // whole point of this gate.
+            val posts = store.allMessages().filter { it.kind == "post" }
+            assertEquals("seeded posts", 3, posts.size)
+            for (m in posts) {
+                @Suppress("UNCHECKED_CAST")
+                val wraps = m.payload["wraps"] as? Map<String, Any?>
+                assertTrue(
+                    "post ${m.msgId} must not already be inline-wrapped to the phone " +
+                        "(it predates the enckey) -- precondition for the wrap_grant proof below",
+                    wraps == null || phoneDevicePub !in wraps)
+            }
+
+            // -- Sync 2: a fresh connection, plain pull (no outbound) --
+            // pulls the wrap_grants node.maintain_own_device_grants() minted
+            // against the enckey pushed in sync 1.
+            val stream2 = SocketStream("127.0.0.1", node.port)
+            KotlinHandshake.authOnlyOverStream(stream2, fixture)
+            val res2 = KotlinSync.run(stream2, store, phoneDevicePub)
+            assertTrue("sync 2 (pull grants): $res2", res2 is SyncResult.Ok)
+
+            val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv)
+            val expectedTexts = setOf("hello from desk", "second post, still text", "with pic")
+            assertEquals("decrypted text must match the seeded post bodies exactly",
+                expectedTexts, decrypted.map { it.text }.toSet())
+            assertEquals(expectedTexts.size, decrypted.size)
+
+            // Every decrypted post must have its content key resolved via a
+            // backfilled wrap_grant -- the precondition above already ruled
+            // out the inline-wrap path, so this confirms the grant path is
+            // the one actually exercised, not merely assumed.
+            var viaGrant = 0
+            for (m in posts) {
+                if (store.wrapGrantsFor(m.msgId, m.identityPub).any { phoneDevicePub in it }) viaGrant++
+            }
+            assertEquals("every seeded post must be covered by a wrap_grant to the phone",
+                posts.size, viaGrant)
         } finally {
             node.kill()
         }
