@@ -10,6 +10,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import java.io.File
 
+/** Task 7 (B.2): bundles the outcome of the enc-key resolve/guard/compose
+ *  step in `syncNow` (see the try/catch around it) into one value so that
+ *  step can be a single expression a `try` can return -- matching the
+ *  store-init block's shape just above it (`val store = try { ... } catch
+ *  { stream.close(); emit(...); return@AsyncFunction Unit }`). */
+private data class EncKeyPrep(
+    val outbound: List<Map<String, Any?>>,
+    val encPriv: String,
+    val encPub: String,
+    val shouldPublish: Boolean,
+)
+
 class TorManagerModule : Module() {
     // recv/send/dial block on socket I/O; keep them OFF the single default
     // AsyncFunction HandlerThread (would deadlock the concurrent recv+send
@@ -169,36 +181,48 @@ class TorManagerModule : Module() {
                 // known identities.)
 
                 // Task 7 (B.2): this device's own enc keypair (generated once,
-                // persisted -- EncKeys.getOrCreate) and the already-published
+                // persisted -- EncKeys.getOrCreate), the already-published
                 // guard (EncKeyPublishGuard) deciding whether THIS sync's
                 // outbound push needs a freshly-composed, freshly-seq'd
-                // `enckey` message. Resolving this before KotlinSync.run so a
-                // guard exception (there shouldn't be one -- it's pure -- but
-                // EncKeys.getOrCreate/store.nextSeq() do real I/O) is caught by
-                // the outer catch below rather than leaving the stream open.
-                val (encPriv, encPub) = EncKeys.getOrCreate(store)
-                val alreadyPublished = store.getPublishedEncPub()
-                val shouldPublish = EncKeyPublishGuard.shouldPublish(encPub, alreadyPublished)
-                val outbound = if (shouldPublish) {
-                    listOf(KotlinSync.composeEncKey(
-                        fx, encPub, store.nextSeq(), System.currentTimeMillis() / 1000.0))
-                } else emptyList()
+                // `enckey` message, and building that message when it does.
+                // EncKeys.getOrCreate / store.getPublishedEncPub / store.nextSeq
+                // are all SQLite I/O and CAN throw (e.g. DB locked -- plausible
+                // under overlapping syncNow calls racing on the same DB file).
+                // authOnlyOverStream succeeding leaves the stream open by
+                // contract -- only KotlinSync.run's finally closes it -- so a
+                // failure here, before KotlinSync.run ever runs, must close the
+                // stream itself or the Tor connection leaks for the process
+                // lifetime -- same reasoning, same shape, as the store-init
+                // try/catch immediately above.
+                val prep = try {
+                    val (priv, pub) = EncKeys.getOrCreate(store)
+                    val publish = EncKeyPublishGuard.shouldPublish(pub, store.getPublishedEncPub())
+                    val outbound = if (publish) {
+                        listOf(KotlinSync.composeEncKey(
+                            fx, pub, store.nextSeq(), System.currentTimeMillis() / 1000.0))
+                    } else emptyList()
+                    EncKeyPrep(outbound, priv, pub, publish)
+                } catch (e: Exception) {
+                    stream.close()
+                    emit(false, 0, 0, 0, "enckey: ${e.message}", false)
+                    return@AsyncFunction Unit
+                }
 
-                when (val r = KotlinSync.run(stream, store, fx.device_pub, outbound)) {
+                when (val r = KotlinSync.run(stream, store, fx.device_pub, prep.outbound)) {
                     is SyncResult.Ok -> {
                         // Mark published ONLY once the sync that carried the
                         // push has FULLY succeeded -- see EncKeyPublishGuard's
                         // doc. A sync that throws/fails below this point never
                         // reaches here, so the marker stays stale/absent and
                         // the very next syncNow call retries the push.
-                        if (shouldPublish) store.setPublishedEncPub(encPub)
+                        if (prep.shouldPublish) store.setPublishedEncPub(prep.encPub)
                         // Decrypt pass + feed cache refresh: only a completed
                         // sync can change what's decryptable (new messages/
                         // wrap_grants may have just been pulled), so this is
                         // the one place the cache is recomputed -- see
                         // feedCache's own doc comment for why getFeed() itself
                         // just serves this cache instead of re-running.
-                        feedCache = DecryptPass.run(store, fx.device_pub, encPriv)
+                        feedCache = DecryptPass.run(store, fx.device_pub, prep.encPriv)
                         emit(true, r.messages, r.blobs, r.identities, null, true)
                     }
                     is SyncResult.SelfRevoked -> emit(false, 0, 0, 0, "self-revoked", false)

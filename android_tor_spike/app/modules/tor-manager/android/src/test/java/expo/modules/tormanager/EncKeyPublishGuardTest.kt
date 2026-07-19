@@ -38,12 +38,18 @@ class EncKeyPublishGuardTest {
         assertTrue(EncKeyPublishGuard.shouldPublish(pubB, publishedMarker = pubA))
     }
 
-    @Test fun failedSyncNeverUpdatesMarkerSoNextCallStillPublishes() {
-        // A failed sync (per TorManagerModule.syncNow's contract) never
-        // calls setPublishedEncPub, so the marker a subsequent call sees is
-        // UNCHANGED from before the failed attempt -- confirm the guard
-        // still says "publish" in that state (i.e. the marker being stale/
-        // absent, not the guard itself, is what drives the retry).
-        assertTrue(EncKeyPublishGuard.shouldPublish(pubA, publishedMarker = null))
-    }
+    // NOTE: a fourth case, "a failed sync never updates the marker, so the
+    // next call still publishes," was deliberately NOT added as a separate
+    // test here (an earlier version of this file had one, byte-identical to
+    // firstSyncNeverPublishedYetMustPublish -- caught in review). The guard
+    // is a pure function of (currentEncPub, publishedMarker) with no notion
+    // of "this call failed" -- from its point of view, "never published yet"
+    // and "published attempt failed, marker was never set" are the exact
+    // same input (publishedMarker == null or == some OLDER value), so they
+    // cannot be expressed as distinct test cases at this layer. That
+    // "failed syncs don't touch the marker" invariant is a property of
+    // TorManagerModule.syncNow's control flow (setPublishedEncPub is only
+    // reachable from the SyncResult.Ok branch), not of this guard -- see
+    // syncNow's own comments and the task report's self-review for that
+    // claim instead.
 }
