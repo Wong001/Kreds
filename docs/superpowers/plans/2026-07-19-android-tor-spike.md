@@ -1817,10 +1817,14 @@ class TorManagerModule : Module() {
 
         AsyncFunction("send") { id: Int, b64: String ->
             val s = conns[id] ?: throw IllegalArgumentException("no conn $id")
-            s.getOutputStream().apply {
-                write(Base64.decode(b64, Base64.NO_WRAP))
-                flush()
-            }
+            // Must end on a Unit-returning call, NOT apply{} (which returns
+            // the OutputStream): Expo marshals an AsyncFunction's last
+            // expression back to JS and cannot serialize SocketOutputStream
+            // -- on-device "FAILED at io: Unknown type" otherwise.
+            // (Amended per on-device finding, 2026-07-19.)
+            val out = s.getOutputStream()
+            out.write(Base64.decode(b64, Base64.NO_WRAP))
+            out.flush()
         }
 
         AsyncFunction("recv") { id: Int, n: Int ->

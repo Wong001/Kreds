@@ -1,9 +1,10 @@
 # Android Tor-dial spike report
 
-**Status: DESK-COMPLETE, on-device run PENDING.** Everything provable at
-the desk is proven and reviewed; the one remaining step is the human-driven
-G20 run (see `ON_DEVICE_CHECKLIST.md`). The two sections marked
-**[PENDING RUN]** are filled in after that run.
+**Status: PROVEN ON HARDWARE (2026-07-19).** The Moto G20 completed a real
+HELLO/AUTH handshake with the desktop home node over Tor and displayed
+**CONNECTED to home node over Tor**. Both spec-proof bullets confirmed on
+the device. Desk gates green throughout (spike pytest 9/9, wire vitest
+20/20).
 
 Spec: `docs/superpowers/specs/2026-07-19-android-tor-spike-design.md`
 Plan: `docs/superpowers/plans/2026-07-19-android-tor-spike.md`
@@ -156,14 +157,48 @@ G20 run.
   (the probe's unsolicited-refusal wait); fine for a one-shot proof, worth
   restructuring for the real client's connection path.
 
-## [PENDING RUN] On-device result
+## On-device result (2026-07-19, G20 serial ZY32DLZQ2N)
 
-_Filled in after the G20 run (ON_DEVICE_CHECKLIST.md):_
-- Did the phone reach **CONNECTED to home node over Tor**? (the two proof
-  bullets, each explicitly confirmed/denied)
-- Any layer that failed, and its stage/result line.
+**CONNECTED to home node over Tor.** Confirmed:
+1. The Kotlin/JNI TorManager bootstrapped GP tor-android in-process and
+   exposed a working SOCKS proxy on the phone -- the run climbed through
+   `tor bootstrap N%` and reached `dialing home node`, so the JNI shim
+   loaded `libtor.so` and `tor_run_main` ran cleanly on hardware (W^X
+   packaging held; no dlopen/symbol TOR_DIED).
+2. The phone SOCKS-dialed the desktop node's `.onion` and completed the
+   real HELLO/AUTH handshake -- the byte-for-byte Ed25519 / canonical-JSON
+   / framing port drove a genuine authenticated session against the real
+   node over a live Tor circuit.
 
-## [PENDING RUN] Timings observed
+The un-enroll behaviour proven on the desk held on device: the phone
+authenticated with an `enroll_other` cert that was never published to the
+node's store (own-identity path).
 
-_Filled in after the run:_ first (cold) bootstrap, warm bootstrap, onion
-dial, handshake round trip.
+### Two on-device issues found and fixed (neither in the crypto/wire layer)
+
+Both surfaced only at runtime -- the compile gate and the desk gate
+(no Expo runtime, non-blocking loopback) structurally could not see them:
+
+1. **The probe deadlock** (caught pre-run by the whole-branch review):
+   Expo's default AsyncFunction queue is a single thread, so the probe's
+   parked `recv` blocked its follow-up `send`. Fixed before the run by
+   running the socket ops on a `Dispatchers.IO` queue -- the run reaching
+   the handshake at all confirms this fix works.
+2. **`send` return-type** (caught DURING the run): the `send` AsyncFunction
+   returned the `java.net.SocketOutputStream` (via `apply{}`), which Expo
+   cannot marshal back to JS -- surfaced as `FAILED at io: ... Unknown
+   type: SocketOutputStream` at the first HELLO write. Fixed by returning
+   `Unit`; the phone then connected on the retry.
+
+Both fixes live in `TorManager` and are inherited by the real client (see
+the inheritance note above).
+
+### Timings
+
+Not instrumented on this run (the screen shows stage transitions, not
+stopwatch numbers). Qualitatively: cold Tor bootstrap was the dominant
+wait (the expected tens-of-seconds-to-minutes first-circuit build), the
+onion dial and the handshake round-trip were both fast enough to read as
+near-immediate stage flips after bootstrap. Instrumenting real timings
+(cold vs. warm bootstrap, dial, RTT) is a cheap follow-up for the real
+client, where bootstrap latency drives the foreground-resume UX.
