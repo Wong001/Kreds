@@ -8,6 +8,7 @@ import java.security.MessageDigest
 
 class SyncStoreTest {
     private val idp = "11".repeat(32); private val dvp = "22".repeat(32)
+    private val idPub = KotlinWire.toHex(org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(KotlinWire.fromHex(idp), 0).generatePublicKey().encoded)
     private fun sha(b: ByteArray) = KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(b))
 
     // Build a REAL signed message via the same primitives (device key = 0x22..).
@@ -24,6 +25,7 @@ class SyncStoreTest {
 
     @Test fun ingestDedupAndSummary() {
         val s = InMemorySyncStore()
+        s.addIdentity(idPub)                          // is_known gate: seed sender identity first
         val m1 = msg(1, mapOf("kind" to "post", "text" to "a", "blobs" to emptyList<String>()))
         assertTrue(s.ingestMessage(m1))
         assertFalse(s.ingestMessage(m1))              // dedup by msg_id
@@ -34,14 +36,36 @@ class SyncStoreTest {
 
     @Test fun rejectsBadSignature() {
         val s = InMemorySyncStore()
+        s.addIdentity(idPub)                          // known identity, so this fails on SIGNATURE specifically
         val good = msg(1, mapOf("kind" to "post", "text" to "a", "blobs" to emptyList<String>()))
         val forged = good.copy(payload = mapOf("kind" to "post", "text" to "EVIL", "blobs" to emptyList<String>()))
         assertFalse(s.ingestMessage(forged))          // sig no longer matches body
         assertEquals(0, s.stats().messages)
     }
 
+    @Test fun rejectsUnknownIdentity() {
+        val s = InMemorySyncStore()
+        // no addIdentity call -- sender is not yet known
+        val m1 = msg(1, mapOf("kind" to "post", "text" to "a", "blobs" to emptyList<String>()))
+        assertFalse(s.ingestMessage(m1))
+        assertEquals(0, s.stats().messages)
+    }
+
+    @Test fun rejectsSeqReuse() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val m1 = msg(5, mapOf("kind" to "post", "text" to "a", "blobs" to emptyList<String>()))
+        assertTrue(s.ingestMessage(m1))
+        // same device, same seq, DIFFERENT payload -> different msg_id, so
+        // dedup-by-msg_id would not catch it; SeenSet must reject seq reuse.
+        val m2 = msg(5, mapOf("kind" to "post", "text" to "b", "blobs" to emptyList<String>()))
+        assertFalse(s.ingestMessage(m2))
+        assertEquals(1, s.stats().messages)
+    }
+
     @Test fun missingBlobsFromPayload() {
         val s = InMemorySyncStore()
+        s.addIdentity(idPub)
         val h = "ab".repeat(32)
         s.ingestMessage(msg(1, mapOf("kind" to "post", "text" to "p", "blobs" to listOf(h))))
         assertEquals(listOf(h), s.missingBlobs())
