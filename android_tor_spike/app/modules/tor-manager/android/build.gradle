@@ -47,6 +47,11 @@ dependencies {
   // Brick A / Task 2: KotlinWire -- Ed25519 for the native heartbeat (no JS
   // runtime while backgrounded). API 30 has no platform Ed25519, so BouncyCastle.
   implementation "org.bouncycastle:bcprov-jdk18on:1.78.1"
+
+  // Brick A / Task 5: TorNodeService uses NotificationCompat for the foreground
+  // notification. Expo modules usually provide androidx.core transitively; pin
+  // explicitly to be safe.
+  implementation "androidx.core:core-ktx:1.13.1"
   testImplementation "junit:junit:4.13.2"
   testImplementation "org.json:json:20240303"
   testImplementation "org.bouncycastle:bcprov-jdk18on:1.78.1"
