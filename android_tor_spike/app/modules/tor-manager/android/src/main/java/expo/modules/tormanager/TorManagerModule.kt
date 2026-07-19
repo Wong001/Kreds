@@ -117,7 +117,7 @@ class TorManagerModule : Module() {
                 // BB-5 desk gate. authOnlyOverStream does HELLO+AUTH only, leaves the
                 // stream open, and throws (rather than returning a verdict) on failure --
                 // accept/refuse is surfaced by KotlinSync.run's own revocations phase.
-                try {
+                val peerCert = try {
                     KotlinHandshake.authOnlyOverStream(stream, fx)
                 } catch (e: Exception) {
                     stream.close()
@@ -125,10 +125,31 @@ class TorManagerModule : Module() {
                     return@AsyncFunction Unit
                 }
 
-                val store = SqliteSyncStore(ctx)
-                // Seed the phone's own identity so ingest's is_known gate admits its
-                // own-identity messages; the HAVE phase adds the node's known identities.
-                store.addIdentity(fx.cert.identity_pub)
+                // authOnlyOverStream verifies the peer cert is validly signed but does
+                // NOT pin it to our home identity (only runOverStream's accepted branch
+                // does that). Pin here so a wrong onion address can never sync us into
+                // a stranger's node.
+                if (peerCert.identity_pub != fx.cert.identity_pub) {
+                    stream.close()
+                    emit(false, 0, 0, 0, "auth: node identity is not our home identity")
+                    return@AsyncFunction Unit
+                }
+
+                // SqliteSyncStore construction / addIdentity are SQLite I/O and can throw
+                // (e.g. DB locked). authOnlyOverStream succeeding leaves the stream open
+                // by contract -- only KotlinSync.run's finally closes it -- so a failure
+                // here, before KotlinSync.run ever runs, must close the stream itself or
+                // the Tor connection leaks for the process lifetime.
+                val store = try {
+                    SqliteSyncStore(ctx).also { it.addIdentity(fx.cert.identity_pub) }
+                } catch (e: Exception) {
+                    stream.close()
+                    emit(false, 0, 0, 0, "store: ${e.message}")
+                    return@AsyncFunction Unit
+                }
+                // (own identity is seeded above, inside the try, so ingest's is_known
+                // gate admits its own-identity messages; the HAVE phase adds the node's
+                // known identities.)
 
                 when (val r = KotlinSync.run(stream, store, fx.device_pub)) {
                     is SyncResult.Ok -> emit(true, r.messages, r.blobs, r.identities, null)
