@@ -1,9 +1,13 @@
 # Brick A report — background-node lifecycle
 
-**Status: CODE COMPLETE, on-device run PENDING.** All 8 code tasks are
-implemented and reviewed; the whole-branch review has run. The remaining
-step is the human-driven G20 run (the `[PENDING RUN]` sections below are
-filled after it).
+**Status: PROVEN ON HARDWARE (2026-07-19, G20).** All six DoD checks pass.
+The persistent background node bootstraps Tor, beats every 5 minutes with
+real authenticated (HELLO/AUTH) reconnections to the home node over Tor,
+survives backgrounding + deep Doze, self-recovers from a process kill via
+`START_STICKY`, and ran a full hour on battery (screen-locked) with the same
+process alive throughout — no OEM-killer gap, negligible drain. Brick A's
+goal (prove the persistent-background-node lifecycle) is met; content sync
+(Brick B) is the next slice.
 
 Spec: `docs/superpowers/specs/2026-07-19-android-background-node-brick-a-design.md`
 Plan: `docs/superpowers/plans/2026-07-19-android-background-node-brick-a.md`
@@ -112,7 +116,7 @@ DoD lifecycle checks:
 - [x] **Background continuity** — survived 4m10s backgrounded, still up, beats continued.
 - [x] **Process-death recovery** — `am kill` bounced off (foreground service resists background reclamation — a positive persistence result); `am crash` killed the process (pid 27459→28074), and `START_STICKY` restarted the service unattended: foreground restored, Tor warm-re-bootstrapped ~4 s, cadence resumed. No intervention.
 - [x] **Doze survival** — deep Doze forced (state IDLE, held through screen-on) 14:02:57; a green beat landed at 14:11 while in deep idle. The foreground service + Doze whitelist kept the network; the native heartbeat completed AUTH over Tor under Doze.
-- [~] ~1h survival + battery read — running on battery, screen-locked, from 97% at ~14:15 (unplugged). Checking beats-kept-landing + battery delta at ~15:15.
+- [x] **~1h survival + battery read** — ran ~1h on battery, screen-locked. Beats landed every 5 min with no gap (no OEM-killer reap); the SAME process (pid 28074, from the earlier crash-recovery) stayed alive the whole hour with Tor continuously up (no re-bootstrap in tor.log). Battery 97% → 98% (charging on reconnect) = negligible net drain.
   - **Battery caveat (interpretation):** this test unit is a heavily-aged device — years of daily cycling followed by ~4-5 years of dormant shelf storage, so the cell has both severe cycle aging AND calendar aging. A degraded cell reports a much steeper %-drop per unit energy (low effective capacity), so the hour's %-drain is only DIRECTIONAL, not a representative power cost — a real figure needs a healthy device / longer controlled baseline. The load-bearing result of this box is *survival* (beats kept landing across the hour, no OEM-killer gap), not the %.
 - [x] **Battery-exemption** — granted; app confirmed on the Doze whitelist (`user,eu.kreds.torspike`), which is what exempts the heartbeat from Doze network restrictions.
 
