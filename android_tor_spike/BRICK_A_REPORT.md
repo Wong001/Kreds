@@ -112,7 +112,8 @@ DoD lifecycle checks:
 - [x] **Background continuity** — survived 4m10s backgrounded, still up, beats continued.
 - [x] **Process-death recovery** — `am kill` bounced off (foreground service resists background reclamation — a positive persistence result); `am crash` killed the process (pid 27459→28074), and `START_STICKY` restarted the service unattended: foreground restored, Tor warm-re-bootstrapped ~4 s, cadence resumed. No intervention.
 - [x] **Doze survival** — deep Doze forced (state IDLE, held through screen-on) 14:02:57; a green beat landed at 14:11 while in deep idle. The foreground service + Doze whitelist kept the network; the native heartbeat completed AUTH over Tor under Doze.
-- [ ] ~1h survival + battery read (passive — leave it running)
+- [~] ~1h survival + battery read — running on battery, screen-locked, from 97% at ~14:15 (unplugged). Checking beats-kept-landing + battery delta at ~15:15.
+  - **Battery caveat (interpretation):** the G20 is an old, used device with a likely-degraded cell, which reports a steeper %-drop per unit energy (lower effective capacity). Treat the hour's %-drain as a LOOSE UPPER BOUND on the node's real cost, not a representative figure — a true power measurement needs a healthy device / longer controlled baseline. The load-bearing result of this box is *survival* (beats kept landing across the hour, no OEM-killer gap), not the exact %.
 - [x] **Battery-exemption** — granted; app confirmed on the Doze whitelist (`user,eu.kreds.torspike`), which is what exempts the heartbeat from Doze network restrictions.
 
 ### Timings observed
