@@ -390,4 +390,30 @@ class SqliteSyncStore(context: Context) :
         }
         return rows.sortedWith(compareBy({ it.createdAt }, { it.seq })).map { it.wraps }
     }
+
+    /** See the SyncStore interface doc: identity_pub -> the latest stored
+     *  KIND_PROFILE message's `name`, by (created_at, seq). Reads msg_json
+     *  the same way missingBlobs()/wrapGrantsFor() above do (no dedicated
+     *  columns for a profile message's payload fields) -- `seq` IS a real
+     *  column here (unlike wrapGrantsFor's target, which isn't), so it's
+     *  read directly rather than decoded from JSON. */
+    override fun profileNames(): Map<String, String> {
+        data class Candidate(val createdAt: Double, val seq: Int, val name: String)
+        val best = linkedMapOf<String, Candidate>()
+        readableDatabase.rawQuery(
+            "SELECT identity_pub, seq, msg_json FROM messages WHERE kind = ?", arrayOf("profile")
+        ).use { c ->
+            while (c.moveToNext()) {
+                val identityPub = c.getString(0)
+                val seq = c.getInt(1)
+                val payload = JSONObject(c.getString(2)).optJSONObject("payload") ?: continue
+                val name = payload.opt("name") as? String ?: continue
+                val createdAt = payload.optDouble("created_at", 0.0)
+                val cur = best[identityPub]
+                if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
+                    best[identityPub] = Candidate(createdAt, seq, name)
+            }
+        }
+        return best.mapValues { it.value.name }
+    }
 }

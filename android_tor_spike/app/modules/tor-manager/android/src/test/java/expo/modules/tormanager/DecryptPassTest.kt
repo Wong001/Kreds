@@ -454,4 +454,104 @@ class DecryptPassTest {
         assertEquals("dm", outDm[0].kind)
         assertEquals(dmCase.getJSONObject("plaintext").getString("text"), outDm[0].text)
     }
+
+    // -- B.2c Task 3: author-name resolution --
+    // KIND_PROFILE payloads are PLAINTEXT (hearth/messages.py:104-115 --
+    // make_profile signs {"kind":"profile","name":...,"created_at":...} with
+    // no wraps/body_ct at all), so these tests build profile SignedMessages
+    // directly with a minimal payload (kind/name/created_at) -- no
+    // encryption fixture material needed, unlike the post/dm cases above.
+
+    private fun profilePayload(name: String, createdAt: Double): Map<String, Any?> =
+        mapOf("kind" to "profile", "name" to name, "created_at" to createdAt)
+
+    @Test fun resolvesAuthorFromStoredFriendProfile() {
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        val profile = signedMessage(
+            c.getString("author"), 2, profilePayload("Alice", c.getDouble("created_at")), "a1".repeat(32))
+        assertTrue(store.ingestMessage(profile))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        assertEquals(1, out.size)
+        assertEquals("a friend with a stored profile message resolves to its name",
+            "Alice", out[0].author)
+    }
+
+    @Test fun fallsBackToIdentityPrefixWithoutAStoredProfile() {
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        // No profile message stored for this identity at all.
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        assertEquals(1, out.size)
+        assertEquals("no stored profile -> falls back to \"friend-\" + identityPub.take(8)",
+            "friend-" + c.getString("author").take(8), out[0].author)
+    }
+
+    @Test fun resolvesOwnAuthorToOwnStoredProfileName() {
+        val c = cases().getJSONObject(0)
+        val ownIdentityPub = c.getString("author")   // we authored this post ourselves
+        val store = InMemorySyncStore()
+        store.addIdentity(ownIdentityPub)
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(ownIdentityPub, 1, postPayload(c, wraps), "a1".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        val ownProfile = signedMessage(
+            ownIdentityPub, 2, profilePayload("Me Myself", c.getDouble("created_at")), "a1".repeat(32))
+        assertTrue(store.ingestMessage(ownProfile))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub)
+        assertEquals(1, out.size)
+        assertEquals("own identity with a stored profile resolves to OUR OWN name, not \"me\"",
+            "Me Myself", out[0].author)
+    }
+
+    @Test fun resolvesOwnAuthorToMeWithoutAStoredOwnProfile() {
+        val c = cases().getJSONObject(0)
+        val ownIdentityPub = c.getString("author")
+        val store = InMemorySyncStore()
+        store.addIdentity(ownIdentityPub)
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(ownIdentityPub, 1, postPayload(c, wraps), "a1".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        // No profile message stored for our own identity.
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub)
+        assertEquals(1, out.size)
+        assertEquals("own identity, no stored profile -> literal \"me\"", "me", out[0].author)
+    }
+
+    @Test fun latestProfileMessageWinsForAuthorResolution() {
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        // Two profile messages for the same identity, older stored SECOND
+        // (seq alone would get this right too, but createdAt is the
+        // documented tiebreak -- this asserts on createdAt ordering, not
+        // insertion/seq order).
+        val newer = signedMessage(
+            c.getString("author"), 2, profilePayload("New Name", c.getDouble("created_at")), "a1".repeat(32))
+        assertTrue(store.ingestMessage(newer))
+        val older = signedMessage(
+            c.getString("author"), 3,
+            profilePayload("Old Name", c.getDouble("created_at") - 100.0), "a1".repeat(32))
+        assertTrue(store.ingestMessage(older))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        assertEquals(1, out.size)
+        assertEquals("the profile with the latest created_at wins, regardless of seq/insertion order",
+            "New Name", out[0].author)
+    }
 }

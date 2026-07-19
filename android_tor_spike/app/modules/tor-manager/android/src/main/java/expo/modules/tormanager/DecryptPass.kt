@@ -26,13 +26,20 @@ package expo.modules.tormanager
  *  (reactions/comments/stories/profile may decrypt but are not rendered
  *  here). */
 object DecryptPass {
-    data class Decrypted(val msgId: String, val kind: String, val text: String, val createdAt: Double)
+    data class Decrypted(
+        val msgId: String, val kind: String, val author: String, val text: String, val createdAt: Double)
 
     fun run(store: SyncStore, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String): List<Decrypted> {
+        // Read once per run(), not once per message: profileNames() does a
+        // full scan over stored profile messages, same shape as
+        // allMessages() itself -- looking it up per-decrypted-message would
+        // make this pass O(messages x profiles) for no benefit, since the
+        // name map doesn't change mid-run.
+        val profileNames = store.profileNames()
         val out = mutableListOf<Decrypted>()
         for (m in store.allMessages()) {
             if (m.kind != "post" && m.kind != "dm") continue
-            decryptOne(store, m, phoneDevicePub, encPrivHex, ownIdentityPub)?.let { out.add(it) }
+            decryptOne(store, m, phoneDevicePub, encPrivHex, ownIdentityPub, profileNames)?.let { out.add(it) }
         }
         // Newest-first: the sensible feed order (most recent content on
         // top). sortedByDescending is a stable sort, so messages sharing a
@@ -41,8 +48,21 @@ object DecryptPass {
         return out.sortedByDescending { it.createdAt }
     }
 
+    /** Author display-name resolution (B.2c Task 3): `profileNames`'s
+     *  latest-stored-profile name for `identityPub`, if any. Own identity
+     *  falls back to the literal "me" when no own profile is stored yet;
+     *  any other identity falls back to "friend-" + the first 8 hex chars
+     *  of its identity_pub -- both fallbacks are deliberately readable-but-
+     *  distinguishable placeholders, never blank/null, so the feed always
+     *  has SOMETHING to show in the author position. */
+    private fun resolveAuthor(profileNames: Map<String, String>, identityPub: String, ownIdentityPub: String): String {
+        profileNames[identityPub]?.let { return it }
+        return if (identityPub == ownIdentityPub) "me" else "friend-" + identityPub.take(8)
+    }
+
     private fun decryptOne(
-        store: SyncStore, m: StoredMsg, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String
+        store: SyncStore, m: StoredMsg, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String,
+        profileNames: Map<String, String>,
     ): Decrypted? {
         val p = m.payload
         val createdAt = (p["created_at"] as? Number)?.toDouble() ?: return null
@@ -63,7 +83,8 @@ object DecryptPass {
         val bodyCt = p["body_ct"] as? String ?: return null
         val body = KotlinDmcrypt.decryptBody(key, bodyNonce, bodyCt, aad) ?: return null
         val text = body["text"] as? String ?: return null
-        return Decrypted(m.msgId, m.kind, text, createdAt)
+        val author = resolveAuthor(profileNames, m.identityPub, ownIdentityPub)
+        return Decrypted(m.msgId, m.kind, author, text, createdAt)
     }
 
     /** Content-key source, in priority order: (1) the message's own inline

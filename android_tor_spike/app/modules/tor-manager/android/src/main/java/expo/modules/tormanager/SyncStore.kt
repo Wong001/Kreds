@@ -94,6 +94,22 @@ interface SyncStore {
      *  gap -- the caller must name every identity it trusts, explicitly,
      *  every time. */
     fun wrapGrantsFor(msgId: String, acceptedSigners: Set<String>): List<Map<String, Any?>>
+    /** Display-name resolution (B.2c Task 3): identity_pub -> the `name`
+     *  field of that identity's LATEST stored KIND_PROFILE message, by
+     *  (created_at, seq). KIND_PROFILE payloads are PLAINTEXT (hearth's
+     *  `messages.make_profile`, messages.py:104-115 -- signs
+     *  {"kind":"profile","name":...,"created_at":...} with no wraps/
+     *  body_ct at all), so this needs no decrypt step, unlike post/dm.
+     *  Identities with no stored profile message are simply absent from
+     *  the returned map -- callers apply their own fallback (DecryptPass:
+     *  own identity -> "me", any other identity -> "friend-" +
+     *  identityPub.take(8)). No entitlement/signer filtering here: unlike
+     *  wrap_grant, a profile message's own author IS its subject (there is
+     *  no "whose name is this" ambiguity for a forged sender to exploit --
+     *  a message from identity X can only ever claim X's own display name,
+     *  gated the same is_known+signature checks every stored message
+     *  already passes at ingest). */
+    fun profileNames(): Map<String, String>
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -183,5 +199,19 @@ class InMemorySyncStore : SyncStore {
                 { (it.payload["created_at"] as? Number)?.toDouble() ?: 0.0 },
                 { it.seq }))
             .mapNotNull { it.payload["wraps"] as? Map<String, Any?> }
+    }
+
+    override fun profileNames(): Map<String, String> {
+        data class Candidate(val createdAt: Double, val seq: Int, val name: String)
+        val best = linkedMapOf<String, Candidate>()
+        for (m in messages.values) {
+            if (m.kind != "profile") continue
+            val name = m.payload["name"] as? String ?: continue
+            val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: 0.0
+            val cur = best[m.cert.identity_pub]
+            if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && m.seq > cur.seq))
+                best[m.cert.identity_pub] = Candidate(createdAt, m.seq, name)
+        }
+        return best.mapValues { it.value.name }
     }
 }
