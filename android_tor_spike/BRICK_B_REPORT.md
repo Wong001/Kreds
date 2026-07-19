@@ -74,9 +74,24 @@ _Filled after the G20 run:_
 - Do the counts match your desktop's own-identity content (roughly)?
 - Any failure stage/reason.
 
-## Follow-ups (carried from reviews)
+## Follow-ups (carried from reviews; whole-branch review = ready-to-merge, tracking only)
 
-- Thumbs empty-string guard (a hearth-consistency nit in missingBlobs).
-- The full `ingest_message` acceptance policy beyond signature/dedup/seq/
-  is_known (deferred to B.2/hardening).
+- **Acceptance-policy hardening (B.2):** `ingestMessage` gates on is_known +
+  device-signature + dedup + seq (seq<1 + reuse), but NOT the enrollment
+  `cert.verify()`, identity-match, `validate_payload`, tombstone, or
+  per-device revocation retro-drop that hearth's `verify_message` applies.
+  Non-exploitable for B.1 (own-identity pull over an authenticated,
+  home-identity-pinned channel; the node applied the full policy before
+  sending; it only ever accepts more, never wrongly rejects) — but a real
+  fidelity gap to close in B.2.
+- Thumbs empty-string guard (a hearth-consistency nit in missingBlobs;
+  identical in InMemory + SQLite, so no desk-vs-phone divergence).
+- `SyncResult.Ok` reports store TOTALS not this-round deltas (the "synced: N
+  msgs" line shows cumulative counts on a second sync — cosmetic).
+- `getSyncStats` blocking/unqueued + `SqliteSyncStore` helpers never closed
+  (potential SQLITE_BUSY if a stats read overlaps a sync write; hygiene
+  follow-up).
+- **On the run, eyeball blob counts vs desktop** — SQLite's
+  `serialize→missingBlobs` org.json round-trip is the one sync seam the desk
+  gate (which uses InMemory) couldn't cover.
 - B.2: enc-key publish + wrap-grants + decryption + friends' content + feed UI.
