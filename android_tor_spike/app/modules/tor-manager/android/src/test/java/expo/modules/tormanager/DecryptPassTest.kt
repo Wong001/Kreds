@@ -27,6 +27,10 @@ class DecryptPassTest {
     // the two author-scoping tests below. Distinct from phoneDevicePub/
     // otherDevicePub, which are DEVICE keys, not identities.
     private val foreignIdentityPub = "99".repeat(32)
+    // The phone's OWN identity for the own-content-only regression test
+    // below -- deliberately distinct from the fixture's "11"-repeat author
+    // (make_dmcrypt_vectors.py), which plays the role of a FRIEND there.
+    private val phoneOwnIdentityPub = "77".repeat(32)
 
     private fun cases(): JSONArray {
         val t = javaClass.classLoader!!.getResourceAsStream("dmcrypt_vectors.json")!!
@@ -84,7 +88,7 @@ class DecryptPassTest {
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
         assertTrue(store.ingestMessage(msg))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
         assertEquals(1, out.size)
         assertEquals(msg.msgId(), out[0].msgId)
         assertEquals("post", out[0].kind)
@@ -112,7 +116,7 @@ class DecryptPassTest {
         val grant = signedMessage(c.getString("author"), 2, grantPayload, "b1".repeat(32))
         assertTrue(store.ingestMessage(grant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
         assertEquals(1, out.size)
         assertEquals("dm", out[0].kind)
         assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
@@ -138,7 +142,7 @@ class DecryptPassTest {
         val m2 = signedMessage(c.getString("author"), 2, tamperedPayload, "c2".repeat(32))
         assertTrue(store.ingestMessage(m2))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
         assertEquals("neither message should decrypt (wrong device / tampered ct)", 0, out.size)
     }
 
@@ -162,7 +166,7 @@ class DecryptPassTest {
             assertTrue(store.ingestMessage(msg))
         }
 
-        val out = DecryptPass.run(store, phoneDevicePub, encPriv)
+        val out = DecryptPass.run(store, phoneDevicePub, encPriv, sameKeyCases[0].getString("author"))
         assertEquals(sameKeyCases.size, out.size)
         val expectedOrder = sameKeyCases.map { it.getDouble("created_at") }.sortedDescending()
         assertEquals(expectedOrder, out.map { it.createdAt })
@@ -214,7 +218,7 @@ class DecryptPassTest {
         val foreignGrant = signedMessage(foreignIdentityPub, 1, foreignGrantPayload, "e1".repeat(32))
         assertTrue(store.ingestMessage(foreignGrant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
         assertEquals("the foreign grant must be ignored; the real, older own grant must still decrypt",
             1, out.size)
         assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
@@ -243,7 +247,36 @@ class DecryptPassTest {
         val foreignGrant = signedMessage(foreignIdentityPub, 1, foreignGrantPayload, "e2".repeat(32))
         assertTrue(store.ingestMessage(foreignGrant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
         assertEquals("only a foreign-authored grant exists -- must be skipped, not decrypted", 0, out.size)
+    }
+
+    @Test fun excludesFriendAuthoredPostEvenWithAValidInlineWrap() {
+        // Reviewer-caught (final whole-branch review): B.2's plan-mandated
+        // Global Constraint is "own-authored content ONLY -- never friends'
+        // content (B.2c)". A real friend graph replicates a friend's OWN
+        // wall posts (and their own wrap_grants/inline wraps) to our synced
+        // store just like our own content does -- run() must not render
+        // them just because a valid wrap to this device happens to exist.
+        // Unlike the wrap_grant author-scoping tests above (which cover a
+        // HOSTILE grant targeting an own-authored post), this test's post
+        // itself is authored by the friend, and its wrap is the REAL,
+        // uncorrupted fixture wrap -- decryptable in every respect -- so a
+        // non-zero result here could only mean the author check was never
+        // reached.
+        val c = cases().getJSONObject(0)
+        assertEquals("post", c.getString("kind"))
+        val store = InMemorySyncStore()
+        // The fixture's "author" plays a KNOWN FRIEND here (not the phone's
+        // own identity, which is phoneOwnIdentityPub) -- addIdentity mirrors
+        // B.1 sync's HAVE phase admitting a friend's identity as known.
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "f1".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        assertEquals("friend-authored post must be excluded even though the wrap is genuinely valid",
+            0, out.size)
     }
 }

@@ -255,7 +255,7 @@ class SyncLoopbackTest {
             val res2 = KotlinSync.run(stream2, store, phoneDevicePub)
             assertTrue("sync 2 (pull grants): $res2", res2 is SyncResult.Ok)
 
-            val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv)
+            val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv, fixture.cert.identity_pub)
             val expectedTexts = setOf("hello from desk", "second post, still text", "with pic")
             assertEquals("decrypted text must match the seeded post bodies exactly",
                 expectedTexts, decrypted.map { it.text }.toSet())

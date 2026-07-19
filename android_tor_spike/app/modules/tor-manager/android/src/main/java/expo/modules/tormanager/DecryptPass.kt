@@ -16,10 +16,12 @@ package expo.modules.tormanager
 object DecryptPass {
     data class Decrypted(val msgId: String, val kind: String, val text: String, val createdAt: Double)
 
-    fun run(store: SyncStore, phoneDevicePub: String, encPrivHex: String): List<Decrypted> {
+    fun run(store: SyncStore, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String): List<Decrypted> {
         val out = mutableListOf<Decrypted>()
         for (m in store.allMessages()) {
             if (m.kind != "post" && m.kind != "dm") continue
+            // B.2 own-content-only: friends' content is B.2c -- exclude anything not authored by us.
+            if (m.identityPub != ownIdentityPub) continue
             decryptOne(store, m, phoneDevicePub, encPrivHex)?.let { out.add(it) }
         }
         // Newest-first: the sensible feed order (most recent content on

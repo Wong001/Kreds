@@ -222,7 +222,7 @@ class TorManagerModule : Module() {
                         // the one place the cache is recomputed -- see
                         // feedCache's own doc comment for why getFeed() itself
                         // just serves this cache instead of re-running.
-                        feedCache = DecryptPass.run(store, fx.device_pub, prep.encPriv)
+                        feedCache = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub)
                         emit(true, r.messages, r.blobs, r.identities, null, true)
                     }
                     is SyncResult.SelfRevoked -> emit(false, 0, 0, 0, "self-revoked", false)
