@@ -108,7 +108,14 @@ class SqliteSyncStore(context: Context) :
         ).use { it.moveToFirst() }
         if (alreadyHave) return false
 
-        // 4. seq-reuse rejection -- SeenSet's whole purpose in the in-memory
+        // 4a. seq<1 rejection -- SeenSet.add(seq) rejects seq<1
+        // unconditionally (`if (seq < 1 || has(seq)) return false`), before
+        // it even checks reuse. A row-existence query alone can't express
+        // that (a first message at seq=0/negative has no existing row to
+        // collide with), so it needs its own explicit gate here.
+        if (m.seq < 1) return false
+
+        // 4b. seq-reuse rejection -- SeenSet's whole purpose in the in-memory
         // reference (D2 Ambush 2; hearth Verifier.verify_message: `if not
         // seen.add(seq): reject`). Rows are never deleted, so a row here
         // with the same (identity_pub, device_pub, seq) can only have a
@@ -134,27 +141,35 @@ class SqliteSyncStore(context: Context) :
     }
 
     /** Re-derives the node's dict shape (cert/seq/payload/signature) from
-     *  the parsed SignedMessage and serializes it via KotlinWire's canonical
-     *  dumps -- ingestMessage only ever receives a parsed SignedMessage
-     *  (KotlinSync parses frames straight into one), never the node's raw
-     *  JSON string, so this is the faithful re-serialization available.
-     *  Safe to call post-verifyDeviceSignature: that call already ran
-     *  KotlinWire.canonical (-> dumps) over this same cert/payload to
-     *  produce m.body(), so dumps() is already known not to throw on them. */
-    private fun serialize(m: SignedMessage): String = KotlinWire.dumps(
-        mapOf(
-            "cert" to mapOf(
-                "identity_pub" to m.cert.identity_pub,
-                "device_pub" to m.cert.device_pub,
-                "device_name" to m.cert.device_name,
-                "enrolled_at" to m.cert.enrolled_at,
-                "signature" to m.cert.signature,
-            ),
-            "seq" to m.seq,
-            "payload" to m.payload,
-            "signature" to m.signature,
-        )
-    )
+     *  the parsed SignedMessage and serializes it via org.json -- ingestMessage
+     *  only ever receives a parsed SignedMessage (KotlinSync parses frames
+     *  straight into one), never the node's raw JSON string, so this is the
+     *  faithful re-serialization available.
+     *
+     *  Deliberately NOT KotlinWire.dumps: dumps routes any Double (incl.
+     *  cert.enrolled_at) through pyFloatRepr, which THROWS outside a narrow
+     *  supported range (|n|>=1e16, <1e-4, or non-finite). enrolled_at is part
+     *  of the enrollment cert, not covered by THIS message's device
+     *  signature -- verifyDeviceSignature() never touches it -- so a
+     *  validly-signed message carrying a hostile/odd enrolled_at would throw
+     *  here, uncaught, and abort KotlinSync.run's whole session (its
+     *  top-level catch turns it into SyncResult.Failed), dropping every
+     *  other good message in the same sync. InMemorySyncStore never
+     *  serializes enrolled_at at all, so it has no equivalent failure mode.
+     *  org.json has no such range restriction, and msg_json is only ever
+     *  read back via org.json (missingBlobs), so this round-trips fine. */
+    private fun serialize(m: SignedMessage): String {
+        val cert = JSONObject().apply {
+            put("identity_pub", m.cert.identity_pub); put("device_pub", m.cert.device_pub)
+            put("device_name", m.cert.device_name); put("enrolled_at", m.cert.enrolled_at)
+            put("signature", m.cert.signature)
+        }
+        return JSONObject().apply {
+            put("cert", cert); put("seq", m.seq)
+            put("payload", JSONObject(m.payload))   // wraps nested Maps/Lists recursively
+            put("signature", m.signature)
+        }.toString()
+    }
 
     /** Blob hashes referenced by stored POST/DM payloads, minus what we
      *  hold. Mirrors InMemorySyncStore.missingBlobs (hearth.store.
