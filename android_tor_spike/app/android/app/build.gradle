@@ -157,6 +157,10 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
+    // Tor-dial spike (Task 7): vendored libtor.so via GuardianProject's tor-android AAR.
+    // JNI shim in Task 8 dlopen's the arm64-v8a libtor.so and calls the tor_api.h entry points.
+    implementation "info.guardianproject:tor-android:0.4.9.11"
+
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";
     def isWebpAnimatedEnabled = (findProperty('expo.webp.animated') ?: "") == "true";
