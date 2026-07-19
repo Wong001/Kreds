@@ -64,8 +64,16 @@ interval-config UI.
   service + notification is largely exempt from Doze's network suspension,
   so the node stays genuinely reachable when idle. Continuous modest
   battery drain is the accepted cost of "persistent."
-- **Heartbeat payload = the spike's proven handshake**, stopping at
-  AUTH-accepted. No content ever flows.
+- **Heartbeat payload = the proven handshake, PORTED TO KOTLIN**
+  (amended 2026-07-19). The background heartbeat must run with no live JS
+  runtime (Doze, and especially after a `START_STICKY` process-restart
+  where no Activity/RN context exists), so the wire layer (canonical JSON,
+  length-frames, Ed25519) and the HELLO/AUTH+probe are re-ported to Kotlin
+  and validated against the **same committed `wire_vectors.json`** plus a
+  loopback check against the real node. `wire.ts`/`handshake.ts` remain the
+  source for the foreground/future-content path; the background heartbeat
+  is pure native so it survives Doze/process-death without a JS runtime.
+  The heartbeat stops at AUTH-accepted; no content ever flows.
 - **Interval N = 5 minutes** default (short enough to observe while
   dogfooding; configurable later, not in this slice).
 - **Enrollment stays the adb-pushed fixture stub** — Brick A does not touch
@@ -94,9 +102,17 @@ engineering work; the existing `TorManager` narrow interface
 - **`TorManager` (existing, unchanged).** Reused as-is
   (bootstrap/dial/suspend + the Dispatchers.IO fix + the `send`-returns-Unit
   fix). Owner changes from RN module to the Service.
-- **Heartbeat runner** — each beat: `dial(onion, 9997)` → `handshake.ts`
+- **`TorEngine` (process-global Kotlin singleton, new).** The Tor-owning
+  state (tor thread, SOCKS conns, bootstrap/dial/send/recv/close/suspend)
+  is extracted out of `TorManagerModule` into a process-global object so it
+  survives Activity destruction and is shared by both the Module (foreground
+  JS calls) and the Service (background heartbeat). The Module becomes a thin
+  delegator; its JS interface is unchanged.
+- **`KotlinWire` + `KotlinHandshake` (new, native heartbeat).** The Kotlin
+  port of the wire layer and HELLO/AUTH+probe, gated by the committed
+  vectors. Each beat: `TorEngine.dial(onion, 9997)` → `KotlinHandshake`
   accepted-path → record `{timestamp, ok, latencyMs, reason?}` → disconnect.
-  Reuses `wire.ts` / `handshake.ts` untouched.
+  Ed25519 via BouncyCastle (API 30 has no platform Ed25519).
 - **Notification** — required by the foreground service and the primary
   observability surface: `Kreds node up · last beat HH:MM ✓ · <n> beats`
   (or `✗ <reason>`). Tapping opens the app. A notification action stops the
@@ -151,10 +167,16 @@ User stops node (screen or notification action)
   Doze-force-idle, `am kill`, and logcat capture of heartbeat lines.
 - **Phone-side (August):** the eyeball on notification/history over a real
   backgrounded run and the "is overnight battery acceptable" judgment.
-- **Reused desk gates:** `wire.ts`/`handshake.ts` are unchanged, so the
-  existing spike pytest 9/9 + vitest 20/20 continue to guard the heartbeat
-  payload's correctness; no new desk tests are needed for the crypto/wire
-  layer.
+- **New Kotlin-port gate (desk, JVM):** a gradle JVM unit test loads the
+  same committed `android_tor_spike/fixtures/wire_vectors.json` and asserts
+  `KotlinWire` reproduces every canonical byte sequence and verifies every
+  Ed25519 signature/cert — the identical contract `wire.test.ts` enforces,
+  so the Kotlin port cannot silently drift from Python. The existing spike
+  pytest 9/9 + vitest 20/20 continue to guard `wire.ts`/`handshake.ts`
+  (unchanged).
+- **Loopback check (desk):** the `test_handshake_desk.py` real-node
+  listener remains; the Kotlin handshake's ultimate correctness proof is
+  the on-device heartbeat completing AUTH against the real node.
 
 ## Definition of done
 
@@ -186,6 +208,10 @@ unattended, with the battery-optimization exemption prompt in place.
   the heartbeat stream; decide binder/bound-service vs. a broadcast/event
   bridge during build (interface stays: the screen observes, the service
   owns).
+- **Kotlin Ed25519 / canonical-JSON fidelity.** The re-port must match
+  Python byte-for-byte (sorted keys, compact separators, `ensure_ascii`,
+  the `enrolled_at` float rendering). The committed-vector JVM gate is the
+  guard; BouncyCastle supplies Ed25519 on API 30.
 
 ## Out of scope (named, so it does not creep in)
 
