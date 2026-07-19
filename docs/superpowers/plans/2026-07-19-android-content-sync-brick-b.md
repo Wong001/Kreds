@@ -469,12 +469,21 @@ class InMemorySyncStore : SyncStore {
     override fun addIdentity(id: String) { identities.add(id) }
 
     override fun ingestMessage(m: SignedMessage): Boolean {
+        // is_known gate (mirrors hearth Store.ingest_message's first check):
+        // accept only from an identity we already know -- own identity is
+        // seeded before sync, friends are added during HAVE. Do NOT
+        // auto-register senders.
+        if (m.cert.identity_pub !in identities) return false
         if (!m.verifyDeviceSignature()) return false
         val id = m.msgId()
-        if (messages.containsKey(id)) return false
+        if (messages.containsKey(id)) return false            // already have this exact message
+        // seq-reuse rejection -- SeenSet's whole purpose (D2 Ambush 2;
+        // hearth Verifier.verify_message: `if not seen.add(seq): reject`).
+        // A device reusing a seq with DIFFERENT content (different msg_id,
+        // so past the dedup above) is rejected here.
+        if (!seen.getOrPut(m.cert.identity_pub to m.cert.device_pub) { SeenSet() }.add(m.seq))
+            return false
         messages[id] = m
-        seen.getOrPut(m.cert.identity_pub to m.cert.device_pub) { SeenSet() }.add(m.seq)
-        identities.add(m.cert.identity_pub)
         return true
     }
 
