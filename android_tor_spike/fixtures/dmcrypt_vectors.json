@@ -1,0 +1,44 @@
+{
+  "cases": [
+    {
+      "kind": "post",
+      "author": "1111111111111111111111111111111111111111111111111111111111111111",
+      "scope": "kreds",
+      "created_at": 1752900000.123456,
+      "enc_priv": "007e55f1ae9b0bd05b14d6909f12079e40a980c43c48e045421758b605949b5a",
+      "wrap": {
+        "eph_pub": "1d2fff7fe3418a059bf0ae3bc9183e8d3c421e76c6bd37bc48be5e9620dacb2c",
+        "nonce": "e92109a365bd13cc71f4e885",
+        "wrapped_key": "7f324253eb25def2d1b0251bb6604f3793ef9867aa3fbb5f26437465a41e9875fc5060a3fb1f0ecbb4a5575ea8b1e309"
+      },
+      "body_nonce": "047d8b1db7bb019596e04898",
+      "body_ct": "99292bb24d867db103af7f0d2f7df2e3333964f1a29bedbe4a115f9525b964b38a76c4c1a2fe027cb89fe12d784373e9a7c34f64350cbc960ef6f04d76b8b3f8a53b1e3e98605a",
+      "content_key": "b588b23265541a35f68dec9f6ebf0787ffe0db7ae39ec42d5d319e3caecae783",
+      "plaintext": {
+        "kind": "post",
+        "text": "hello from the desk",
+        "blobs": []
+      }
+    },
+    {
+      "kind": "dm",
+      "author": "1111111111111111111111111111111111111111111111111111111111111111",
+      "to": "2222222222222222222222222222222222222222222222222222222222222222",
+      "created_at": 1752900000.123456,
+      "enc_priv": "d0020297dad71680c65dbdfc7f656ad4605761d9ee21b514f51ee5cba8df3063",
+      "wrap": {
+        "eph_pub": "4752bafd54c8085c6a4ffd5bb73cf9b7f44e30d7cc167aa3a98fa906739c222e",
+        "nonce": "d130f9e2d45b7b9ef031e8e0",
+        "wrapped_key": "22f17b9aae6027f60dca91059c2e86744ad4b4a2a01c088fa56122225de1c6584e4b4327395aa0578c8d3bdb59025241"
+      },
+      "body_nonce": "70e2d80237db1a5d018e5e32",
+      "body_ct": "390e7cb7f123a2a31d531a3c80dc1b48d56f81c94d3e4843344cc4fd3593a967b783b77d6254354bff20ec6214f6142bd4fcad26bc146fc127533546647669a0fca39c2c1e0f7dea118034f613d59a32fa4c1ab0362ac70ee6f881af48527d5f1c4da657810087e600e920db85e2c5b7cd2f88187a82b5dc",
+      "content_key": "63741964e88be5dab0154ac9b72aefe226a79bd5b429c3ff7ee48a390bd83f7e",
+      "plaintext": {
+        "kind": "dm",
+        "text": "secret dm",
+        "to": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    }
+  ]
+}

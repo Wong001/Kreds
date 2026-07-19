@@ -8,3 +8,7 @@ src/test/resources/wire_vectors.json
 # Generated copy of the committed fixture (copyMessageVectors gradle task) --
 # the source of truth is android_tor_spike/fixtures/message_vectors.json.
 src/test/resources/message_vectors.json
+
+# Generated copy of the committed fixture (copyDmcryptVectors gradle task) --
+# the source of truth is android_tor_spike/fixtures/dmcrypt_vectors.json.
+src/test/resources/dmcrypt_vectors.json
