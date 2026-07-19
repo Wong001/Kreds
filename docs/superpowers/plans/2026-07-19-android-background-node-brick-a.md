@@ -835,7 +835,7 @@ class TorNodeService : Service() {
         fun beatNow(ctx: Context) = ctx.startService(Intent(ctx, TorNodeService::class.java).setAction(ACTION_BEAT_NOW))
     }
 
-    private var scheduler: ScheduledExecutorService? = null
+    @Volatile private var scheduler: ScheduledExecutorService? = null
     @Volatile private var beats = 0
     @Volatile private var lastLine = "starting"
 
@@ -861,10 +861,21 @@ class TorNodeService : Service() {
             TorEngine.bootstrap(
                 onProgress = { p -> updateNotification("Tor bootstrap $p%") },
                 onDone = {
+                    // onDone fires on TorEngine's watcher thread, NOT the
+                    // scheduler thread. Post ALL heartbeat work back onto the
+                    // single scheduler thread so beats never overlap (a beatNow
+                    // queued during bootstrap would otherwise race the first
+                    // beat). scheduler?. + runCatching guard the stop-during-
+                    // bootstrap race (shutdown() nulls/shuts the executor);
+                    // without them scheduler!!.schedule NPEs or throws
+                    // RejectedExecutionException on this thread and kills the process.
                     broadcastState("up")
-                    heartbeat()   // immediate first beat
-                    scheduler!!.scheduleAtFixedRate({ heartbeat() },
-                        HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                    val s = scheduler
+                    runCatching {
+                        s?.execute { heartbeat() }   // immediate first beat, on the scheduler thread
+                        s?.scheduleAtFixedRate({ heartbeat() },
+                            HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                    }
                 },
                 onError = { code, msg ->
                     broadcastState("error")
@@ -898,7 +909,13 @@ class TorNodeService : Service() {
         } catch (e: Exception) {
             Beat(start, false, System.currentTimeMillis() - start, "io: ${e.message}")
         }
-        recordAndBroadcast(beat)
+        // recordAndBroadcast does prefs I/O + notify + sendBroadcast, all of
+        // which can throw on-device. An uncaught throwable in a
+        // scheduleAtFixedRate task SILENTLY CANCELS all future beats, so this
+        // MUST be guarded -- a transient notify/prefs hiccup must not
+        // permanently kill the heartbeat. heartbeat() therefore never throws
+        // to the executor.
+        runCatching { recordAndBroadcast(beat) }
     }
 
     private fun recordAndBroadcast(beat: Beat) {
