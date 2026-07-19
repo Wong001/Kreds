@@ -8,6 +8,7 @@ import expo.modules.kotlin.modules.ModuleDefinition
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import java.io.File
 
 class TorManagerModule : Module() {
     // recv/send/dial block on socket I/O; keep them OFF the single default
@@ -23,7 +24,7 @@ class TorManagerModule : Module() {
             "fixtureDir" to (appContext.reactContext?.getExternalFilesDir(null)?.absolutePath ?: "")
         )
 
-        Events("torProgress", "nodeBeat", "nodeState")
+        Events("torProgress", "nodeBeat", "nodeState", "nodeSync")
 
         OnCreate {
             val ctx = appContext.reactContext ?: return@OnCreate
@@ -88,6 +89,62 @@ class TorManagerModule : Module() {
             HeartbeatStore.history(ctx).map {
                 mapOf("ts" to it.ts, "ok" to it.ok, "latencyMs" to it.latencyMs, "reason" to it.reason)
             }
+        }
+
+        // -- Brick B.1: foreground-triggered content sync --
+        AsyncFunction("syncNow") {
+            fun emit(ok: Boolean, messages: Int, blobs: Int, identities: Int, reason: String?) {
+                sendEvent("nodeSync", mapOf(
+                    "ok" to ok, "messages" to messages, "blobs" to blobs,
+                    "identities" to identities, "reason" to reason))
+            }
+            val ctx = appContext.reactContext
+            if (ctx == null) { emit(false, 0, 0, 0, "no context"); return@AsyncFunction Unit }
+            if (!TorEngine.isUp) {
+                emit(false, 0, 0, 0, "tor not up - start the node first")
+                return@AsyncFunction Unit
+            }
+            try {
+                val fx = KotlinHandshake.parseFixture(
+                    File(TorEngine.externalDir(), "spike_phone_fixture.json").readText())
+                val (host, port) = KotlinHandshake.splitAddr(fx.onion_addr)
+                val stream = TorStream(TorEngine.dial(host, port))
+
+                // AUTH ONLY -- do NOT use KotlinHandshake.run/runOverStream here: their
+                // acceptance probe IS the sync REVOCATIONS swap, and chaining straight
+                // into KotlinSync.run (whose own first phase also sends "revocations")
+                // would send that frame twice and desync the session -- proved on the
+                // BB-5 desk gate. authOnlyOverStream does HELLO+AUTH only, leaves the
+                // stream open, and throws (rather than returning a verdict) on failure --
+                // accept/refuse is surfaced by KotlinSync.run's own revocations phase.
+                try {
+                    KotlinHandshake.authOnlyOverStream(stream, fx)
+                } catch (e: Exception) {
+                    stream.close()
+                    emit(false, 0, 0, 0, "auth: ${e.message}")
+                    return@AsyncFunction Unit
+                }
+
+                val store = SqliteSyncStore(ctx)
+                // Seed the phone's own identity so ingest's is_known gate admits its
+                // own-identity messages; the HAVE phase adds the node's known identities.
+                store.addIdentity(fx.cert.identity_pub)
+
+                when (val r = KotlinSync.run(stream, store, fx.device_pub)) {
+                    is SyncResult.Ok -> emit(true, r.messages, r.blobs, r.identities, null)
+                    is SyncResult.SelfRevoked -> emit(false, 0, 0, 0, "self-revoked")
+                    is SyncResult.Failed -> emit(false, 0, 0, 0, "${r.stage}: ${r.reason}")
+                }
+            } catch (e: Exception) {
+                emit(false, 0, 0, 0, "io: ${e.message}")
+            }
+        }.runOnQueue(ioScope)
+
+        AsyncFunction("getSyncStats") {
+            val ctx = appContext.reactContext
+                ?: return@AsyncFunction mapOf("messages" to 0, "blobs" to 0, "identities" to 0)
+            val st = SqliteSyncStore(ctx).stats()
+            mapOf("messages" to st.messages, "blobs" to st.blobs, "identities" to st.identities)
         }
 
         Function("isBatteryExempt") {
