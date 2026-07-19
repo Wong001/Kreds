@@ -38,8 +38,12 @@ object Base64Portable {
 }
 
 /** Runs the post-AUTH sync phases (hearth/sync.py _session) as INITIATOR,
- *  over an already-authenticated Stream. Read-only pull: sends empty
- *  msgs/blobs; ingests the node's own-identity messages + blobs.
+ *  over an already-authenticated Stream. Sends empty revs/notices/blobs, and
+ *  (since B.2 Task 4) the caller-supplied `outbound` messages -- for B.2, at
+ *  most one: the phone's device-signed enckey (see composeEncKey below).
+ *  `outbound` defaults to empty, so a bare pull (B.1's original shape) is
+ *  still `run(stream, store, ownDevicePub)`. Always ingests the node's
+ *  own-identity messages + blobs.
  *
  *  Blocking, like KotlinHandshake.run -- callers (BB-7) must invoke this
  *  off the main thread (Dispatchers.IO), same reason TorEngine's own
@@ -104,7 +108,57 @@ object KotlinSync {
         else -> v
     }
 
-    fun run(stream: Stream, store: SyncStore, ownDevicePub: String): SyncResult {
+    /** Builds a `SignedMessage.to_dict()`-shaped map for a KIND_ENCKEY payload
+     *  ({"kind":"enckey","enc_pub":...,"created_at":...}), signed by this
+     *  device -- byte-matches hearth's `messages.make_enckey` +
+     *  `identity.DeviceKeys.sign_message` (hearth/messages.py:126-131,
+     *  hearth/identity.py:304-316): the canonical signed body is
+     *  {"type":"message","protocol":PROTOCOL,"identity_pub":...,
+     *  "device_pub":...,"seq":...,"payload":...}, which is exactly what
+     *  `SignedMessage.body()` (SignedMessageKt.kt) already builds and
+     *  `SignedMessageTest` already vector-proves byte-correct against real
+     *  hearth output for other payload kinds (post/dm) -- reused here
+     *  (via a throwaway-signature `SignedMessage` + `.copy`) rather than
+     *  re-implemented, so this inherits that byte-fidelity proof instead of
+     *  risking a second, subtly-divergent construction.
+     *
+     *  `createdAt` and `seq` are supplied by the caller, not computed here:
+     *  the phone needs a real wall-clock reading (`System.currentTimeMillis()
+     *  /1000.0`, no `Date.now()`-style call inside this object) and its own
+     *  persisted next-seq counter (`SyncStore.nextSeq()`, starts at 1 -- see
+     *  that method's doc comment). */
+    fun composeEncKey(
+        fixture: KotlinHandshake.Fixture,
+        encPub: String,
+        seq: Int,
+        createdAt: Double,
+    ): Map<String, Any?> {
+        val payload: Map<String, Any?> = mapOf(
+            "kind" to "enckey", "enc_pub" to encPub, "created_at" to createdAt,
+        )
+        val unsigned = SignedMessage(fixture.cert, seq, payload, "")
+        val signed = unsigned.copy(signature = KotlinWire.signRaw(fixture.device_priv, unsigned.body()))
+        return mapOf(
+            "cert" to certToMap(signed.cert), "seq" to signed.seq,
+            "payload" to signed.payload, "signature" to signed.signature,
+        )
+    }
+
+    // Mirrors KotlinHandshake's private certToMap (identity_pub/device_pub/
+    // device_name/enrolled_at/signature) but with enrolled_at as a plain
+    // Double rather than a KotlinWire.PyFloat wrapper -- KotlinWire.dumps'
+    // `is Double` case (the BB-5 fix, see KotlinSync.unwrap's comment above)
+    // formats a bare Double identically to a PyFloat-wrapped one, so the two
+    // produce byte-identical wire output; plain Double is simpler here and
+    // lets composeEncKey's own result be compared with ordinary Kotlin Map
+    // equality in tests (a PyFloat instance has no value-based equals()).
+    private fun certToMap(c: KotlinWire.CertDict): Map<String, Any?> = mapOf(
+        "identity_pub" to c.identity_pub, "device_pub" to c.device_pub,
+        "device_name" to c.device_name, "enrolled_at" to c.enrolled_at,
+        "signature" to c.signature)
+
+    fun run(stream: Stream, store: SyncStore, ownDevicePub: String,
+            outbound: List<Map<String, Any?>> = emptyList()): SyncResult {
         try {
             // -- REVOCATIONS -- (initiator writes then reads)
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
@@ -128,8 +182,9 @@ object KotlinSync {
             val known = have.optJSONArray("known") ?: JSONArray()
             for (i in 0 until known.length()) store.addIdentity(known.getString(i))
 
-            // -- MESSAGES -- (send empty, ingest node's)
-            writeFrame(stream, mapOf("t" to "messages", "msgs" to emptyList<Any>()))
+            // -- MESSAGES -- (push outbound -- for B.2, at most the phone's
+            // device-signed enckey, see composeEncKey -- and ingest node's)
+            writeFrame(stream, mapOf("t" to "messages", "msgs" to outbound))
             val msgs = readFrame(stream)
             val msgArr = msgs.optJSONArray("msgs") ?: JSONArray()
             for (i in 0 until msgArr.length()) {

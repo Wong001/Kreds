@@ -63,6 +63,15 @@ class SyncStoreTest {
         assertEquals(1, s.stats().messages)
     }
 
+    @Test fun nextSeqStartsAtOneAndIncrements() {
+        val s = InMemorySyncStore()
+        // hearth's DeviceKeys.sign_message: self.seq starts at 0, incremented
+        // BEFORE first use -- a device's first-ever message is seq=1.
+        assertEquals(1, s.nextSeq())
+        assertEquals(2, s.nextSeq())
+        assertEquals(3, s.nextSeq())
+    }
+
     @Test fun missingBlobsFromPayload() {
         val s = InMemorySyncStore()
         s.addIdentity(idPub)

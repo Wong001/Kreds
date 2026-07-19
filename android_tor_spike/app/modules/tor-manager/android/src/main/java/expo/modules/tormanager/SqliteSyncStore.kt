@@ -260,4 +260,27 @@ class SqliteSyncStore(context: Context) :
             db.endTransaction()
         }
     }
+
+    /** This device's next outbound message seq (Task 4, B.2), persisted in
+     *  the SAME `keys` k/v table Task 3 added for enc_priv/enc_pub -- one
+     *  more small durable value, not a reason for a new table. Absent row
+     *  means "never sent a message yet" -> starts at 1 (mirrors hearth
+     *  DeviceKeys.sign_message: seq starts at 0, incremented before first
+     *  use, so a device's first-ever message is seq=1). Transacted like
+     *  setEncKey above: a reader must never be able to observe the same seq
+     *  handed out twice because a crash landed between reading the old value
+     *  and persisting the incremented one. */
+    override fun nextSeq(): Int {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val current = readKey(db, "next_seq")?.toInt() ?: 1
+            val cv = ContentValues().apply { put("k", "next_seq"); put("v", (current + 1).toString()) }
+            db.insertWithOnConflict("keys", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+            db.setTransactionSuccessful()
+            return current
+        } finally {
+            db.endTransaction()
+        }
+    }
 }

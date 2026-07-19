@@ -16,6 +16,15 @@ interface SyncStore {
      *  if none has been generated yet. See EncKeys.getOrCreate. */
     fun getEncKey(): Pair<String, String>?
     fun setEncKey(priv: String, pub: String)
+    /** This device's next outbound message seq (Task 4, B.2): the phone
+     *  tracks its own seq the same way hearth's DeviceKeys.sign_message does
+     *  (identity.py:304-316) -- starts at 1 (seq starts at 0, incremented
+     *  BEFORE first use, so the first-ever message is seq=1), and each call
+     *  returns the seq to use for the NEXT outbound message while persisting
+     *  the following value, so a second call never repeats a seq (a repeat
+     *  would be rejected at the peer's seq-reuse gate -- hearth
+     *  identity.py:577, Verifier.verify_message). */
+    fun nextSeq(): Int
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -26,6 +35,7 @@ class InMemorySyncStore : SyncStore {
     private val seen = hashMapOf<Pair<String, String>, SeenSet>()   // (ipub,dpub) -> seen
     private val blobs = linkedMapOf<String, ByteArray>()            // hash -> data
     private var encKey: Pair<String, String>? = null                // (encPrivHex, encPubHex)
+    private var seqCounter = 0                                      // next nextSeq() call returns seqCounter+1
 
     private fun sha(b: ByteArray) =
         KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(b))
@@ -83,4 +93,6 @@ class InMemorySyncStore : SyncStore {
 
     override fun getEncKey(): Pair<String, String>? = encKey
     override fun setEncKey(priv: String, pub: String) { encKey = priv to pub }
+
+    override fun nextSeq(): Int { seqCounter += 1; return seqCounter }
 }
