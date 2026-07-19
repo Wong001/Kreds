@@ -62,6 +62,11 @@ class TorManagerModule : Module() {
         AsyncFunction("dial") { host: String, port: Int -> TorEngine.dial(host, port) }.runOnQueue(ioScope)
 
         AsyncFunction("send") { id: Int, b64: String ->
+            // Last expression must be Unit: Expo marshals it back to JS and
+            // cannot serialize java.net.SocketOutputStream ("Unknown type",
+            // an on-device failure the spike hit). TorEngine.send is a
+            // Unit-returning fun, so this is safe -- do not inline it into an
+            // apply{} that returns the stream.
             TorEngine.send(id, Base64.decode(b64, Base64.NO_WRAP))
         }.runOnQueue(ioScope)
 

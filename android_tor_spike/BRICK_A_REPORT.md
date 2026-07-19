@@ -62,6 +62,24 @@ lifecycle designs, on purpose.
 - **Battery-exemption re-check timing.** The 500ms re-check fires before the
   user answers the system dialog; the banner may persist until a re-render.
   Follow-up: an `AppState` resume listener.
+- **ART vs JVM float repr (watch on the run).** `KotlinWire`'s float
+  rendering is vector-proven on OpenJDK 17, but the heartbeat runs on
+  Android's ART, whose `Double.toString` is not proven digit-identical to
+  Python for the runtime cert `enrolled_at` (a value in no vector). If it
+  diverges, EVERY beat fails uniformly with `hello: node cert failed
+  verification` — that uniform pattern means float-repr divergence, NOT a
+  network problem. Cheap future de-risk: an on-device (androidTest/ART)
+  assertion that `KotlinWire` reproduces the committed vectors.
+- **No auto-recovery from bootstrap-failure / tor-thread death.** The beat
+  cadence is armed only on bootstrap success. If the initial cold bootstrap
+  times out (`TOR_TIMEOUT`/`TOR_DIED` — possible if Doze lands mid-bootstrap)
+  the service stays foreground but idle (no retry); if the tor thread dies
+  after cadence starts, beats FAIL every 5 min with no re-bootstrap.
+  `START_STICKY` only rescues full process death. In practice the foreground
+  service keeps Tor up through Doze, so the risk is mainly the
+  bootstrap-never-completed case. Watch for a permanently-stuck
+  `Tor bootstrap X%` or an unbroken FAIL streak. Follow-up (natural Brick-A
+  hardening): re-bootstrap on tor-death + retry on bootstrap timeout.
 
 ## On-device run (ON_DEVICE_CHECKLIST steps 1-2 for mint/push, then)
 
