@@ -15,3 +15,5 @@ release/
 packaging/tor/
 dist.zip
 launch-notes.md
+android_tor_spike/spike_phone_fixture.json
+android_tor_spike/logcat.txt
