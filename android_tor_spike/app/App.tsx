@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { Button, FlatList, SafeAreaView, StyleSheet, Text, View } from "react-native";
 import {
-  Beat, beatNow, getHistory, getSyncStats, isBatteryExempt, onBeat, onState,
-  onSync, requestBatteryExemption, startNode, stopNode, syncNow, SyncStats,
+  Beat, beatNow, FeedItem, getFeed, getHistory, getSyncStats, isBatteryExempt, onBeat,
+  onState, onSync, requestBatteryExemption, startNode, stopNode, syncNow, SyncStats,
 } from "./modules/tor-manager";
 
 export default function App() {
@@ -11,14 +11,19 @@ export default function App() {
   const [exempt, setExempt] = useState(true);
   const [syncStats, setSyncStats] = useState<SyncStats>({ messages: 0, blobs: 0, identities: 0 });
   const [lastSync, setLastSync] = useState<string>("");
+  // null = not yet fetched this mount (loading); [] = fetched, nothing decrypted yet
+  // (distinct empty-state, see the getFeed() render below).
+  const [feed, setFeed] = useState<FeedItem[] | null>(null);
 
   const refresh = useCallback(async () => setBeats(await getHistory()), []);
   const refreshSyncStats = useCallback(async () => setSyncStats(await getSyncStats()), []);
+  const refreshFeed = useCallback(async () => setFeed(await getFeed()), []);
 
   useEffect(() => {
     setExempt(isBatteryExempt());
     refresh();
     refreshSyncStats();
+    refreshFeed();
     const offState = onState(setState);
     const offBeat = onBeat((b) => setBeats((prev) => [b, ...prev].slice(0, 50)));
     const offSync = onSync((r) => {
@@ -26,9 +31,10 @@ export default function App() {
       setLastSync(r.ok
         ? `synced: ${r.messages} msgs, ${r.blobs} blobs, ${r.identities} friends`
         : `sync failed: ${r.reason}`);
+      if (r.feedUpdated) refreshFeed();
     });
     return () => { offState(); offBeat(); offSync(); };
-  }, [refresh, refreshSyncStats]);
+  }, [refresh, refreshSyncStats, refreshFeed]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -54,6 +60,23 @@ export default function App() {
         messages: {syncStats.messages} / blobs: {syncStats.blobs} / friends: {syncStats.identities}
       </Text>
       {!!lastSync && <Text style={lastSync.startsWith("sync failed") ? styles.fail : styles.ok}>{lastSync}</Text>}
+      <Text style={styles.subtitle}>Feed ({feed === null ? "..." : feed.length})</Text>
+      {feed === null && <Text style={styles.state}>Loading feed...</Text>}
+      {feed !== null && feed.length === 0 && (
+        <Text style={styles.state}>No decrypted items yet - Sync now to load your history</Text>
+      )}
+      {feed !== null && feed.length > 0 && (
+        <FlatList
+          style={styles.list}
+          data={feed}
+          keyExtractor={(item) => item.msgId}
+          renderItem={({ item }) => (
+            <Text style={styles.feedItem}>
+              {new Date(item.createdAt * 1000).toLocaleString()} [{item.kind}] {item.text}
+            </Text>
+          )}
+        />
+      )}
       <Text style={styles.subtitle}>Heartbeats ({beats.length})</Text>
       <FlatList
         style={styles.list}
@@ -78,6 +101,7 @@ const styles = StyleSheet.create({
   list: { flex: 1 },
   ok: { fontSize: 14, color: "#1a7f37", paddingVertical: 2 },
   fail: { fontSize: 14, color: "#b00020", paddingVertical: 2 },
+  feedItem: { fontSize: 14, paddingVertical: 2 },
   warn: { backgroundColor: "#fff3cd", padding: 10, borderRadius: 6, gap: 6 },
   warnText: { fontSize: 14 },
 });
