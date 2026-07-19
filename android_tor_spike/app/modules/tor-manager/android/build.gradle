@@ -6,6 +6,18 @@ plugins {
 group = 'expo.modules.tormanager'
 version = '0.1.0'
 
+// Copy the single source-of-truth wire vectors into test resources so the
+// KotlinWire gate reads the SAME bytes the TS vitest gate does.
+tasks.register('copyWireVectors', Copy) {
+  // projectDir is .../modules/tor-manager/android; the fixture lives at
+  // android_tor_spike/fixtures -- 4 levels up (android > tor-manager > modules > app),
+  // not 3 (brief's path resolved to app/fixtures, which doesn't exist -- verified NO-SOURCE).
+  from "${projectDir}/../../../../fixtures/wire_vectors.json"
+  into "${projectDir}/src/test/resources"
+}
+tasks.named('preBuild') { dependsOn 'copyWireVectors' }
+tasks.withType(Test).configureEach { dependsOn 'copyWireVectors' }
+
 android {
   namespace "expo.modules.tormanager"
   ndkVersion "26.3.11579264"
@@ -31,4 +43,16 @@ dependencies {
   // (0.4.9.11 needs minCompileSdk=37, this project is compileSdk 36; 0.4.9.5/.5.1
   // pull a kotlin-stdlib newer than this project's Kotlin compiler can read).
   implementation "info.guardianproject:tor-android:0.4.9.6"
+
+  // Brick A / Task 2: KotlinWire -- Ed25519 for the native heartbeat (no JS
+  // runtime while backgrounded). API 30 has no platform Ed25519, so BouncyCastle.
+  implementation "org.bouncycastle:bcprov-jdk18on:1.78.1"
+
+  // Brick A / Task 5: TorNodeService uses NotificationCompat for the foreground
+  // notification. Expo modules usually provide androidx.core transitively; pin
+  // explicitly to be safe.
+  implementation "androidx.core:core-ktx:1.13.1"
+  testImplementation "junit:junit:4.13.2"
+  testImplementation "org.json:json:20240303"
+  testImplementation "org.bouncycastle:bcprov-jdk18on:1.78.1"
 }
