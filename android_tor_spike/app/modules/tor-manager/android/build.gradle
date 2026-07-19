@@ -18,6 +18,16 @@ tasks.register('copyWireVectors', Copy) {
 tasks.named('preBuild') { dependsOn 'copyWireVectors' }
 tasks.withType(Test).configureEach { dependsOn 'copyWireVectors' }
 
+// Task 2 (BB-2): same treatment for the SignedMessage vectors -- same 4-levels-up
+// path as copyWireVectors above (the task-2 brief's path was written as 3 levels,
+// mirroring the same already-corrected copyWireVectors mistake; kept consistent here).
+tasks.register('copyMessageVectors', Copy) {
+  from "${projectDir}/../../../../fixtures/message_vectors.json"
+  into "${projectDir}/src/test/resources"
+}
+tasks.named('preBuild') { dependsOn 'copyMessageVectors' }
+tasks.withType(Test).configureEach { dependsOn 'copyMessageVectors' }
+
 android {
   namespace "expo.modules.tormanager"
   ndkVersion "26.3.11579264"

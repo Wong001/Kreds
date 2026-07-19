@@ -4,3 +4,7 @@ build/
 # Generated copy of the committed fixture (copyWireVectors gradle task) --
 # the source of truth is android_tor_spike/fixtures/wire_vectors.json.
 src/test/resources/wire_vectors.json
+
+# Generated copy of the committed fixture (copyMessageVectors gradle task) --
+# the source of truth is android_tor_spike/fixtures/message_vectors.json.
+src/test/resources/message_vectors.json
