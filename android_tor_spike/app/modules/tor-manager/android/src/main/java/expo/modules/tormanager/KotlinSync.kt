@@ -78,6 +78,29 @@ object KotlinSync {
         is JSONObject -> toMap(v)
         is JSONArray -> (0 until v.length()).map { unwrap(v.get(it)) }
         JSONObject.NULL -> null
+        // BB-5 desk-gate finding: a real node's created_at (time.time(),
+        // ~17 significant decimal digits) parses through org.json as
+        // java.math.BigDecimal, not Double -- org.json's number parser
+        // keeps the exact-value type whenever Java's own Double.toString()
+        // doesn't echo the original literal character-for-character (a
+        // FORMATTING mismatch, e.g. scientific-notation threshold, the same
+        // Java/Python repr() divergence KotlinWire.pyFloatRepr already
+        // works around elsewhere -- not an actual precision loss). Every
+        // hand-built fixture/vector used a "clean" literal that happens to
+        // round-trip through Double.toString() exactly, so this never
+        // surfaced before a real node's wall-clock timestamps hit it here.
+        // Normalize to a plain Double (not KotlinWire.PyFloat): the SAME
+        // parsed value also flows through plain `as Number` casts elsewhere
+        // (SignedMessageKt.fromDict reads a message's embedded cert.
+        // enrolled_at that way), which a PyFloat wrapper would break.
+        // KotlinWire.dumps gained a matching `is Double` case (this same
+        // BB-5 fix) so re-serialization (message body/msgId/signature
+        // verification) still reproduces the exact canonical bytes the node
+        // signed -- BigDecimal.toDouble() is a correctly-rounded decimal ->
+        // IEEE754 conversion (same contract java.lang.Double.parseDouble
+        // uses), recovering the identical double bit pattern Python's
+        // repr() encoded.
+        is java.math.BigDecimal -> v.toDouble()
         else -> v
     }
 
