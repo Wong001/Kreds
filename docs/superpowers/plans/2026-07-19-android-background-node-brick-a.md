@@ -362,7 +362,7 @@ class KotlinWireVectorTest {
                 cd.getString("identity_pub"), cd.getString("device_pub"),
                 cd.getString("device_name"), cd.getDouble("enrolled_at"),
                 cd.getString("signature"))
-            assertEquals(c.getString("name") ?: "cert", c.getBoolean("valid"),
+            assertEquals("cert_case $i", c.getBoolean("valid"),
                 KotlinWire.verifyCert(cert))
             if (!c.isNull("body_hex"))
                 assertEquals(c.getString("body_hex"), KotlinWire.toHex(KotlinWire.certBody(cert)))
