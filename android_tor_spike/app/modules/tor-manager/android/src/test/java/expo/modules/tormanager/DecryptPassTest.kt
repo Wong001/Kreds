@@ -23,6 +23,10 @@ class DecryptPassTest {
     // looks up in payload.wraps / a grant's wraps, exactly like production.
     private val phoneDevicePub = "44".repeat(32)
     private val otherDevicePub = "55".repeat(32)
+    // A DIFFERENT (but known -- i.e. a synced "friend") identity, used by
+    // the two author-scoping tests below. Distinct from phoneDevicePub/
+    // otherDevicePub, which are DEVICE keys, not identities.
+    private val foreignIdentityPub = "99".repeat(32)
 
     private fun cases(): JSONArray {
         val t = javaClass.classLoader!!.getResourceAsStream("dmcrypt_vectors.json")!!
@@ -162,5 +166,84 @@ class DecryptPassTest {
         assertEquals(sameKeyCases.size, out.size)
         val expectedOrder = sameKeyCases.map { it.getDouble("created_at") }.sortedDescending()
         assertEquals(expectedOrder, out.map { it.createdAt })
+    }
+
+    @Test fun ignoresForeignAuthoredGrantAndPrefersOlderOwnAuthoredGrant() {
+        // Reviewer-caught (2026-07-19): B.1's sync admits more than
+        // literally-own-authored messages into this store -- a known
+        // friend's wrap_grant naming OUR device as a target for OUR OWN
+        // post can be synced in too (KotlinSync's HAVE phase adds every
+        // identity the node reports as `known`; the node's messages_not_in
+        // then serves anything an entitled peer is owed). Unfiltered,
+        // DecryptPass's newest-wins fold over wrap_grant would prefer a
+        // hostile, NEWER, foreign-authored grant over the real (older)
+        // own-authored one -- unwrapKey "succeeds" with the wrong key,
+        // decryptBody then fails AEAD auth, and the real post silently
+        // vanishes (a fail-closed but real denial-of-render).
+        // wrapGrantsFor(msgId, authorIdentityPub) must reject the foreign
+        // grant regardless of its timestamp.
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        store.addIdentity(foreignIdentityPub)
+
+        // Not wrapped inline -- both the real content key and the "attack"
+        // must come from a wrap_grant.
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "a2".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        // The legitimate own-authored grant: OLDER created_at, the REAL wrap.
+        val ownGrantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at") - 10.0,
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        val ownGrant = signedMessage(c.getString("author"), 2, ownGrantPayload, "a3".repeat(32))
+        assertTrue(store.ingestMessage(ownGrant))
+
+        // The hostile grant: signed by a DIFFERENT (but known/"friend")
+        // identity, NEWER created_at, a bogus (syntactically valid, semantically
+        // wrong) wrap that would fail to decrypt if it were ever tried.
+        val bogusWrap = mapOf("eph_pub" to "ab".repeat(32), "nonce" to "cd".repeat(12), "wrapped_key" to "ef".repeat(48))
+        val foreignGrantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at") + 10.0,
+            "wraps" to mapOf(phoneDevicePub to bogusWrap),
+        )
+        val foreignGrant = signedMessage(foreignIdentityPub, 1, foreignGrantPayload, "e1".repeat(32))
+        assertTrue(store.ingestMessage(foreignGrant))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"))
+        assertEquals("the foreign grant must be ignored; the real, older own grant must still decrypt",
+            1, out.size)
+        assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
+    }
+
+    @Test fun skipsWhenOnlyAForeignAuthoredGrantExists() {
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        store.addIdentity(foreignIdentityPub)
+
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "a4".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        // Only a foreign-authored grant exists for this target -- no own
+        // grant, no inline wrap. It carries the REAL wrap (so a naive "any
+        // grant targeting this msgId" fold WOULD decrypt it) -- rejection
+        // here must come purely from the author mismatch, not from the
+        // wrap being corrupt.
+        val foreignGrantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        val foreignGrant = signedMessage(foreignIdentityPub, 1, foreignGrantPayload, "e2".repeat(32))
+        assertTrue(store.ingestMessage(foreignGrant))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"))
+        assertEquals("only a foreign-authored grant exists -- must be skipped, not decrypted", 0, out.size)
     }
 }

@@ -55,17 +55,23 @@ object DecryptPass {
     /** Content-key source, in priority order: (1) the message's own inline
      *  wrap -- new content auto-wraps to the phone once its enckey is known
      *  (hearth's `_scope_device_pubs`), no grant needed; (2) a backfilled
-     *  wrap_grant targeting this message -- wrapGrantsFor returns them
-     *  oldest-to-newest, so folding left-to-right and keeping the LAST
-     *  match yields the newest grant, matching hearth's own per-device
-     *  latest-wins semantics (store.wrap_grants' `out.update(...)` fold). */
+     *  wrap_grant targeting this message, signed by the message's OWN
+     *  author (`m.identityPub`) -- wrapGrantsFor(msgId, authorIdentityPub)
+     *  already filters to that author (mirroring hearth's
+     *  store.wrap_grants(target, author); see the SyncStore interface doc
+     *  for why that author scoping is load-bearing, not optional -- a
+     *  friend-authored grant naming this device must never be considered
+     *  here) and returns them oldest-to-newest, so folding left-to-right
+     *  and keeping the LAST match yields the newest grant, matching
+     *  hearth's own per-device latest-wins semantics (store.wrap_grants'
+     *  `out.update(...)` fold). */
     @Suppress("UNCHECKED_CAST")
     private fun resolveWrap(store: SyncStore, m: StoredMsg, phoneDevicePub: String): Map<String, Any?>? {
         (m.payload["wraps"] as? Map<*, *>)?.get(phoneDevicePub)?.let {
             return it as? Map<String, Any?>
         }
         var newest: Map<String, Any?>? = null
-        for (wraps in store.wrapGrantsFor(m.msgId)) {
+        for (wraps in store.wrapGrantsFor(m.msgId, m.identityPub)) {
             (wraps[phoneDevicePub] as? Map<String, Any?>)?.let { newest = it }
         }
         return newest

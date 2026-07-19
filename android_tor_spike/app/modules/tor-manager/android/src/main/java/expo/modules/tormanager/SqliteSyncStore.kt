@@ -312,23 +312,32 @@ class SqliteSyncStore(context: Context) :
         ).use { c ->
             while (c.moveToNext()) {
                 val payload = JSONObject(c.getString(3)).optJSONObject("payload") ?: JSONObject()
-                out.add(StoredMsg(c.getString(0), c.getString(2) ?: "", c.getString(1), jsonToMap(payload)))
+                // Both identity_pub and kind guarded the same way (`?: ""`)
+                // even though identity_pub is a NOT NULL column and should
+                // never actually come back null -- StoredMsg.identityPub is
+                // a non-null String, so this keeps the two columns'
+                // null-handling visibly consistent rather than trusting the
+                // schema constraint implicitly.
+                out.add(StoredMsg(c.getString(0), c.getString(2) ?: "", c.getString(1) ?: "", jsonToMap(payload)))
             }
         }
         return out
     }
 
-    /** wrap_grant rows targeting msgId, decoded from msg_json (no target_id
-     *  column exists in this schema -- unlike hearth's store.py -- so the
-     *  match is done in application code, same style as missingBlobs()
-     *  above). Returned oldest-to-newest by (created_at, seq) -- see the
-     *  SyncStore interface doc for why callers can fold newest-wins from
-     *  that order. */
-    override fun wrapGrantsFor(msgId: String): List<Map<String, Any?>> {
+    /** wrap_grant rows targeting msgId AND signed by authorIdentityPub,
+     *  decoded from msg_json (no target_id column exists in this schema --
+     *  unlike hearth's store.py -- so the target match is done in
+     *  application code, same style as missingBlobs() above; the author
+     *  match IS a real column, `identity_pub`, filtered directly in SQL).
+     *  Returned oldest-to-newest by (created_at, seq) -- see the SyncStore
+     *  interface doc for why callers can fold newest-wins from that order,
+     *  and why the author filter is load-bearing, not optional. */
+    override fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>> {
         data class Row(val createdAt: Double, val seq: Int, val wraps: Map<String, Any?>)
         val rows = mutableListOf<Row>()
         readableDatabase.rawQuery(
-            "SELECT seq, msg_json FROM messages WHERE kind = ?", arrayOf("wrap_grant")
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("wrap_grant", authorIdentityPub)
         ).use { c ->
             while (c.moveToNext()) {
                 val seq = c.getInt(0)

@@ -35,20 +35,42 @@ interface SyncStore {
      *  identity.py:577, Verifier.verify_message). */
     fun nextSeq(): Int
     /** Every stored message (Task 5, B.2 DecryptPass): unfiltered by kind or
-     *  author -- DecryptPass itself filters to post/dm and (per the B.2
-     *  slice's own-content-only scope) everything currently in the store is
-     *  this identity's own content anyway. */
+     *  author. NOTE (corrected -- a prior version of this comment claimed
+     *  the store only ever holds own-identity content; that is FALSE):
+     *  KotlinSync's HAVE phase adds every identity the node reports as
+     *  `known` (the friend list) via `addIdentity`, and the node's
+     *  messages_not_in then serves any message an entitled peer's identity
+     *  is owed -- so this store CAN and does hold friend-authored messages
+     *  (e.g. a friend-authored wrap_grant, see wrapGrantsFor's doc below).
+     *  DecryptPass itself filters to kind post/dm; it does not (this task)
+     *  additionally filter by author -- see wrapGrantsFor's doc for why
+     *  that distinction matters for grants specifically. */
     fun allMessages(): List<StoredMsg>
     /** The `wraps` maps from every stored wrap_grant message whose `target`
-     *  equals msgId, ordered OLDEST-TO-NEWEST by (created_at, seq) -- mirrors
-     *  hearth's store.wrap_grants "ORDER BY created_at ASC, seq ASC" so a
-     *  caller wanting newest-wins for one device can fold left-to-right and
-     *  keep the last entry containing that device (DecryptPass does exactly
-     *  this). Does not filter by grant author: Task 5's scope is own-content
-     *  only, so every wrap_grant in the store already targets own content
-     *  (minted by hearth's maintain_own_device_grants, Task 2) -- an
-     *  author check belongs to friend-content handling (B.2c), not here. */
-    fun wrapGrantsFor(msgId: String): List<Map<String, Any?>>
+     *  equals msgId AND whose SIGNING identity (the grant message's own
+     *  cert.identity_pub) equals authorIdentityPub, ordered OLDEST-TO-NEWEST
+     *  by (created_at, seq) -- mirrors hearth's `store.wrap_grants(target,
+     *  author)` (store.py:773-790) exactly, INCLUDING its author scoping.
+     *  Callers fold left-to-right over the (already author-filtered) result
+     *  to prefer the newest grant for a given device (DecryptPass does
+     *  this).
+     *
+     *  The author filter is NOT optional (correcting an earlier version of
+     *  this comment, which wrongly reasoned it could be skipped because
+     *  "the store only holds own content"): B.1's sync does not admit only
+     *  own-authored messages -- see allMessages' doc above. A hostile
+     *  mutual friend, once known, can author `wrap_grant{target: <your own
+     *  post>, wraps:{yourDevicePub: crafted}, created_at: <future>}` and
+     *  have it synced into this same store. Without this filter, a newest-
+     *  wins fold over UNFILTERED grants would prefer that crafted grant
+     *  over your real (older) own-authored one; unwrapKey would "succeed"
+     *  with the wrong key, decryptBody would then fail AEAD auth, and your
+     *  own real post would silently vanish from the feed -- a fail-closed
+     *  but real denial-of-render. Requiring `authorIdentityPub` as a
+     *  parameter (rather than a separate unfiltered accessor) is
+     *  deliberate: it stops a future caller (e.g. B.2c, friends' content)
+     *  from accidentally reintroducing this gap. */
+    fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>>
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -123,10 +145,13 @@ class InMemorySyncStore : SyncStore {
     override fun allMessages(): List<StoredMsg> =
         messages.entries.map { (id, m) -> StoredMsg(id, m.kind, m.cert.identity_pub, m.payload) }
 
-    override fun wrapGrantsFor(msgId: String): List<Map<String, Any?>> {
+    override fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>> {
         @Suppress("UNCHECKED_CAST")
         return messages.values
-            .filter { it.kind == "wrap_grant" && it.payload["target"] == msgId }
+            .filter {
+                it.kind == "wrap_grant" && it.payload["target"] == msgId &&
+                    it.cert.identity_pub == authorIdentityPub
+            }
             .sortedWith(compareBy(
                 { (it.payload["created_at"] as? Number)?.toDouble() ?: 0.0 },
                 { it.seq }))
