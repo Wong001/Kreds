@@ -47,7 +47,14 @@ object KotlinWire {
         val digits = if (neg) mantissa.substring(1) else mantissa
         val dotIdx = digits.indexOf('.')
         val intPart = if (dotIdx < 0) digits else digits.substring(0, dotIdx)
-        val fracPart = if (dotIdx < 0) "" else digits.substring(dotIdx + 1)
+        var fracPart = if (dotIdx < 0) "" else digits.substring(dotIdx + 1)
+        // Java's Double.toString() always emits at least one fractional digit,
+        // even when the minimal round-trip representation is a single
+        // significant digit (e.g. 0.0005 -> "5.0E-4"). That lone "0" is
+        // mandatory filler, never a real digit -- a genuine minimal-form
+        // fractional part is never exactly "0". Strip it before building
+        // allDigits, or it inflates e.g. 0.0005 into "0.00050".
+        if (fracPart == "0") fracPart = ""
         val allDigits = intPart + fracPart
         val pointPos = intPart.length + exp   // digits before the decimal point, post-shift
         val sb = StringBuilder()
