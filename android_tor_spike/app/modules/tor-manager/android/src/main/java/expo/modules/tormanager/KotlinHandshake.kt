@@ -4,8 +4,6 @@ import org.json.JSONObject
 import java.security.SecureRandom
 
 object KotlinHandshake {
-    private const val PROBE_GRACE_MS = 1500L
-
     data class Fixture(
         val device_priv: String, val device_pub: String,
         val cert: KotlinWire.CertDict, val onion_addr: String,
@@ -40,10 +38,10 @@ object KotlinHandshake {
 
     private fun readFrame(connId: Int): JSONObject {
         val header = TorEngine.recv(connId, 4)
-        val n = ((header[0].toInt() and 0xff) shl 24) or ((header[1].toInt() and 0xff) shl 16) or
-                ((header[2].toInt() and 0xff) shl 8) or (header[3].toInt() and 0xff)
+        val n = (((header[0].toLong() and 0xff) shl 24) or ((header[1].toLong() and 0xff) shl 16) or
+                 ((header[2].toLong() and 0xff) shl 8) or (header[3].toLong() and 0xff))
         require(n <= KotlinWire.MAX_FRAME) { "frame too large" }
-        val body = TorEngine.recv(connId, n)
+        val body = TorEngine.recv(connId, n.toInt())
         for (bb in body) require((bb.toInt() and 0xff) <= 0x7e) { "non-ascii frame byte" }
         return JSONObject(String(body, Charsets.US_ASCII))
     }
@@ -79,17 +77,18 @@ object KotlinHandshake {
             if (!KotlinWire.verifyRaw(peerCert.device_pub, peerAuth.getString("sig"), KotlinWire.authBody(myNonce)))
                 return HandshakeResult.Failed("auth", "node failed device-key proof")
 
-            // Acceptance probe: one verdict read up front, grace-wait for an
-            // unsolicited refusal, then send empty revocations and await the
-            // SAME read (see handshake.ts amendment -- write-first races the
-            // refusing node's close). recv is blocking, so emulate the grace
-            // by setting a short read deadline is not available here; instead
-            // we send the revocations frame immediately after AUTH -- on the
-            // accepted path the node (responder) is already blocked reading
-            // it, and on refusal the node has already written "refused" which
-            // arrives ahead of our frame on the wire. A refusing node closing
-            // after its write still delivers the buffered "refused" because
-            // our very next recv reads it before noticing the close.
+            // Acceptance probe. The ACCEPTED path (the only path the
+            // heartbeat runs operationally -- the phone always presents its
+            // valid home-identity cert to its own node) is unambiguous: the
+            // node advances to REVOCATIONS and, as responder, reads our
+            // frame before writing its own, so write-then-read completes
+            // cleanly. The REFUSED path (node writes "refused" then closes)
+            // is NOT exercised in normal operation; whether write-then-read
+            // reliably surfaces "refused" vs a Failed("io") over Tor/SOCKS on
+            // Android is unverified (handshake.ts hit a Windows-loopback RST
+            // purge that may not reproduce here). Carried to on-device
+            // verification; a future refused-path test would pin it. Do not
+            // change handshake.ts.
             writeFrame(connId, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             val verdict = readFrame(connId)
             return when (verdict.optString("t")) {
