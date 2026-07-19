@@ -171,7 +171,7 @@ Parse + verify + `msg_id`, gated against vectors generated from the real hearth 
 
 **Interfaces:**
 - Consumes: `KotlinWire` (canonical/PyFloat/verifyRaw/CertDict/toHex), the message-body shape from Global Constraints.
-- Produces `data class SignedMessage(val cert: KotlinWire.CertDict, val seq: Int, val payload: Map<String, Any?>, val signature: String)` with `fun body(): ByteArray`, `fun msgId(): String`, `fun verifyDeviceSignature(): Boolean`, `val kind: String` (`payload["type"] as? String ?: ""`), companion `fun fromDict(d: Map<String, Any?>): SignedMessage`.
+- Produces `data class SignedMessage(val cert: KotlinWire.CertDict, val seq: Int, val payload: Map<String, Any?>, val signature: String)` with `fun body(): ByteArray`, `fun msgId(): String`, `fun verifyDeviceSignature(): Boolean`, `val kind: String` (`payload["kind"] as? String ?: ""` — the payload's kind discriminator is `"kind"`, NOT `"type"`; `"type"` is the signed-envelope field. `KIND_POST="post"`, `KIND_DM="dm"` per hearth/messages.py), companion `fun fromDict(d: Map<String, Any?>): SignedMessage`.
 
 - [ ] **Step 1: Write `make_message_vectors.py`** (deterministic, throwaway keys — output committed to the public repo)
 ```python
@@ -208,18 +208,22 @@ def _msg(seq: int, payload: dict) -> SignedMessage:
 
 def build() -> dict:
     cases = []
+    # Payloads use the REAL field name "kind" (not "type"); "blobs"/"poster"/
+    # "thumbs" are the cleartext blob-ref fields hearth.store.referenced_blobs
+    # reads. Body_ct/scope minimal (BB-2 gates verify/msgId/kind, not the
+    # encrypted-body semantics; the loopback gate proves against real node msgs).
     for seq, payload in [
-        (1, {"type": "post", "text": "hello", "blobs": []}),
-        (2, {"type": "post", "text": "pic", "blobs": ["aa" * 32], "thumbs": ["bb" * 32]}),
-        (3, {"type": "dm", "recipient": IDPUB, "poster": "cc" * 32}),
+        (1, {"kind": "post", "scope": "kreds", "body_ct": "aa", "blobs": []}),
+        (2, {"kind": "post", "scope": "kreds", "body_ct": "bb", "blobs": ["aa" * 32], "thumbs": ["bb" * 32]}),
+        (3, {"kind": "dm", "recipient": IDPUB, "body_ct": "cc", "poster": "cc" * 32}),
     ]:
         m = _msg(seq, payload)
-        cases.append({"dict": m.to_dict(), "msg_id": m.msg_id,
+        cases.append({"dict": m.to_dict(), "msg_id": m.msg_id, "kind": payload["kind"],
                       "body_hex": m.body().hex(), "valid": True})
     # a tampered message (payload changed after signing) -> invalid
-    good = _msg(4, {"type": "post", "text": "orig", "blobs": []})
-    tampered = dict(good.to_dict(), payload={"type": "post", "text": "EVIL", "blobs": []})
-    cases.append({"dict": tampered, "msg_id": None, "body_hex": None, "valid": False})
+    good = _msg(4, {"kind": "post", "scope": "kreds", "body_ct": "orig", "blobs": []})
+    tampered = dict(good.to_dict(), payload={"kind": "post", "scope": "kreds", "body_ct": "EVIL", "blobs": []})
+    cases.append({"dict": tampered, "msg_id": None, "kind": "post", "body_hex": None, "valid": False})
     return {"cases": cases}
 
 
@@ -304,7 +308,11 @@ data class SignedMessage(
     val payload: Map<String, Any?>,
     val signature: String,
 ) {
-    val kind: String get() = payload["type"] as? String ?: ""
+    // The payload's kind discriminator is "kind" (KIND_POST="post",
+    // KIND_DM="dm" per hearth/messages.py), NOT "type" -- "type" is the
+    // signed ENVELOPE field ("message"). Reading "type" here returns "" for
+    // every real message and silently breaks missingBlobs' kind filter.
+    val kind: String get() = payload["kind"] as? String ?: ""
 
     fun body(): ByteArray = KotlinWire.canonical(mapOf(
         "type" to "message", "protocol" to KotlinWire.PROTOCOL,
