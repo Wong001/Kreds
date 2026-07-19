@@ -41,12 +41,16 @@ class SqliteSyncStore(context: Context) :
         // Backs both the ingestMessage seq-reuse gate and summary()'s fold.
         db.execSQL("CREATE INDEX idx_messages_idp_dp_seq ON messages(identity_pub, device_pub, seq)")
         db.execSQL("CREATE TABLE blobs (hash TEXT PRIMARY KEY, data BLOB NOT NULL)")
+        // Task 3 (B.2): this device's own X25519 enc keypair, keyed enc_priv/enc_pub.
+        // Plaintext at rest -- accepted posture, matches desktop (see EncKeys.kt).
+        db.execSQL("CREATE TABLE keys (k TEXT PRIMARY KEY, v TEXT)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         db.execSQL("DROP TABLE IF EXISTS identities")
         db.execSQL("DROP TABLE IF EXISTS messages")
         db.execSQL("DROP TABLE IF EXISTS blobs")
+        db.execSQL("DROP TABLE IF EXISTS keys")
         onCreate(db)
     }
 
@@ -212,5 +216,26 @@ class SqliteSyncStore(context: Context) :
             "SELECT COUNT(*) FROM $table", null
         ).use { c -> c.moveToFirst(); c.getInt(0) }
         return SyncStats(count("messages"), count("blobs"), count("identities"))
+    }
+
+    /** Reads the `keys` table row for `k`, or null if absent. */
+    private fun readKey(db: SQLiteDatabase, k: String): String? =
+        db.rawQuery("SELECT v FROM keys WHERE k = ? LIMIT 1", arrayOf(k)).use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+
+    override fun getEncKey(): Pair<String, String>? {
+        val db = readableDatabase
+        val priv = readKey(db, "enc_priv") ?: return null
+        val pub = readKey(db, "enc_pub") ?: return null
+        return priv to pub
+    }
+
+    override fun setEncKey(priv: String, pub: String) {
+        val db = writableDatabase
+        val cvPriv = ContentValues().apply { put("k", "enc_priv"); put("v", priv) }
+        val cvPub = ContentValues().apply { put("k", "enc_pub"); put("v", pub) }
+        db.insertWithOnConflict("keys", null, cvPriv, SQLiteDatabase.CONFLICT_REPLACE)
+        db.insertWithOnConflict("keys", null, cvPub, SQLiteDatabase.CONFLICT_REPLACE)
     }
 }

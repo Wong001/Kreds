@@ -12,6 +12,10 @@ interface SyncStore {
     fun missingBlobs(): List<String>
     fun putBlob(hash: String, data: ByteArray): Boolean
     fun stats(): SyncStats
+    /** This device's own X25519 enc keypair (encPrivHex, encPubHex), or null
+     *  if none has been generated yet. See EncKeys.getOrCreate. */
+    fun getEncKey(): Pair<String, String>?
+    fun setEncKey(priv: String, pub: String)
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -21,6 +25,7 @@ class InMemorySyncStore : SyncStore {
     private val messages = linkedMapOf<String, SignedMessage>()     // msg_id -> msg
     private val seen = hashMapOf<Pair<String, String>, SeenSet>()   // (ipub,dpub) -> seen
     private val blobs = linkedMapOf<String, ByteArray>()            // hash -> data
+    private var encKey: Pair<String, String>? = null                // (encPrivHex, encPubHex)
 
     private fun sha(b: ByteArray) =
         KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(b))
@@ -75,4 +80,7 @@ class InMemorySyncStore : SyncStore {
     }
 
     override fun stats(): SyncStats = SyncStats(messages.size, blobs.size, identities.size)
+
+    override fun getEncKey(): Pair<String, String>? = encKey
+    override fun setEncKey(priv: String, pub: String) { encKey = priv to pub }
 }
