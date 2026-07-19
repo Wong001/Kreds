@@ -9,6 +9,34 @@ sealed class SyncResult {
     data class Failed(val stage: String, val reason: String) : SyncResult()
 }
 
+private const val MAX_BLOB_BYTES = 10 * 1024 * 1024   // hearth/messages.py:56
+
+/** RFC-4648 standard-alphabet base64 decoder, hand-rolled instead of either
+ *  android.util.Base64 (Android-only, breaks the BB-5 JVM desk gate) or
+ *  java.util.Base64 (API 26+, this module's minSdkVersion is 24 -- would
+ *  NoSuchMethodError on API 24/25 devices, uncaught by assembleDebug since
+ *  lintOptions.abortOnError is false). Works on any API level and on a
+ *  plain JVM. The node encodes blobs with Python's base64.b64encode,
+ *  which uses this same standard alphabet. */
+object Base64Portable {
+    private val DEC = IntArray(128) { -1 }.also {
+        val a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        for (i in a.indices) it[a[i].code] = i
+    }
+    fun decode(s: String): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        var buf = 0; var bits = 0
+        for (c in s) {
+            if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue
+            val v = if (c.code < 128) DEC[c.code] else -1
+            require(v >= 0) { "bad base64 char" }
+            buf = (buf shl 6) or v; bits += 6
+            if (bits >= 8) { bits -= 8; out.write((buf shr bits) and 0xff) }
+        }
+        return out.toByteArray()
+    }
+}
+
 /** Runs the post-AUTH sync phases (hearth/sync.py _session) as INITIATOR,
  *  over an already-authenticated Stream. Read-only pull: sends empty
  *  msgs/blobs; ingests the node's own-identity messages + blobs.
@@ -93,11 +121,13 @@ object KotlinSync {
             val blobs = readFrame(stream)
             val given = blobs.optJSONObject("blobs") ?: JSONObject()
             for (h in given.keys()) {
-                // java.util.Base64, not android.util.Base64: keeps KotlinSync
-                // Android-free so the desk gate (BB-5) can run it on a plain
-                // JVM. Available on both JVM and Android API 26+.
-                val data = java.util.Base64.getDecoder().decode(given.getString(h))
-                store.putBlob(h, data)   // verifies hash internally
+                val data = Base64Portable.decode(given.getString(h))
+                // Size bound mirrors hearth/sync.py:661 (len(data) <=
+                // MAX_BLOB_BYTES and blob_hash==h) -- store.putBlob only
+                // hash-verifies; an oversized blob (bounded only by
+                // MAX_FRAME, ~16 MiB > MAX_BLOB_BYTES's 10 MiB) from a
+                // hostile/buggy node must be rejected before it's stored.
+                if (data.size <= MAX_BLOB_BYTES) store.putBlob(h, data)   // store.putBlob does the hash check
             }
 
             val st = store.stats()
