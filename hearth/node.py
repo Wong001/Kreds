@@ -2106,6 +2106,52 @@ class HearthNode:
                 self._publish(make_wrap_grant(self.device, msg.msg_id,
                                               wraps, now=now))
 
+    def maintain_own_device_grants(self, now: Optional[float] = None):
+        """Re-wrap this identity's OWN-authored content to its OWN other
+        devices' enc keys (a satellite phone), via author-signed
+        wrap_grants -- so a device-key-only device can decrypt the author's
+        existing history. Distinct from maintain_wrap_grants (friends,
+        kreds-wall only), which is left UNTOUCHED. Own devices see ALL own
+        content (journal + wall + inner + DMs): it is yours, on your device.
+
+        Guard mirrors maintain_wrap_grants: minting signs, so
+        locked/revoked/unenrolled skip entirely -- a revoked/locked node
+        must mint nothing (no signing key), so the whole sweep is skipped
+        rather than guarded per-mint."""
+        if self.revoked or self.locked or self.device.identity_pub is None:
+            return
+        now = now if now is not None else time.time()
+        own = self.store.enckeys(self.identity_pub)
+        targets = {d: e for d, e in own.items()
+                   if d != self.device.device_pub}
+        if not targets:
+            return
+        for msg in self._own_authored_messages():
+            wrapped = set(msg.payload.get("wraps", {}))
+            granted = self.store.wrap_grants(msg.msg_id, self.identity_pub)
+            need = {d: e for d, e in targets.items()
+                    if d not in wrapped and d not in granted}
+            if not need:
+                continue
+            key, aad = self._content_key(msg)
+            if key is None:                 # unhandled/unrecoverable kind:
+                continue                    # skip, never crash the sweep
+            wraps = wrap_key(key, need, aad)
+            if wraps:
+                self._publish(make_wrap_grant(self.device, msg.msg_id,
+                                              wraps, now=now))
+
+    def _own_authored_messages(self):
+        """Own posts (all placements/scopes) + own DMs -- the content the
+        catch-up re-wraps to a new own device. Posts come from
+        post_messages(identity); own DMs are the KIND_DM rows this identity
+        authored (messages_by_author filtered -- there is no single own-DM
+        iterator, and dm_thread/dm_conversations are peer-scoped)."""
+        posts = self.store.post_messages(self.identity_pub)
+        dms = [m for m in self.store.messages_by_author(self.identity_pub)
+               if m.payload.get("kind") == KIND_DM]
+        return list(posts) + dms
+
     def _dm_device_pubs(self, to_identity: str) -> dict:
         theirs = self.store.enckeys(to_identity)
         if not theirs:
