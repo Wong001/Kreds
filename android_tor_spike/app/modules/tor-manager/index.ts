@@ -41,3 +41,21 @@ export async function dial(host: string, port: number): Promise<TorStream> {
 export function suspendTor(): Promise<void> {
   return native.suspendTor();
 }
+
+export interface Beat { ts: number; ok: boolean; latencyMs: number; reason: string | null }
+
+export function startNode(): void { native.startNode(); }
+export function stopNode(): void { native.stopNode(); }
+export function beatNow(): void { native.beatNow(); }
+export function getHistory(): Promise<Beat[]> { return native.getHistory(); }
+export function isBatteryExempt(): boolean { return native.isBatteryExempt(); }
+export function requestBatteryExemption(): void { native.requestBatteryExemption(); }
+
+export function onBeat(cb: (b: Beat) => void): () => void {
+  const sub = native.addListener("nodeBeat", (e: Beat) => cb(e));
+  return () => sub.remove();
+}
+export function onState(cb: (s: string) => void): () => void {
+  const sub = native.addListener("nodeState", (e: { state: string }) => cb(e.state));
+  return () => sub.remove();
+}
