@@ -184,8 +184,8 @@ class DecryptPassTest {
         // own-authored one -- unwrapKey "succeeds" with the wrong key,
         // decryptBody then fails AEAD auth, and the real post silently
         // vanishes (a fail-closed but real denial-of-render).
-        // wrapGrantsFor(msgId, authorIdentityPub) must reject the foreign
-        // grant regardless of its timestamp.
+        // wrapGrantsFor(msgId, acceptedSigners) -- accepted = {author} for a
+        // post -- must reject the foreign grant regardless of its timestamp.
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
         store.addIdentity(c.getString("author"))
