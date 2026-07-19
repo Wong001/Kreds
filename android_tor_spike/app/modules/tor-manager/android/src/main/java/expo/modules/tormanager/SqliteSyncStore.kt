@@ -43,14 +43,26 @@ class SqliteSyncStore(context: Context) :
         db.execSQL("CREATE TABLE blobs (hash TEXT PRIMARY KEY, data BLOB NOT NULL)")
         // Task 3 (B.2): this device's own X25519 enc keypair, keyed enc_priv/enc_pub.
         // Plaintext at rest -- accepted posture, matches desktop (see EncKeys.kt).
-        db.execSQL("CREATE TABLE keys (k TEXT PRIMARY KEY, v TEXT)")
+        // IF NOT EXISTS: onUpgrade calls onCreate after dropping the OTHER
+        // tables but deliberately preserves this one (see onUpgrade comment) --
+        // this must be a no-op when the table already survived an upgrade.
+        db.execSQL("CREATE TABLE IF NOT EXISTS keys (k TEXT PRIMARY KEY, v TEXT)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         db.execSQL("DROP TABLE IF EXISTS identities")
         db.execSQL("DROP TABLE IF EXISTS messages")
         db.execSQL("DROP TABLE IF EXISTS blobs")
-        db.execSQL("DROP TABLE IF EXISTS keys")
+        // `keys` is deliberately NOT dropped here, unlike the tables above:
+        // identities/messages/blobs are all resyncable (the next sync
+        // repopulates them from the home node), but `keys` holds this
+        // device's own enc-key identity material, which is NOT recoverable
+        // that way. hearth's maintain_own_device_grants (Task 2) may already
+        // have minted server-side wrap_grants against this device's current
+        // enc_pub -- dropping `keys` on a schema bump would silently mint a
+        // new enc key next launch and orphan that already-granted history
+        // (undecryptable until the new key propagates and is re-granted).
+        // Never wipe this table on migration.
         onCreate(db)
     }
 
@@ -231,11 +243,21 @@ class SqliteSyncStore(context: Context) :
         return priv to pub
     }
 
+    /** Writes both keys rows atomically -- a reader must never observe an
+     *  enc_priv/enc_pub pair from two different writes (see EncKeys.getOrCreate,
+     *  which also serializes same-process callers; this transaction protects
+     *  against a crash/interleaving mid-write leaving a half-written row pair). */
     override fun setEncKey(priv: String, pub: String) {
         val db = writableDatabase
-        val cvPriv = ContentValues().apply { put("k", "enc_priv"); put("v", priv) }
-        val cvPub = ContentValues().apply { put("k", "enc_pub"); put("v", pub) }
-        db.insertWithOnConflict("keys", null, cvPriv, SQLiteDatabase.CONFLICT_REPLACE)
-        db.insertWithOnConflict("keys", null, cvPub, SQLiteDatabase.CONFLICT_REPLACE)
+        db.beginTransaction()
+        try {
+            val cvPriv = ContentValues().apply { put("k", "enc_priv"); put("v", priv) }
+            val cvPub = ContentValues().apply { put("k", "enc_pub"); put("v", pub) }
+            db.insertWithOnConflict("keys", null, cvPriv, SQLiteDatabase.CONFLICT_REPLACE)
+            db.insertWithOnConflict("keys", null, cvPub, SQLiteDatabase.CONFLICT_REPLACE)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 }

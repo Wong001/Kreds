@@ -2,6 +2,7 @@ package expo.modules.tormanager
 
 import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -37,5 +38,22 @@ class EncKeysTest {
             X25519PrivateKeyParameters(KotlinWire.fromHex(priv), 0).generatePublicKey().encoded
         )
         assertEquals(rederived, pub)
+    }
+
+    @Test fun getOrCreateSelfHealsMismatchedStoredPair() {
+        val s = InMemorySyncStore()
+        // A deliberately corrupt pair -- ff-repeat is not the real X25519
+        // public key for aa-repeat's private scalar (this is what a
+        // concurrent-write race could produce pre-fix: privA persisted with
+        // pubB from a different generation). getOrCreate must not trust it.
+        val badPriv = "aa".repeat(32); val badPub = "ff".repeat(32)
+        s.setEncKey(badPriv, badPub)
+        val (priv, pub) = EncKeys.getOrCreate(s)
+        assertNotEquals(badPriv to badPub, priv to pub)      // corrupt pair replaced
+        val rederived = KotlinWire.toHex(
+            X25519PrivateKeyParameters(KotlinWire.fromHex(priv), 0).generatePublicKey().encoded
+        )
+        assertEquals(rederived, pub)                          // new pair is internally consistent
+        assertEquals(s.getEncKey(), priv to pub)              // healed pair was persisted
     }
 }
