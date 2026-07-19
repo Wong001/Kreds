@@ -159,7 +159,15 @@ dependencies {
 
     // Tor-dial spike (Task 7): vendored libtor.so via GuardianProject's tor-android AAR.
     // JNI shim in Task 8 dlopen's the arm64-v8a libtor.so and calls the tor_api.h entry points.
-    implementation "info.guardianproject:tor-android:0.4.9.11"
+    // Pinned to 0.4.9.6 (not the newer 0.4.9.11, and not 0.4.9.5): 0.4.9.6.2+ set
+    // minCompileSdk=37, but this project's compileSdk is 36 (Expo SDK 57 default) and we
+    // are not bumping it for one AAR. 0.4.9.5 (and 0.4.9.5.1) looked viable on minCompileSdk
+    // (=1) but their POM pins kotlin-stdlib 2.3.0/2.3.10, which is newer than this project's
+    // Kotlin compiler (2.1.20) can read (metadata binary version cap ~2.2.0) -- compileDebugKotlin
+    // fails with "Module was compiled with an incompatible version of Kotlin". 0.4.9.6 has
+    // minCompileSdk=36 (exact match) and kotlin-stdlib 2.2.10 (same pin as 0.4.9.11, known
+    // compatible), and carries the same tor_api symbol surface and 4-ABI libtor.so set.
+    implementation "info.guardianproject:tor-android:0.4.9.6"
 
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";
