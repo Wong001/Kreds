@@ -101,12 +101,35 @@ interface). Bootstrap failures now surface the JNI exit code
 layer, desk-proven), the committed cross-language vectors (a permanent
 regression gate for any future port change), and the `TorManager` module
 (the narrow, swap-friendly Tor interface the whole client depends on).
+Two things that MUST travel with the TorManager code when the real client
+inherits it: (a) `recv`/`send`/`dial` run on a `Dispatchers.IO`-scoped
+custom queue, not Expo's default single-thread AsyncFunction queue -- the
+whole-branch review found that the default queue deadlocks the handshake's
+concurrent recv+send on the accepted path (see below); (b) the module's
+`ioScope` (a `SupervisorJob`) is never cancelled -- fine for a one-shot
+spike, but the real client should tear it down on module destroy.
 
 **Rebuilt for the real client (normal work, not novel risk):** the fixture
 transport -> the real pairing/enrollment ceremony (D2 already validated the
 crypto); the one-button screen -> real app UI + navigation; identity-key
 provisioning (`DeviceKeys.install`); content sync (HAVE/MESSAGES/BLOBS);
 and the Tor background/foreground lifecycle.
+
+## The deadlock the whole-branch review caught (fixed pre-run)
+
+The most valuable catch of the build, and one no per-task review could see:
+on-device, the ACCEPTED (success) path would have deadlocked. Expo's
+default `AsyncFunction` queue is a single `HandlerThread`, so the probe's
+parked `recv` blocked the follow-up `send` on that same thread -- node and
+phone each waiting for the other's frame until the 120 s socket timeout,
+surfacing as `FAILED at io`. The REFUSED path worked (the `refused` frame
+arrives before any `send` is needed), which made the failure invisible on
+the desk gate (whose `node_stream.ts` is a non-blocking event loop where a
+pending read and a write coexist trivially). Fixed by running
+`recv`/`send`/`dial` on a `Dispatchers.IO`-scoped custom queue so the
+parked recv and the concurrent send land on different pool threads.
+Verified against the expo-modules-core 57.0.6 sources; runtime proof is the
+G20 run.
 
 ## Two plan bugs found during implementation (both amended)
 
