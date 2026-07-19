@@ -497,6 +497,28 @@ class DecryptPassTest {
             "friend-" + c.getString("author").take(8), out[0].author)
     }
 
+    @Test fun fallsBackToIdentityPrefixWhenStoredProfileNameIsBlank() {
+        // Hardening (post-review): a stored profile message with an empty
+        // (or whitespace-only) name must NOT render as a blank author
+        // segment -- it must be treated the same as "no profile stored",
+        // falling back to the "friend-" + prefix. Blank here is a strictly
+        // WORSE candidate than absent, not a valid empty display name.
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        val blankProfile = signedMessage(
+            c.getString("author"), 2, profilePayload("   ", c.getDouble("created_at")), "a1".repeat(32))
+        assertTrue(store.ingestMessage(blankProfile))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        assertEquals(1, out.size)
+        assertEquals("a blank stored name must fall back to the \"friend-\" prefix, not render blank",
+            "friend-" + c.getString("author").take(8), out[0].author)
+    }
+
     @Test fun resolvesOwnAuthorToOwnStoredProfileName() {
         val c = cases().getJSONObject(0)
         val ownIdentityPub = c.getString("author")   // we authored this post ourselves

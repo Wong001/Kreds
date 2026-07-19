@@ -206,7 +206,14 @@ class InMemorySyncStore : SyncStore {
         val best = linkedMapOf<String, Candidate>()
         for (m in messages.values) {
             if (m.kind != "profile") continue
-            val name = m.payload["name"] as? String ?: continue
+            // Blank ("" or all-whitespace) stored names are treated as
+            // absent, not as a valid-but-empty display name -- otherwise a
+            // profile message with name:"" would render as a blank author
+            // segment in the feed instead of falling back to the readable
+            // "friend-" + prefix. A later profile message (real name) for
+            // the same identity can still win normally; this only rejects
+            // THIS candidate, not the identity as a whole.
+            val name = (m.payload["name"] as? String)?.takeIf { it.isNotBlank() } ?: continue
             val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: 0.0
             val cur = best[m.cert.identity_pub]
             if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && m.seq > cur.seq))

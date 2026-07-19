@@ -407,7 +407,9 @@ class SqliteSyncStore(context: Context) :
                 val identityPub = c.getString(0)
                 val seq = c.getInt(1)
                 val payload = JSONObject(c.getString(2)).optJSONObject("payload") ?: continue
-                val name = payload.opt("name") as? String ?: continue
+                // Blank stored names are treated as absent -- see
+                // InMemorySyncStore.profileNames' matching comment.
+                val name = (payload.opt("name") as? String)?.takeIf { it.isNotBlank() } ?: continue
                 val createdAt = payload.optDouble("created_at", 0.0)
                 val cur = best[identityPub]
                 if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))

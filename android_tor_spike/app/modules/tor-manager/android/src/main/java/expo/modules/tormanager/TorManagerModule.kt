@@ -60,19 +60,20 @@ class TorManagerModule : Module() {
      *  as a parameter -- getSyncStats has no fixture in scope today, and
      *  parsing here keeps both call sites' fix identical instead of one
      *  passing a value the other derives fresh. If the fixture can't be
-     *  read (e.g. getSyncStats called before the very first successful
-     *  syncNow, when the identities table is also still empty), this falls
-     *  back to the raw known-identities count -- unverified against a real
-     *  "self" but harmless in practice, since an empty table's count is 0
-     *  either way. */
+     *  read, this fails toward "no friends" (returns 0) rather than the
+     *  phantom-friend direction (previously: falling back to the raw,
+     *  unfiltered known-identities count, which could silently re-admit the
+     *  own identity as a counted "friend" -- the exact bug this whole
+     *  function exists to fix). A caller seeing 0 friends when the fixture
+     *  is temporarily unreadable is the safe failure shape; seeing an
+     *  inflated count never is. */
     private fun friendsCount(store: SyncStore): Int {
         val ownIdentityPub = try {
             KotlinHandshake.parseFixture(
                 File(TorEngine.externalDir(), "spike_phone_fixture.json").readText()
             ).cert.identity_pub
-        } catch (e: Exception) { null }
-        val known = store.knownIdentities()
-        return if (ownIdentityPub != null) known.count { it != ownIdentityPub } else known.size
+        } catch (e: Exception) { return 0 }
+        return store.knownIdentities().count { it != ownIdentityPub }
     }
 
     override fun definition() = ModuleDefinition {
