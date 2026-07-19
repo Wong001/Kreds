@@ -9,6 +9,9 @@ import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 private const val SOCKS_PORT = 39050
 private const val CONTROL_PORT = 39051
@@ -19,6 +22,17 @@ class TorManagerModule : Module() {
     @Volatile private var torExitCode: Int? = null
     private val conns = ConcurrentHashMap<Int, Socket>()
     private val nextConn = AtomicInteger(1)
+
+    // recv/send/dial block on real socket I/O and must NOT run on
+    // expo-modules-core's default AsyncFunction queue: Queues.DEFAULT is a
+    // single HandlerThread (AppContext.modulesQueue, "expo.modules.AsyncFunctionQueue"),
+    // so a parked recv (readExact waiting on the node's reply) would
+    // serialize behind a concurrently-queued send on that one thread and
+    // deadlock the accepted-path handshake (grace-read-then-write). Dispatchers.IO
+    // is a multi-threaded pool, so overlapping calls actually run concurrently.
+    // SupervisorJob so one call's exception (e.g. "no conn $id") can't cancel
+    // other in-flight recv/send/dial calls sharing this scope.
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // tor state (guards/consensus) stays app-internal; the LOG goes to the
     // external files dir so `adb pull` reaches it without run-as.
@@ -91,7 +105,7 @@ class TorManagerModule : Module() {
             val id = nextConn.getAndIncrement()
             conns[id] = s
             id
-        }
+        }.runOnQueue(ioScope)
 
         AsyncFunction("send") { id: Int, b64: String ->
             val s = conns[id] ?: throw IllegalArgumentException("no conn $id")
@@ -99,12 +113,12 @@ class TorManagerModule : Module() {
                 write(Base64.decode(b64, Base64.NO_WRAP))
                 flush()
             }
-        }
+        }.runOnQueue(ioScope)
 
         AsyncFunction("recv") { id: Int, n: Int ->
             val s = conns[id] ?: throw IllegalArgumentException("no conn $id")
             Base64.encodeToString(s.getInputStream().readExact(n), Base64.NO_WRAP)
-        }
+        }.runOnQueue(ioScope)
 
         Function("closeConn") { id: Int ->
             conns.remove(id)?.close()
