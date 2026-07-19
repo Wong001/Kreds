@@ -15,7 +15,8 @@ private const val CONTROL_PORT = 39051
 private const val BOOTSTRAP_TIMEOUT_MS = 300_000L
 
 class TorManagerModule : Module() {
-    private var torThread: Thread? = null
+    @Volatile private var torThread: Thread? = null
+    @Volatile private var torExitCode: Int? = null
     private val conns = ConcurrentHashMap<Int, Socket>()
     private val nextConn = AtomicInteger(1)
 
@@ -50,14 +51,22 @@ class TorManagerModule : Module() {
                 "--DataDirectory", dir.absolutePath,
                 "--Log", "notice file ${logFile.absolutePath}",
             )
-            torThread = thread(name = "tor-main") { TorRunner.nativeRunTor(args) }
+            torThread = thread(name = "tor-main") { torExitCode = TorRunner.nativeRunTor(args) }
             thread(name = "tor-bootstrap-watch") {
                 val ctl = ControlPort(CONTROL_PORT, File(dir, "control_auth_cookie"))
                 val deadline = System.currentTimeMillis() + BOOTSTRAP_TIMEOUT_MS
                 var last = -1
                 while (System.currentTimeMillis() < deadline) {
                     if (torThread?.isAlive != true) {
-                        promise.reject("TOR_DIED", "tor thread exited during bootstrap (see tor.log)", null)
+                        val code = torExitCode
+                        val detail = when (code) {
+                            -100 -> "dlopen(libtor.so) failed"
+                            -101 -> "tor_api symbol missing"
+                            -102 -> "tor_main_configuration_set_command_line failed"
+                            null -> "no exit code captured"
+                            else -> "tor exited with code $code"
+                        }
+                        promise.reject("TOR_DIED", "tor thread exited during bootstrap: $detail (see tor.log if present)", null)
                         return@thread
                     }
                     val p = ctl.bootstrapProgress()
