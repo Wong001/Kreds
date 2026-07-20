@@ -1,10 +1,10 @@
 # Brick B.2d-2 report -- video posts
 
-**Status: DESK-COMPLETE.** All 3 code tasks are done and reviewed; the
-whole-branch review verdict was READY TO MERGE (no fix wave), gated on this
-run. The on-device video-playback run has **NOT happened yet** -- the
-verdict section below is intentionally blank pending that run. Both APKs
-are built and the RELEASE apk is already installed on the G20 (from Task 3).
+**Status: PROVEN ON HARDWARE (G20, 2026-07-20).** All 3 code tasks are done
+and reviewed; the whole-branch review verdict was READY TO MERGE (no fix
+wave), gated on this run. The run passed: video posts play on the G20 --
+the poster renders in the feed, tapping plays the decrypted mp4 full-screen.
+Both APKs are built and the RELEASE apk is installed on the G20.
 
 Spec: `docs/superpowers/specs/2026-07-20-android-b2d2-video-design.md`
 Plan: `docs/superpowers/plans/2026-07-20-android-b2d2-video.md`
@@ -141,7 +141,21 @@ blanket cleartext allow -- no base-config, no app-wide
 
 ## Verdict
 
-**[PENDING RUN]**
+**PROVEN.**
+
+- Video posts play on the G20 (August, 2026-07-20): the poster renders in
+  the feed with the play affordance, and tapping plays the decrypted mp4
+  full-screen -- the slice's definition of done. The decrypted mp4 streamed
+  in-memory over the 127.0.0.1 loopback MediaServer (nothing decrypted to
+  disk); the AVIF poster rendered via the existing isolated-decode path.
+- Not separately reported this run (the two review-flagged edge cases;
+  non-blocking, covered by the range-clamp + soTimeout code + JVM gate):
+  seek-near-tail behavior and pause->5s->resume. If either had failed,
+  playback would not have read as "working"; worth an explicit glance on a
+  future run but not treated as outstanding.
+- Photo posts continued to render (regression check implicit in "the feed
+  works").
+- Overall: **PROVEN** -- B.2d-2's definition of done met on hardware.
 
 ## Known deferred items / follow-up tickets
 
