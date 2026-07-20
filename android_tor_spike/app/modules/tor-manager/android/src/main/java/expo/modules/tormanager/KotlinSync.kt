@@ -166,12 +166,28 @@ object KotlinSync {
      *  Never affects control flow -- the phases/order/data below are
      *  unchanged; this only observes them. The trailing "done" phase is
      *  emitted by the MODULE after DecryptPass, not here (this object has
-     *  no knowledge of DecryptPass). */
+     *  no knowledge of DecryptPass).
+     *
+     *  Every call site below goes through the local `progress` wrapper, NOT
+     *  `onProgress` directly (code review fix): this whole function body
+     *  runs inside a `try` whose `catch (e: Exception)` turns ANY thrown
+     *  exception into `SyncResult.Failed("io", ...)` -- in production,
+     *  `onProgress` is the module's `{ phase, count -> sendEvent(...) }`
+     *  (TorManagerModule.syncNow), and `sendEvent` reaching across a
+     *  possible lifecycle/teardown race on a 1-2 min background sync is
+     *  exactly the kind of thing that can throw for reasons that have
+     *  nothing to do with whether the sync itself succeeded. A side
+     *  channel (observability) must never be able to flip the main
+     *  channel's (sync correctness) result -- `progress` swallows so an
+     *  `onProgress` failure can never surface as a false sync failure. */
     fun run(stream: Stream, store: SyncStore, ownDevicePub: String,
             outbound: List<Map<String, Any?>> = emptyList(),
             onProgress: (phase: String, count: Int) -> Unit = { _, _ -> }): SyncResult {
+        fun progress(phase: String, count: Int) {
+            try { onProgress(phase, count) } catch (_: Throwable) {}
+        }
         try {
-            onProgress("connecting", 0)
+            progress("connecting", 0)
             // -- REVOCATIONS -- (initiator writes then reads)
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             val revs = readFrame(stream)
@@ -193,7 +209,7 @@ object KotlinSync {
             val have = readFrame(stream)
             val known = have.optJSONArray("known") ?: JSONArray()
             for (i in 0 until known.length()) store.addIdentity(known.getString(i))
-            onProgress("handshake", 0)
+            progress("handshake", 0)
 
             // -- MESSAGES -- (push outbound -- for B.2, at most the phone's
             // device-signed enckey, see composeEncKey -- and ingest node's)
@@ -203,7 +219,7 @@ object KotlinSync {
             for (i in 0 until msgArr.length()) {
                 val m = SignedMessageKt.fromDict(toMap(msgArr.getJSONObject(i)))
                 store.ingestMessage(m)   // verifies + dedups internally
-                onProgress("messages", i + 1)
+                progress("messages", i + 1)
             }
 
             // -- BLOBS -- (want swap, then blobs swap)
@@ -223,11 +239,11 @@ object KotlinSync {
                 if (data.size <= MAX_BLOB_BYTES) {
                     store.putBlob(h, data)   // store.putBlob does the hash check
                     storedBlobs++
-                    onProgress("blobs", storedBlobs)
+                    progress("blobs", storedBlobs)
                 }
             }
 
-            onProgress("decrypting", 0)
+            progress("decrypting", 0)
             val st = store.stats()
             return SyncResult.Ok(st.messages, st.blobs, st.identities)
         } catch (e: Exception) {

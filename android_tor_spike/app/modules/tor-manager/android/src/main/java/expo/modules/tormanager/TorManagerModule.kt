@@ -305,7 +305,21 @@ class TorManagerModule : Module() {
                         // size (res.feed.size), matching what just became
                         // visible to the UI, not the raw wire message count
                         // (r.messages) some of which may not be decryptable.
-                        sendEvent("onSyncProgress", mapOf("phase" to "done", "count" to res.feed.size))
+                        //
+                        // Own try/catch, swallowed (code review fix): this
+                        // sendEvent runs AFTER feedCache/blobKeys are already
+                        // mutated to their successful state, inside syncNow's
+                        // OUTER try -- if it threw uncaught, the outer catch
+                        // below would emit nodeSync ok=false and the real
+                        // emit(true, ...) two lines down would never run,
+                        // reporting a sync that fully succeeded (feed already
+                        // updated) as failed. A side-channel (observability)
+                        // send must never be able to flip the terminal
+                        // nodeSync outcome -- same reasoning as KotlinSync's
+                        // own `progress` swallow wrapper.
+                        try {
+                            sendEvent("onSyncProgress", mapOf("phase" to "done", "count" to res.feed.size))
+                        } catch (_: Throwable) {}
                         // r.identities (SyncResult.Ok, from KotlinSync.run --
                         // UNTOUCHABLE) is the raw identities-table count,
                         // which includes the phone's own identity (seeded
