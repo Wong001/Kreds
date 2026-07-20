@@ -44,6 +44,27 @@ class TorManagerModule : Module() {
     // result) is never mutated after being built, only replaced wholesale.
     @Volatile private var feedCache: List<DecryptPass.Decrypted> = emptyList()
 
+    // Task 5 (B.2d): per-message content keys for every message in
+    // feedCache that carries a blob (DecryptPass.Result.keys -- msgId ->
+    // contentKey), needed by getBlobImage to decrypt a blob on demand.
+    // SAME lifetime as feedCache, deliberately: both come from the same
+    // DecryptPass.Result (`res` in syncNow's success branch, captured once
+    // so `res.feed` and `res.keys` are guaranteed to describe the SAME
+    // decrypt pass -- calling DecryptPass.run twice and assigning each
+    // field separately could race a concurrent syncNow into pairing one
+    // run's feed with a DIFFERENT run's keys). In-memory only, replaced
+    // wholesale on every successful sync, NEVER persisted to disk -- this
+    // is key material (a message's content key), and feedCache's own
+    // reasoning (nothing here survives past the next sync, no reason to
+    // ever write it out) applies with even more force here. @Volatile for
+    // the same cross-thread-visibility reason as feedCache: written from
+    // ioScope (Dispatchers.IO) in syncNow, read from getBlobImage's
+    // AsyncFunction body (also ioScope, but a possibly different thread --
+    // Dispatchers.IO is a pool). The Map itself is never mutated after
+    // being built (DecryptPass.run returns a fresh Map each call), only
+    // the reference is replaced.
+    @Volatile private var blobKeys: Map<String, ByteArray> = emptyMap()
+
     /** B.2c Task 3: the phone's real friend count -- `store.knownIdentities()`
      *  minus the phone's OWN identity. Both `getSyncStats` and `syncNow`'s
      *  success path previously surfaced the identities-table's raw row
@@ -255,13 +276,18 @@ class TorManagerModule : Module() {
                         // reaches here, so the marker stays stale/absent and
                         // the very next syncNow call retries the push.
                         if (prep.shouldPublish) store.setPublishedEncPub(prep.encPub)
-                        // Decrypt pass + feed cache refresh: only a completed
+                        // Decrypt pass + feed/key cache refresh: only a completed
                         // sync can change what's decryptable (new messages/
                         // wrap_grants may have just been pulled), so this is
-                        // the one place the cache is recomputed -- see
-                        // feedCache's own doc comment for why getFeed() itself
-                        // just serves this cache instead of re-running.
-                        feedCache = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub).feed
+                        // the one place the caches are recomputed -- see
+                        // feedCache's and blobKeys' own doc comments for why
+                        // getFeed()/getBlobImage() just serve these caches
+                        // instead of re-running. Captured once into `res` so
+                        // feedCache and blobKeys are always set from the SAME
+                        // decrypt pass (see blobKeys' doc for why that matters).
+                        val res = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub)
+                        feedCache = res.feed
+                        blobKeys = res.keys
                         // r.identities (SyncResult.Ok, from KotlinSync.run --
                         // UNTOUCHABLE) is the raw identities-table count,
                         // which includes the phone's own identity (seeded
@@ -289,16 +315,43 @@ class TorManagerModule : Module() {
                 // String from a SQL column, kind: String, text: String
                 // pulled from an org.json body via `as? String` -- org.json
                 // strings ARE plain java.lang.String, not a wrapper type --
-                // createdAt: Double, already normalized in DecryptPass).
+                // createdAt: Double, already normalized in DecryptPass;
+                // blobs: List<String> and thumbs: List<String?>, Task 5
+                // (B.2d) -- hash REFERENCES only, never blob bytes/keys --
+                // the UI resolves each into a data URI on demand via
+                // getBlobImage(msgId, hash)).
                 // Rebuilt into a fresh Map here anyway rather than passing
                 // the data class through, matching this module's existing
                 // event/return marshaling style (getHistory/getSyncStats).
                 mapOf(
                     "msgId" to d.msgId, "kind" to d.kind, "author" to d.author,
                     "text" to d.text, "createdAt" to d.createdAt,
+                    "blobs" to d.blobs, "thumbs" to d.thumbs,
                 )
             }
         }
+
+        // Task 5 (B.2d): lazy in-memory blob decrypt+decode -- resolves one
+        // blob/thumb reference from getFeed's `blobs`/`thumbs` lists into a
+        // displayable `data:<mime>;base64,<...>` URI, or null on ANY miss
+        // (no content key for msgId, blob not synced yet, wrong-key/tampered
+        // AEAD failure, or a format toRenderable can't render, e.g. a video)
+        // -- never throws, so the UI's contract is simply "null -> show a
+        // placeholder", matching DecryptPass's own fail-closed-per-item
+        // idiom rather than failing the whole feed render. Store I/O (SQLite
+        // blob read) + AVIF decode (isolated-process IPC via
+        // ImageDecodeClient, Task 3) both can block, so this runs on
+        // ioScope/Dispatchers.IO, same as syncNow/dial/send/recv -- not the
+        // module's default single HandlerThread.
+        AsyncFunction("getBlobImage") { msgId: String, hash: String ->
+            val ctx = appContext.reactContext ?: return@AsyncFunction null
+            val key = blobKeys[msgId] ?: return@AsyncFunction null
+            val store = SqliteSyncStore(ctx)
+            val cipher = store.getBlob(hash) ?: return@AsyncFunction null
+            val plain = KotlinBlobCrypt.decryptBlob(key, cipher) ?: return@AsyncFunction null
+            val (mime, bytes) = KotlinImageDecode.toRenderable(plain) ?: return@AsyncFunction null
+            "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+        }.runOnQueue(ioScope)
 
         AsyncFunction("getSyncStats") {
             val ctx = appContext.reactContext

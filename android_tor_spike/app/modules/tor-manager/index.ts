@@ -76,9 +76,29 @@ export function getSyncStats(): Promise<SyncStats> { return native.getSyncStats(
 // author -- the latest stored profile name for that identity, else
 // "friend-" + identityPub.take(8) (or "me" for our own identity with no
 // stored profile yet). See DecryptPass.resolveAuthor.
-export interface FeedItem { msgId: string; kind: string; author: string; text: string; createdAt: number }
+// `blobs`/`thumbs` (B.2d Task 5): hash REFERENCES only -- never blob bytes
+// or key material -- resolved on demand via getBlobImage(msgId, hash).
+// `thumbs` is (string | null)[], position-aligned with `blobs`: hearth
+// legitimately records a null entry for a photo whose thumbnail generation
+// failed (see DecryptPass.Decrypted's doc).
+export interface FeedItem {
+  msgId: string; kind: string; author: string; text: string; createdAt: number;
+  blobs: string[]; thumbs: (string | null)[];
+}
 
 export function getFeed(): Promise<FeedItem[]> { return native.getFeed(); }
+
+// Task 5 (B.2d): resolves one blob/thumb hash reference (from a FeedItem's
+// `blobs`/`thumbs`) into a displayable `data:<mime>;base64,<...>` URI, or
+// null on any miss (not yet synced, no content key, decrypt/decode
+// failure) -- callers show a placeholder on null, never treat it as an
+// error. Lazy: nothing is decrypted/decoded until a caller actually asks
+// for this specific (msgId, hash) pair (e.g. when a feed image scrolls
+// into view), and nothing here is cached on the JS side -- the native
+// side re-derives it from blobKeys + the stored cipher blob on every call.
+export function getBlobImage(msgId: string, hash: string): Promise<string | null> {
+  return native.getBlobImage(msgId, hash);
+}
 
 export function onSync(cb: (r: {
   ok: boolean; messages: number; blobs: number; identities: number; reason?: string;
