@@ -235,6 +235,60 @@ class SyncLoopbackTest {
         }
     }
 
+    /** Brick C Task 1 -- transport-parity gate for the SyncRunner extraction.
+     *  Drives the SAME plain-pull transport syncsRealOwnIdentityContent proves
+     *  (authOnlyOverStream + identity pin + KotlinSync.run against the real
+     *  seeded node), but flows the result through SyncRunner's own outcome
+     *  mapping (`mapSyncResult`) and asserts the resulting SyncOutcome counts
+     *  equal node.expect -- i.e. the extraction's outcome mapping surfaces the
+     *  EXACT messages/blobs/identities the pre-refactor inline path reported
+     *  from store.stats() (SyncResult.Ok carries st.messages/blobs/identities,
+     *  which syncsRealOwnIdentityContent asserts equal node.expect directly).
+     *
+     *  Why not drive the full `SyncRunner.runSync`: it hard-depends on both
+     *  `TorEngine.dial` (real Tor) and `SqliteSyncStore(ctx)` (an Android
+     *  Context) -- neither exists in this plain JVM unit test, which is exactly
+     *  why the whole loopback gate uses InMemorySyncStore over a bare TCP
+     *  socket. So the TRANSPORT is proven at the KotlinSync.run level (that
+     *  code is byte-identical to what runSync now calls -- moved verbatim), and
+     *  the NEW assembly logic runSync adds (enc-key prep + publish-guard +
+     *  outcome-mapping) is proven via the internal ...ForTest seams here and in
+     *  SyncRunnerTest. The enckey push is suppressed (published marker pre-
+     *  seeded) so the outbound is empty and the pulled counts stay identical to
+     *  syncsRealOwnIdentityContent's -- the parity this test asserts. */
+    @Test fun syncRunnerOutcomeMatchesRawTransport() {
+        val node = startNode()
+        try {
+            val fixture = KotlinHandshake.parseFixture(node.fixtureJson)
+            val stream = SocketStream("127.0.0.1", node.port)
+
+            val peerCert = KotlinHandshake.authOnlyOverStream(stream, fixture)
+            // Identity pin -- runSync does this inline; assert it holds here too.
+            assertEquals("node cert identity", fixture.cert.identity_pub, peerCert.identity_pub)
+
+            val store = InMemorySyncStore()
+            store.addIdentity(fixture.cert.identity_pub)
+            // Suppress the enckey push so the pulled counts stay identical to
+            // the raw pull: pre-seed the published marker to the current pub.
+            val (_, pub) = EncKeys.getOrCreate(store)
+            store.setPublishedEncPub(pub)
+            val prep = SyncRunner.prepareEncKeyOutboundForTest(fixture, store)
+            assertTrue("publish must be suppressed for the count-parity pull", prep.outbound.isEmpty())
+
+            val r = KotlinSync.run(stream, store, fixture.device_pub, prep.outbound)
+            val outcome = SyncRunner.mapSyncResultForTest(r, prep, store)
+
+            assertTrue("outcome.ran", outcome.ran)
+            assertTrue("outcome.ok: ${outcome.error}", outcome.ok)
+            val expect = node.expect
+            assertEquals("messages", expect.getInt("messages"), outcome.messages)
+            assertEquals("blobs", expect.getInt("blobs"), outcome.blobs)
+            assertEquals("identities", expect.getInt("identities"), outcome.identities)
+        } finally {
+            node.kill()
+        }
+    }
+
     /** Task 6 (B.2d): proves KotlinSync.run's new `onProgress` callback
      *  fires at the expected phase boundaries, in order, against a REAL
      *  loopback node (not a mock) -- the same node/seed
