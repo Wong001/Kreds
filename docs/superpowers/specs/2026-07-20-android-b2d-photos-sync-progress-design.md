@@ -38,6 +38,25 @@ works down-level. Decision: native decode over a WebView (August, 2026-07-20)
 — keeps the feed native and matches the "use their codec behind our own
 boundary" pattern (as with tor-android).
 
+## Decoder threat model + isolation (August, 2026-07-20)
+
+An image decoder is a classic RCE surface (cf. libwebp CVE-2023-4863), and
+`imagegate.py` re-encodes only THIS node's own uploads to known-good bytes —
+content received over gossip is NOT re-gated (imagegate.py:8-12): a peer's
+bytes behind a content-hash reach our decoder as-is, and the hash-check only
+proves we got the bytes the author committed to, not that they are benign.
+So a malicious friend can author a post carrying a hand-crafted AVIF and our
+decoder processes it. A self-built decoder is NOT the answer — hand-writing
+an AV1/AVIF decoder is the same roll-your-own-security antipattern rejected
+for Tor, and would be MORE bug-prone than the continuously-fuzzed
+dav1d/libavif the maintained libs wrap. Instead: use a battle-tested decoder
+(dav1d/libavif-backed) behind our boundary AND **run the decode in an
+`android:isolatedProcess` service** so a decoder exploit is sandboxed away
+from the node's keys, store, and network. The main process decrypts the blob
+(it holds the content key) and passes only ONE image's cleartext compressed
+bytes to the sandbox, which returns decoded pixels — the isolated process
+never sees keys, ciphertext, the store, or a network socket.
+
 ## Scope
 
 **In:** decrypt + render image blobs and their thumbnails in the feed —
@@ -79,7 +98,7 @@ returns, alongside the `Decrypted` list, a `Map<String, ByteArray>` of
 decrypt those blobs lazily without re-running the unwrap. (Keys for
 blob-less messages are not retained.)
 
-### 3. `KotlinImageDecode` (new — the AVIF decode boundary)
+### 3. `KotlinImageDecode` (new — the AVIF decode boundary) + isolated decode service
 
 `object KotlinImageDecode { fun toRenderable(bytes: ByteArray): Pair<String, ByteArray>? }`
 — returns `(mime, bytes)` ready for a native `<Image>` data URI, or null if
@@ -87,13 +106,27 @@ the bytes are not a supported image (a video mp4 lands here). Format by
 magic bytes: JPEG `FF D8`, PNG `89 50 4E 47`, GIF `47 49 46 38`, WebP
 `RIFF`+`WEBP`, BMP `42 4D`, TIFF `49 49 2A 00`/`4D 4D 00 2A` (mirroring
 `imagegate.is_image_bytes`) pass through unchanged with their mime. **AVIF**
-(`bytes[4..8] == "ftyp"` and `bytes[8..12]` in `avif`/`avis`) is decoded to
-a `Bitmap` via a maintained native AVIF decoder and re-encoded to PNG
-(`Bitmap.compress(PNG)`), returned as `("image/png", pngBytes)`. Decoder:
-a maintained AVIF library supporting API 24+ (e.g. `com.github.awxkee:avif-coder`);
-the implementer confirms the exact lib, that its license is AGPL-compatible,
-and that it decodes down to API 30 on the G20. The decode call is isolated
-behind this one boundary so a swap is a backend change.
+(`bytes[4..8] == "ftyp"` and `bytes[8..12]` in `avif`/`avis`) is handed to
+the isolated decode service and returned as `("image/png", pngBytes)`.
+
+The magic-byte DISPATCH is pure and JVM-testable and lives here. The AVIF
+decode itself runs in a **separate `android:isolatedProcess` bound service**
+(`ImageDecodeService`): the main process sends the cleartext compressed AVIF
+bytes over IPC, the service decodes to a `Bitmap` via the maintained
+decoder, compresses to PNG, and returns the PNG bytes. The isolated process
+runs under its own restricted UID with no app data, no permissions, and no
+network — a decoder RCE is contained there. Decoder: a maintained
+dav1d/libavif-backed AVIF library supporting API 30 (e.g.
+`com.github.awxkee:avif-coder`); the implementer confirms the exact lib, an
+AGPL-compatible license, arm64-v8a `.so`s, and that it loads inside the
+isolated process. Only the isolated service links the decoder — the main
+process never calls it directly, so an exploit cannot reach the node.
+
+**IPC payload size:** decoded PNGs and some AVIFs exceed Binder's ~1 MB
+transaction cap, so input and output bytes transfer via a
+`ParcelFileDescriptor` pipe (or `SharedMemory`/ashmem), not plain Parcel
+args. Pin the exact mechanism during build; a synchronous decode-and-return
+over an FD pair is the shape.
 
 ### 4. Module: `getBlobImage(msgId, hash)` + progress event
 
@@ -141,11 +174,16 @@ sync -> DecryptPass: per message recover content key (as B.2) -> decrypt body
         blob-carrying messages; module caches it (in-memory, feedCache life)
    ... during sync: KotlinSync.onProgress -> module onSyncProgress -> status line
 feed row mounts -> per image hash: getBlobImage(msgId, thumbOrBlobHash)
-        -> cached key + ciphertext blob -> KotlinBlobCrypt.decryptBlob
-        -> KotlinImageDecode.toRenderable (AVIF -> PNG; others pass through)
+        -> cached key + ciphertext blob -> KotlinBlobCrypt.decryptBlob   [main proc]
+        -> KotlinImageDecode.toRenderable: magic-byte dispatch            [main proc]
+             - PNG/JPEG/GIF/WebP/BMP/TIFF -> pass through
+             - AVIF -> IPC cleartext bytes to ImageDecodeService          [isolated proc]
+                       -> decoder -> Bitmap -> PNG -> PNG bytes back       [isolated proc]
         -> base64 data URI  (or null -> placeholder)
 tap thumbnail -> Modal: getBlobImage(msgId, fullBlobHash) -> full image
 ```
+The isolated process receives only one image's cleartext compressed bytes;
+never keys, ciphertext, the store, or a socket.
 
 ## Testing
 
@@ -174,21 +212,25 @@ decode itself is proven on-device, while everything around it is desk-gated.
 - **Sync progress:** a JVM test that `KotlinSync.run` invokes `onProgress`
   with the expected phase sequence and a non-decreasing message/blob count
   against the loopback node.
-- **On-device (the AVIF decode proof):** real AVIF photos render in the feed
-  (own + friend), tapping opens full-screen, non-image posts show the
-  placeholder, and the sync status line ticks up live during a real sync.
-  A committed tiny AVIF fixture (generated via hearth's `transcode_photo`
-  from a test image) is decoded + rendered on the G20 as the decode's
-  ground-truth check.
+- **On-device (the AVIF decode + isolation proof):** real AVIF photos render
+  in the feed (own + friend) — proving the isolated `ImageDecodeService`
+  round-trips end to end — tapping opens full-screen, non-image posts show
+  the placeholder, and the sync status line ticks up live during a real
+  sync. A committed tiny AVIF fixture (generated via hearth's
+  `transcode_photo` from a test image) is decoded + rendered on the G20 as
+  the decode's ground-truth check. Sanity-check that the decode runs in a
+  distinct process (`adb shell ps` shows the `:imagedecode` isolated
+  process) so the isolation is real, not just declared.
 
 ## Definition of done
 
-The G20 feed shows real photos (own + friends', AVIF decoded on the phone),
-tapping opens the full image full-screen, unsupported media shows a
-placeholder, and the sync shows live progress instead of 1-2 minutes of dead
-air. Desk-proven where provable (blob vector gate, format-dispatch, loopback
-decrypt+detect, progress unit test); the AVIF pixel decode is proven on the
-G20 (native decoder, not JVM-loadable).
+The G20 feed shows real photos (own + friends', AVIF decoded on the phone in
+an isolated process), tapping opens the full image full-screen, unsupported
+media shows a placeholder, and the sync shows live progress instead of 1-2
+minutes of dead air. Desk-proven where provable (blob vector gate,
+format-dispatch, loopback decrypt+detect, progress unit test); the AVIF pixel
+decode and its process isolation are proven on the G20 (native decoder +
+isolated service, not JVM-loadable).
 
 ## Risks / honest unknowns (resolve during build)
 
@@ -208,17 +250,28 @@ G20 (native decoder, not JVM-loadable).
   plus AVIF; confirm the signatures cover what the desktop actually stores
   (photos = AVIF, avatars/banners = PNG, animated GIF = raw).
 - **AVIF decoder dependency** — the load-bearing new dependency. Confirm
-  during build: (1) a maintained lib that decodes AVIF on API 30 (the G20);
-  (2) license AGPL-compatible (the repo is AGPL-3.0); (3) it ships arm64-v8a
-  `.so`s (the G20 ABI) and doesn't bloat the APK unreasonably; (4) it is
-  isolated behind `KotlinImageDecode` so a later swap (or a WebView
-  fallback) is a backend change. If no acceptable lib is found, escalate —
-  do not silently fall back to shipping AVIF as placeholders.
-- **Native decode not JVM-testable** — the AVIF decode is proven on-device,
-  not at the desk. The format-dispatch and the decrypt legs ARE desk-gated;
-  the pixel decode's ground truth is the committed AVIF fixture rendered on
-  the G20. Accept this coverage boundary (same shape as the existing
-  no-Robolectric SQLite gap).
+  during build: (1) a maintained dav1d/libavif-backed lib that decodes AVIF
+  on API 30 (the G20); (2) license AGPL-compatible (the repo is AGPL-3.0);
+  (3) it ships arm64-v8a `.so`s (the G20 ABI) and doesn't bloat the APK
+  unreasonably; (4) it loads and runs inside the `isolatedProcess` service;
+  (5) pinned version, watched for CVEs. Only `ImageDecodeService` links it.
+  If no acceptable lib is found, escalate — do not silently ship AVIF as
+  placeholders, and do not hand-roll a decoder.
+- **Isolated-process plumbing** — the real new engineering weight this slice
+  adds beyond a plain decode. `android:isolatedProcess` services cannot
+  touch app storage and get an ephemeral UID (that IS the security value),
+  so ALL data crosses via IPC. Binder's ~1 MB cap means image bytes move
+  over a `ParcelFileDescriptor` pipe / `SharedMemory`, not Parcel args —
+  pin the mechanism early; it is the trickiest part. Service lifecycle
+  (bind on first decode, unbind/idle-stop) and a decode timeout (a wedged
+  or crashing decoder must yield null -> placeholder, never hang the feed)
+  are required.
+- **Native decode + isolation not JVM-testable** — proven on-device, not at
+  the desk (the `.so` and the isolated process need a real device). The
+  format-dispatch and the decrypt legs ARE desk-gated; the pixel decode +
+  isolation ground truth is the committed AVIF fixture rendered on the G20,
+  with `ps` confirming the separate process. Accept this coverage boundary
+  (same shape as the existing no-Robolectric SQLite gap).
 - **Missing blobs** — a referenced hash the phone never synced -> null ->
   placeholder; never a crash. (Blob sync completeness is B.1's concern, not
   this slice's.)
