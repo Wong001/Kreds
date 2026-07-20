@@ -1200,3 +1200,20 @@ body.lb-open { overflow: hidden; }   /* lock background scroll behind the lightb
    buildEntry) rather than a bare img selector so the 0.3.13 .eavatar
    specificity fix stays unchallenged. Click opens the lightbox. */
 #view-journal .epic { max-height: min(480px, 60vh); width: auto; }
+
+/* vp1: read-only mirror. Hide every write affordance while keeping read content
+   (reaction count chips, comments, posts) fully visible. Desktop never sets
+   body.readonly, so this is inert there. */
+body.readonly .composer,
+body.readonly .comment-composer,
+body.readonly .rx-open,
+body.readonly .rx-picker,
+body.readonly .pact.del,
+body.readonly .settings-del,
+body.readonly .story-tile .story-ring.add {
+  display: none !important;
+}
+/* keep the story-add tile's label from leaving an empty column */
+body.readonly .story-tile:has(.story-ring.add) {
+  display: none !important;
+}
