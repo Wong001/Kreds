@@ -118,6 +118,18 @@ fresh build proved the render. Branch tree is clean; no diagnostic code merges.
 
 ## Follow-up tickets (Minor, none blocking merge)
 
+- **Own response on your own post renders as an alias, not "you"** (August,
+  2026-07-20). Because `public_engagement` is off by default, even a self-
+  reaction/comment is private → sealed in `mutual_box` with NO plaintext
+  identity, so the phone (which never opens the box — seal_slots deferred)
+  cannot know it is yours and shows the colored alias. The desktop shows your
+  name only because it resolves its own identity in its own view. Real fix is
+  wiring the **`public_engagement` HTTP toggle** (compose_response already reads
+  the setting, node.py:2364/2406 — only the GET/POST side is unwired): a public
+  response carries the identity in the clear and the phone's existing
+  responder_sig + device-binding path attributes it by name. Until then all
+  responses are alias-only on every viewer. Deferred.
+
 - **M1 (cross-platform parity):** App.tsx renders alias hue at `hsl(h, 60%, 45%)`;
   web `app.js` uses `55%` saturation, and `KotlinResponses.kt:457`'s doc claims
   `55%`. The **hue** (the security-relevant part) is byte-exact; only the fixed
