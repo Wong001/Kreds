@@ -27,7 +27,13 @@ function Thumbnail({ msgId, displayHash, fullHash, onOpen }: {
   useEffect(() => {
     let cancelled = false;
     setUri(undefined);
-    getBlobImage(msgId, displayHash).then((r) => { if (!cancelled) setUri(r); });
+    getBlobImage(msgId, displayHash)
+      .then((r) => { if (!cancelled) setUri(r); })
+      // Defensive: getBlobImage's native contract says it never rejects, but
+      // if a bridge error ever did surface here, fail closed into the
+      // distinct "media unavailable" placeholder rather than getting stuck
+      // on the loading state forever.
+      .catch(() => { if (!cancelled) setUri(null); });
     return () => { cancelled = true; };
   }, [msgId, displayHash]);
 
@@ -117,7 +123,10 @@ export default function App() {
     if (!fullscreen) return;
     let cancelled = false;
     setFullImage(undefined);
-    getBlobImage(fullscreen.msgId, fullscreen.hash).then((r) => { if (!cancelled) setFullImage(r); });
+    getBlobImage(fullscreen.msgId, fullscreen.hash)
+      .then((r) => { if (!cancelled) setFullImage(r); })
+      // Same fail-closed guarantee as the Thumbnail effect above.
+      .catch(() => { if (!cancelled) setFullImage(null); });
     return () => { cancelled = true; };
   }, [fullscreen]);
 
