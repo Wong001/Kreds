@@ -76,6 +76,33 @@ def build():
         "wrap": w4["dev1"], "body_nonce": n4, "body_ct": c4,
         "content_key": key4.hex(), "plaintext": body4,
     })
+    # A post whose BODY carries real blob hash refs, with THUMBS living
+    # only in the OUTER (never-encrypted) payload (Task 4, B.2d
+    # DecryptPass): mirrors node.py's compose_post exactly --
+    # encrypt_body(key, {"text": text, "blobs": refs}, aad) never includes
+    # "thumbs" in the body; thumbs rides in the outer SIGNED payload only
+    # (make_post's `thumbs` param, same plaintext-envelope-metadata class as
+    # poster/codec). This case proves DecryptPass's body-blobs / payload-
+    # thumbs split against REAL hearth-shaped ciphertext, not hand-rolled
+    # JSON. "thumbs" is a top-level case field (not part of "plaintext",
+    # since it is deliberately NOT in the encrypted body) -- a null entry
+    # mirrors a failed thumbnail generation (node.py's
+    # `thumbs.append(None)`).
+    enc_priv5, enc_pub5 = _gen_x25519_pair()
+    created_5 = created_at + 5.0
+    aad5 = post_aad(author, "kreds", created_5)
+    key5 = new_content_key()
+    blob_refs5 = ["ab" * 32, "cd" * 32]
+    body5 = {"kind": "post", "text": "post with photos", "blobs": blob_refs5}
+    n5, c5 = encrypt_body(key5, body5, aad5)
+    w5 = wrap_key(key5, {"dev1": enc_pub5}, aad5)
+    cases.append({
+        "kind": "post", "author": author, "scope": "kreds",
+        "created_at": created_5, "enc_priv": enc_priv5,
+        "wrap": w5["dev1"], "body_nonce": n5, "body_ct": c5,
+        "content_key": key5.hex(), "plaintext": body5,
+        "thumbs": ["ef" * 32, None],
+    })
     # a blob encrypted with a content key (BLOB_AAD, no per-message aad)
     from hearth.dmcrypt import encrypt_blob
     bkey = new_content_key()

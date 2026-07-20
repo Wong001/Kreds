@@ -261,7 +261,7 @@ class TorManagerModule : Module() {
                         // the one place the cache is recomputed -- see
                         // feedCache's own doc comment for why getFeed() itself
                         // just serves this cache instead of re-running.
-                        feedCache = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub)
+                        feedCache = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub).feed
                         // r.identities (SyncResult.Ok, from KotlinSync.run --
                         // UNTOUCHABLE) is the raw identities-table count,
                         // which includes the phone's own identity (seeded

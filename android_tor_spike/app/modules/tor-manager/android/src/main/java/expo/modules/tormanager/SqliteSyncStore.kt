@@ -239,6 +239,14 @@ class SqliteSyncStore(context: Context) :
         return true
     }
 
+    /** Read counterpart to putBlob (Task 4, B.2d) -- see the SyncStore
+     *  interface doc for why a missing hash returns null rather than
+     *  throwing. */
+    override fun getBlob(hash: String): ByteArray? =
+        readableDatabase.rawQuery(
+            "SELECT data FROM blobs WHERE hash = ? LIMIT 1", arrayOf(hash)
+        ).use { c -> if (c.moveToFirst()) c.getBlob(0) else null }
+
     override fun stats(): SyncStats {
         fun count(table: String): Int = readableDatabase.rawQuery(
             "SELECT COUNT(*) FROM $table", null

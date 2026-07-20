@@ -3,7 +3,9 @@ package expo.modules.tormanager
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.json.JSONArray
 import org.json.JSONObject
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -88,7 +90,7 @@ class DecryptPassTest {
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
         assertTrue(store.ingestMessage(msg))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
         assertEquals(1, out.size)
         assertEquals(msg.msgId(), out[0].msgId)
         assertEquals("post", out[0].kind)
@@ -116,7 +118,7 @@ class DecryptPassTest {
         val grant = signedMessage(c.getString("author"), 2, grantPayload, "b1".repeat(32))
         assertTrue(store.ingestMessage(grant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
         assertEquals(1, out.size)
         assertEquals("dm", out[0].kind)
         assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
@@ -142,7 +144,7 @@ class DecryptPassTest {
         val m2 = signedMessage(c.getString("author"), 2, tamperedPayload, "c2".repeat(32))
         assertTrue(store.ingestMessage(m2))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
         assertEquals("neither message should decrypt (wrong device / tampered ct)", 0, out.size)
     }
 
@@ -166,7 +168,7 @@ class DecryptPassTest {
             assertTrue(store.ingestMessage(msg))
         }
 
-        val out = DecryptPass.run(store, phoneDevicePub, encPriv, sameKeyCases[0].getString("author"))
+        val out = DecryptPass.run(store, phoneDevicePub, encPriv, sameKeyCases[0].getString("author")).feed
         assertEquals(sameKeyCases.size, out.size)
         val expectedOrder = sameKeyCases.map { it.getDouble("created_at") }.sortedDescending()
         assertEquals(expectedOrder, out.map { it.createdAt })
@@ -218,7 +220,7 @@ class DecryptPassTest {
         val foreignGrant = signedMessage(foreignIdentityPub, 1, foreignGrantPayload, "e1".repeat(32))
         assertTrue(store.ingestMessage(foreignGrant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
         assertEquals("the foreign grant must be ignored; the real, older own grant must still decrypt",
             1, out.size)
         assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
@@ -247,7 +249,7 @@ class DecryptPassTest {
         val foreignGrant = signedMessage(foreignIdentityPub, 1, foreignGrantPayload, "e2".repeat(32))
         assertTrue(store.ingestMessage(foreignGrant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
         assertEquals("only a foreign-authored grant exists -- must be skipped, not decrypted", 0, out.size)
     }
 
@@ -273,7 +275,7 @@ class DecryptPassTest {
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "f1".repeat(32))
         assertTrue(store.ingestMessage(msg))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
         assertEquals("friend-authored post with a genuinely valid wrap must now decrypt (B.2c)",
             1, out.size)
         assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
@@ -303,7 +305,7 @@ class DecryptPassTest {
         val grant = signedMessage(c.getString("author"), 2, grantPayload, "a5".repeat(32))
         assertTrue(store.ingestMessage(grant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
         assertEquals("friend-authored post via an author-signed grant must decrypt", 1, out.size)
         assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
     }
@@ -338,7 +340,7 @@ class DecryptPassTest {
         val grant = signedMessage(ownIdentityPub, 1, grantPayload, "a7".repeat(32))
         assertTrue(store.ingestMessage(grant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub).feed
         assertEquals("received DM must decrypt via a recipient-signed grant alone", 1, out.size)
         assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
     }
@@ -371,7 +373,7 @@ class DecryptPassTest {
         val hostileGrant = signedMessage(foreignIdentityPub, 1, grantPayload, "a9".repeat(32))
         assertTrue(store.ingestMessage(hostileGrant))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub).feed
         assertEquals("a third-identity-signed 'recipient-style' grant must never be trusted",
             0, out.size)
     }
@@ -437,7 +439,7 @@ class DecryptPassTest {
         // Posts, via the posts' shared enc key: the DM (wrapped under a
         // DIFFERENT key) must fail AEAD auth and be silently skipped,
         // leaving exactly the 3 posts, newest-first.
-        val outPosts = DecryptPass.run(store, phoneDevicePub, postCase.getString("enc_priv"), ownIdentityPub)
+        val outPosts = DecryptPass.run(store, phoneDevicePub, postCase.getString("enc_priv"), ownIdentityPub).feed
         assertEquals(3, outPosts.size)
         val expectedPostOrder = listOf(
             newerPostCase.getDouble("created_at"),
@@ -449,7 +451,7 @@ class DecryptPassTest {
         // The own-sent DM, via ITS OWN enc key: the 3 posts (wrapped under a
         // different key) fail AEAD auth and are skipped, leaving exactly
         // the DM.
-        val outDm = DecryptPass.run(store, phoneDevicePub, dmCase.getString("enc_priv"), ownIdentityPub)
+        val outDm = DecryptPass.run(store, phoneDevicePub, dmCase.getString("enc_priv"), ownIdentityPub).feed
         assertEquals(1, outDm.size)
         assertEquals("dm", outDm[0].kind)
         assertEquals(dmCase.getJSONObject("plaintext").getString("text"), outDm[0].text)
@@ -476,7 +478,7 @@ class DecryptPassTest {
             c.getString("author"), 2, profilePayload("Alice", c.getDouble("created_at")), "a1".repeat(32))
         assertTrue(store.ingestMessage(profile))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
         assertEquals(1, out.size)
         assertEquals("a friend with a stored profile message resolves to its name",
             "Alice", out[0].author)
@@ -491,7 +493,7 @@ class DecryptPassTest {
         assertTrue(store.ingestMessage(msg))
         // No profile message stored for this identity at all.
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
         assertEquals(1, out.size)
         assertEquals("no stored profile -> falls back to \"friend-\" + identityPub.take(8)",
             "friend-" + c.getString("author").take(8), out[0].author)
@@ -513,7 +515,7 @@ class DecryptPassTest {
             c.getString("author"), 2, profilePayload("   ", c.getDouble("created_at")), "a1".repeat(32))
         assertTrue(store.ingestMessage(blankProfile))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
         assertEquals(1, out.size)
         assertEquals("a blank stored name must fall back to the \"friend-\" prefix, not render blank",
             "friend-" + c.getString("author").take(8), out[0].author)
@@ -531,7 +533,7 @@ class DecryptPassTest {
             ownIdentityPub, 2, profilePayload("Me Myself", c.getDouble("created_at")), "a1".repeat(32))
         assertTrue(store.ingestMessage(ownProfile))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub).feed
         assertEquals(1, out.size)
         assertEquals("own identity with a stored profile resolves to OUR OWN name, not \"me\"",
             "Me Myself", out[0].author)
@@ -547,7 +549,7 @@ class DecryptPassTest {
         assertTrue(store.ingestMessage(msg))
         // No profile message stored for our own identity.
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), ownIdentityPub).feed
         assertEquals(1, out.size)
         assertEquals("own identity, no stored profile -> literal \"me\"", "me", out[0].author)
     }
@@ -571,9 +573,78 @@ class DecryptPassTest {
             profilePayload("Old Name", c.getDouble("created_at") - 100.0), "a1".repeat(32))
         assertTrue(store.ingestMessage(older))
 
-        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
         assertEquals(1, out.size)
         assertEquals("the profile with the latest created_at wins, regardless of seq/insertion order",
             "New Name", out[0].author)
+    }
+
+    // -- B.2d Task 4: blob/thumb ref surfacing + per-message content keys --
+    // Case 4 in the fixture (make_dmcrypt_vectors.py) is a post whose
+    // DECRYPTED BODY carries real blob hash refs -- mirrors hearth's
+    // compose_post exactly (encrypt_body(key, {"text": text, "blobs":
+    // refs}, aad)) -- while its "thumbs" rides ONLY in the outer
+    // (never-encrypted) payload, because hearth never puts thumbs in the
+    // body (make_post's thumbs param is a plaintext envelope field
+    // alongside poster/codec, same disclosure class as make_dm's
+    // story_ref). These tests exercise DecryptPass against that REAL
+    // ciphertext, not hand-rolled JSON.
+
+    private fun jsonStringList(a: JSONArray): List<String> =
+        (0 until a.length()).map { a.getString(it) }
+    private fun jsonNullableStringList(a: JSONArray): List<String?> =
+        (0 until a.length()).map { if (a.isNull(it)) null else a.getString(it) }
+
+    @Test fun surfacesBlobsFromBodyAndThumbsFromPayloadAlongsideContentKey() {
+        val c = cases().getJSONObject(4)
+        assertEquals("post", c.getString("kind"))
+        assertEquals("post with photos", c.getJSONObject("plaintext").getString("text"))
+        val expectedBlobs = jsonStringList(c.getJSONObject("plaintext").getJSONArray("blobs"))
+        assertTrue("fixture precondition: this case's body actually carries blob refs",
+            expectedBlobs.isNotEmpty())
+        val expectedThumbs = jsonNullableStringList(c.getJSONArray("thumbs"))
+
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        // Outer payload mirrors the body's blobs (as validate_payload does
+        // for a real message) and additionally carries "thumbs" -- the
+        // ONLY place hearth ever puts them.
+        val payload = postPayload(c, wraps).toMutableMap().apply {
+            put("blobs", expectedBlobs)
+            put("thumbs", expectedThumbs)
+        }
+        val msg = signedMessage(c.getString("author"), 1, payload, "b6".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val result = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        assertEquals(1, result.feed.size)
+        assertEquals("blobs must be read from the DECRYPTED BODY", expectedBlobs, result.feed[0].blobs)
+        assertEquals(
+            "thumbs must fall back to the outer payload (hearth never puts them in the body)",
+            expectedThumbs, result.feed[0].thumbs)
+        assertArrayEquals(
+            "Result.keys must expose the real content key for a blob-carrying message",
+            KotlinWire.fromHex(c.getString("content_key")), result.keys[msg.msgId()])
+    }
+
+    @Test fun blobLessMessageIsAbsentFromResultKeys() {
+        // Case 0's body carries "blobs": [] -- a message with genuinely no
+        // blobs must still decrypt into the feed (with an empty blobs
+        // list), but its content key must NOT appear in Result.keys --
+        // nothing downstream would ever use it to decrypt a blob.
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "b7".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val result = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        assertEquals(1, result.feed.size)
+        assertTrue("a blob-less message's body must yield an empty blobs list",
+            result.feed[0].blobs.isEmpty())
+        assertFalse("a blob-less message must be absent from Result.keys",
+            result.keys.containsKey(msg.msgId()))
     }
 }
