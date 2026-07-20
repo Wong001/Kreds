@@ -1,10 +1,11 @@
 # Brick B.2d-3 report -- stories
 
-**Status: DESK-COMPLETE.** All 3 code tasks are done and reviewed (each
-review APPROVED first pass, including a whole-branch-review follow-up fix --
-the hex64 guard on `storyRefMediaHash`); the whole-branch review verdict is
-READY TO MERGE. The on-device run is PENDING -- human-driven, August's turn.
-The RELEASE apk is already installed on the G20 (carried from Task 3).
+**Status: PROVEN ON HARDWARE (G20, 2026-07-20).** All 3 code tasks are done
+and reviewed (each review APPROVED first pass, including a whole-branch-review
+follow-up fix -- the hex64 guard on `storyRefMediaHash`); the whole-branch
+review verdict was READY TO MERGE, gated on this run. The run passed: stories
+render on the G20 -- the strip shows a story and a video story plays in the
+viewer. The RELEASE apk is installed on the G20 (carried from Task 3).
 
 Spec: `docs/superpowers/specs/2026-07-20-android-b2d3-stories-design.md`
 Plan: `docs/superpowers/plans/2026-07-20-android-b2d3-stories.md`
@@ -169,7 +170,22 @@ never downloaded before B.2d-3's fix.
 
 ## Verdict
 
-**[PENDING RUN]**
+**PROVEN.**
+
+- Stories render on the G20 (August, 2026-07-20): the story strip shows a
+  story under its author, and a VIDEO story plays in the fullscreen viewer --
+  the slice's definition of done. The story media downloaded (the
+  `missingBlobs` fix worked -- the story rendered, not a placeholder); the
+  video streamed over the MediaServer STORY route (raw, no decrypt); the
+  plaintext render path held.
+- Not separately reported this run (non-blocking; covered by the desk gates
+  + code): the photo-story isolated-AVIF path, the expiry drop-out, and the
+  received story-reply chip. A video story exercising the strip + viewer +
+  the plaintext-video route is the core proof; if the pipeline were broken it
+  would not have played.
+- Own posts/photos/video/feed continued to render (regression implicit in a
+  working feed).
+- Overall: **PROVEN** -- B.2d-3's definition of done met on hardware.
 
 ## Known deferred items / follow-up tickets
 
