@@ -108,4 +108,86 @@ class SyncStoreTest {
         assertArrayEquals(data, s.getBlob(realHash))
         assertEquals("a hash never stored returns null, not throw", null, s.getBlob(hash))
     }
+
+    // -- B.2d-3 Task 1: activeStories + missingBlobs story fix --
+
+    private fun storyPayload(
+        media: String, createdAt: Double, expiresAt: Double,
+        mediaKind: String = "photo", poster: String? = null, caption: String = "cap"
+    ): Map<String, Any?> = mapOf(
+        "kind" to "story", "media_kind" to mediaKind, "media" to media,
+        "poster" to poster, "caption" to caption,
+        "created_at" to createdAt, "expires_at" to expiresAt
+    )
+
+    @Test fun activeStoriesReturnsOnlyUnexpiredStoryWithFields() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val now = 1752900000.0
+        val fresh = msg(1, storyPayload(
+            media = "aa".repeat(32), createdAt = now - 5.0, expiresAt = now + 1000.0,
+            mediaKind = "video", poster = "bb".repeat(32), caption = "hello"
+        ))
+        val expired = msg(2, storyPayload(media = "cc".repeat(32), createdAt = now - 2000.0, expiresAt = now - 10.0))
+        val post = msg(3, mapOf("kind" to "post", "text" to "p", "blobs" to emptyList<String>()))
+        assertTrue(s.ingestMessage(fresh))
+        assertTrue(s.ingestMessage(expired))
+        assertTrue(s.ingestMessage(post))
+
+        val active = s.activeStories(now)
+        assertEquals(1, active.size)
+        val story = active.first()
+        assertEquals(idPub, story.author)
+        assertEquals("video", story.mediaKind)
+        assertEquals("aa".repeat(32), story.media)
+        assertEquals("bb".repeat(32), story.poster)
+        assertEquals("hello", story.caption)
+        assertEquals(now - 5.0, story.createdAt, 0.0)
+    }
+
+    @Test fun activeStoriesExcludesExpiresAtExactlyNow() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val now = 1752900000.0
+        // expires_at == now is NOT "unexpired" -- the filter is strictly
+        // `> nowSeconds`, mirroring the design doc's `payload.expires_at > now`.
+        val boundary = msg(1, storyPayload(media = "aa".repeat(32), createdAt = now - 100.0, expiresAt = now))
+        assertTrue(s.ingestMessage(boundary))
+        assertTrue(s.activeStories(now).isEmpty())
+    }
+
+    @Test fun activeStoriesOrderedNewestFirst() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val now = 1752900000.0
+        val older = msg(1, storyPayload(media = "aa".repeat(32), createdAt = now - 100.0, expiresAt = now + 900.0))
+        val newer = msg(2, storyPayload(media = "bb".repeat(32), createdAt = now - 10.0, expiresAt = now + 900.0))
+        assertTrue(s.ingestMessage(older))
+        assertTrue(s.ingestMessage(newer))
+        assertEquals(listOf("bb".repeat(32), "aa".repeat(32)), s.activeStories(now).map { it.media })
+    }
+
+    @Test fun missingBlobsIncludesStoryMediaAndPosterNotPostMediaDiscriminator() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val storyMedia = "aa".repeat(32)
+        val storyPoster = "bb".repeat(32)
+        val postBlob = "cc".repeat(32)
+        val story = msg(1, storyPayload(media = storyMedia, poster = storyPoster, createdAt = 1.0, expiresAt = 2.0))
+        val post = msg(2, mapOf("kind" to "post", "text" to "p", "blobs" to listOf(postBlob)))
+        // The field-shape trap: a POST's "media" is the photo/video
+        // DISCRIMINATOR, not a hash -- it must never leak into missingBlobs.
+        val postWithMediaDiscriminator = msg(3, mapOf(
+            "kind" to "post", "text" to "v", "media" to "video", "blobs" to emptyList<String>()
+        ))
+        assertTrue(s.ingestMessage(story))
+        assertTrue(s.ingestMessage(post))
+        assertTrue(s.ingestMessage(postWithMediaDiscriminator))
+
+        val missing = s.missingBlobs()
+        assertTrue("story media missing", missing.contains(storyMedia))
+        assertTrue("story poster missing", missing.contains(storyPoster))
+        assertTrue("regression: post blobs still tracked", missing.contains(postBlob))
+        assertFalse("field-shape trap: post's media discriminator must not appear", missing.contains("video"))
+    }
 }

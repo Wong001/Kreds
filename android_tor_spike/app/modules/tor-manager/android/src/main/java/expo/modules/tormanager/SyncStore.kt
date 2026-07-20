@@ -13,6 +13,18 @@ data class SyncStats(val messages: Int, val blobs: Int, val identities: Int)
  *  a real post/dm payload carries no "from"/"author" key at all. */
 data class StoredMsg(val msgId: String, val kind: String, val identityPub: String, val payload: Map<String, Any?>)
 
+/** A stored, unexpired KIND_STORY row, shaped for the module/UI (B.2d-3
+ *  Task 1). `author` is the stored identity_pub (the cert's, same
+ *  provenance as StoredMsg.identityPub -- a story payload carries no
+ *  "author"/"from" field of its own). `media`/`poster` are blob hashes
+ *  (poster is null for photo stories, or when a video story has none);
+ *  `mediaKind` is the "photo"|"video" discriminator. Stories are PLAINTEXT
+ *  (see hearth messages.make_story / node.py _content_key returning
+ *  (None, None) for KIND_STORY) -- no content-key/decrypt step applies. */
+data class StoredStory(
+    val msgId: String, val author: String, val mediaKind: String,
+    val media: String, val poster: String?, val caption: String, val createdAt: Double)
+
 interface SyncStore {
     fun summary(): Map<String, Map<String, Map<String, Any>>>
     fun knownIdentities(): List<String>
@@ -116,6 +128,14 @@ interface SyncStore {
      *  gated the same is_known+signature checks every stored message
      *  already passes at ingest). */
     fun profileNames(): Map<String, String>
+    /** Unexpired KIND_STORY rows (B.2d-3 Task 1) -- `payload.expires_at as
+     *  Number > nowSeconds` (strict: a story whose expires_at == nowSeconds
+     *  is treated as already expired, not still-active), newest-first by
+     *  `created_at`. Mirrors the design doc's `payload.expires_at > now`
+     *  filter -- expiry/GC of the underlying stored message is the
+     *  desktop's job; this accessor only decides what the phone SHOWS.
+     *  Stories are plaintext (see StoredStory's doc) -- no decrypt step. */
+    fun activeStories(nowSeconds: Double): List<StoredStory>
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -160,16 +180,27 @@ class InMemorySyncStore : SyncStore {
         return true
     }
 
-    /** Blob hashes referenced by stored POST/DM payloads, minus what we hold.
-     *  Mirrors hearth.store.referenced_blobs for the KIND_POST/KIND_DM fields
-     *  (blobs list + poster str + thumbs list), junk-guarded to strings. */
+    /** Blob hashes referenced by stored POST/DM/STORY payloads, minus what
+     *  we hold. Mirrors hearth.store.referenced_blobs for the KIND_POST/
+     *  KIND_DM fields (blobs list + poster str + thumbs list), junk-guarded
+     *  to strings, WIDENED (B.2d-3 Task 1) to also scan `story` rows.
+     *
+     *  The `poster` extraction below is already generic across kinds, so
+     *  adding "story" to the scanned kinds makes a story's poster flow
+     *  through it for free. `media`, however, is guarded to `kind=="story"`
+     *  ONLY: a story's `media` is a blob hash (single hex64 string), but a
+     *  POST's `media` is the "photo"/"video" DISCRIMINATOR -- extracting it
+     *  unconditionally would add the literal string "photo"/"video" to
+     *  missingBlobs as a bogus hash (the field-shape trap). */
     override fun missingBlobs(): List<String> {
         val refs = linkedSetOf<String>()
         for (m in messages.values) {
-            if (m.kind != "post" && m.kind != "dm") continue
+            if (m.kind != "post" && m.kind != "dm" && m.kind != "story") continue
             (m.payload["blobs"] as? List<*>)?.forEach { if (it is String) refs.add(it) }
             (m.payload["poster"] as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
             (m.payload["thumbs"] as? List<*>)?.forEach { if (it is String) refs.add(it) }
+            if (m.kind == "story")
+                (m.payload["media"] as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
         }
         return refs.filter { it !in blobs }
     }
@@ -228,5 +259,22 @@ class InMemorySyncStore : SyncStore {
                 best[m.cert.identity_pub] = Candidate(createdAt, m.seq, name)
         }
         return best.mapValues { it.value.name }
+    }
+
+    override fun activeStories(nowSeconds: Double): List<StoredStory> {
+        val out = mutableListOf<StoredStory>()
+        for ((id, m) in messages) {
+            if (m.kind != "story") continue
+            val expiresAt = (m.payload["expires_at"] as? Number)?.toDouble() ?: continue
+            if (expiresAt <= nowSeconds) continue          // strict: == now is expired, not active
+            val mediaKind = (m.payload["media_kind"] as? String) ?: continue
+            val media = (m.payload["media"] as? String) ?: continue
+            val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: 0.0
+            out.add(StoredStory(
+                msgId = id, author = m.cert.identity_pub, mediaKind = mediaKind, media = media,
+                poster = m.payload["poster"] as? String,
+                caption = (m.payload["caption"] as? String) ?: "", createdAt = createdAt))
+        }
+        return out.sortedByDescending { it.createdAt }
     }
 }
