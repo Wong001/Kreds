@@ -157,9 +157,37 @@ object KotlinSync {
         "device_name" to c.device_name, "enrolled_at" to c.enrolled_at,
         "signature" to c.signature)
 
+    /** `onProgress` (Task 6, B.2d): purely additive observability -- fired at
+     *  the phase boundaries already present below (connecting/handshake/
+     *  messages/blobs/decrypting) so a caller (the module) can surface live
+     *  sync status while the ~1-2 min sync runs. Defaults to a no-op so
+     *  every pre-existing caller/test (KotlinSyncTest, SyncLoopbackTest's
+     *  earlier tests) compiles and behaves identically without passing it.
+     *  Never affects control flow -- the phases/order/data below are
+     *  unchanged; this only observes them. The trailing "done" phase is
+     *  emitted by the MODULE after DecryptPass, not here (this object has
+     *  no knowledge of DecryptPass).
+     *
+     *  Every call site below goes through the local `progress` wrapper, NOT
+     *  `onProgress` directly (code review fix): this whole function body
+     *  runs inside a `try` whose `catch (e: Exception)` turns ANY thrown
+     *  exception into `SyncResult.Failed("io", ...)` -- in production,
+     *  `onProgress` is the module's `{ phase, count -> sendEvent(...) }`
+     *  (TorManagerModule.syncNow), and `sendEvent` reaching across a
+     *  possible lifecycle/teardown race on a 1-2 min background sync is
+     *  exactly the kind of thing that can throw for reasons that have
+     *  nothing to do with whether the sync itself succeeded. A side
+     *  channel (observability) must never be able to flip the main
+     *  channel's (sync correctness) result -- `progress` swallows so an
+     *  `onProgress` failure can never surface as a false sync failure. */
     fun run(stream: Stream, store: SyncStore, ownDevicePub: String,
-            outbound: List<Map<String, Any?>> = emptyList()): SyncResult {
+            outbound: List<Map<String, Any?>> = emptyList(),
+            onProgress: (phase: String, count: Int) -> Unit = { _, _ -> }): SyncResult {
+        fun progress(phase: String, count: Int) {
+            try { onProgress(phase, count) } catch (_: Throwable) {}
+        }
         try {
+            progress("connecting", 0)
             // -- REVOCATIONS -- (initiator writes then reads)
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             val revs = readFrame(stream)
@@ -181,6 +209,7 @@ object KotlinSync {
             val have = readFrame(stream)
             val known = have.optJSONArray("known") ?: JSONArray()
             for (i in 0 until known.length()) store.addIdentity(known.getString(i))
+            progress("handshake", 0)
 
             // -- MESSAGES -- (push outbound -- for B.2, at most the phone's
             // device-signed enckey, see composeEncKey -- and ingest node's)
@@ -190,6 +219,7 @@ object KotlinSync {
             for (i in 0 until msgArr.length()) {
                 val m = SignedMessageKt.fromDict(toMap(msgArr.getJSONObject(i)))
                 store.ingestMessage(m)   // verifies + dedups internally
+                progress("messages", i + 1)
             }
 
             // -- BLOBS -- (want swap, then blobs swap)
@@ -198,6 +228,7 @@ object KotlinSync {
             writeFrame(stream, mapOf("t" to "blobs", "blobs" to emptyMap<String, Any>()))
             val blobs = readFrame(stream)
             val given = blobs.optJSONObject("blobs") ?: JSONObject()
+            var storedBlobs = 0
             for (h in given.keys()) {
                 val data = Base64Portable.decode(given.getString(h))
                 // Size bound mirrors hearth/sync.py:661 (len(data) <=
@@ -205,9 +236,14 @@ object KotlinSync {
                 // hash-verifies; an oversized blob (bounded only by
                 // MAX_FRAME, ~16 MiB > MAX_BLOB_BYTES's 10 MiB) from a
                 // hostile/buggy node must be rejected before it's stored.
-                if (data.size <= MAX_BLOB_BYTES) store.putBlob(h, data)   // store.putBlob does the hash check
+                if (data.size <= MAX_BLOB_BYTES) {
+                    store.putBlob(h, data)   // store.putBlob does the hash check
+                    storedBlobs++
+                    progress("blobs", storedBlobs)
+                }
             }
 
+            progress("decrypting", 0)
             val st = store.stats()
             return SyncResult.Ok(st.messages, st.blobs, st.identities)
         } catch (e: Exception) {

@@ -1,5 +1,6 @@
 package expo.modules.tormanager
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -93,5 +94,18 @@ class SyncStoreTest {
         // now h is still missing (we stored a different blob), sha(data) present
         assertEquals(listOf(h), s.missingBlobs())
         assertEquals(1, s.stats().blobs)
+    }
+
+    @Test fun getBlobRoundTripsAndMissingHashReturnsNull() {
+        val s = InMemorySyncStore()
+        val hash = "aa".repeat(32)
+        val data = byteArrayOf(9, 8, 7, 6)
+        // putBlob's own hash gate means the hash must actually match --
+        // reuse the real sha() helper rather than an arbitrary hash, same
+        // as missingBlobsFromPayload above.
+        val realHash = sha(data)
+        assertTrue(s.putBlob(realHash, data))
+        assertArrayEquals(data, s.getBlob(realHash))
+        assertEquals("a hash never stored returns null, not throw", null, s.getBlob(hash))
     }
 }

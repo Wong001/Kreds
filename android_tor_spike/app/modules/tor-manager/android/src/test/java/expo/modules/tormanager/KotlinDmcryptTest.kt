@@ -20,6 +20,10 @@ class KotlinDmcryptTest {
         val cs = cases()
         for (i in 0 until cs.length()) {
             val c = cs.getJSONObject(i)
+            // The shared fixture also carries "blob" cases (KotlinBlobCryptTest,
+            // B.2d Task 1) which have no wrap/body_nonce/body_ct -- this test
+            // covers only the post/dm wrap+body path.
+            if (c.getString("kind") != "post" && c.getString("kind") != "dm") continue
             val aad = if (c.getString("kind") == "post")
                 KotlinDmcrypt.postAad(c.getString("author"), c.getString("scope"), c.getDouble("created_at"))
             else

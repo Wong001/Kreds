@@ -20,6 +20,12 @@ interface SyncStore {
     fun ingestMessage(m: SignedMessage): Boolean
     fun missingBlobs(): List<String>
     fun putBlob(hash: String, data: ByteArray): Boolean
+    /** Read counterpart to putBlob (Task 4, B.2d): the stored blob's raw
+     *  (still content-key-encrypted -- see KotlinBlobCrypt) bytes for
+     *  `hash`, or null if no blob with that hash has ever been stored.
+     *  Never throws for a missing hash -- callers (feed photo loading) must
+     *  be able to treat "not synced yet" as an ordinary, expected state. */
+    fun getBlob(hash: String): ByteArray?
     fun stats(): SyncStats
     /** This device's own X25519 enc keypair (encPrivHex, encPubHex), or null
      *  if none has been generated yet. See EncKeys.getOrCreate. */
@@ -173,6 +179,8 @@ class InMemorySyncStore : SyncStore {
         blobs[hash] = data
         return true
     }
+
+    override fun getBlob(hash: String): ByteArray? = blobs[hash]
 
     override fun stats(): SyncStats = SyncStats(messages.size, blobs.size, identities.size)
 

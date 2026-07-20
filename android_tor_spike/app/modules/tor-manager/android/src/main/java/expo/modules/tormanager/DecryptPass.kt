@@ -1,5 +1,7 @@
 package expo.modules.tormanager
 
+import org.json.JSONArray
+
 /** Task 5 (B.2), entitlement rule generalized in B.2c (Task 2): a decrypt
  *  pass over every stored POST/DM message this device is ENTITLED to, via
  *  either the message's own inline wrap (`payload.wraps[phoneDevicePub]`)
@@ -27,9 +29,29 @@ package expo.modules.tormanager
  *  here). */
 object DecryptPass {
     data class Decrypted(
-        val msgId: String, val kind: String, val author: String, val text: String, val createdAt: Double)
+        val msgId: String, val kind: String, val author: String, val text: String, val createdAt: Double,
+        // Task 4 (B.2d): blob/thumb HASH REFERENCES only, never the blob
+        // bytes themselves -- those are fetched separately (SyncStore.
+        // getBlob) and decrypted with the per-message content key surfaced
+        // in Result.keys below. thumbs is List<String?> (not List<String>)
+        // because hearth legitimately records a null entry for a photo
+        // whose thumbnail generation failed (node.py's `thumbs.append(
+        // None)`) -- position in the list still lines up with `blobs`.
+        val blobs: List<String>, val thumbs: List<String?>)
 
-    fun run(store: SyncStore, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String): List<Decrypted> {
+    /** run()'s result (Task 4, B.2d): the decrypted feed, newest-first
+     *  (unchanged from the pre-Task-4 shape), alongside the per-message
+     *  content KEY recovered while decrypting -- needed downstream to
+     *  decrypt any blob a message references (KotlinBlobCrypt.decryptBlob
+     *  takes the same content key `unwrapKey` already recovers here, not a
+     *  fresh one). `keys` maps msgId -> contentKey ONLY for messages that
+     *  actually carry blobs (`decrypted.blobs` non-empty) -- a blob-less
+     *  message's key would never be used for anything, so it is
+     *  deliberately omitted rather than surfacing key material nobody asked
+     *  for. `keys` is a plain lookup table, not feed-ordered. */
+    data class Result(val feed: List<Decrypted>, val keys: Map<String, ByteArray>)
+
+    fun run(store: SyncStore, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String): Result {
         // Read once per run(), not once per message: profileNames() does a
         // full scan over stored profile messages, same shape as
         // allMessages() itself -- looking it up per-decrypted-message would
@@ -37,15 +59,19 @@ object DecryptPass {
         // name map doesn't change mid-run.
         val profileNames = store.profileNames()
         val out = mutableListOf<Decrypted>()
+        val keys = mutableMapOf<String, ByteArray>()
         for (m in store.allMessages()) {
             if (m.kind != "post" && m.kind != "dm") continue
-            decryptOne(store, m, phoneDevicePub, encPrivHex, ownIdentityPub, profileNames)?.let { out.add(it) }
+            val (decrypted, key) =
+                decryptOne(store, m, phoneDevicePub, encPrivHex, ownIdentityPub, profileNames) ?: continue
+            out.add(decrypted)
+            if (decrypted.blobs.isNotEmpty()) keys[decrypted.msgId] = key
         }
         // Newest-first: the sensible feed order (most recent content on
         // top). sortedByDescending is a stable sort, so messages sharing a
         // createdAt keep allMessages()' relative order rather than an
         // arbitrary shuffle.
-        return out.sortedByDescending { it.createdAt }
+        return Result(out.sortedByDescending { it.createdAt }, keys)
     }
 
     /** Author display-name resolution (B.2c Task 3): `profileNames`'s
@@ -60,10 +86,48 @@ object DecryptPass {
         return if (identityPub == ownIdentityPub) "me" else "friend-" + identityPub.take(8)
     }
 
+    /** Junk-guarded blob-hash-list read: `v` must be either a plain Kotlin
+     *  List (the shape every OUTER payload value already has -- both store
+     *  impls hand back real Kotlin List/Map, see SqliteSyncStore's
+     *  jsonToMap/unwrapJson) OR a raw org.json JSONArray (the shape a
+     *  DECRYPTED BODY value has -- KotlinDmcrypt.decryptBody only
+     *  shallow-converts its top-level JSONObject into a Map, it does NOT
+     *  recursively unwrap nested JSONArray/JSONObject values the way the
+     *  stores' own payload readers do, and decryptBody is untouchable
+     *  consumed API here, not something this pass can fix at the source).
+     *  Only String elements survive (a wrong-type element is dropped, not
+     *  fatal) -- same "keep what's valid, skip what isn't" idiom as
+     *  SyncStore.missingBlobs' own blobs/thumbs reads. Anything else
+     *  (missing key, neither shape) -> empty, never a crash. */
+    private fun stringList(v: Any?): List<String> = when (v) {
+        is List<*> -> v.filterIsInstance<String>()
+        is JSONArray -> (0 until v.length()).mapNotNull { v.opt(it) as? String }
+        else -> emptyList()
+    }
+
+    /** Same as stringList but position-preserving and per-element
+     *  null-tolerant: a thumbs list legitimately carries a null entry for a
+     *  photo whose thumbnail generation failed (hearth node.py's
+     *  `thumbs.append(None)`), and dropping that entry would desync the
+     *  list's alignment with `blobs` by index. A junk (non-null, non-
+     *  String) element becomes null too -- same fail-closed spirit as
+     *  stringList, just position-preserving. Handles both the List shape
+     *  (outer payload) and the raw JSONArray shape (decrypted body) --
+     *  see stringList's doc for why both are needed. */
+    private fun nullableStringList(v: Any?): List<String?> = when (v) {
+        is List<*> -> v.map { it as? String }
+        is JSONArray -> (0 until v.length()).map { i -> if (v.isNull(i)) null else v.opt(i) as? String }
+        else -> emptyList()
+    }
+
+    /** Decrypts one stored post/dm message, returning its Decrypted view
+     *  alongside the CONTENT KEY recovered along the way (Task 4, B.2d) --
+     *  run() surfaces that key in Result.keys for blob-carrying messages
+     *  only; see Result's own doc for why. */
     private fun decryptOne(
         store: SyncStore, m: StoredMsg, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String,
         profileNames: Map<String, String>,
-    ): Decrypted? {
+    ): Pair<Decrypted, ByteArray>? {
         val p = m.payload
         val createdAt = (p["created_at"] as? Number)?.toDouble() ?: return null
         val aad = when (m.kind) {
@@ -84,7 +148,24 @@ object DecryptPass {
         val body = KotlinDmcrypt.decryptBody(key, bodyNonce, bodyCt, aad) ?: return null
         val text = body["text"] as? String ?: return null
         val author = resolveAuthor(profileNames, m.identityPub, ownIdentityPub)
-        return Decrypted(m.msgId, m.kind, author, text, createdAt)
+        // blobs/thumbs (Task 4, B.2d): read from the DECRYPTED BODY --
+        // the content the key actually protects, not the outer plaintext
+        // payload -- falling back to the outer payload only when the body
+        // doesn't carry the field at all. Verified against hearth's own
+        // reference decrypt (node.py's _decrypt_post_row/dm_thread) and
+        // compose (node.py compose_post/compose_dm): the encrypted body is
+        // always built as `{"text": text, "blobs": refs}` -- "blobs" IS in
+        // the body in practice, so the body branch is the one actually
+        // taken -- but "thumbs" is NEVER put in the body by hearth; it
+        // rides in the outer SIGNED payload only (make_post's `thumbs`
+        // param, alongside poster/codec -- same "plaintext envelope
+        // metadata" disclosure class as make_dm's story_ref), and DMs never
+        // carry thumbs at all (make_dm has no thumbs parameter). So thumbs
+        // always falls through to the outer payload here -- confirmed
+        // present-day hearth behavior, not merely a defensive hedge.
+        val blobs = if (body.containsKey("blobs")) stringList(body["blobs"]) else stringList(p["blobs"])
+        val thumbs = if (body.containsKey("thumbs")) nullableStringList(body["thumbs"]) else nullableStringList(p["thumbs"])
+        return Decrypted(m.msgId, m.kind, author, text, createdAt, blobs, thumbs) to key
     }
 
     /** Content-key source, in priority order: (1) the message's own inline

@@ -78,6 +78,15 @@ import java.nio.file.Files
  *      verified INLINE-wrapped, not via any grant), the original B.2
  *      own-content regression, and author-name resolution to the friend
  *      node's published profile name ("Freja").
+ *   5. syncEmitsProgressPhasesInOrder (Task 6, B.2d) -- proves
+ *      KotlinSync.run's new `onProgress` callback (purely additive
+ *      observability, default no-op, and exception-isolated from the sync
+ *      result via a local swallowing wrapper) fires all five of its own
+ *      phases -- connecting/handshake/messages/blobs/decrypting -- in
+ *      order against this same real node, with non-decreasing per-message
+ *      counts. Every other test above passes no onProgress argument at
+ *      all -- that they still pass is the proof the default no-op leaves
+ *      existing callers unaffected.
  */
 class SyncLoopbackTest {
 
@@ -226,6 +235,88 @@ class SyncLoopbackTest {
         }
     }
 
+    /** Task 6 (B.2d): proves KotlinSync.run's new `onProgress` callback
+     *  fires at the expected phase boundaries, in order, against a REAL
+     *  loopback node (not a mock) -- the same node/seed
+     *  syncsRealOwnIdentityContent uses (3 seeded posts, one with a photo,
+     *  so both the messages and blobs phases are non-trivially exercised).
+     *  Asserted, per the task brief plus the review follow-up that added
+     *  "decrypting": (a) all five of run()'s own phases --  "connecting",
+     *  "handshake", "messages", "blobs", "decrypting" -- fire, in that
+     *  relative order (each phase's LAST event strictly before the next
+     *  phase's FIRST event, so the phases don't interleave and "decrypting"
+     *  is confirmed to be the final one, immediately preceding the Ok
+     *  return); (b) the "messages" phase's counts are non-decreasing across
+     *  the run (KotlinSync.kt's ingest loop passes `i + 1`, so this is
+     *  really strictly increasing, but non-decreasing is the contract the
+     *  brief asks for and is robust to a future implementation that reports
+     *  the same count twice). "done" is emitted by the MODULE (after
+     *  DecryptPass), not by run() itself, so it is correctly out of scope
+     *  here -- see TorManagerModuleTest-level coverage instead (there is
+     *  none dedicated; syncNow's "done" emit is reviewed by inspection,
+     *  wrapped in its own swallowed try/catch so it can never flip the
+     *  terminal nodeSync outcome). This test passes its own onProgress
+     *  collector -- every OTHER test in this file calls KotlinSync.run with
+     *  no onProgress argument at all, which is exactly how the default-
+     *  no-op parameter is proven not to change their behavior (they're
+     *  unmodified and still pass). */
+    @Test fun syncEmitsProgressPhasesInOrder() {
+        val node = startNode()
+        try {
+            val fixture = KotlinHandshake.parseFixture(node.fixtureJson)
+            val stream = SocketStream("127.0.0.1", node.port)
+            KotlinHandshake.authOnlyOverStream(stream, fixture)
+
+            val store = InMemorySyncStore()
+            store.addIdentity(fixture.cert.identity_pub)
+
+            val events = mutableListOf<Pair<String, Int>>()
+            val res = KotlinSync.run(stream, store, fixture.device_pub,
+                onProgress = { phase, count -> events.add(phase to count) })
+            assertTrue("sync: $res", res is SyncResult.Ok)
+
+            // Sanity: this node/seed must actually exercise messages+blobs,
+            // or the ordering assertions below would pass vacuously.
+            val expect = node.expect
+            assertTrue("seed must include messages for this test to mean anything",
+                expect.getInt("messages") > 0)
+            assertTrue("seed must include blobs for this test to mean anything",
+                expect.getInt("blobs") > 0)
+
+            val phases = events.map { it.first }
+            val firstConnecting = phases.indexOf("connecting")
+            val firstHandshake = phases.indexOf("handshake")
+            val firstMessages = phases.indexOf("messages")
+            val lastMessages = phases.lastIndexOf("messages")
+            val firstBlobs = phases.indexOf("blobs")
+            val lastBlobs = phases.lastIndexOf("blobs")
+            val firstDecrypting = phases.indexOf("decrypting")
+            assertTrue("connecting phase must fire: $phases", firstConnecting >= 0)
+            assertTrue("handshake phase must fire: $phases", firstHandshake >= 0)
+            assertTrue("messages phase must fire: $phases", firstMessages >= 0)
+            assertTrue("blobs phase must fire: $phases", firstBlobs >= 0)
+            assertTrue("decrypting phase must fire: $phases", firstDecrypting >= 0)
+            assertTrue("connecting must precede handshake: $phases", firstConnecting < firstHandshake)
+            assertTrue("handshake must precede messages: $phases", firstHandshake < firstMessages)
+            assertTrue("messages must complete before blobs begins: $phases", lastMessages < firstBlobs)
+            // "decrypting" (KotlinSync.kt, fired just before returning
+            // SyncResult.Ok) must come after blobs completes -- i.e. it is
+            // the LAST of the five run()-emitted phases. ("done" is emitted
+            // by the MODULE, after DecryptPass, and is correctly out of
+            // scope for this KotlinSync-level test -- run() itself has no
+            // knowledge of DecryptPass.)
+            assertTrue("blobs must complete before decrypting begins: $phases", lastBlobs < firstDecrypting)
+
+            val messageCounts = events.filter { it.first == "messages" }.map { it.second }
+            for (i in 1 until messageCounts.size) {
+                assertTrue("messages counts must be non-decreasing: $messageCounts",
+                    messageCounts[i] >= messageCounts[i - 1])
+            }
+        } finally {
+            node.kill()
+        }
+    }
+
     @Test fun phoneDecryptsRealBackfilledContent() {
         val node = startNode()
         try {
@@ -282,7 +373,7 @@ class SyncLoopbackTest {
             val res2 = KotlinSync.run(stream2, store, phoneDevicePub)
             assertTrue("sync 2 (pull grants): $res2", res2 is SyncResult.Ok)
 
-            val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv, fixture.cert.identity_pub)
+            val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv, fixture.cert.identity_pub).feed
             val expectedTexts = setOf("hello from desk", "second post, still text", "with pic")
             assertEquals("decrypted text must match the seeded post bodies exactly",
                 expectedTexts, decrypted.map { it.text }.toSet())
@@ -345,7 +436,7 @@ class SyncLoopbackTest {
             val res2 = KotlinSync.run(stream2, store, phoneDevicePub)
             assertTrue("sync 2 (pull friend content): $res2", res2 is SyncResult.Ok)
 
-            val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv, ownIdentityPub)
+            val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv, ownIdentityPub).feed
             val texts = decrypted.map { it.text }.toSet()
 
             // Own-content regression: the original B.2 desk posts must
