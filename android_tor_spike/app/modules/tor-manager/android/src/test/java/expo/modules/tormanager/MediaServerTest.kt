@@ -54,6 +54,40 @@ class MediaServerTest {
         assertEquals(404, c.responseCode)
     }
 
+    @Test fun rangeEndPastEofClampsTo206WithLastBytes() {
+        // RFC 7233: an end past EOF is clamped to the last byte, not rejected -- a
+        // 416 here would break player seek/tail playback near the end of the file.
+        val s = server()
+        val c = get(s.urlFor("m1", "h1"), range = "bytes=4990-6000")
+        assertEquals(206, c.responseCode)
+        assertEquals("bytes 4990-4999/5000", c.getHeaderField("Content-Range"))
+        val got = c.inputStream.readBytes()
+        assertArrayEquals(payload.copyOfRange(4990, 5000), got)
+    }
+
+    @Test fun rangeStartAtOrPastEofIs416() {
+        val s = server()
+        val c = get(s.urlFor("m1", "h1"), range = "bytes=6000-7000")
+        assertEquals(416, c.responseCode)
+    }
+
+    @Test fun suffixRangeIs206WithLastNBytes() {
+        val s = server()
+        val c = get(s.urlFor("m1", "h1"), range = "bytes=-100")
+        assertEquals(206, c.responseCode)
+        assertEquals("bytes 4900-4999/5000", c.getHeaderField("Content-Range"))
+        val got = c.inputStream.readBytes()
+        assertArrayEquals(payload.copyOfRange(4900, 5000), got)
+    }
+
+    @Test fun garbageRangeIsIgnoredServesFullBody200() {
+        val s = server()
+        val c = get(s.urlFor("m1", "h1"), range = "bytes=abc")
+        assertEquals(200, c.responseCode)
+        val got = c.inputStream.readBytes()
+        assertArrayEquals(payload, got)
+    }
+
     @Test fun bindsLoopbackOnly() {
         val s = server()
         // The server must NOT be reachable on a non-loopback local address.

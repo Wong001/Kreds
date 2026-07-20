@@ -46,10 +46,18 @@ class MediaServer(private val resolve: (msgId: String, hash: String) -> ByteArra
     }
 
     private fun handle(sock: Socket) {
+        // DoS hardening: a local client that connects and never finishes sending a
+        // request (or streams headers forever) must not hang this thread forever.
+        // A SocketTimeoutException here is uncaught by design -- it propagates to
+        // the accept loop's `runCatching { handle(sock) }`, which swallows it, and
+        // the paired `runCatching { sock.close() }` still runs right after.
+        sock.soTimeout = 5000
         val reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.ISO_8859_1))
         val requestLine = reader.readLine() ?: return
         var range: String? = null
-        while (true) {                       // consume headers
+        var headerLines = 0
+        while (true) {                       // consume headers (capped -- an endless header stream can't hang this thread)
+            if (++headerLines > 50) break
             val line = reader.readLine() ?: break
             if (line.isEmpty()) break
             if (line.startsWith("Range:", true)) range = line.substringAfter(":").trim()
@@ -72,11 +80,19 @@ class MediaServer(private val resolve: (msgId: String, hash: String) -> ByteArra
             val spec = range.removePrefix("bytes=").split("-")
             val a = spec.getOrNull(0)?.toIntOrNull()
             val b = spec.getOrNull(1)?.toIntOrNull()
-            if (a != null) { start = a; end = b ?: (total - 1) }
-            else if (b != null) { start = maxOf(0, total - b); end = total - 1 }   // suffix range
-            if (start < 0 || start >= total || end >= total || start > end)
-                return respond(out, 416, "range not satisfiable")
-            code = 206; status = "Partial Content"
+            var parsed = false
+            if (a != null) { start = a; end = b ?: (total - 1); parsed = true }
+            else if (b != null) { start = maxOf(0, total - b); end = total - 1; parsed = true }   // suffix range
+            // else: unparseable range ("bytes=abc", "bytes=") -- ignore it and fall
+            // through to a plain 200 full-body response rather than a bogus 206.
+            if (parsed) {
+                if (start < 0 || start >= total || start > end)
+                    return respond(out, 416, "range not satisfiable")
+                // RFC 7233: an end past EOF is clamped to the last byte, not rejected --
+                // some players request ranges past EOF near the tail during seek/playback.
+                if (end >= total) end = total - 1
+                code = 206; status = "Partial Content"
+            }
         }
         val len = end - start + 1
         val sb = StringBuilder()
