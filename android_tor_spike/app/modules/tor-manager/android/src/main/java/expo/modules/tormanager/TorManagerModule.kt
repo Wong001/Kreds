@@ -62,6 +62,20 @@ class TorManagerModule : Module() {
     // the reference is replaced.
     @Volatile private var blobKeys: Map<String, ByteArray> = emptyMap()
 
+    // Task 3 (B.2d-4): a post's msgId -> its aggregated engagement view
+    // (DecryptPass.responsesPass -- reactions tally + resolved comment
+    // list), read by getFeed to attach a `responses` field to each feed
+    // item. SAME lifetime/refresh point as feedCache/blobKeys, deliberately
+    // -- populated in syncNow's SAME success branch, from a decrypt pass
+    // over the SAME just-refreshed store, so a getFeed call always sees a
+    // responsesByPost consistent with the feedCache it's serving alongside
+    // (never a stale responses map paired with a freshly-synced feed, or
+    // vice versa). @Volatile for the same cross-thread-visibility reason as
+    // feedCache/blobKeys (written on ioScope, read from getFeed's queue).
+    // In-memory only, never persisted -- decrypt-on-read, same reasoning as
+    // blobKeys' own doc.
+    @Volatile private var responsesByPost: Map<String, KotlinResponses.Responses> = emptyMap()
+
     // Task 3 (B.2d-2): the loopback media server getVideoUrl streams decrypted
     // video bytes through. Lazily constructed by ensureMediaServer() below --
     // NOT in OnCreate -- so a phone that never opens a video post never spins
@@ -392,8 +406,18 @@ class TorManagerModule : Module() {
                     val store = SqliteSyncStore(ctx)
                     val (priv, _) = EncKeys.getOrCreate(store)
                     val res = DecryptPass.run(store, fx.device_pub, priv, fx.cert.identity_pub)
+                    // Task 3 (B.2d-4): computed BEFORE any of the three
+                    // caches are mutated, same reasoning as capturing `res`
+                    // above -- if responsesPass throws (same SQLite-I/O risk
+                    // as DecryptPass.run), feedCache/blobKeys/responsesByPost
+                    // must ALL stay at their prior, mutually consistent
+                    // values (the outer catch below then reports this sync
+                    // as failed) rather than feedCache/blobKeys advancing to
+                    // the new sync while responsesByPost is left stale.
+                    val responses = DecryptPass.responsesPass(store, fx.device_pub, priv, fx.cert.identity_pub)
                     feedCache = res.feed
                     blobKeys = res.keys
+                    responsesByPost = responses
                     // Task 6 (B.2d): the trailing "done" phase -- emitted here
                     // (not inside KotlinSync.run, which returned before
                     // DecryptPass even started) once the feed cache this sync
@@ -469,6 +493,28 @@ class TorManagerModule : Module() {
                     // as any other story media. null for an ordinary DM or
                     // any post.
                     "storyRefMediaHash" to d.storyRefMediaHash,
+                    // responses (B.2d-4 Task 3): this post's aggregated
+                    // engagement view (DecryptPass.responsesPass, via the
+                    // responsesByPost cache -- same lifetime as feedCache,
+                    // see its own doc comment), or null when this msgId has
+                    // no valid KIND_RESPONSES record (no engagement yet, or
+                    // nothing decryptable/attributable-for-this-target --
+                    // responsesPass is fail-closed, so "null" covers every
+                    // one of those cases identically). `comments` rebuilt
+                    // into plain marshalable maps -- KotlinResponses.Comment
+                    // is a Kotlin data class, not directly bridge-safe, same
+                    // reasoning as this whole mapOf() rebuild.
+                    "responses" to responsesByPost[d.msgId]?.let { r ->
+                        mapOf(
+                            "reactions" to r.reactions,
+                            "comments" to r.comments.map { c ->
+                                mapOf(
+                                    "body" to c.body, "display" to c.display,
+                                    "color" to c.aliasColor, "createdAt" to c.createdAt,
+                                )
+                            },
+                        )
+                    },
                 )
             }
         }
