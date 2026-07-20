@@ -100,9 +100,15 @@ export function getSyncStats(): Promise<SyncStats> { return native.getSyncStats(
 // `thumbs` is (string | null)[], position-aligned with `blobs`: hearth
 // legitimately records a null entry for a photo whose thumbnail generation
 // failed (see DecryptPass.Decrypted's doc).
+// `media`/`poster` (B.2d-2 Task 1): plaintext OUTER-PAYLOAD envelope fields
+// -- "photo" (default) or "video" -- mirroring DecryptPass.Decrypted.media/
+// poster (see its Kotlin doc comment). `poster` is a hex64 blob-hash
+// reference to the video's AVIF still (resolved the same way as any other
+// blob/thumb hash, via getBlobImage), or null for a photo post.
 export interface FeedItem {
   msgId: string; kind: string; author: string; text: string; createdAt: number;
   blobs: string[]; thumbs: (string | null)[];
+  media: string; poster: string | null;
 }
 
 export function getFeed(): Promise<FeedItem[]> { return native.getFeed(); }

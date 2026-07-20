@@ -328,6 +328,11 @@ class TorManagerModule : Module() {
                     "msgId" to d.msgId, "kind" to d.kind, "author" to d.author,
                     "text" to d.text, "createdAt" to d.createdAt,
                     "blobs" to d.blobs, "thumbs" to d.thumbs,
+                    // media/poster (B.2d-2 Task 1): plaintext outer-payload
+                    // envelope fields (DecryptPass.Decrypted.media's doc) --
+                    // "photo"/"video" plus the video's poster blob-hash ref
+                    // (null for a photo post).
+                    "media" to d.media, "poster" to d.poster,
                 )
             }
         }
