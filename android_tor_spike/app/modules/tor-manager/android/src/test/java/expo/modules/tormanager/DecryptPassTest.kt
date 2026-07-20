@@ -604,14 +604,24 @@ class DecryptPassTest {
             expectedBlobs.isNotEmpty())
         val expectedThumbs = jsonNullableStringList(c.getJSONArray("thumbs"))
 
+        // Reviewer-caught (2026-07-20): a DECOY outer-payload "blobs" list,
+        // deliberately DIFFERENT from the body's real blobs -- a real
+        // message's outer payload mirrors the body's blobs exactly
+        // (validate_payload), so asserting against a mirrored value can't
+        // tell "read from body" apart from "fell through to payload". Using
+        // a differing decoy makes this test fail if the body/payload
+        // branch order for blobs is ever flipped.
+        val decoyPayloadBlobs = listOf("ff".repeat(32))
+        assertTrue("decoy precondition: must actually differ from the body's real blobs",
+            decoyPayloadBlobs != expectedBlobs)
+
         val store = InMemorySyncStore()
         store.addIdentity(c.getString("author"))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
-        // Outer payload mirrors the body's blobs (as validate_payload does
-        // for a real message) and additionally carries "thumbs" -- the
-        // ONLY place hearth ever puts them.
+        // Outer payload carries the DECOY blobs (never the real ones) plus
+        // "thumbs" -- the ONLY place hearth ever puts them.
         val payload = postPayload(c, wraps).toMutableMap().apply {
-            put("blobs", expectedBlobs)
+            put("blobs", decoyPayloadBlobs)
             put("thumbs", expectedThumbs)
         }
         val msg = signedMessage(c.getString("author"), 1, payload, "b6".repeat(32))
@@ -619,7 +629,8 @@ class DecryptPassTest {
 
         val result = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
         assertEquals(1, result.feed.size)
-        assertEquals("blobs must be read from the DECRYPTED BODY", expectedBlobs, result.feed[0].blobs)
+        assertEquals("blobs must be read from the DECRYPTED BODY, not the decoy outer payload",
+            expectedBlobs, result.feed[0].blobs)
         assertEquals(
             "thumbs must fall back to the outer payload (hearth never puts them in the body)",
             expectedThumbs, result.feed[0].thumbs)
