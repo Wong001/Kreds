@@ -10,18 +10,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import java.io.File
 
-/** Task 7 (B.2): bundles the outcome of the enc-key resolve/guard/compose
- *  step in `syncNow` (see the try/catch around it) into one value so that
- *  step can be a single expression a `try` can return -- matching the
- *  store-init block's shape just above it (`val store = try { ... } catch
- *  { stream.close(); emit(...); return@AsyncFunction Unit }`). */
-private data class EncKeyPrep(
-    val outbound: List<Map<String, Any?>>,
-    val encPriv: String,
-    val encPub: String,
-    val shouldPublish: Boolean,
-)
-
 class TorManagerModule : Module() {
     // recv/send/dial block on socket I/O; keep them OFF the single default
     // AsyncFunction HandlerThread (would deadlock the concurrent recv+send
@@ -174,18 +162,47 @@ class TorManagerModule : Module() {
         AsyncFunction("getHistory") {
             val ctx = appContext.reactContext ?: return@AsyncFunction emptyList<Map<String, Any?>>()
             HeartbeatStore.history(ctx).map {
-                mapOf("ts" to it.ts, "ok" to it.ok, "latencyMs" to it.latencyMs, "reason" to it.reason)
+                // Brick C Task 3: surface the pulled counts Task 2 added to the
+                // persisted Beat (messages/blobs/identities) -- defaulted to 0
+                // on the Kotlin side for pre-Brick-C entries, so every history
+                // item always carries them here regardless of when it was
+                // recorded. The live "nodeBeat" broadcast/event is UNCHANGED
+                // (ts/ok/latencyMs/reason only) -- these three fields exist
+                // ONLY on this getHistory() result, per index.ts's Beat type.
+                // `skipped` (Task 3 fix): the dedicated mutex-skip flag --
+                // App.tsx renders a skipped=true row neutral regardless of
+                // `reason`'s exact wording.
+                mapOf("ts" to it.ts, "ok" to it.ok, "latencyMs" to it.latencyMs, "reason" to it.reason,
+                    "messages" to it.messages, "blobs" to it.blobs, "identities" to it.identities,
+                    "skipped" to it.skipped)
             }
         }
 
         // -- Brick B.1: foreground-triggered content sync --
         // -- Brick B.2 (Task 7): + enc-key publish (guarded) + decrypt pass --
+        // -- Brick C  (Task 1): the TRANSPORT (dial/auth/pin/store/enc-key/
+        //    KotlinSync.run/mark-published) now lives in SyncRunner, run under
+        //    a process-wide mutex and callable JS-free by the background
+        //    service. syncNow keeps ONLY the foreground concerns: the fixture
+        //    read, the onProgress event bridge, and -- on a returned success --
+        //    the DecryptPass + feed/blob-key cache refresh + terminal
+        //    nodeSync/onSyncProgress emits. The single new behavior is the
+        //    "sync already in progress" skip (outcome.ran == false). --
         AsyncFunction("syncNow") {
-            fun emit(ok: Boolean, messages: Int, blobs: Int, identities: Int, reason: String?, feedUpdated: Boolean) {
+            // `skipped` (Task 3 fix): defaults false so every pre-existing
+            // call site (real successes/failures) is unaffected -- only the
+            // outcome.ran == false branch below passes skipped = true. This
+            // is the dedicated boolean the JS side checks; `reason`'s exact
+            // wording ("sync already in progress") is display text only, no
+            // longer load-bearing for the neutral-vs-red decision.
+            fun emit(
+                ok: Boolean, messages: Int, blobs: Int, identities: Int, reason: String?,
+                feedUpdated: Boolean, skipped: Boolean = false,
+            ) {
                 sendEvent("nodeSync", mapOf(
                     "ok" to ok, "messages" to messages, "blobs" to blobs,
                     "identities" to identities, "reason" to reason,
-                    "feedUpdated" to feedUpdated))
+                    "feedUpdated" to feedUpdated, "skipped" to skipped))
             }
             val ctx = appContext.reactContext
             if (ctx == null) { emit(false, 0, 0, 0, "no context", false); return@AsyncFunction Unit }
@@ -193,146 +210,98 @@ class TorManagerModule : Module() {
                 emit(false, 0, 0, 0, "tor not up - start the node first", false)
                 return@AsyncFunction Unit
             }
-            try {
-                val fx = KotlinHandshake.parseFixture(
+            // Fixture read stays foreground (SyncRunner takes an already-parsed
+            // Fixture). A read/parse failure emits the same "io:" nodeSync the
+            // pre-refactor single outer try/catch did.
+            val fx = try {
+                KotlinHandshake.parseFixture(
                     File(TorEngine.externalDir(), "spike_phone_fixture.json").readText())
-                val (host, port) = KotlinHandshake.splitAddr(fx.onion_addr)
-                val stream = TorStream(TorEngine.dial(host, port))
-
-                // AUTH ONLY -- do NOT use KotlinHandshake.run/runOverStream here: their
-                // acceptance probe IS the sync REVOCATIONS swap, and chaining straight
-                // into KotlinSync.run (whose own first phase also sends "revocations")
-                // would send that frame twice and desync the session -- proved on the
-                // BB-5 desk gate. authOnlyOverStream does HELLO+AUTH only, leaves the
-                // stream open, and throws (rather than returning a verdict) on failure --
-                // accept/refuse is surfaced by KotlinSync.run's own revocations phase.
-                val peerCert = try {
-                    KotlinHandshake.authOnlyOverStream(stream, fx)
-                } catch (e: Exception) {
-                    stream.close()
-                    emit(false, 0, 0, 0, "auth: ${e.message}", false)
-                    return@AsyncFunction Unit
-                }
-
-                // authOnlyOverStream verifies the peer cert is validly signed but does
-                // NOT pin it to our home identity (only runOverStream's accepted branch
-                // does that). Pin here so a wrong onion address can never sync us into
-                // a stranger's node.
-                if (peerCert.identity_pub != fx.cert.identity_pub) {
-                    stream.close()
-                    emit(false, 0, 0, 0, "auth: node identity is not our home identity", false)
-                    return@AsyncFunction Unit
-                }
-
-                // SqliteSyncStore construction / addIdentity are SQLite I/O and can throw
-                // (e.g. DB locked). authOnlyOverStream succeeding leaves the stream open
-                // by contract -- only KotlinSync.run's finally closes it -- so a failure
-                // here, before KotlinSync.run ever runs, must close the stream itself or
-                // the Tor connection leaks for the process lifetime.
-                val store = try {
-                    SqliteSyncStore(ctx).also { it.addIdentity(fx.cert.identity_pub) }
-                } catch (e: Exception) {
-                    stream.close()
-                    emit(false, 0, 0, 0, "store: ${e.message}", false)
-                    return@AsyncFunction Unit
-                }
-                // (own identity is seeded above, inside the try, so ingest's is_known
-                // gate admits its own-identity messages; the HAVE phase adds the node's
-                // known identities.)
-
-                // Task 7 (B.2): this device's own enc keypair (generated once,
-                // persisted -- EncKeys.getOrCreate), the already-published
-                // guard (EncKeyPublishGuard) deciding whether THIS sync's
-                // outbound push needs a freshly-composed, freshly-seq'd
-                // `enckey` message, and building that message when it does.
-                // EncKeys.getOrCreate / store.getPublishedEncPub / store.nextSeq
-                // are all SQLite I/O and CAN throw (e.g. DB locked -- plausible
-                // under overlapping syncNow calls racing on the same DB file).
-                // authOnlyOverStream succeeding leaves the stream open by
-                // contract -- only KotlinSync.run's finally closes it -- so a
-                // failure here, before KotlinSync.run ever runs, must close the
-                // stream itself or the Tor connection leaks for the process
-                // lifetime -- same reasoning, same shape, as the store-init
-                // try/catch immediately above.
-                val prep = try {
-                    val (priv, pub) = EncKeys.getOrCreate(store)
-                    val publish = EncKeyPublishGuard.shouldPublish(pub, store.getPublishedEncPub())
-                    val outbound = if (publish) {
-                        listOf(KotlinSync.composeEncKey(
-                            fx, pub, store.nextSeq(), System.currentTimeMillis() / 1000.0))
-                    } else emptyList()
-                    EncKeyPrep(outbound, priv, pub, publish)
-                } catch (e: Exception) {
-                    stream.close()
-                    emit(false, 0, 0, 0, "enckey: ${e.message}", false)
-                    return@AsyncFunction Unit
-                }
-
-                // Task 6 (B.2d): purely additive observability -- the sync
-                // takes 1-2 min on-device with no visible activity today.
-                // Forwards KotlinSync.run's phase-boundary callbacks
-                // (connecting/handshake/messages/blobs/decrypting) straight
-                // through as "onSyncProgress" events; does not affect what
-                // syncNow does, only what it reports while doing it.
-                val onProgress = { phase: String, count: Int ->
-                    sendEvent("onSyncProgress", mapOf("phase" to phase, "count" to count))
-                }
-                when (val r = KotlinSync.run(stream, store, fx.device_pub, prep.outbound, onProgress)) {
-                    is SyncResult.Ok -> {
-                        // Mark published ONLY once the sync that carried the
-                        // push has FULLY succeeded -- see EncKeyPublishGuard's
-                        // doc. A sync that throws/fails below this point never
-                        // reaches here, so the marker stays stale/absent and
-                        // the very next syncNow call retries the push.
-                        if (prep.shouldPublish) store.setPublishedEncPub(prep.encPub)
-                        // Decrypt pass + feed/key cache refresh: only a completed
-                        // sync can change what's decryptable (new messages/
-                        // wrap_grants may have just been pulled), so this is
-                        // the one place the caches are recomputed -- see
-                        // feedCache's and blobKeys' own doc comments for why
-                        // getFeed()/getBlobImage() just serve these caches
-                        // instead of re-running. Captured once into `res` so
-                        // feedCache and blobKeys are always set from the SAME
-                        // decrypt pass (see blobKeys' doc for why that matters).
-                        val res = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub)
-                        feedCache = res.feed
-                        blobKeys = res.keys
-                        // Task 6 (B.2d): the trailing "done" phase -- emitted
-                        // here (not inside KotlinSync.run, which returned
-                        // before DecryptPass even started) once the feed
-                        // cache this sync just refreshed is actually ready
-                        // for getFeed() to serve. Count is the decrypted feed
-                        // size (res.feed.size), matching what just became
-                        // visible to the UI, not the raw wire message count
-                        // (r.messages) some of which may not be decryptable.
-                        //
-                        // Own try/catch, swallowed (code review fix): this
-                        // sendEvent runs AFTER feedCache/blobKeys are already
-                        // mutated to their successful state, inside syncNow's
-                        // OUTER try -- if it threw uncaught, the outer catch
-                        // below would emit nodeSync ok=false and the real
-                        // emit(true, ...) two lines down would never run,
-                        // reporting a sync that fully succeeded (feed already
-                        // updated) as failed. A side-channel (observability)
-                        // send must never be able to flip the terminal
-                        // nodeSync outcome -- same reasoning as KotlinSync's
-                        // own `progress` swallow wrapper.
-                        try {
-                            sendEvent("onSyncProgress", mapOf("phase" to "done", "count" to res.feed.size))
-                        } catch (_: Throwable) {}
-                        // r.identities (SyncResult.Ok, from KotlinSync.run --
-                        // UNTOUCHABLE) is the raw identities-table count,
-                        // which includes the phone's own identity (seeded
-                        // just above, before KotlinSync.run) -- see
-                        // friendsCount's doc for why that's the wrong number
-                        // to label "friends" downstream.
-                        emit(true, r.messages, r.blobs, friendsCount(store), null, true)
-                    }
-                    is SyncResult.SelfRevoked -> emit(false, 0, 0, 0, "self-revoked", false)
-                    is SyncResult.Failed -> emit(false, 0, 0, 0, "${r.stage}: ${r.reason}", false)
-                }
             } catch (e: Exception) {
                 emit(false, 0, 0, 0, "io: ${e.message}", false)
+                return@AsyncFunction Unit
+            }
+
+            // Task 6 (B.2d): purely additive observability -- forwards
+            // SyncRunner/KotlinSync.run's phase-boundary callbacks
+            // (connecting/handshake/messages/blobs/decrypting) as
+            // "onSyncProgress" events. The injected onProgress param;
+            // SyncRunner's background caller (Task 2) passes the default no-op.
+            val onProgress = { phase: String, count: Int ->
+                sendEvent("onSyncProgress", mapOf("phase" to phase, "count" to count))
+            }
+
+            val outcome = SyncRunner.runSync(ctx, fx, onProgress)
+
+            if (!outcome.ran) {
+                // The one new behavior: a concurrent sync already held the
+                // process-wide mutex, so this call skipped immediately (no
+                // second Tor dial, no double KotlinSync.run). Feed unchanged.
+                // skipped = true is the source of truth for the UI's neutral
+                // note; `reason` stays human-readable text only.
+                emit(false, 0, 0, 0, "sync already in progress", false, skipped = true)
+                return@AsyncFunction Unit
+            }
+
+            if (outcome.ok) {
+                // Decrypt pass + feed/key cache refresh: only a completed sync
+                // can change what's decryptable (new messages/wrap_grants may
+                // have just been pulled), so this is the one place the caches
+                // are recomputed -- see feedCache's and blobKeys' own doc
+                // comments for why getFeed()/getBlobImage() just serve these
+                // caches instead of re-running. Captured once into `res` so
+                // feedCache and blobKeys are always set from the SAME decrypt
+                // pass (see blobKeys' doc for why that matters). EncKeys.
+                // getOrCreate is idempotent -- it returns the SAME persisted
+                // priv SyncRunner's transport already generated/read this sync.
+                //
+                // Wrapped in its own try: DecryptPass.run / SqliteSyncStore are
+                // SQLite I/O and can throw. The pre-refactor code ran this
+                // inside syncNow's single outer try, whose catch emitted an
+                // "io:" nodeSync -- preserve that exact failure shape (feed
+                // left as it was, since the throw precedes the cache writes).
+                try {
+                    val store = SqliteSyncStore(ctx)
+                    val (priv, _) = EncKeys.getOrCreate(store)
+                    val res = DecryptPass.run(store, fx.device_pub, priv, fx.cert.identity_pub)
+                    feedCache = res.feed
+                    blobKeys = res.keys
+                    // Task 6 (B.2d): the trailing "done" phase -- emitted here
+                    // (not inside KotlinSync.run, which returned before
+                    // DecryptPass even started) once the feed cache this sync
+                    // refreshed is ready for getFeed() to serve. Count is the
+                    // decrypted feed size (res.feed.size), matching what just
+                    // became visible to the UI, not the raw wire message count.
+                    //
+                    // Own try/catch, swallowed: this sendEvent runs AFTER
+                    // feedCache/blobKeys are already mutated to their
+                    // successful state -- if it threw uncaught, the enclosing
+                    // catch would emit nodeSync ok=false and the real
+                    // emit(true, ...) below would never run, reporting a sync
+                    // that fully succeeded (feed already updated) as failed. A
+                    // side-channel (observability) send must never flip the
+                    // terminal nodeSync outcome -- same reasoning as
+                    // KotlinSync's own `progress` swallow wrapper.
+                    try {
+                        sendEvent("onSyncProgress", mapOf("phase" to "done", "count" to res.feed.size))
+                    } catch (_: Throwable) {}
+                    // friendsCount(store), NOT outcome.identities: outcome.
+                    // identities is KotlinSync.run's raw identities-table count,
+                    // which includes the phone's own identity (seeded before
+                    // the sync) -- see friendsCount's doc for why that's the
+                    // wrong number to label "friends" downstream. Preserves the
+                    // exact value the pre-refactor success branch emitted.
+                    emit(true, outcome.messages, outcome.blobs, friendsCount(store), null, true)
+                } catch (e: Exception) {
+                    emit(false, 0, 0, 0, "io: ${e.message}", false)
+                }
+            } else {
+                // SelfRevoked / Failed / io -- SyncRunner already mapped these
+                // to (messages,blobs,identities)=(0,0,0) with the matching
+                // reason ("self-revoked" / "${stage}: ${reason}" / "io: ...").
+                // feedUpdated stays false (no sync failure ever refreshes the
+                // feed), exactly as the pre-refactor SelfRevoked/Failed/outer-
+                // catch branches emitted.
+                emit(false, outcome.messages, outcome.blobs, outcome.identities, outcome.error, false)
             }
         }.runOnQueue(ioScope)
 
