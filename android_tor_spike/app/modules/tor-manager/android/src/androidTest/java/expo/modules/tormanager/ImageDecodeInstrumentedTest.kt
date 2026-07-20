@@ -68,6 +68,27 @@ class ImageDecodeInstrumentedTest {
     }
 
     @Test
+    fun rebindsAfterTeardown() {
+        val avif = fixtureAvif()
+        // First decode binds the isolated service and works.
+        assertNotNull(ImageDecodeClient.decodeAvif(avif))
+        // Simulate the decode-TIMEOUT recovery: force the binding down. This is
+        // exactly what the timeout path does to reclaim a WEDGED :imagedecode
+        // process (a real native hang can't be forced cheaply over live IPC).
+        ImageDecodeClient.teardown()
+        // The next decode must do a clean fresh bind and still succeed -- proves
+        // a wedge is recoverable without an app restart, not a permanent feed DoS.
+        val png = ImageDecodeClient.decodeAvif(avif)
+        assertNotNull("decode did not recover after teardown/rebind", png)
+        png!!
+        assertTrue(
+            "recovered output is not PNG",
+            png.size >= 4 && (png[0].toInt() and 0xFF) == 0x89 &&
+                (png[1].toInt() and 0xFF) == 0x50,
+        )
+    }
+
+    @Test
     fun garbageBytesFailClosed() {
         // Hostile / non-AVIF bytes handed straight to the boundary must yield
         // null (-> UI placeholder), never a hang or an app crash. This exercises

@@ -98,13 +98,45 @@ object ImageDecodeClient {
             try { writer.get(DRAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS) } catch (_: Throwable) {}
             if (ok && looksPng(png)) png else null
         } catch (t: Throwable) {
-            // Timeout / remote crash / cancellation -> fail closed. Drop the
-            // service ref so a wedged isolated process is rebound next call, and
-            // tear everything down.
-            service = null
+            // Timeout / remote crash / cancellation -> fail closed (this call
+            // returns null; no exception escapes). The isolated process may be
+            // WEDGED: alive but its binder thread stuck in a native decode loop
+            // on a hostile AVIF. A wedge fires NO onServiceDisconnected, so
+            // merely nulling `service` and waiting for a reconnect would leave
+            // it null forever and degrade every future decode to a placeholder
+            // (a hostile-input DoS on the whole feed until app restart).
+            // So actively TEAR THE BINDING DOWN: unbinding drops the last
+            // binding and the OS reclaims the wedged :imagedecode process; the
+            // next decodeAvif does a fresh bind that spawns a new one. (A
+            // genuine process DEATH still recovers via the onServiceDisconnected
+            // -> onServiceConnected auto-reconnect path below, unchanged.)
             call.cancel(true); reader.cancel(true); writer.cancel(true)
             listOf(inRead, inWrite, outRead, outWrite).forEach { closeQuietly(it) }
+            teardown()
             null
+        }
+    }
+
+    /**
+     * Drop the binding and reset to the unbound state so the next [decodeAvif]
+     * does a fresh bind (spawning a new isolated process). Called on the decode
+     * TIMEOUT path to reclaim a WEDGED `:imagedecode` process -- unbinding is
+     * what lets the OS kill a process that never fires onServiceDisconnected.
+     * Lock-guarded and idempotent: after it runs `connection` is null, so a
+     * concurrent second call skips the unbind (no "Service not registered"
+     * double-unbind crash). Also the seam the instrumented rebind-after-teardown
+     * test drives (a real wedge can't be forced cheaply over live IPC).
+     */
+    internal fun teardown() {
+        synchronized(lock) {
+            val conn = connection
+            val ctx = appContext
+            if (conn != null && ctx != null) {
+                try { ctx.unbindService(conn) } catch (_: Throwable) {}
+            }
+            connection = null
+            connectLatch = null
+            service = null
         }
     }
 
