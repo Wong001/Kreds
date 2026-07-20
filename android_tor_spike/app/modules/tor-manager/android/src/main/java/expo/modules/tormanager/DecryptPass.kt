@@ -37,7 +37,16 @@ object DecryptPass {
         // because hearth legitimately records a null entry for a photo
         // whose thumbnail generation failed (node.py's `thumbs.append(
         // None)`) -- position in the list still lines up with `blobs`.
-        val blobs: List<String>, val thumbs: List<String?>)
+        val blobs: List<String>, val thumbs: List<String?>,
+        // media/poster (B.2d-2 Task 1): plaintext OUTER PAYLOAD envelope
+        // fields, same disclosure class as thumbs above -- hearth's
+        // make_post signs `"media": media, "poster": poster` straight into
+        // the outer payload (never the encrypted body; validate_payload's
+        // KIND_POST branch reads them the same way, messages.py:307-317).
+        // media defaults to "photo" when absent (matching make_post's own
+        // default param); poster is a hex64 blob-hash reference to a video
+        // post's AVIF still, or null for a photo post.
+        val media: String, val poster: String?)
 
     /** run()'s result (Task 4, B.2d): the decrypted feed, newest-first
      *  (unchanged from the pre-Task-4 shape), alongside the per-message
@@ -165,7 +174,11 @@ object DecryptPass {
         // present-day hearth behavior, not merely a defensive hedge.
         val blobs = if (body.containsKey("blobs")) stringList(body["blobs"]) else stringList(p["blobs"])
         val thumbs = if (body.containsKey("thumbs")) nullableStringList(body["thumbs"]) else nullableStringList(p["thumbs"])
-        return Decrypted(m.msgId, m.kind, author, text, createdAt, blobs, thumbs) to key
+        // media/poster (B.2d-2 Task 1): OUTER payload only, never the
+        // decrypted body -- see Decrypted.media's doc above for why.
+        val media = (p["media"] as? String) ?: "photo"
+        val poster = p["poster"] as? String
+        return Decrypted(m.msgId, m.kind, author, text, createdAt, blobs, thumbs, media, poster) to key
     }
 
     /** Content-key source, in priority order: (1) the message's own inline

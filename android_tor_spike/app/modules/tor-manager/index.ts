@@ -100,9 +100,15 @@ export function getSyncStats(): Promise<SyncStats> { return native.getSyncStats(
 // `thumbs` is (string | null)[], position-aligned with `blobs`: hearth
 // legitimately records a null entry for a photo whose thumbnail generation
 // failed (see DecryptPass.Decrypted's doc).
+// `media`/`poster` (B.2d-2 Task 1): plaintext OUTER-PAYLOAD envelope fields
+// -- "photo" (default) or "video" -- mirroring DecryptPass.Decrypted.media/
+// poster (see its Kotlin doc comment). `poster` is a hex64 blob-hash
+// reference to the video's AVIF still (resolved the same way as any other
+// blob/thumb hash, via getBlobImage), or null for a photo post.
 export interface FeedItem {
   msgId: string; kind: string; author: string; text: string; createdAt: number;
   blobs: string[]; thumbs: (string | null)[];
+  media: string; poster: string | null;
 }
 
 export function getFeed(): Promise<FeedItem[]> { return native.getFeed(); }
@@ -117,6 +123,19 @@ export function getFeed(): Promise<FeedItem[]> { return native.getFeed(); }
 // side re-derives it from blobKeys + the stored cipher blob on every call.
 export function getBlobImage(msgId: string, hash: string): Promise<string | null> {
   return native.getBlobImage(msgId, hash);
+}
+
+// Task 3 (B.2d-2): resolves a video post's full blob hash (FeedItem.blobs[0]
+// when media === "video") into a http://127.0.0.1 URL a platform video
+// player can stream (range requests included) -- backed by TorManagerModule's
+// lazily-started, token-guarded loopback MediaServer (see its Kotlin class
+// doc). null on the same misses getBlobImage returns null for (no content
+// key for msgId -- not yet synced / not entitled), checked BEFORE the server
+// is ever started. Nothing is cached on the JS side, same as getBlobImage --
+// each call re-resolves the URL (the server itself, once started, is reused
+// across calls for this module's lifetime).
+export function getVideoUrl(msgId: string, hash: string): Promise<string | null> {
+  return native.getVideoUrl(msgId, hash);
 }
 
 // Task 6 (B.2d): live sync-progress feedback -- the sync takes 1-2 min

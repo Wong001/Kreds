@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Task 3 (B.2d-2): permits cleartext (plain http://) ONLY to loopback, so
+     expo-video can stream from TorManagerModule's MediaServer
+     (http://127.0.0.1:<port>/media/<token>/<msgId>/<hash>). Everything else
+     the app talks to (Tor's own raw-socket dial path) is unaffected by this
+     file: it has nothing to do with cleartextTrafficPermitted, which only
+     gates platform HTTP clients (e.g. the ExoPlayer/Media3 stack behind
+     expo-video's VideoView).
+
+     Needed because: this app's targetSdkVersion is 36, so
+     cleartextTrafficPermitted defaults to false platform-wide unless a
+     domain is explicitly exempted here. Android only ships an IMPLICIT
+     loopback exemption from Android 17 (API 37) onward; the spike's G20
+     test device runs Android 11 (API 30), well below that, so without this
+     explicit domain-config every getVideoUrl() playback attempt would fail
+     immediately with a cleartext-not-permitted error. Scoped to loopback
+     addresses only (127.0.0.1 / ::1 / localhost), NOT a blanket
+     android:usesCleartextTraffic="true", which would weaken the whole app's
+     traffic policy for no reason MediaServer's design doesn't already cover
+     (it binds 127.0.0.1 only and gates every request behind a per-session
+     token; see MediaServer.kt's class doc). -->
+<network-security-config>
+  <domain-config cleartextTrafficPermitted="true">
+    <domain includeSubdomains="false">127.0.0.1</domain>
+    <domain includeSubdomains="false">::1</domain>
+    <domain includeSubdomains="false">localhost</domain>
+  </domain-config>
+</network-security-config>

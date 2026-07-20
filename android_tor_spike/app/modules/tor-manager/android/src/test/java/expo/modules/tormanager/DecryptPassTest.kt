@@ -639,6 +639,50 @@ class DecryptPassTest {
             KotlinWire.fromHex(c.getString("content_key")), result.keys[msg.msgId()])
     }
 
+    // -- B.2d-2 Task 1: post media/poster surfacing --
+    // media/poster are PLAINTEXT OUTER PAYLOAD fields (hearth messages.py's
+    // make_post: `"media": media, "poster": poster` -- validate_payload's
+    // KIND_POST branch, messages.py:307-317), never inside the encrypted
+    // body -- same disclosure class as thumbs (Task 4 above). Built the same
+    // way as the thumbs decoy test: start from postPayload(c, wraps) and
+    // overlay media/poster via toMutableMap().apply.
+
+    @Test fun surfacesVideoMediaAndPosterFromOuterPayload() {
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val posterHash = "ab".repeat(32)
+        val payload = postPayload(c, wraps).toMutableMap().apply {
+            put("media", "video")
+            put("poster", posterHash)
+            put("blobs", listOf("cd".repeat(32)))
+        }
+        val msg = signedMessage(c.getString("author"), 1, payload, "e3".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
+        assertEquals(1, out.size)
+        assertEquals("video", out[0].media)
+        assertEquals(posterHash, out[0].poster)
+    }
+
+    @Test fun defaultsToPhotoMediaWithNullPosterWhenAbsentFromOuterPayload() {
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        // postPayload(c, wraps) carries no "media"/"poster" key at all --
+        // the ordinary photo-post shape.
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "e4".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
+        assertEquals(1, out.size)
+        assertEquals("photo", out[0].media)
+        assertEquals(null, out[0].poster)
+    }
+
     @Test fun blobLessMessageIsAbsentFromResultKeys() {
         // Case 0's body carries "blobs": [] -- a message with genuinely no
         // blobs must still decrypt into the feed (with an empty blobs
