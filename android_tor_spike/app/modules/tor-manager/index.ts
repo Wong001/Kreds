@@ -100,6 +100,25 @@ export function getBlobImage(msgId: string, hash: string): Promise<string | null
   return native.getBlobImage(msgId, hash);
 }
 
+// Task 6 (B.2d): live sync-progress feedback -- the sync takes 1-2 min
+// on-device with no visible activity otherwise. Forwards KotlinSync.run's
+// phase-boundary callbacks (fired from the native side as they happen,
+// not batched) plus a trailing "done" phase the module emits once the
+// post-sync decrypt pass (getFeed's cache) is ready. `phase` is one of
+// "connecting" | "handshake" | "messages" | "blobs" | "decrypting" | "done"
+// -- not a closed union here (deliberately: a future phase name is a
+// forward-compatible no-op for any listener that only recognizes a
+// subset, no need to update this type union in lockstep with the native
+// side). `count` is phase-specific (e.g. running message/blob counts
+// during "messages"/"blobs", the decrypted feed size for "done") and 0 for
+// phases with nothing to count yet. Purely additive observability --
+// never changes what syncNow does, only what it reports while doing it;
+// the existing onSync (terminal nodeSync event) is unaffected.
+export function onSyncProgress(cb: (p: { phase: string; count: number }) => void): () => void {
+  const sub = native.addListener("onSyncProgress", (e: { phase: string; count: number }) => cb(e));
+  return () => sub.remove();
+}
+
 export function onSync(cb: (r: {
   ok: boolean; messages: number; blobs: number; identities: number; reason?: string;
   // Task 7 (B.2): true iff this sync completed successfully and the decrypted

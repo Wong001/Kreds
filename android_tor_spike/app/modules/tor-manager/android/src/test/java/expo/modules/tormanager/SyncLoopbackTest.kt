@@ -78,6 +78,13 @@ import java.nio.file.Files
  *      verified INLINE-wrapped, not via any grant), the original B.2
  *      own-content regression, and author-name resolution to the friend
  *      node's published profile name ("Freja").
+ *   5. syncEmitsProgressPhasesInOrder (Task 6, B.2d) -- proves
+ *      KotlinSync.run's new `onProgress` callback (purely additive
+ *      observability, default no-op) fires connecting/handshake/messages/
+ *      blobs in order against this same real node, with non-decreasing
+ *      per-message counts. Every other test above passes no onProgress
+ *      argument at all -- that they still pass is the proof the default
+ *      no-op leaves existing callers unaffected.
  */
 class SyncLoopbackTest {
 
@@ -221,6 +228,70 @@ class SyncLoopbackTest {
             assertEquals("messages", expect.getInt("messages"), stats.messages)
             assertEquals("blobs", expect.getInt("blobs"), stats.blobs)
             assertEquals("identities", expect.getInt("identities"), stats.identities)
+        } finally {
+            node.kill()
+        }
+    }
+
+    /** Task 6 (B.2d): proves KotlinSync.run's new `onProgress` callback
+     *  fires at the expected phase boundaries, in order, against a REAL
+     *  loopback node (not a mock) -- the same node/seed
+     *  syncsRealOwnIdentityContent uses (3 seeded posts, one with a photo,
+     *  so both the messages and blobs phases are non-trivially exercised).
+     *  Two things asserted, per the task brief: (a) "connecting" ..
+     *  "handshake" .. "messages" .. "blobs" appear, in that relative order
+     *  (the last "messages" event strictly before the first "blobs" event,
+     *  so the phases don't interleave); (b) the "messages" phase's counts
+     *  are non-decreasing across the run (KotlinSync.kt's ingest loop
+     *  passes `i + 1`, so this is really strictly increasing, but
+     *  non-decreasing is the contract the brief asks for and is robust to
+     *  a future implementation that reports the same count twice). This
+     *  test passes its own onProgress collector -- every OTHER test in
+     *  this file calls KotlinSync.run with no onProgress argument at all,
+     *  which is exactly how the default-no-op parameter is proven not to
+     *  change their behavior (they're unmodified and still pass). */
+    @Test fun syncEmitsProgressPhasesInOrder() {
+        val node = startNode()
+        try {
+            val fixture = KotlinHandshake.parseFixture(node.fixtureJson)
+            val stream = SocketStream("127.0.0.1", node.port)
+            KotlinHandshake.authOnlyOverStream(stream, fixture)
+
+            val store = InMemorySyncStore()
+            store.addIdentity(fixture.cert.identity_pub)
+
+            val events = mutableListOf<Pair<String, Int>>()
+            val res = KotlinSync.run(stream, store, fixture.device_pub,
+                onProgress = { phase, count -> events.add(phase to count) })
+            assertTrue("sync: $res", res is SyncResult.Ok)
+
+            // Sanity: this node/seed must actually exercise messages+blobs,
+            // or the ordering assertions below would pass vacuously.
+            val expect = node.expect
+            assertTrue("seed must include messages for this test to mean anything",
+                expect.getInt("messages") > 0)
+            assertTrue("seed must include blobs for this test to mean anything",
+                expect.getInt("blobs") > 0)
+
+            val phases = events.map { it.first }
+            val firstConnecting = phases.indexOf("connecting")
+            val firstHandshake = phases.indexOf("handshake")
+            val firstMessages = phases.indexOf("messages")
+            val lastMessages = phases.lastIndexOf("messages")
+            val firstBlobs = phases.indexOf("blobs")
+            assertTrue("connecting phase must fire: $phases", firstConnecting >= 0)
+            assertTrue("handshake phase must fire: $phases", firstHandshake >= 0)
+            assertTrue("messages phase must fire: $phases", firstMessages >= 0)
+            assertTrue("blobs phase must fire: $phases", firstBlobs >= 0)
+            assertTrue("connecting must precede handshake: $phases", firstConnecting < firstHandshake)
+            assertTrue("handshake must precede messages: $phases", firstHandshake < firstMessages)
+            assertTrue("messages must complete before blobs begins: $phases", lastMessages < firstBlobs)
+
+            val messageCounts = events.filter { it.first == "messages" }.map { it.second }
+            for (i in 1 until messageCounts.size) {
+                assertTrue("messages counts must be non-decreasing: $messageCounts",
+                    messageCounts[i] >= messageCounts[i - 1])
+            }
         } finally {
             node.kill()
         }

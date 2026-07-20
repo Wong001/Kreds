@@ -104,7 +104,7 @@ class TorManagerModule : Module() {
             "fixtureDir" to (appContext.reactContext?.getExternalFilesDir(null)?.absolutePath ?: "")
         )
 
-        Events("torProgress", "nodeBeat", "nodeState", "nodeSync")
+        Events("torProgress", "nodeBeat", "nodeState", "nodeSync", "onSyncProgress")
 
         OnCreate {
             val ctx = appContext.reactContext ?: return@OnCreate
@@ -268,7 +268,16 @@ class TorManagerModule : Module() {
                     return@AsyncFunction Unit
                 }
 
-                when (val r = KotlinSync.run(stream, store, fx.device_pub, prep.outbound)) {
+                // Task 6 (B.2d): purely additive observability -- the sync
+                // takes 1-2 min on-device with no visible activity today.
+                // Forwards KotlinSync.run's phase-boundary callbacks
+                // (connecting/handshake/messages/blobs/decrypting) straight
+                // through as "onSyncProgress" events; does not affect what
+                // syncNow does, only what it reports while doing it.
+                val onProgress = { phase: String, count: Int ->
+                    sendEvent("onSyncProgress", mapOf("phase" to phase, "count" to count))
+                }
+                when (val r = KotlinSync.run(stream, store, fx.device_pub, prep.outbound, onProgress)) {
                     is SyncResult.Ok -> {
                         // Mark published ONLY once the sync that carried the
                         // push has FULLY succeeded -- see EncKeyPublishGuard's
@@ -288,6 +297,15 @@ class TorManagerModule : Module() {
                         val res = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub)
                         feedCache = res.feed
                         blobKeys = res.keys
+                        // Task 6 (B.2d): the trailing "done" phase -- emitted
+                        // here (not inside KotlinSync.run, which returned
+                        // before DecryptPass even started) once the feed
+                        // cache this sync just refreshed is actually ready
+                        // for getFeed() to serve. Count is the decrypted feed
+                        // size (res.feed.size), matching what just became
+                        // visible to the UI, not the raw wire message count
+                        // (r.messages) some of which may not be decryptable.
+                        sendEvent("onSyncProgress", mapOf("phase" to "done", "count" to res.feed.size))
                         // r.identities (SyncResult.Ok, from KotlinSync.run --
                         // UNTOUCHABLE) is the raw identities-table count,
                         // which includes the phone's own identity (seeded
