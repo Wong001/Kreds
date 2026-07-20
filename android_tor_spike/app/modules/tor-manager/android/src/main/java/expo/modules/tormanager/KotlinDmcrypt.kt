@@ -27,6 +27,12 @@ object KotlinDmcrypt {
             "from" to sender, "to" to to,
             "created_at" to KotlinWire.PyFloat(createdAt)))
 
+    fun responsesAad(author: String, target: String, createdAt: Double): ByteArray =
+        KotlinWire.canonical(mapOf(
+            "type" to "responses-aad", "protocol" to KotlinWire.PROTOCOL,
+            "from" to author, "target" to target,
+            "created_at" to KotlinWire.PyFloat(createdAt)))
+
     private fun deriveKek(shared: ByteArray): ByteArray {
         val out = ByteArray(32)
         val hkdf = HKDFBytesGenerator(SHA256Digest())

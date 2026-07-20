@@ -6,13 +6,113 @@ ASCII-only output.
 Cases 0-1 (Task 1): one post + one dm, fresh per-case enc keypair each.
 Cases 2-3 (Task 5, DecryptPass): two more posts sharing case 0's enc
 keypair but at earlier/later created_at, so DecryptPass tests can decrypt
->=3 messages with ONE encPrivHex and assert newest-first feed ordering."""
-import json, sys
+>=3 messages with ONE encPrivHex and assert newest-first feed ordering.
+
+The "responses" case (B.2d-4 Task 1) is different in kind from every case
+above: it is not hand-built JSON encrypted with hearth's primitives, it is
+a REAL aggregated KIND_RESPONSES record produced by driving hearth's own
+node/store API end to end (compose_post, compose_response, the author's
+process_responses sweep) -- see _build_responses_case below."""
+import json, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from hearth.dmcrypt import new_content_key, encrypt_body, wrap_key, post_aad, dm_aad
 from hearth.identity import _gen_x25519_pair
+from hearth.node import HearthNode
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "dmcrypt_vectors.json"
+
+
+def _sync(a, b):
+    """Hand-carry every message `a` holds (authored by `a`) that `b`
+    hasn't ingested yet -- the same no-real-sockets idiom
+    tests/test_responses.py uses (mirrors one direction of a real gossip
+    round)."""
+    for m in a.store.messages_not_in({}, {a.identity_pub}, b.identity_pub):
+        b.store.ingest_message(m)
+
+
+def _befriend(a, b):
+    a.store.add_identity(b.identity_pub)
+    b.store.add_identity(a.identity_pub)
+    a.ensure_enckey()
+    b.ensure_enckey()
+    _sync(a, b)          # b learns a's enckey
+    _sync(b, a)          # a learns b's enckey
+
+
+def _build_responses_case():
+    """Drive real hearth to produce a genuine KIND_RESPONSES record: an
+    author node composes a journal post; one responder node has
+    public_engagement on and PUBLICLY comments (so its entry carries a
+    real identity/device_pub/responder_sig in the clear); a second
+    responder PRIVATELY reacts (default: sealed behind a mutual box, no
+    identity in the clear). The responses reach the author, whose
+    process_responses() sweep folds them and republishes the aggregated,
+    re-encrypted KIND_RESPONSES record -- the exact same fold path
+    tests/test_responses.py's test_author_sweep_republishes_record pins.
+    The decrypting party is the PRIVATE reactor's own device: a genuine
+    scope ("kreds") recipient of the record, not the author re-reading
+    their own post, proving the record is readable by its real audience."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        author = HearthNode.create(tdp / "author", "Author", "author-dev")
+        commenter = HearthNode.create(tdp / "commenter", "Commenter",
+                                      "commenter-dev")
+        reactor = HearthNode.create(tdp / "reactor", "Reactor", "reactor-dev")
+        try:
+            _befriend(author, commenter)
+            _befriend(author, reactor)
+
+            pid = author.compose_post("hello from the vector generator", "kreds")
+            _sync(author, commenter)
+            _sync(author, reactor)
+
+            commenter.store.set_meta("public_engagement", "1")
+            commenter.compose_response(pid, "comment", "nice post!")
+            reactor.compose_response(pid, "reaction", "heart")
+
+            _sync(commenter, author)         # raw responses reach the author
+            _sync(reactor, author)
+            rebuilt = author.process_responses()  # folds + republishes the record
+            assert rebuilt == 1, "expected exactly one target rebuilt"
+
+            rec = author.store.responses_record(pid, author.identity_pub)
+            assert rec is not None, "author sweep produced no KIND_RESPONSES record"
+            key, aad = author._content_key(rec)
+            assert key is not None, "author could not decrypt its own record"
+            from hearth.dmcrypt import decrypt_body
+            body = decrypt_body(key, rec.payload["body_nonce"],
+                                rec.payload["body_ct"], aad)
+            entries = body["entries"]
+            public_entry = next(e for e in entries if e["rkind"] == "comment")
+            private_entry = next(e for e in entries if e["rkind"] == "reaction")
+            assert public_entry.get("identity") == commenter.identity_pub
+            assert public_entry.get("device_pub") == commenter.device.device_pub
+            assert "identity" not in private_entry     # private stays sealed
+
+            wraps = rec.payload["wraps"]
+            reactor_wrap = wraps[reactor.device.device_pub]
+
+            result = {
+                "kind": "responses", "author": author.identity_pub,
+                "target": pid, "created_at": rec.payload["created_at"],
+                "enc_priv": reactor.device.enc_priv, "wrap": reactor_wrap,
+                "body_nonce": rec.payload["body_nonce"],
+                "body_ct": rec.payload["body_ct"],
+                "content_key": key.hex(), "entries": entries,
+                "public_responder_device": public_entry["device_pub"],
+                "public_responder_identity": public_entry["identity"],
+                "public_responder_sig": public_entry["responder_sig"],
+            }
+        finally:
+            # Close every sqlite handle before the TemporaryDirectory
+            # context tries to rmtree itself -- Windows refuses to
+            # delete a file a still-open handle in THIS SAME process
+            # holds (unlike POSIX, which allows unlinking an open file).
+            author.store.close()
+            commenter.store.close()
+            reactor.store.close()
+        return result
 
 
 def build():
@@ -112,6 +212,11 @@ def build():
         "kind": "blob", "content_key": bkey.hex(),
         "cipher": blob_cipher.hex(), "plain": blob_plain.hex(),
     })
+    # A real, hearth-aggregated KIND_RESPONSES record (B.2d-4 Task 1):
+    # unlike every case above, this is produced by driving hearth's
+    # actual node/store API (compose_post/compose_response/
+    # process_responses), not by hand-encrypting JSON.
+    cases.append(_build_responses_case())
     return {"cases": cases}
 
 
