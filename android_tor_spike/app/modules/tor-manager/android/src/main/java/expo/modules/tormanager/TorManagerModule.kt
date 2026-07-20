@@ -462,6 +462,13 @@ class TorManagerModule : Module() {
                     // "photo"/"video" plus the video's poster blob-hash ref
                     // (null for a photo post).
                     "media" to d.media, "poster" to d.poster,
+                    // storyRefMediaHash (B.2d-3 Task 3, gap fix): plaintext,
+                    // DM-only outer-payload field (DecryptPass.Decrypted.
+                    // storyRefMediaHash's doc) -- the story-reply chip's
+                    // ONLY consumer, resolved via getStoryImage(hash) same
+                    // as any other story media. null for an ordinary DM or
+                    // any post.
+                    "storyRefMediaHash" to d.storyRefMediaHash,
                 )
             }
         }

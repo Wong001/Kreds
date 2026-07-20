@@ -105,10 +105,19 @@ export function getSyncStats(): Promise<SyncStats> { return native.getSyncStats(
 // poster (see its Kotlin doc comment). `poster` is a hex64 blob-hash
 // reference to the video's AVIF still (resolved the same way as any other
 // blob/thumb hash, via getBlobImage), or null for a photo post.
+// `storyRefMediaHash` (B.2d-3 Task 3, gap fix): plaintext, DM-only
+// outer-payload field -- mirrors DecryptPass.Decrypted.storyRefMediaHash
+// (its Kotlin doc has the full disclosure-class reasoning, same class as
+// media/poster above). Present (a hex64 blob hash) iff this DM's payload
+// carried a shape-valid `story_ref`; null for an ordinary DM or any post.
+// The story-reply chip's ONLY consumer: resolves via getStoryImage(hash) --
+// plaintext, same as any other story media -- for the "replied to your
+// story" thumbnail on this DM's feed row.
 export interface FeedItem {
   msgId: string; kind: string; author: string; text: string; createdAt: number;
   blobs: string[]; thumbs: (string | null)[];
   media: string; poster: string | null;
+  storyRefMediaHash: string | null;
 }
 
 export function getFeed(): Promise<FeedItem[]> { return native.getFeed(); }

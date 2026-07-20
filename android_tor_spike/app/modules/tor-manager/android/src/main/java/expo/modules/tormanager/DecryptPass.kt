@@ -46,7 +46,19 @@ object DecryptPass {
         // media defaults to "photo" when absent (matching make_post's own
         // default param); poster is a hex64 blob-hash reference to a video
         // post's AVIF still, or null for a photo post.
-        val media: String, val poster: String?)
+        val media: String, val poster: String?,
+        // storyRefMediaHash (B.2d-3 Task 3, gap fix): a DM-only, PLAINTEXT
+        // OUTER PAYLOAD field -- hearth's make_dm signs an optional
+        // `"story_ref": {"story_id", "media_hash"}` straight into the outer
+        // payload (messages.py:138-156, `_valid_story_ref`), never inside
+        // the encrypted body -- same disclosure class as media/poster
+        // above. Only `media_hash` is surfaced here: it is the sole field
+        // the story-reply chip's thumbnail fetch (getStoryImage) needs;
+        // `story_id` has no UI consumer yet, so it is read only far enough
+        // to shape-guard (see storyRefMediaHash() below), not exposed.
+        // null for an ordinary DM, a DM whose story_ref fails the shape
+        // guard, or any post (story_ref is DM-only by construction).
+        val storyRefMediaHash: String?)
 
     /** run()'s result (Task 4, B.2d): the decrypted feed, newest-first
      *  (unchanged from the pre-Task-4 shape), alongside the per-message
@@ -178,7 +190,30 @@ object DecryptPass {
         // decrypted body -- see Decrypted.media's doc above for why.
         val media = (p["media"] as? String) ?: "photo"
         val poster = p["poster"] as? String
-        return Decrypted(m.msgId, m.kind, author, text, createdAt, blobs, thumbs, media, poster) to key
+        // storyRefMediaHash (B.2d-3 Task 3, gap fix): DM-only, OUTER payload
+        // only -- see Decrypted.storyRefMediaHash's doc above. Gated on
+        // m.kind == "dm" even though storyRefMediaHash() below would return
+        // null for any non-Map value anyway (a post payload never carries
+        // this key) -- the explicit gate documents the DM-only contract at
+        // the call site rather than leaving it implicit in the helper.
+        val storyRefMediaHash = if (m.kind == "dm") storyRefMediaHash(p["story_ref"]) else null
+        return Decrypted(m.msgId, m.kind, author, text, createdAt, blobs, thumbs, media, poster, storyRefMediaHash) to key
+    }
+
+    /** Shape-guards a DM's optional outer-payload `story_ref` value (see
+     *  Decrypted.storyRefMediaHash's doc) and, if valid, returns its
+     *  `media_hash`. Mirrors hearth's own `_valid_story_ref` (messages.py)
+     *  defensively: both `story_id` and `media_hash` must be present,
+     *  non-empty strings, or this is null -- same fail-closed idiom as
+     *  stringList/nullableStringList above (a malformed or missing field
+     *  degrades to "no story_ref", never a crash). `story_id` is checked but
+     *  not returned -- see the field's doc for why it has no consumer yet. */
+    private fun storyRefMediaHash(v: Any?): String? {
+        val ref = v as? Map<*, *> ?: return null
+        val storyId = ref["story_id"] as? String
+        val mediaHash = ref["media_hash"] as? String
+        if (storyId.isNullOrEmpty() || mediaHash.isNullOrEmpty()) return null
+        return mediaHash
     }
 
     /** Content-key source, in priority order: (1) the message's own inline
