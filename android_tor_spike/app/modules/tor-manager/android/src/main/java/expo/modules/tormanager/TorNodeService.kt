@@ -21,7 +21,7 @@ class TorNodeService : Service() {
     companion object {
         const val CHANNEL_ID = "kreds-node"
         const val NOTIF_ID = 1
-        private const val HEARTBEAT_INTERVAL_MS = 300_000L    // N = 5 min
+        private const val SYNC_INTERVAL_MS = 900_000L    // N = 15 min (Brick C: was the 5-min AUTH heartbeat)
         const val ACTION_STOP = "eu.kreds.torspike.STOP"
         const val ACTION_BEAT_NOW = "eu.kreds.torspike.BEAT_NOW"
         const val BROADCAST_BEAT = "eu.kreds.torspike.BEAT"
@@ -37,7 +37,7 @@ class TorNodeService : Service() {
     }
 
     @Volatile private var scheduler: ScheduledExecutorService? = null
-    @Volatile private var beats = 0
+    @Volatile private var syncs = 0
     @Volatile private var lastLine = "starting"
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -45,7 +45,7 @@ class TorNodeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> { shutdown(); return START_NOT_STICKY }
-            ACTION_BEAT_NOW -> { scheduler?.execute { heartbeat() }; return START_STICKY }
+            ACTION_BEAT_NOW -> { scheduler?.execute { syncCycle() }; return START_STICKY }   // manual "beat now" now triggers a full sync
         }
         if (scheduler == null) startNode()
         return START_STICKY      // OS restarts us after process death
@@ -57,25 +57,25 @@ class TorNodeService : Service() {
         broadcastState("bootstrapping")
         TorEngine.init(this)
         scheduler = Executors.newSingleThreadScheduledExecutor()
-        // Bootstrap once on the scheduler thread; on success, begin the beat cadence.
+        // Bootstrap once on the scheduler thread; on success, begin the sync cadence.
         scheduler!!.execute {
             TorEngine.bootstrap(
                 onProgress = { p -> updateNotification("Tor bootstrap $p%") },
                 onDone = {
                     // onDone fires on TorEngine's watcher thread, NOT the
-                    // scheduler thread. Post ALL heartbeat work back onto the
-                    // single scheduler thread so beats never overlap (a beatNow
+                    // scheduler thread. Post ALL sync work back onto the
+                    // single scheduler thread so syncs never overlap (a beatNow
                     // queued during bootstrap would otherwise race the first
-                    // beat). scheduler?. + runCatching guard the stop-during-
+                    // sync). scheduler?. + runCatching guard the stop-during-
                     // bootstrap race (shutdown() nulls/shuts the executor);
                     // without them scheduler!!.schedule NPEs or throws
                     // RejectedExecutionException on this thread and kills the process.
                     broadcastState("up")
                     val s = scheduler
                     runCatching {
-                        s?.execute { heartbeat() }   // immediate first beat, on the scheduler thread
-                        s?.scheduleAtFixedRate({ heartbeat() },
-                            HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                        s?.execute { syncCycle() }   // immediate first sync, on the scheduler thread
+                        s?.scheduleAtFixedRate({ syncCycle() },
+                            SYNC_INTERVAL_MS, SYNC_INTERVAL_MS, TimeUnit.MILLISECONDS)
                     }
                 },
                 onError = { code, msg ->
@@ -92,40 +92,46 @@ class TorNodeService : Service() {
         return KotlinHandshake.parseFixture(f.readText())
     }
 
-    private fun heartbeat() {
+    // Brick C Task 2: was the bare AUTH heartbeat (dial + KotlinHandshake.run).
+    // Now drives the full content-sync transport via SyncRunner.runSync, which
+    // owns dial -> AUTH -> identity pin -> store-seed -> enc-key prep -> sync ->
+    // mark-published, under the process-wide sync mutex shared with the
+    // foreground module's syncNow. SyncRunner NEVER decrypts (background
+    // stores encrypted only; decrypt-on-read happens in the foreground), so
+    // no decrypt/content-key/feed-cache work is introduced here.
+    private fun syncCycle() {
         val start = System.currentTimeMillis()
         val beat = try {
             if (!TorEngine.isUp) throw IllegalStateException("tor not up")
             val fx = fixture()
-            val (host, port) = KotlinHandshake.splitAddr(fx.onion_addr)
-            val conn = TorEngine.dial(host, port)
-            when (val r = KotlinHandshake.run(conn, fx)) {
-                is KotlinHandshake.HandshakeResult.Accepted ->
-                    Beat(start, true, System.currentTimeMillis() - start, null)
-                is KotlinHandshake.HandshakeResult.Refused ->
-                    Beat(start, false, System.currentTimeMillis() - start, "refused")
-                is KotlinHandshake.HandshakeResult.Failed ->
-                    Beat(start, false, System.currentTimeMillis() - start, "${r.stage}: ${r.reason}")
-            }
+            val o = SyncRunner.runSync(this, fx)     // default no-op progress; NEVER decrypts
+            if (!o.ran) Beat(start, false, System.currentTimeMillis() - start, "skipped (in progress)")
+            else if (o.ok) Beat(start, true, System.currentTimeMillis() - start, null, o.messages, o.blobs, o.identities)
+            else Beat(start, false, System.currentTimeMillis() - start, o.error ?: "sync failed")
         } catch (e: Exception) {
             Beat(start, false, System.currentTimeMillis() - start, "io: ${e.message}")
         }
         // recordAndBroadcast does prefs I/O + notify + sendBroadcast, all of
         // which can throw on-device. An uncaught throwable in a
-        // scheduleAtFixedRate task SILENTLY CANCELS all future beats, so this
+        // scheduleAtFixedRate task SILENTLY CANCELS all future syncs, so this
         // MUST be guarded -- a transient notify/prefs hiccup must not
-        // permanently kill the heartbeat. heartbeat() therefore never throws
-        // to the executor.
+        // permanently kill the sync cadence. syncCycle() therefore never
+        // throws to the executor.
         runCatching { recordAndBroadcast(beat) }
     }
 
     private fun recordAndBroadcast(beat: Beat) {
         HeartbeatStore.record(this, beat)
-        beats++
+        syncs++
         val hhmm = SimpleDateFormat("HH:mm", Locale.US).format(Date(beat.ts))
-        lastLine = if (beat.ok) "last beat $hhmm OK, ${beat.latencyMs}ms - $beats beats"
-                   else "last beat $hhmm FAIL (${beat.reason}) - $beats beats"
+        lastLine = if (beat.ok) "last sync $hhmm OK, ${beat.messages} msgs, ${beat.latencyMs}ms - $syncs syncs"
+                   else "last sync $hhmm FAIL (${beat.reason}) - $syncs syncs"
         updateNotification(lastLine)
+        // Payload intentionally unchanged from Brick A (ts/ok/latencyMs/reason)
+        // -- the new pulled counts live on Beat/HeartbeatStore for now. Adding
+        // them here would require updating TorManagerModule's BROADCAST_BEAT
+        // receiver + App.tsx (Task 3); flagged in the Task 2 report rather
+        // than done here to keep this change surgical.
         sendBroadcast(Intent(BROADCAST_BEAT).setPackage(packageName).apply {
             putExtra("ts", beat.ts); putExtra("ok", beat.ok)
             putExtra("latencyMs", beat.latencyMs); putExtra("reason", beat.reason)
