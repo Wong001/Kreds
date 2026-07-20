@@ -38,3 +38,6 @@ yarn-error.*
 
 # generated native folders
 /ios
+
+# vp1: hearth/web is copied in at build time (single source of truth) — never commit the copy
+/android/app/src/main/assets/www/

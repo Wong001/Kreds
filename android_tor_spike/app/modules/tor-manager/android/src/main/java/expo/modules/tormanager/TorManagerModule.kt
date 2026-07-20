@@ -90,6 +90,12 @@ class TorManagerModule : Module() {
     // thread never outlives this module instance.
     @Volatile private var mediaServer: MediaServer? = null
 
+    // vp1: the loopback web server the WebView loads. Same lazy-construct /
+    // shared-`destroyed`-flag lifecycle as mediaServer (see ensureMediaServer's
+    // doc). One instance per module; torn down in OnDestroy so its accept-loop
+    // daemon thread never outlives the module.
+    @Volatile private var localServer: LocalWebServer? = null
+
     // Review fix (B.2d-2 Task 3): closes a construct/destroy race that the
     // plain @Volatile teardown in OnDestroy left open. ensureMediaServer and
     // teardownMediaServer are BOTH @Synchronized on the same monitor
@@ -183,6 +189,32 @@ class TorManagerModule : Module() {
         mediaServer = null
     }
 
+    /** vp1: lazily starts (once) the WebView shell's loopback server, mirroring
+     *  ensureMediaServer's lifecycle exactly (shared `destroyed` flag + `this`
+     *  monitor close the same construct/destroy race). The assets provider
+     *  reads the bundled hearth/web from assets/www; the api provider is
+     *  LocalApi (read-only /api routes). Returns null once the module is destroyed. */
+    @Synchronized
+    private fun ensureLocalServer(ctx: android.content.Context): LocalWebServer? {
+        if (destroyed) return null
+        localServer?.let { return it }
+        val api = LocalApi(ctx)
+        val s = LocalWebServer(
+            assets = { path -> LocalAssets.provide(ctx, path) },
+            api = { method, path, _, _, _ -> api.handle(method, path) },
+        )
+        s.start()
+        localServer = s
+        return s
+    }
+
+    @Synchronized
+    private fun teardownLocalServer() {
+        destroyed = true
+        localServer?.stop()
+        localServer = null
+    }
+
     /** B.2c Task 3: the phone's real friend count -- `store.knownIdentities()`
      *  minus the phone's OWN identity. Both `getSyncStats` and `syncNow`'s
      *  success path previously surfaced the identities-table's raw row
@@ -266,6 +298,7 @@ class TorManagerModule : Module() {
             // even if getVideoUrl was never invoked (mediaServer stays null
             // -> no-op stop).
             teardownMediaServer()
+            teardownLocalServer()
         }
 
         AsyncFunction("bootstrap") { promise: Promise ->
@@ -561,6 +594,13 @@ class TorManagerModule : Module() {
             // getVideoUrl already returns null for every other "can't resolve"
             // case (no content key, no reactContext).
             if (blobKeys[msgId] == null) null else ensureMediaServer(ctx)?.urlFor(msgId, hash)
+        }.runOnQueue(ioScope)
+
+        // vp1: the full loopback URL (with one-time query token) the WebView
+        // loads. Starts the server on first call (lazy), null once destroyed.
+        AsyncFunction("getWebUrl") {
+            val ctx = appContext.reactContext ?: return@AsyncFunction null
+            ensureLocalServer(ctx)?.rootUrl()
         }.runOnQueue(ioScope)
 
         // -- B.2d-3 Task 2: plaintext story render paths --
