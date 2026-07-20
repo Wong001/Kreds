@@ -59,12 +59,17 @@ export default function App() {
   const [beats, setBeats] = useState<Beat[]>([]);
   const [exempt, setExempt] = useState(true);
   const [syncStats, setSyncStats] = useState<SyncStats>({ messages: 0, blobs: 0, identities: 0 });
-  // Task 3 (Brick C): the outcome text of the last MANUAL "Sync now" tap
+  // Task 3 (Brick C): the outcome of the last MANUAL "Sync now" tap
   // specifically (via the nodeSync terminal event) -- distinct from the
   // "last sync" line below, which reflects the latest sync overall
   // (background-service or manual) via getHistory. Named syncNowResult
   // (not lastSync) to keep that distinction visible in the code.
-  const [syncNowResult, setSyncNowResult] = useState<string>("");
+  // {text, kind} rather than a bare string (review fix): `kind` is set
+  // directly from r.ok/r.skipped in the onSync handler below, so the
+  // render's style choice never has to string-match `text` -- the fragile
+  // pattern this fix removes (r.reason's exact wording is display text
+  // only, never load-bearing for neutral-vs-red).
+  const [syncNowResult, setSyncNowResult] = useState<{ text: string; kind: "ok" | "skip" | "fail" } | null>(null);
   // null = not yet fetched this mount (loading); [] = fetched, nothing decrypted yet
   // (distinct empty-state, see the getFeed() render below).
   const [feed, setFeed] = useState<FeedItem[] | null>(null);
@@ -120,16 +125,19 @@ export default function App() {
     const offSync = onSync((r) => {
       if (r.ok) {
         setSyncStats({ messages: r.messages, blobs: r.blobs, identities: r.identities });
-        setSyncNowResult(`synced: ${r.messages} msgs, ${r.blobs} blobs, ${r.identities} friends`);
-      } else if (r.reason === "sync already in progress") {
-        // Task 3: a concurrent sync (almost certainly the 15-min background
-        // one) already held the mutex -- this is a skip, not a failure, so
-        // it gets a neutral note rather than the red fail styling, and
-        // leaves syncStats alone (r's counts are meaningless zeros here).
-        setSyncNowResult("sync already in progress - the background sync is running, try again shortly");
+        setSyncNowResult({ kind: "ok", text: `synced: ${r.messages} msgs, ${r.blobs} blobs, ${r.identities} friends` });
+      } else if (r.skipped) {
+        // Task 3 review fix: r.skipped is the dedicated native flag (set by
+        // TorManagerModule's syncNow only on the outcome.ran == false
+        // branch) -- NOT a match on r.reason's text. A concurrent sync
+        // (almost certainly the 15-min background one) already held the
+        // mutex; this is a skip, not a failure, so it gets a neutral note
+        // rather than the red fail styling, and leaves syncStats alone
+        // (r's counts are meaningless zeros here).
+        setSyncNowResult({ kind: "skip", text: "sync already in progress - the background sync is running, try again shortly" });
       } else {
         setSyncStats({ messages: r.messages, blobs: r.blobs, identities: r.identities });
-        setSyncNowResult(`sync failed: ${r.reason}`);
+        setSyncNowResult({ kind: "fail", text: `sync failed: ${r.reason}` });
       }
       // Terminal event: the live progress line resolves into syncNowResult above.
       setProgressPhase(null);
@@ -161,12 +169,16 @@ export default function App() {
           manual), sourced from getHistory via `beats` -- NOT syncNowResult
           below, which is scoped to this device's own manual "Sync now" tap.
           beats[0] is newest-first (HeartbeatStore prepends), kept fresh by
-          the onBeat->refresh() wiring in the effect above. */}
+          the onBeat->refresh() wiring in the effect above. `skipped` (review
+          fix) is the native flag, not a match on `reason`'s text -- a
+          background mutex-skip renders neutral here too, not red. */}
       {beats[0] ? (
-        <Text style={beats[0].ok ? styles.ok : styles.fail}>
-          last sync: {new Date(beats[0].ts).toLocaleTimeString()} — {beats[0].ok
-            ? `ok, ${beats[0].messages ?? 0} msgs / ${beats[0].blobs ?? 0} blobs`
-            : (beats[0].reason ?? "failed")}
+        <Text style={beats[0].skipped ? styles.neutral : beats[0].ok ? styles.ok : styles.fail}>
+          last sync: {new Date(beats[0].ts).toLocaleTimeString()} — {beats[0].skipped
+            ? (beats[0].reason ?? "sync in progress")
+            : beats[0].ok
+              ? `ok, ${beats[0].messages ?? 0} msgs / ${beats[0].blobs ?? 0} blobs`
+              : (beats[0].reason ?? "failed")}
         </Text>
       ) : (
         <Text style={styles.state}>last sync: none yet</Text>
@@ -197,10 +209,10 @@ export default function App() {
       </Text>
       {!!syncNowResult && (
         <Text style={
-          syncNowResult.startsWith("sync failed") ? styles.fail
-          : syncNowResult.startsWith("sync already in progress") ? styles.neutral
+          syncNowResult.kind === "fail" ? styles.fail
+          : syncNowResult.kind === "skip" ? styles.neutral
           : styles.ok
-        }>{syncNowResult}</Text>
+        }>{syncNowResult.text}</Text>
       )}
       <Text style={styles.subtitle}>Feed ({feed === null ? "..." : feed.length})</Text>
       {feed === null && <Text style={styles.state}>Loading feed...</Text>}
@@ -238,17 +250,21 @@ export default function App() {
           service now runs a full content sync on this cadence (was a bare
           AUTH heartbeat pre-Brick-C), so each row is a sync result. Ok rows
           show the pulled counts (now on every getHistory() entry) in place
-          of the old raw latencyMs. */}
+          of the old raw latencyMs. A `skipped` row (review fix: the native
+          flag, not a match on `reason`'s text) is a benign background
+          mutex-skip, not a failure -- rendered neutral/SKIP, not red/FAIL. */}
       <Text style={styles.subtitle}>Recent syncs ({beats.length})</Text>
       <FlatList
         style={styles.list}
         data={beats}
         keyExtractor={(b) => String(b.ts)}
         renderItem={({ item }) => (
-          <Text style={item.ok ? styles.ok : styles.fail}>
-            {new Date(item.ts).toLocaleTimeString()} {item.ok
-              ? `OK ${item.messages ?? 0} msgs / ${item.blobs ?? 0} blobs`
-              : `FAIL ${item.reason}`}
+          <Text style={item.skipped ? styles.neutral : item.ok ? styles.ok : styles.fail}>
+            {new Date(item.ts).toLocaleTimeString()} {item.skipped
+              ? `SKIP ${item.reason ?? "sync in progress"}`
+              : item.ok
+                ? `OK ${item.messages ?? 0} msgs / ${item.blobs ?? 0} blobs`
+                : `FAIL ${item.reason}`}
           </Text>
         )}
       />

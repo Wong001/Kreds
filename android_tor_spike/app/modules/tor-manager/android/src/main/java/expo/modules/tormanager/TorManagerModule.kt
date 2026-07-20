@@ -169,8 +169,12 @@ class TorManagerModule : Module() {
                 // recorded. The live "nodeBeat" broadcast/event is UNCHANGED
                 // (ts/ok/latencyMs/reason only) -- these three fields exist
                 // ONLY on this getHistory() result, per index.ts's Beat type.
+                // `skipped` (Task 3 fix): the dedicated mutex-skip flag --
+                // App.tsx renders a skipped=true row neutral regardless of
+                // `reason`'s exact wording.
                 mapOf("ts" to it.ts, "ok" to it.ok, "latencyMs" to it.latencyMs, "reason" to it.reason,
-                    "messages" to it.messages, "blobs" to it.blobs, "identities" to it.identities)
+                    "messages" to it.messages, "blobs" to it.blobs, "identities" to it.identities,
+                    "skipped" to it.skipped)
             }
         }
 
@@ -185,11 +189,20 @@ class TorManagerModule : Module() {
         //    nodeSync/onSyncProgress emits. The single new behavior is the
         //    "sync already in progress" skip (outcome.ran == false). --
         AsyncFunction("syncNow") {
-            fun emit(ok: Boolean, messages: Int, blobs: Int, identities: Int, reason: String?, feedUpdated: Boolean) {
+            // `skipped` (Task 3 fix): defaults false so every pre-existing
+            // call site (real successes/failures) is unaffected -- only the
+            // outcome.ran == false branch below passes skipped = true. This
+            // is the dedicated boolean the JS side checks; `reason`'s exact
+            // wording ("sync already in progress") is display text only, no
+            // longer load-bearing for the neutral-vs-red decision.
+            fun emit(
+                ok: Boolean, messages: Int, blobs: Int, identities: Int, reason: String?,
+                feedUpdated: Boolean, skipped: Boolean = false,
+            ) {
                 sendEvent("nodeSync", mapOf(
                     "ok" to ok, "messages" to messages, "blobs" to blobs,
                     "identities" to identities, "reason" to reason,
-                    "feedUpdated" to feedUpdated))
+                    "feedUpdated" to feedUpdated, "skipped" to skipped))
             }
             val ctx = appContext.reactContext
             if (ctx == null) { emit(false, 0, 0, 0, "no context", false); return@AsyncFunction Unit }
@@ -223,7 +236,9 @@ class TorManagerModule : Module() {
                 // The one new behavior: a concurrent sync already held the
                 // process-wide mutex, so this call skipped immediately (no
                 // second Tor dial, no double KotlinSync.run). Feed unchanged.
-                emit(false, 0, 0, 0, "sync already in progress", false)
+                // skipped = true is the source of truth for the UI's neutral
+                // note; `reason` stays human-readable text only.
+                emit(false, 0, 0, 0, "sync already in progress", false, skipped = true)
                 return@AsyncFunction Unit
             }
 

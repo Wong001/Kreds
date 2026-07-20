@@ -105,7 +105,13 @@ class TorNodeService : Service() {
             if (!TorEngine.isUp) throw IllegalStateException("tor not up")
             val fx = fixture()
             val o = SyncRunner.runSync(this, fx)     // default no-op progress; NEVER decrypts
-            if (!o.ran) Beat(start, false, System.currentTimeMillis() - start, "skipped (in progress)")
+            // skipped = true (Brick C Task 3 fix): SyncRunner.ran == false is
+            // a benign mutex contention (the foreground syncNow held the
+            // lock), not a real failure -- flagged with a dedicated boolean
+            // rather than relying on callers to string-match this reason
+            // text, so the Recent-syncs list can render it neutral instead
+            // of red FAIL.
+            if (!o.ran) Beat(start, false, System.currentTimeMillis() - start, "skipped (in progress)", skipped = true)
             else if (o.ok) Beat(start, true, System.currentTimeMillis() - start, null, o.messages, o.blobs, o.identities)
             else Beat(start, false, System.currentTimeMillis() - start, o.error ?: "sync failed")
         } catch (e: Exception) {

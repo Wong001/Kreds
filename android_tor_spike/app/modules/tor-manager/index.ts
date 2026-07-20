@@ -52,9 +52,15 @@ export function suspendTor(): Promise<void> {
 // into; App.tsx's onBeat handler re-runs getHistory() on every live beat
 // rather than trusting the (count-less) live payload, so the dashboard's
 // derived "last sync" line always reads from the count-carrying source.
+// `skipped` (Task 3 review fix): true iff this Beat is a benign mutex skip
+// (TorNodeService's syncCycle saw SyncRunner.SyncOutcome.ran == false) --
+// a dedicated flag, NOT to be inferred from `reason`'s text. Same
+// availability shape as the counts above: present on getHistory() entries,
+// absent on the live nodeBeat broadcast (defaults to false via `??` at
+// call sites).
 export interface Beat {
   ts: number; ok: boolean; latencyMs: number; reason: string | null;
-  messages?: number; blobs?: number; identities?: number;
+  messages?: number; blobs?: number; identities?: number; skipped?: boolean;
 }
 
 export function startNode(): void { native.startNode(); }
@@ -140,6 +146,15 @@ export function onSync(cb: (r: {
   // call. Always present (the native side emits it on every nodeSync event,
   // success or failure); existing callers that don't read it are unaffected.
   feedUpdated: boolean;
+  // `skipped` (Task 3 review fix): true iff this terminal event is a benign
+  // mutex skip (a concurrent sync -- almost always the 15-min background
+  // one -- already held SyncRunner's process-wide lock), not a real
+  // failure. Always present (the module's `emit` defaults it false and sets
+  // it true only on the outcome.ran == false branch) -- the dedicated
+  // source of truth for the dashboard's neutral-vs-red decision. `reason`
+  // ("sync already in progress") is display text only; do not string-match
+  // it to detect a skip.
+  skipped: boolean;
 }) => void): () => void {
   const sub = native.addListener("nodeSync", (e: any) => cb(e));
   return () => sub.remove();
