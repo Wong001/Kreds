@@ -72,7 +72,11 @@ export function getSyncStats(): Promise<SyncStats> { return native.getSyncStats(
 // inline wrap or a backfilled wrap_grant). Populated by syncNow (re-run
 // after every successful sync); getFeed() just reads that cache -- see
 // TorManagerModule's feedCache doc comment.
-export interface FeedItem { msgId: string; kind: string; text: string; createdAt: number }
+// `author` (B.2c Task 3): the resolved display name for the message's
+// author -- the latest stored profile name for that identity, else
+// "friend-" + identityPub.take(8) (or "me" for our own identity with no
+// stored profile yet). See DecryptPass.resolveAuthor.
+export interface FeedItem { msgId: string; kind: string; author: string; text: string; createdAt: number }
 
 export function getFeed(): Promise<FeedItem[]> { return native.getFeed(); }
 

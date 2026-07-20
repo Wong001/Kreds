@@ -44,6 +44,38 @@ class TorManagerModule : Module() {
     // result) is never mutated after being built, only replaced wholesale.
     @Volatile private var feedCache: List<DecryptPass.Decrypted> = emptyList()
 
+    /** B.2c Task 3: the phone's real friend count -- `store.knownIdentities()`
+     *  minus the phone's OWN identity. Both `getSyncStats` and `syncNow`'s
+     *  success path previously surfaced the identities-table's raw row
+     *  count (SqliteSyncStore.stats().identities / SyncResult.Ok.identities)
+     *  as-is under the JS-facing key "identities" (App.tsx labels it
+     *  "friends") -- but that table holds the phone's OWN identity too,
+     *  seeded via `store.addIdentity(fx.cert.identity_pub)` at the top of
+     *  every syncNow, alongside real friends admitted by KotlinSync.run's
+     *  (untouchable) HAVE phase from the node's reported `known` list. A
+     *  phone with zero real friends therefore showed "friends: 1" (itself).
+     *
+     *  The own identity is read from the same fixture file syncNow already
+     *  parses (`spike_phone_fixture.json`), rather than threading it through
+     *  as a parameter -- getSyncStats has no fixture in scope today, and
+     *  parsing here keeps both call sites' fix identical instead of one
+     *  passing a value the other derives fresh. If the fixture can't be
+     *  read, this fails toward "no friends" (returns 0) rather than the
+     *  phantom-friend direction (previously: falling back to the raw,
+     *  unfiltered known-identities count, which could silently re-admit the
+     *  own identity as a counted "friend" -- the exact bug this whole
+     *  function exists to fix). A caller seeing 0 friends when the fixture
+     *  is temporarily unreadable is the safe failure shape; seeing an
+     *  inflated count never is. */
+    private fun friendsCount(store: SyncStore): Int {
+        val ownIdentityPub = try {
+            KotlinHandshake.parseFixture(
+                File(TorEngine.externalDir(), "spike_phone_fixture.json").readText()
+            ).cert.identity_pub
+        } catch (e: Exception) { return 0 }
+        return store.knownIdentities().count { it != ownIdentityPub }
+    }
+
     override fun definition() = ModuleDefinition {
         Name("TorManager")
 
@@ -223,7 +255,13 @@ class TorManagerModule : Module() {
                         // feedCache's own doc comment for why getFeed() itself
                         // just serves this cache instead of re-running.
                         feedCache = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub)
-                        emit(true, r.messages, r.blobs, r.identities, null, true)
+                        // r.identities (SyncResult.Ok, from KotlinSync.run --
+                        // UNTOUCHABLE) is the raw identities-table count,
+                        // which includes the phone's own identity (seeded
+                        // just above, before KotlinSync.run) -- see
+                        // friendsCount's doc for why that's the wrong number
+                        // to label "friends" downstream.
+                        emit(true, r.messages, r.blobs, friendsCount(store), null, true)
                     }
                     is SyncResult.SelfRevoked -> emit(false, 0, 0, 0, "self-revoked", false)
                     is SyncResult.Failed -> emit(false, 0, 0, 0, "${r.stage}: ${r.reason}", false)
@@ -249,7 +287,7 @@ class TorManagerModule : Module() {
                 // the data class through, matching this module's existing
                 // event/return marshaling style (getHistory/getSyncStats).
                 mapOf(
-                    "msgId" to d.msgId, "kind" to d.kind,
+                    "msgId" to d.msgId, "kind" to d.kind, "author" to d.author,
                     "text" to d.text, "createdAt" to d.createdAt,
                 )
             }
@@ -258,8 +296,9 @@ class TorManagerModule : Module() {
         AsyncFunction("getSyncStats") {
             val ctx = appContext.reactContext
                 ?: return@AsyncFunction mapOf("messages" to 0, "blobs" to 0, "identities" to 0)
-            val st = SqliteSyncStore(ctx).stats()
-            mapOf("messages" to st.messages, "blobs" to st.blobs, "identities" to st.identities)
+            val store = SqliteSyncStore(ctx)
+            val st = store.stats()
+            mapOf("messages" to st.messages, "blobs" to st.blobs, "identities" to friendsCount(store))
         }
 
         Function("isBatteryExempt") {

@@ -353,20 +353,32 @@ class SqliteSyncStore(context: Context) :
         return out
     }
 
-    /** wrap_grant rows targeting msgId AND signed by authorIdentityPub,
-     *  decoded from msg_json (no target_id column exists in this schema --
-     *  unlike hearth's store.py -- so the target match is done in
-     *  application code, same style as missingBlobs() above; the author
-     *  match IS a real column, `identity_pub`, filtered directly in SQL).
-     *  Returned oldest-to-newest by (created_at, seq) -- see the SyncStore
-     *  interface doc for why callers can fold newest-wins from that order,
-     *  and why the author filter is load-bearing, not optional. */
-    override fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>> {
+    /** wrap_grant rows targeting msgId AND signed by any identity in
+     *  acceptedSigners, decoded from msg_json (no target_id column exists in
+     *  this schema -- unlike hearth's store.py -- so the target match is
+     *  done in application code, same style as missingBlobs() above; the
+     *  signer match IS a real column, `identity_pub`, filtered directly in
+     *  SQL via `IN (...)`). Returned oldest-to-newest by (created_at, seq) --
+     *  see the SyncStore interface doc for why callers can fold newest-wins
+     *  from that order, and why the signer-set filter is load-bearing, not
+     *  optional (B.2c: DecryptPass passes {author} for posts, {author,
+     *  ownIdentityPub} for a DM addressed to us, else {author}).
+     *
+     *  Empty acceptedSigners returns no rows without ever touching SQL --
+     *  `IN ()` is invalid syntax in SQLite, and DecryptPass's entitlement
+     *  rule never actually produces an empty set (every branch includes at
+     *  least the message's own author), but a caller passing one legitimately
+     *  means "trust nobody", not "trust everybody" (which an unguarded query
+     *  with zero placeholders could otherwise be misread as). */
+    override fun wrapGrantsFor(msgId: String, acceptedSigners: Set<String>): List<Map<String, Any?>> {
+        if (acceptedSigners.isEmpty()) return emptyList()
         data class Row(val createdAt: Double, val seq: Int, val wraps: Map<String, Any?>)
         val rows = mutableListOf<Row>()
+        val placeholders = acceptedSigners.joinToString(",") { "?" }
+        val args = (listOf("wrap_grant") + acceptedSigners).toTypedArray()
         readableDatabase.rawQuery(
-            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
-            arrayOf("wrap_grant", authorIdentityPub)
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub IN ($placeholders)",
+            args
         ).use { c ->
             while (c.moveToNext()) {
                 val seq = c.getInt(0)
@@ -377,5 +389,33 @@ class SqliteSyncStore(context: Context) :
             }
         }
         return rows.sortedWith(compareBy({ it.createdAt }, { it.seq })).map { it.wraps }
+    }
+
+    /** See the SyncStore interface doc: identity_pub -> the latest stored
+     *  KIND_PROFILE message's `name`, by (created_at, seq). Reads msg_json
+     *  the same way missingBlobs()/wrapGrantsFor() above do (no dedicated
+     *  columns for a profile message's payload fields) -- `seq` IS a real
+     *  column here (unlike wrapGrantsFor's target, which isn't), so it's
+     *  read directly rather than decoded from JSON. */
+    override fun profileNames(): Map<String, String> {
+        data class Candidate(val createdAt: Double, val seq: Int, val name: String)
+        val best = linkedMapOf<String, Candidate>()
+        readableDatabase.rawQuery(
+            "SELECT identity_pub, seq, msg_json FROM messages WHERE kind = ?", arrayOf("profile")
+        ).use { c ->
+            while (c.moveToNext()) {
+                val identityPub = c.getString(0)
+                val seq = c.getInt(1)
+                val payload = JSONObject(c.getString(2)).optJSONObject("payload") ?: continue
+                // Blank stored names are treated as absent -- see
+                // InMemorySyncStore.profileNames' matching comment.
+                val name = (payload.opt("name") as? String)?.takeIf { it.isNotBlank() } ?: continue
+                val createdAt = payload.optDouble("created_at", 0.0)
+                val cur = best[identityPub]
+                if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
+                    best[identityPub] = Candidate(createdAt, seq, name)
+            }
+        }
+        return best.mapValues { it.value.name }
     }
 }

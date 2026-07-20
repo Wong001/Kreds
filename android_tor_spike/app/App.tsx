@@ -72,7 +72,7 @@ export default function App() {
           keyExtractor={(item) => item.msgId}
           renderItem={({ item }) => (
             <Text style={styles.feedItem}>
-              {new Date(item.createdAt * 1000).toLocaleString()} [{item.kind}] {item.text}
+              {item.author} · {item.kind} · {new Date(item.createdAt * 1000).toLocaleString()} — {item.text}
             </Text>
           )}
         />

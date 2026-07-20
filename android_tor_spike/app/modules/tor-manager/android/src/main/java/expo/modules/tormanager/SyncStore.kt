@@ -66,14 +66,18 @@ interface SyncStore {
     fun allMessages(): List<StoredMsg>
     /** The `wraps` maps from every stored wrap_grant message whose `target`
      *  equals msgId AND whose SIGNING identity (the grant message's own
-     *  cert.identity_pub) equals authorIdentityPub, ordered OLDEST-TO-NEWEST
-     *  by (created_at, seq) -- mirrors hearth's `store.wrap_grants(target,
-     *  author)` (store.py:773-790) exactly, INCLUDING its author scoping.
-     *  Callers fold left-to-right over the (already author-filtered) result
-     *  to prefer the newest grant for a given device (DecryptPass does
-     *  this).
+     *  cert.identity_pub) is a MEMBER OF acceptedSigners, ordered OLDEST-TO-
+     *  NEWEST by (created_at, seq) -- mirrors hearth's `store.wrap_grants(
+     *  target, author)` (store.py:773-790), generalized from a single
+     *  author to a caller-chosen signer set (B.2c: DecryptPass's entitlement
+     *  rule -- posts accept only the post's author; DMs additionally accept
+     *  the DM's recipient, but ONLY when that recipient is our own identity,
+     *  covering hearth's `maintain_received_dm_grants` recipient-signed
+     *  backfill). Callers fold left-to-right over the (already filtered)
+     *  result to prefer the newest grant for a given device (DecryptPass
+     *  does this).
      *
-     *  The author filter is NOT optional (correcting an earlier version of
+     *  The signer filter is NOT optional (correcting an earlier version of
      *  this comment, which wrongly reasoned it could be skipped because
      *  "the store only holds own content"): B.1's sync does not admit only
      *  own-authored messages -- see allMessages' doc above. A hostile
@@ -84,11 +88,28 @@ interface SyncStore {
      *  over your real (older) own-authored one; unwrapKey would "succeed"
      *  with the wrong key, decryptBody would then fail AEAD auth, and your
      *  own real post would silently vanish from the feed -- a fail-closed
-     *  but real denial-of-render. Requiring `authorIdentityPub` as a
+     *  but real denial-of-render. Requiring `acceptedSigners` as a
      *  parameter (rather than a separate unfiltered accessor) is
-     *  deliberate: it stops a future caller (e.g. B.2c, friends' content)
-     *  from accidentally reintroducing this gap. */
-    fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>>
+     *  deliberate: it stops a caller from accidentally reintroducing this
+     *  gap -- the caller must name every identity it trusts, explicitly,
+     *  every time. */
+    fun wrapGrantsFor(msgId: String, acceptedSigners: Set<String>): List<Map<String, Any?>>
+    /** Display-name resolution (B.2c Task 3): identity_pub -> the `name`
+     *  field of that identity's LATEST stored KIND_PROFILE message, by
+     *  (created_at, seq). KIND_PROFILE payloads are PLAINTEXT (hearth's
+     *  `messages.make_profile`, messages.py:104-115 -- signs
+     *  {"kind":"profile","name":...,"created_at":...} with no wraps/
+     *  body_ct at all), so this needs no decrypt step, unlike post/dm.
+     *  Identities with no stored profile message are simply absent from
+     *  the returned map -- callers apply their own fallback (DecryptPass:
+     *  own identity -> "me", any other identity -> "friend-" +
+     *  identityPub.take(8)). No entitlement/signer filtering here: unlike
+     *  wrap_grant, a profile message's own author IS its subject (there is
+     *  no "whose name is this" ambiguity for a forged sender to exploit --
+     *  a message from identity X can only ever claim X's own display name,
+     *  gated the same is_known+signature checks every stored message
+     *  already passes at ingest). */
+    fun profileNames(): Map<String, String>
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -167,16 +188,37 @@ class InMemorySyncStore : SyncStore {
     override fun allMessages(): List<StoredMsg> =
         messages.entries.map { (id, m) -> StoredMsg(id, m.kind, m.cert.identity_pub, m.payload) }
 
-    override fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>> {
+    override fun wrapGrantsFor(msgId: String, acceptedSigners: Set<String>): List<Map<String, Any?>> {
         @Suppress("UNCHECKED_CAST")
         return messages.values
             .filter {
                 it.kind == "wrap_grant" && it.payload["target"] == msgId &&
-                    it.cert.identity_pub == authorIdentityPub
+                    it.cert.identity_pub in acceptedSigners
             }
             .sortedWith(compareBy(
                 { (it.payload["created_at"] as? Number)?.toDouble() ?: 0.0 },
                 { it.seq }))
             .mapNotNull { it.payload["wraps"] as? Map<String, Any?> }
+    }
+
+    override fun profileNames(): Map<String, String> {
+        data class Candidate(val createdAt: Double, val seq: Int, val name: String)
+        val best = linkedMapOf<String, Candidate>()
+        for (m in messages.values) {
+            if (m.kind != "profile") continue
+            // Blank ("" or all-whitespace) stored names are treated as
+            // absent, not as a valid-but-empty display name -- otherwise a
+            // profile message with name:"" would render as a blank author
+            // segment in the feed instead of falling back to the readable
+            // "friend-" + prefix. A later profile message (real name) for
+            // the same identity can still win normally; this only rejects
+            // THIS candidate, not the identity as a whole.
+            val name = (m.payload["name"] as? String)?.takeIf { it.isNotBlank() } ?: continue
+            val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: 0.0
+            val cur = best[m.cert.identity_pub]
+            if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && m.seq > cur.seq))
+                best[m.cert.identity_pub] = Candidate(createdAt, m.seq, name)
+        }
+        return best.mapValues { it.value.name }
     }
 }

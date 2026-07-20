@@ -2187,6 +2187,92 @@ class HearthNode:
                 self._publish(make_wrap_grant(self.device, msg.msg_id,
                                               wraps, now=now))
 
+    def maintain_received_dm_grants(self, now: Optional[float] = None):
+        """Re-wrap RECEIVED DMs' content keys to this identity's OWN other
+        devices via RECIPIENT-signed wrap_grants -- the phone can then read
+        old friend DMs composed before its enc key existed. The recipient
+        already holds the plaintext; re-wrapping to its own enrolled device
+        (identity-signed cert, the same thing AUTH requires) discloses
+        nothing new. These grants route ONLY to the devices named in their
+        wraps -- and every wrap here targets an OWN satellite device -- so
+        one can never reach a friend.
+
+        Trust model (the point of B.2c): make_wrap_grant signs with whoever
+        mints, so a grant minted HERE for a friend's DM is RECIPIENT-signed.
+        Consumers honor a recipient-signed grant only for the recipient's
+        OWN devices, so the mint side MUST wrap to nothing but own satellite
+        devices (store.enckeys(own) minus self). That is why `targets` is
+        derived solely from the own identity's enckeys.
+
+        Distinct from maintain_wrap_grants (friends' kreds-wall coverage)
+        and maintain_own_device_grants (this identity's OWN-authored
+        content) -- both left UNTOUCHED. A received DM is author != self,
+        so those two sweeps never iterate it; NO carry-forward is needed
+        because the (author=self, target=friend-dm-id) prune key is minted
+        by this sweep alone -- no other minter shares it, so the latest
+        full-coverage grant is always self-sufficient for the prune.
+
+        Guard identical to the other two sweeps: minting signs, so
+        locked/revoked/unenrolled skip the whole sweep."""
+        if self.revoked or self.locked or self.device.identity_pub is None:
+            return
+        now = now if now is not None else time.time()
+        own = self.store.enckeys(self.identity_pub)
+        targets = {d: e for d, e in own.items()
+                   if d != self.device.device_pub}
+        if not targets:
+            return
+        # Recipient-signed grants ARE own-minted (kind=WRAP_GRANT, author
+        # self), so _latest_own_wrap_grants already surfaces the prune-
+        # surviving grant for each received-DM target -- keyspace exclusive
+        # to this sweep, so `latest` reflects only prior rounds of it.
+        latest = self._latest_own_wrap_grants()
+        for msg in self._received_dms():
+            wrapped = set(msg.payload.get("wraps", {}))
+            grant = latest.get(msg.msg_id, {})
+            grantable = {}       # every own target device NOT inline-wrapped
+                                 # -> its CURRENT enc key (full-coverage set)
+            missing = False      # any own device lacking current coverage?
+            for dpub, enc_pub in targets.items():
+                if dpub in wrapped:
+                    continue     # inline envelope wins; no grant needed
+                grantable[dpub] = enc_pub
+                g = grant.get(dpub)
+                # Covered only if the LATEST grant sealed to the device's
+                # CURRENT enc key (mirrors the enc_pub annotation check; a
+                # pre-annotation grant counts as covered).
+                if g is None or g.get("enc_pub", enc_pub) != enc_pub:
+                    missing = True
+            if not missing:
+                continue
+            key, aad = self._content_key(msg)
+            if key is None:                 # unkeyable (e.g. desk not in
+                continue                    # wraps): skip, never crash sweep
+            # FULL-COVERAGE mint: wrap to ALL grantable own devices (not just
+            # the missing ones), annotate each with its current enc_pub. No
+            # carry-forward: this sweep owns the (self, this-dm) prune key.
+            wraps = wrap_key(key, grantable, aad)
+            for dpub in wraps:
+                wraps[dpub]["enc_pub"] = grantable[dpub]
+            if wraps:
+                self._publish(make_wrap_grant(self.device, msg.msg_id,
+                                              wraps, now=now))
+
+    def _received_dms(self):
+        """Friend-authored DMs addressed to this identity (kind==KIND_DM,
+        author != self, payload['to'] == self). There is no single received-
+        DM store iterator (dm_thread is peer-scoped, messages_by_author is
+        own-authored), so compose it from dm_conversations + dm_thread --
+        the same peer-scoped accessors _own_authored_messages builds on."""
+        out = []
+        for other in self.store.dm_conversations(self.identity_pub):
+            for msg in self.store.dm_thread(self.identity_pub, other):
+                if (msg.payload.get("kind") == KIND_DM
+                        and msg.cert.identity_pub != self.identity_pub
+                        and msg.payload.get("to") == self.identity_pub):
+                    out.append(msg)
+        return out
+
     def _latest_own_wrap_grants(self):
         """target_id -> wraps of THIS identity's latest wrap_grant per
         target, by the same (created_at, seq) tie-break
