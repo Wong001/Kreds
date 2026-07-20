@@ -76,6 +76,15 @@ def build():
         "wrap": w4["dev1"], "body_nonce": n4, "body_ct": c4,
         "content_key": key4.hex(), "plaintext": body4,
     })
+    # a blob encrypted with a content key (BLOB_AAD, no per-message aad)
+    from hearth.dmcrypt import encrypt_blob
+    bkey = new_content_key()
+    blob_plain = b"\x89PNG\r\n\x1a\n" + b"kreds-blob-vector-bytes" * 4
+    blob_cipher = encrypt_blob(bkey, blob_plain)
+    cases.append({
+        "kind": "blob", "content_key": bkey.hex(),
+        "cipher": blob_cipher.hex(), "plain": blob_plain.hex(),
+    })
     return {"cases": cases}
 
 
