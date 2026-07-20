@@ -439,6 +439,21 @@ class SqliteSyncStore(context: Context) :
         return best.mapValues { it.value.name }
     }
 
+    /** Distinct device_pubs of `identity`'s stored (verified-at-ingest)
+     *  messages (B.2d-4 Task 2) -- the SQLite mirror of InMemorySyncStore.
+     *  deviceViews and of hearth's store.load_views; see the SyncStore
+     *  interface doc for why this is the device-binding source and why an
+     *  empty result is permissive at the caller. `device_pub` is a real
+     *  indexed column (idx_messages_idp_dp_seq), so this is a direct query,
+     *  not a JSON scan. */
+    override fun deviceViews(identity: String): Set<String> {
+        val out = linkedSetOf<String>()
+        readableDatabase.rawQuery(
+            "SELECT DISTINCT device_pub FROM messages WHERE identity_pub = ?", arrayOf(identity)
+        ).use { c -> while (c.moveToNext()) out.add(c.getString(0)) }
+        return out
+    }
+
     /** Unexpired KIND_STORY rows (B.2d-3 Task 1) -- see the SyncStore
      *  interface doc for the strict `expires_at > nowSeconds` filter (a row
      *  with expires_at == nowSeconds is expired, not active). Reads
