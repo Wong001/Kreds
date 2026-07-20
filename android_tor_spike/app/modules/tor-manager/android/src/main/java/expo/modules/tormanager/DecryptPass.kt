@@ -202,19 +202,31 @@ object DecryptPass {
 
     /** Shape-guards a DM's optional outer-payload `story_ref` value (see
      *  Decrypted.storyRefMediaHash's doc) and, if valid, returns its
-     *  `media_hash`. Mirrors hearth's own `_valid_story_ref` (messages.py)
-     *  defensively: both `story_id` and `media_hash` must be present,
-     *  non-empty strings, or this is null -- same fail-closed idiom as
-     *  stringList/nullableStringList above (a malformed or missing field
-     *  degrades to "no story_ref", never a crash). `story_id` is checked but
-     *  not returned -- see the field's doc for why it has no consumer yet. */
+     *  `media_hash`. Genuinely mirrors hearth's own `_valid_story_ref`
+     *  (messages.py:241-255) now: `story_id` must be a present, non-empty
+     *  string (checked but not returned -- see the field's doc for why it
+     *  has no consumer yet); `media_hash` must additionally pass the same
+     *  hex64 shape hearth's `_is_hex64` enforces (exactly 64 lowercase hex
+     *  chars) -- not just "non-empty" -- since media_hash is the literal
+     *  blob-store lookup key this value feeds into (getStoryImage), a
+     *  tighter fail-closed guard here is real input validation for that
+     *  fetch, not merely cosmetic parity. Any shape failure -> null, same
+     *  fail-closed idiom as stringList/nullableStringList above (malformed
+     *  or missing degrades to "no story_ref", never a crash). */
     private fun storyRefMediaHash(v: Any?): String? {
         val ref = v as? Map<*, *> ?: return null
         val storyId = ref["story_id"] as? String
         val mediaHash = ref["media_hash"] as? String
-        if (storyId.isNullOrEmpty() || mediaHash.isNullOrEmpty()) return null
+        if (storyId.isNullOrEmpty() || !isHex64(mediaHash)) return null
         return mediaHash
     }
+
+    /** Mirrors hearth's `_is_hex64` (messages.py): exactly 64 lowercase
+     *  hex characters. Used to validate `media_hash` above -- a real blob-
+     *  store lookup key, not just an opaque display string, so the shape
+     *  check is load-bearing input validation, not decoration. */
+    private fun isHex64(s: String?): Boolean =
+        s != null && s.length == 64 && s.all { it in "0123456789abcdef" }
 
     /** Content-key source, in priority order: (1) the message's own inline
      *  wrap -- new content auto-wraps to the phone once its enckey is known
