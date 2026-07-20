@@ -1,8 +1,8 @@
-import { registerRootComponent } from 'expo';
+import { registerRootComponent } from "expo";
 
-import App from './App';
+import WebShell from "./WebShell";
 
-// registerRootComponent calls AppRegistry.registerComponent('main', () => App);
-// It also ensures that whether you load the app in Expo Go or in a native build,
-// the environment is set up appropriately
-registerRootComponent(App);
+// vp1: the phone's UI is now the desktop web app in a WebView (WebShell owns
+// the engine lifecycle for slice 1). App.tsx (the old dev dashboard) is left in
+// the tree, unregistered, for reference / engine-control fallback.
+registerRootComponent(WebShell);
