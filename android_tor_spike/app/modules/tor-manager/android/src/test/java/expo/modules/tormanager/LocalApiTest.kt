@@ -126,4 +126,52 @@ class LocalApiTest {
         val us = o.getJSONObject("update_status")
         assertFalse(us.getBoolean("available")); assertTrue(us.isNull("kind")); assertTrue(us.isNull("version"))
     }
+
+    // -- Task 5: sniff + storiesJson --
+
+    @Test fun sniffMagicBytes() {
+        assertEquals("image/png", LocalApi.sniff(byteArrayOf(0x89.toByte(), 'P'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte(), 0, 0)))
+        assertEquals("image/jpeg", LocalApi.sniff(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0, 0)))
+        assertEquals("image/gif", LocalApi.sniff("GIF89a".toByteArray()))
+        assertEquals("image/webp", LocalApi.sniff("RIFF....WEBP".toByteArray()))
+        assertEquals("application/octet-stream", LocalApi.sniff("zzzz".toByteArray()))
+    }
+
+    @Test fun sniffFtypAvifVsMp4() {
+        // bytes[4:8] == "ftyp"; bytes[8:12] brand decides avif vs mp4
+        val avif = ByteArray(16); "xxxx".toByteArray().copyInto(avif, 0)
+        "ftyp".toByteArray().copyInto(avif, 4); "avif".toByteArray().copyInto(avif, 8)
+        assertEquals("image/avif", LocalApi.sniff(avif))
+        val mp4 = ByteArray(16); "xxxx".toByteArray().copyInto(mp4, 0)
+        "ftyp".toByteArray().copyInto(mp4, 4); "isom".toByteArray().copyInto(mp4, 8)
+        assertEquals("video/mp4", LocalApi.sniff(mp4))
+    }
+
+    @Test fun storiesJsonGroupsByAuthorSelfFirst() {
+        val stories = listOf(
+            StoredStory("s1", "cara", "photo", "h1", null, "cap1", 10.0),
+            StoredStory("s2", "own", "video", "h2", "p2", "cap2", 20.0),
+            StoredStory("s3", "cara", "photo", "h3", null, "cap3", 30.0))
+        val json = LocalApi.storiesJson(stories, mapOf("cara" to "Cara"), ownIdentityPub = "own")
+        val arr = org.json.JSONArray(json)
+        // self ("own") first
+        assertEquals("own", arr.getJSONObject(0).getString("identity_pub"))
+        assertTrue(arr.getJSONObject(0).getBoolean("mine"))
+        val cara = arr.getJSONObject(1)
+        assertEquals("cara", cara.getString("identity_pub"))
+        assertFalse(cara.getBoolean("mine"))
+        assertEquals("Cara", cara.getString("name"))
+        assertTrue(cara.isNull("avatar"))
+        // items OLDEST-first within a group (confirmed against hearth
+        // store.py's active_stories(): "SELECT ... ORDER BY created_at ASC"
+        // appended in that scan order, with no reversal -- this is a
+        // story-viewer playback order (oldest to newest), NOT the
+        // newest-first order an unconfirmed reading of the shape might
+        // assume). s1 (created_at 10.0) precedes s3 (created_at 30.0).
+        val items = cara.getJSONArray("items")
+        assertEquals("s1", items.getJSONObject(0).getString("msg_id"))
+        assertEquals("s3", items.getJSONObject(1).getString("msg_id"))
+        assertEquals(setOf("msg_id", "media_kind", "media", "poster", "caption", "created_at"),
+            items.getJSONObject(0).keys().asSequence().toSet())
+    }
 }

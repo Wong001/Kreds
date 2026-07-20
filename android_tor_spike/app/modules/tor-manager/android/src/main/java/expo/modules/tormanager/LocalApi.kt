@@ -21,11 +21,20 @@ class LocalApi(private val ctx: Context) {
 
     fun handle(method: String, path: String): HttpResponse? {
         if (method != "GET") return null
-        return when (path) {
-            "/api/bootstrap" -> json(bootstrapJson())
-            "/api/applock" -> json(applockJson())
-            "/api/state" -> json(state())
-            "/api/feed" -> json(feed())
+        return when {
+            path == "/api/bootstrap" -> json(bootstrapJson())
+            path == "/api/applock" -> json(applockJson())
+            path == "/api/state" -> json(state())
+            path == "/api/feed" -> json(feed())
+            path == "/api/stories" -> json(stories())
+            path.startsWith("/api/post-blob/") -> {
+                val seg = path.removePrefix("/api/post-blob/").split("/")
+                if (seg.size != 2 || seg[0].isEmpty() || seg[1].isEmpty()) notFound() else postBlob(seg[0], seg[1])
+            }
+            path.startsWith("/api/blob/") -> {
+                val h = path.removePrefix("/api/blob/")
+                if (h.isEmpty() || h.contains("/")) notFound() else blob(h)
+            }
             else -> null
         }
     }
@@ -65,9 +74,111 @@ class LocalApi(private val ctx: Context) {
         KotlinHandshake.parseFixture(File(TorEngine.externalDir(), "spike_phone_fixture.json").readText())
     } catch (e: Exception) { null }
 
+    private fun stories(): String {
+        val fx = fixtureOrNull()
+        val store = SqliteSyncStore(ctx)
+        val own = fx?.cert?.identity_pub ?: ""
+        val now = System.currentTimeMillis() / 1000.0
+        return storiesJson(store.activeStories(now), store.profileNames(), own)
+    }
+
+    // /api/blob/{h}: raw plaintext-at-rest bytes (avatars/plaintext content),
+    // NO content-key decrypt -- mirrors getStoryImage's decrypt-skipping path.
+    private fun blob(hash: String): HttpResponse {
+        val data = SqliteSyncStore(ctx).getBlob(hash) ?: return notFound()
+        return mediaResponse(data)
+    }
+
+    // /api/post-blob/{msg_id}/{h}: content-key-decrypted post/DM blob bytes,
+    // streamed decrypt-on-read. AVIF is served raw (image/avif) -- the WebView
+    // Chromium renderer decodes it (it never has our keys; we hand it already-
+    // decrypted plaintext), matching desktop exactly.
+    private fun postBlob(msgId: String, hash: String): HttpResponse {
+        val store = SqliteSyncStore(ctx)
+        // vp1: use the cache warmed by /api/feed; only fall back to a full
+        // DecryptPass.run if this blob's key isn't cached yet (first paint before
+        // any feed(), or a key that aged out).
+        var key = keysCache[msgId]
+        if (key == null) {
+            val fx = fixtureOrNull() ?: return notFound()
+            val (priv, _) = EncKeys.getOrCreate(store)
+            val res = DecryptPass.run(store, fx.device_pub, priv, fx.cert.identity_pub)
+            keysCache = res.keys
+            key = res.keys[msgId] ?: return notFound()
+        }
+        val cipher = store.getBlob(hash) ?: return notFound()
+        val plain = KotlinBlobCrypt.decryptBlob(key, cipher) ?: return notFound()
+        return mediaResponse(plain)
+    }
+
+    private fun mediaResponse(bytes: ByteArray) = HttpResponse(200, mapOf(
+        "Content-Type" to sniff(bytes),
+        "X-Content-Type-Options" to "nosniff",
+        "Cache-Control" to "private, max-age=31536000, immutable"), bytes)
+
+    private fun notFound() = HttpResponse(404, mapOf("Content-Type" to "text/plain"), "not found".toByteArray())
+
     companion object {
         fun json(body: String) =
             HttpResponse(200, mapOf("Content-Type" to "application/json; charset=utf-8"), body.toByteArray())
+
+        // Kotlin port of hearth api.py `_sniff` (magic-byte content-type).
+        fun sniff(data: ByteArray): String {
+            fun startsWith(prefix: ByteArray): Boolean {
+                if (data.size < prefix.size) return false
+                for (i in prefix.indices) if (data[i] != prefix[i]) return false
+                return true
+            }
+            if (startsWith(byteArrayOf(0x89.toByte(), 'P'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte()))) return "image/png"
+            if (startsWith(byteArrayOf(0xFF.toByte(), 0xD8.toByte()))) return "image/jpeg"
+            if (startsWith("GIF8".toByteArray(Charsets.ISO_8859_1))) return "image/gif"
+            if (startsWith("RIFF".toByteArray(Charsets.ISO_8859_1))) return "image/webp"
+            if (data.size >= 12 && String(data, 4, 4, Charsets.ISO_8859_1) == "ftyp") {
+                val brand = String(data, 8, 4, Charsets.ISO_8859_1)
+                if (brand == "avif" || brand == "avis") return "image/avif"
+                return "video/mp4"
+            }
+            return "application/octet-stream"
+        }
+
+        // hearth /api/stories (node.py stories_view + store.py active_stories):
+        // one group per author, self ("mine") first, then other groups by
+        // last-created-at desc (store.active_stories() already sorts groups
+        // that way; node.py's stable `sort(key=lambda g: (not g["mine"],))`
+        // only pulls the self group to the front, otherwise preserving that
+        // order). Items within a group are OLDEST-first: store.py's SQL is
+        // `ORDER BY created_at ASC` and items are appended in that scan
+        // order with NO reversal -- confirmed against hearth source (not
+        // reversed the way a naive "recent stories" reading might assume);
+        // this is a story-viewer playback order (oldest to newest). Avatars
+        // deferred (null) -- vp1 slice 1 has no avatar-blob accessor yet.
+        fun storiesJson(stories: List<StoredStory>, profileNames: Map<String, String>, ownIdentityPub: String): String {
+            val groups = linkedMapOf<String, MutableList<StoredStory>>()
+            for (s in stories) groups.getOrPut(s.author) { mutableListOf() }.add(s)
+            data class G(val mine: Boolean, val last: Double, val obj: JSONObject)
+            val built = groups.map { (ipub, items) ->
+                val itemsArr = JSONArray()
+                for (it in items.sortedBy { it.createdAt }) {
+                    itemsArr.put(JSONObject()
+                        .put("msg_id", it.msgId)
+                        .put("media_kind", it.mediaKind)
+                        .put("media", it.media)
+                        .put("poster", it.poster ?: JSONObject.NULL)
+                        .put("caption", it.caption)
+                        .put("created_at", it.createdAt))
+                }
+                val mine = ipub == ownIdentityPub
+                G(mine, items.maxOf { it.createdAt }, JSONObject()
+                    .put("identity_pub", ipub)
+                    .put("items", itemsArr)
+                    .put("mine", mine)
+                    .put("name", profileNames[ipub] ?: ipub.take(8))
+                    .put("avatar", JSONObject.NULL))
+            }.sortedWith(compareByDescending<G> { it.mine }.thenByDescending { it.last })
+            val out = JSONArray()
+            for (g in built) out.put(g.obj)
+            return out.toString()
+        }
 
         fun bootstrapJson(): String =
             JSONObject().put("initialized", true).put("onboarding_done", true).toString()
