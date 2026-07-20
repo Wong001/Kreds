@@ -88,6 +88,13 @@ class TorManagerModule : Module() {
         OnCreate {
             val ctx = appContext.reactContext ?: return@OnCreate
             TorEngine.init(ctx)
+            // Task 3 (B.2d): route AVIF decode through the isolated :imagedecode
+            // process. KotlinImageDecode's magic-byte dispatcher (pure, in the
+            // main process) hands only AVIF payloads to this decoder; everything
+            // it touches is one image's cleartext bytes, decoded in the sandbox.
+            // The main process never links the native decoder itself.
+            ImageDecodeClient.init(ctx)
+            KotlinImageDecode.avifDecoder = { bytes -> ImageDecodeClient.decodeAvif(bytes) }
             val filter = android.content.IntentFilter().apply {
                 addAction(TorNodeService.BROADCAST_BEAT); addAction(TorNodeService.BROADCAST_STATE)
             }

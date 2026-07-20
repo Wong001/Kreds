@@ -45,12 +45,32 @@ android {
     versionName "0.1.0"
     minSdkVersion 24
     ndk { abiFilters "arm64-v8a" }
+    // Task 3 (B.2d): instrumented gate for the isolated AVIF decode service
+    // (ImageDecodeInstrumentedTest) -- runs on the G20, not the JVM.
+    testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+  }
+  // Task 3 (B.2d): the IPC contract for the isolated decode service is an AIDL
+  // interface (IImageDecodeService). AGP 8+ ships with the AIDL build feature
+  // OFF by default, so enable it explicitly.
+  buildFeatures {
+    aidl true
   }
   externalNativeBuild {
     cmake { path "src/main/cpp/CMakeLists.txt" }
   }
   lintOptions {
     abortOnError false
+  }
+}
+
+// Task 3 (B.2d): avif-coder 2.2.1's HeifCoder API classes carry Kotlin 2.3.0
+// metadata; this project's compiler is 2.1.20 (reads up to 2.2.0). Allow the
+// compiler to consume the newer library metadata. Scoped to THIS module only.
+// (Its transitive kotlin-stdlib 2.3.0 is excluded above so only avif-coder's
+// own classes are read leniently -- the module's code + stdlib stay on 2.1.20.)
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+  compilerOptions {
+    freeCompilerArgs.add("-Xskip-metadata-version-check")
   }
 }
 
@@ -71,7 +91,37 @@ dependencies {
   // notification. Expo modules usually provide androidx.core transitively; pin
   // explicitly to be safe.
   implementation "androidx.core:core-ktx:1.13.1"
+
+  // Task 3 (B.2d): maintained dav1d/libavif-backed AVIF decoder. The G20 is
+  // API 30 (Android 11) which has no platform AVIF decode (that arrived in
+  // API 31), so photos (stored AVIF by hearth) need a bundled native decoder.
+  // io.github.awxkee:avif-coder wraps libavif + libdav1d, decodes on API 24+,
+  // ships arm64-v8a .so's (the G20 ABI; abiFilters strips the rest), and is
+  // permissively licensed (MIT / Apache-2.0 / BSD-3, all AGPL-3.0-compatible).
+  // ONLY ImageDecodeService (the isolated :imagedecode process) references its
+  // HeifCoder, so the decoder's native library only ever loads in the sandbox.
+  // Maven Central (already in repos); versions <2.2.0 were jitpack-only.
+  //
+  // Kotlin-version note: avif-coder 2.2.1 is built with Kotlin 2.3.0 and
+  // declares kotlin-stdlib 2.3.0 transitively. This project's compiler is
+  // Kotlin 2.1.20 (Expo SDK 57 / RN 0.86), whose metadata reader tops out at
+  // 2.2.0. Letting stdlib 2.3.0 onto the module classpath breaks compilation of
+  // every file (the compiler can't read kotlin.Unit/Pair/etc.), so exclude the
+  // transitive stdlib and keep the module on the project's own 2.1.20 stdlib.
+  // avif-coder's own thin HeifCoder API classes are still 2.3.0 metadata; the
+  // module reads them leniently via -Xskip-metadata-version-check (below).
+  // Bumping the whole Expo/RN toolchain's Kotlin is out of scope and high-risk.
+  implementation("io.github.awxkee:avif-coder:2.2.1") {
+    exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib"
+  }
+
   testImplementation "junit:junit:4.13.2"
   testImplementation "org.json:json:20240303"
   testImplementation "org.bouncycastle:bcprov-jdk18on:1.78.1"
+
+  // Task 3 (B.2d): the AVIF decode + process isolation are proven on-device
+  // (native .so + a real second process are not JVM-loadable) via
+  // ImageDecodeInstrumentedTest.
+  androidTestImplementation "androidx.test.ext:junit:1.2.1"
+  androidTestImplementation "androidx.test:runner:1.6.2"
 }

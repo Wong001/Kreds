@@ -10,5 +10,16 @@
             android:name="expo.modules.tormanager.TorNodeService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Task 3 (B.2d): AVIF decode sandbox. isolatedProcess gives it an
+             ephemeral, permissionless UID with no app-data access and no
+             network, so a decoder RCE on friend-authored (un-re-gated) image
+             bytes is contained here, away from the node's keys/store/socket.
+             All data crosses via IPC (ParcelFileDescriptor pipes). -->
+        <service
+            android:name="expo.modules.tormanager.ImageDecodeService"
+            android:isolatedProcess="true"
+            android:process=":imagedecode"
+            android:exported="false" />
     </application>
 </manifest>
