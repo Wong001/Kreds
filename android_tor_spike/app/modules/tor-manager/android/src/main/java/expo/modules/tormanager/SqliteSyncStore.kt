@@ -22,6 +22,13 @@ class SqliteSyncStore(context: Context) :
     companion object {
         private const val DB_NAME = "sync_store.db"
         private const val DB_VERSION = 1
+        // Task 3 (B.2): this device's own X25519 enc keypair, keyed enc_priv/enc_pub.
+        // Plaintext at rest -- accepted posture, matches desktop (see EncKeys.kt).
+        // Shared by onCreate (fresh DBs) and onOpen (existing B.1-era DBs --
+        // see onOpen below for why the latter is needed) so the two sites
+        // can't drift out of sync.
+        private const val CREATE_KEYS_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS keys (k TEXT PRIMARY KEY, v TEXT)"
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -41,12 +48,37 @@ class SqliteSyncStore(context: Context) :
         // Backs both the ingestMessage seq-reuse gate and summary()'s fold.
         db.execSQL("CREATE INDEX idx_messages_idp_dp_seq ON messages(identity_pub, device_pub, seq)")
         db.execSQL("CREATE TABLE blobs (hash TEXT PRIMARY KEY, data BLOB NOT NULL)")
+        // IF NOT EXISTS: onUpgrade calls onCreate after dropping the OTHER
+        // tables but deliberately preserves this one (see onUpgrade comment) --
+        // this must be a no-op when the table already survived an upgrade.
+        db.execSQL(CREATE_KEYS_TABLE_SQL)
+    }
+
+    // Field bug (G20, B.2 live run): DB_VERSION was never bumped past 1, so
+    // an existing B.1-era phone DB (created before the `keys` table existed)
+    // never runs onCreate OR onUpgrade -- it just opens straight through,
+    // and every keys-table query fails with "no such table: keys". onOpen
+    // runs on every open regardless of version, so ensure the table here too;
+    // IF NOT EXISTS makes this a no-op on DBs that already have it.
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        db.execSQL(CREATE_KEYS_TABLE_SQL)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         db.execSQL("DROP TABLE IF EXISTS identities")
         db.execSQL("DROP TABLE IF EXISTS messages")
         db.execSQL("DROP TABLE IF EXISTS blobs")
+        // `keys` is deliberately NOT dropped here, unlike the tables above:
+        // identities/messages/blobs are all resyncable (the next sync
+        // repopulates them from the home node), but `keys` holds this
+        // device's own enc-key identity material, which is NOT recoverable
+        // that way. hearth's maintain_own_device_grants (Task 2) may already
+        // have minted server-side wrap_grants against this device's current
+        // enc_pub -- dropping `keys` on a schema bump would silently mint a
+        // new enc key next launch and orphan that already-granted history
+        // (undecryptable until the new key propagates and is re-granted).
+        // Never wipe this table on migration.
         onCreate(db)
     }
 
@@ -212,5 +244,138 @@ class SqliteSyncStore(context: Context) :
             "SELECT COUNT(*) FROM $table", null
         ).use { c -> c.moveToFirst(); c.getInt(0) }
         return SyncStats(count("messages"), count("blobs"), count("identities"))
+    }
+
+    /** Reads the `keys` table row for `k`, or null if absent. */
+    private fun readKey(db: SQLiteDatabase, k: String): String? =
+        db.rawQuery("SELECT v FROM keys WHERE k = ? LIMIT 1", arrayOf(k)).use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+
+    override fun getEncKey(): Pair<String, String>? {
+        val db = readableDatabase
+        val priv = readKey(db, "enc_priv") ?: return null
+        val pub = readKey(db, "enc_pub") ?: return null
+        return priv to pub
+    }
+
+    /** Writes both keys rows atomically -- a reader must never observe an
+     *  enc_priv/enc_pub pair from two different writes (see EncKeys.getOrCreate,
+     *  which also serializes same-process callers; this transaction protects
+     *  against a crash/interleaving mid-write leaving a half-written row pair). */
+    override fun setEncKey(priv: String, pub: String) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val cvPriv = ContentValues().apply { put("k", "enc_priv"); put("v", priv) }
+            val cvPub = ContentValues().apply { put("k", "enc_pub"); put("v", pub) }
+            db.insertWithOnConflict("keys", null, cvPriv, SQLiteDatabase.CONFLICT_REPLACE)
+            db.insertWithOnConflict("keys", null, cvPub, SQLiteDatabase.CONFLICT_REPLACE)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /** This device's next outbound message seq (Task 4, B.2), persisted in
+     *  the SAME `keys` k/v table Task 3 added for enc_priv/enc_pub -- one
+     *  more small durable value, not a reason for a new table. Absent row
+     *  means "never sent a message yet" -> starts at 1 (mirrors hearth
+     *  DeviceKeys.sign_message: seq starts at 0, incremented before first
+     *  use, so a device's first-ever message is seq=1). Transacted like
+     *  setEncKey above: a reader must never be able to observe the same seq
+     *  handed out twice because a crash landed between reading the old value
+     *  and persisting the incremented one. */
+    override fun nextSeq(): Int {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val current = readKey(db, "next_seq")?.toInt() ?: 1
+            val cv = ContentValues().apply { put("k", "next_seq"); put("v", (current + 1).toString()) }
+            db.insertWithOnConflict("keys", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+            db.setTransactionSuccessful()
+            return current
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /** Backed by the same `keys` table as enc_priv/enc_pub/next_seq, under
+     *  its own row key -- see the SyncStore interface doc on
+     *  getPublishedEncPub/setPublishedEncPub for why this is tracked
+     *  separately from the enc keypair itself. Not transacted (unlike
+     *  setEncKey/nextSeq): it's a single independent row with no paired
+     *  write and no read-then-increment race to protect against. */
+    override fun getPublishedEncPub(): String? = readKey(readableDatabase, "enckey_published")
+
+    override fun setPublishedEncPub(pub: String) {
+        val cv = ContentValues().apply { put("k", "enckey_published"); put("v", pub) }
+        writableDatabase.insertWithOnConflict("keys", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    // org.json -> plain Kotlin bridge (JSONObject -> Map, JSONArray -> List),
+    // same idiom as KotlinSync's private toMap/unwrap (each file keeps its
+    // own copy -- see KotlinSync.kt's comment on why: values are consumed
+    // downstream via Map/List casts -- e.g. KotlinDmcrypt.unwrapKey's
+    // `wrap["eph_pub"] as String` -- which throws on a raw org.json type).
+    private fun jsonToMap(o: JSONObject): Map<String, Any?> =
+        o.keys().asSequence().associateWith { unwrapJson(o.get(it)) }
+
+    private fun unwrapJson(v: Any?): Any? = when (v) {
+        is JSONObject -> jsonToMap(v)
+        is JSONArray -> (0 until v.length()).map { unwrapJson(v.get(it)) }
+        JSONObject.NULL -> null
+        is java.math.BigDecimal -> v.toDouble()
+        else -> v
+    }
+
+    /** Every stored message (Task 5, B.2 DecryptPass) -- payload
+     *  recursively converted from the stored JSON into plain Kotlin
+     *  Map/List so callers can use ordinary casts, exactly like
+     *  InMemorySyncStore's native-Kotlin payloads already allow.
+     *  identity_pub is a real column, not re-parsed from JSON. */
+    override fun allMessages(): List<StoredMsg> {
+        val out = mutableListOf<StoredMsg>()
+        readableDatabase.rawQuery(
+            "SELECT msg_id, identity_pub, kind, msg_json FROM messages", null
+        ).use { c ->
+            while (c.moveToNext()) {
+                val payload = JSONObject(c.getString(3)).optJSONObject("payload") ?: JSONObject()
+                // Both identity_pub and kind guarded the same way (`?: ""`)
+                // even though identity_pub is a NOT NULL column and should
+                // never actually come back null -- StoredMsg.identityPub is
+                // a non-null String, so this keeps the two columns'
+                // null-handling visibly consistent rather than trusting the
+                // schema constraint implicitly.
+                out.add(StoredMsg(c.getString(0), c.getString(2) ?: "", c.getString(1) ?: "", jsonToMap(payload)))
+            }
+        }
+        return out
+    }
+
+    /** wrap_grant rows targeting msgId AND signed by authorIdentityPub,
+     *  decoded from msg_json (no target_id column exists in this schema --
+     *  unlike hearth's store.py -- so the target match is done in
+     *  application code, same style as missingBlobs() above; the author
+     *  match IS a real column, `identity_pub`, filtered directly in SQL).
+     *  Returned oldest-to-newest by (created_at, seq) -- see the SyncStore
+     *  interface doc for why callers can fold newest-wins from that order,
+     *  and why the author filter is load-bearing, not optional. */
+    override fun wrapGrantsFor(msgId: String, authorIdentityPub: String): List<Map<String, Any?>> {
+        data class Row(val createdAt: Double, val seq: Int, val wraps: Map<String, Any?>)
+        val rows = mutableListOf<Row>()
+        readableDatabase.rawQuery(
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("wrap_grant", authorIdentityPub)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val seq = c.getInt(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
+                if (payload.optString("target") != msgId) continue
+                val wraps = payload.optJSONObject("wraps") ?: continue
+                rows.add(Row(payload.optDouble("created_at", 0.0), seq, jsonToMap(wraps)))
+            }
+        }
+        return rows.sortedWith(compareBy({ it.createdAt }, { it.seq })).map { it.wraps }
     }
 }

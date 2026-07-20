@@ -10,12 +10,39 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import java.io.File
 
+/** Task 7 (B.2): bundles the outcome of the enc-key resolve/guard/compose
+ *  step in `syncNow` (see the try/catch around it) into one value so that
+ *  step can be a single expression a `try` can return -- matching the
+ *  store-init block's shape just above it (`val store = try { ... } catch
+ *  { stream.close(); emit(...); return@AsyncFunction Unit }`). */
+private data class EncKeyPrep(
+    val outbound: List<Map<String, Any?>>,
+    val encPriv: String,
+    val encPub: String,
+    val shouldPublish: Boolean,
+)
+
 class TorManagerModule : Module() {
     // recv/send/dial block on socket I/O; keep them OFF the single default
     // AsyncFunction HandlerThread (would deadlock the concurrent recv+send
     // of the accepted-path probe). Dispatchers.IO is multi-threaded.
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var nodeReceiver: android.content.BroadcastReceiver? = null
+
+    // Task 7 (B.2): the decrypted feed as of the last successful sync.
+    // getFeed() serves this cache rather than re-running DecryptPass on
+    // every call (DecryptPass.run does a full table scan over
+    // store.allMessages() plus, per message, resolving wraps/wrap_grants --
+    // cheap at B.2's real scale (253 messages) but there is no reason to
+    // redo that work on every dashboard poll when only a completed sync can
+    // possibly change the answer). Written from syncNow's SyncResult.Ok
+    // branch on ioScope (Dispatchers.IO); read from getFeed's AsyncFunction
+    // body on the module's default (non-ioScope) queue -- a different
+    // thread. @Volatile guarantees the reader sees a fully-published List
+    // reference rather than relying on incidental happens-before from
+    // elsewhere; the List itself (DecryptPass.run's sortedByDescending
+    // result) is never mutated after being built, only replaced wholesale.
+    @Volatile private var feedCache: List<DecryptPass.Decrypted> = emptyList()
 
     override fun definition() = ModuleDefinition {
         Name("TorManager")
@@ -92,16 +119,18 @@ class TorManagerModule : Module() {
         }
 
         // -- Brick B.1: foreground-triggered content sync --
+        // -- Brick B.2 (Task 7): + enc-key publish (guarded) + decrypt pass --
         AsyncFunction("syncNow") {
-            fun emit(ok: Boolean, messages: Int, blobs: Int, identities: Int, reason: String?) {
+            fun emit(ok: Boolean, messages: Int, blobs: Int, identities: Int, reason: String?, feedUpdated: Boolean) {
                 sendEvent("nodeSync", mapOf(
                     "ok" to ok, "messages" to messages, "blobs" to blobs,
-                    "identities" to identities, "reason" to reason))
+                    "identities" to identities, "reason" to reason,
+                    "feedUpdated" to feedUpdated))
             }
             val ctx = appContext.reactContext
-            if (ctx == null) { emit(false, 0, 0, 0, "no context"); return@AsyncFunction Unit }
+            if (ctx == null) { emit(false, 0, 0, 0, "no context", false); return@AsyncFunction Unit }
             if (!TorEngine.isUp) {
-                emit(false, 0, 0, 0, "tor not up - start the node first")
+                emit(false, 0, 0, 0, "tor not up - start the node first", false)
                 return@AsyncFunction Unit
             }
             try {
@@ -121,7 +150,7 @@ class TorManagerModule : Module() {
                     KotlinHandshake.authOnlyOverStream(stream, fx)
                 } catch (e: Exception) {
                     stream.close()
-                    emit(false, 0, 0, 0, "auth: ${e.message}")
+                    emit(false, 0, 0, 0, "auth: ${e.message}", false)
                     return@AsyncFunction Unit
                 }
 
@@ -131,7 +160,7 @@ class TorManagerModule : Module() {
                 // a stranger's node.
                 if (peerCert.identity_pub != fx.cert.identity_pub) {
                     stream.close()
-                    emit(false, 0, 0, 0, "auth: node identity is not our home identity")
+                    emit(false, 0, 0, 0, "auth: node identity is not our home identity", false)
                     return@AsyncFunction Unit
                 }
 
@@ -144,22 +173,87 @@ class TorManagerModule : Module() {
                     SqliteSyncStore(ctx).also { it.addIdentity(fx.cert.identity_pub) }
                 } catch (e: Exception) {
                     stream.close()
-                    emit(false, 0, 0, 0, "store: ${e.message}")
+                    emit(false, 0, 0, 0, "store: ${e.message}", false)
                     return@AsyncFunction Unit
                 }
                 // (own identity is seeded above, inside the try, so ingest's is_known
                 // gate admits its own-identity messages; the HAVE phase adds the node's
                 // known identities.)
 
-                when (val r = KotlinSync.run(stream, store, fx.device_pub)) {
-                    is SyncResult.Ok -> emit(true, r.messages, r.blobs, r.identities, null)
-                    is SyncResult.SelfRevoked -> emit(false, 0, 0, 0, "self-revoked")
-                    is SyncResult.Failed -> emit(false, 0, 0, 0, "${r.stage}: ${r.reason}")
+                // Task 7 (B.2): this device's own enc keypair (generated once,
+                // persisted -- EncKeys.getOrCreate), the already-published
+                // guard (EncKeyPublishGuard) deciding whether THIS sync's
+                // outbound push needs a freshly-composed, freshly-seq'd
+                // `enckey` message, and building that message when it does.
+                // EncKeys.getOrCreate / store.getPublishedEncPub / store.nextSeq
+                // are all SQLite I/O and CAN throw (e.g. DB locked -- plausible
+                // under overlapping syncNow calls racing on the same DB file).
+                // authOnlyOverStream succeeding leaves the stream open by
+                // contract -- only KotlinSync.run's finally closes it -- so a
+                // failure here, before KotlinSync.run ever runs, must close the
+                // stream itself or the Tor connection leaks for the process
+                // lifetime -- same reasoning, same shape, as the store-init
+                // try/catch immediately above.
+                val prep = try {
+                    val (priv, pub) = EncKeys.getOrCreate(store)
+                    val publish = EncKeyPublishGuard.shouldPublish(pub, store.getPublishedEncPub())
+                    val outbound = if (publish) {
+                        listOf(KotlinSync.composeEncKey(
+                            fx, pub, store.nextSeq(), System.currentTimeMillis() / 1000.0))
+                    } else emptyList()
+                    EncKeyPrep(outbound, priv, pub, publish)
+                } catch (e: Exception) {
+                    stream.close()
+                    emit(false, 0, 0, 0, "enckey: ${e.message}", false)
+                    return@AsyncFunction Unit
+                }
+
+                when (val r = KotlinSync.run(stream, store, fx.device_pub, prep.outbound)) {
+                    is SyncResult.Ok -> {
+                        // Mark published ONLY once the sync that carried the
+                        // push has FULLY succeeded -- see EncKeyPublishGuard's
+                        // doc. A sync that throws/fails below this point never
+                        // reaches here, so the marker stays stale/absent and
+                        // the very next syncNow call retries the push.
+                        if (prep.shouldPublish) store.setPublishedEncPub(prep.encPub)
+                        // Decrypt pass + feed cache refresh: only a completed
+                        // sync can change what's decryptable (new messages/
+                        // wrap_grants may have just been pulled), so this is
+                        // the one place the cache is recomputed -- see
+                        // feedCache's own doc comment for why getFeed() itself
+                        // just serves this cache instead of re-running.
+                        feedCache = DecryptPass.run(store, fx.device_pub, prep.encPriv, fx.cert.identity_pub)
+                        emit(true, r.messages, r.blobs, r.identities, null, true)
+                    }
+                    is SyncResult.SelfRevoked -> emit(false, 0, 0, 0, "self-revoked", false)
+                    is SyncResult.Failed -> emit(false, 0, 0, 0, "${r.stage}: ${r.reason}", false)
                 }
             } catch (e: Exception) {
-                emit(false, 0, 0, 0, "io: ${e.message}")
+                emit(false, 0, 0, 0, "io: ${e.message}", false)
             }
         }.runOnQueue(ioScope)
+
+        // Task 7 (B.2): the decrypted own-authored feed (post/dm text), as of
+        // the last successful syncNow -- see feedCache's doc comment. No
+        // store/network I/O here, so this deliberately does NOT need
+        // .runOnQueue(ioScope) (nothing here can block).
+        AsyncFunction("getFeed") {
+            feedCache.map { d ->
+                // Plain Kotlin/JS-marshalable types only (String/Double) --
+                // DecryptPass.Decrypted's fields are already plain (msgId:
+                // String from a SQL column, kind: String, text: String
+                // pulled from an org.json body via `as? String` -- org.json
+                // strings ARE plain java.lang.String, not a wrapper type --
+                // createdAt: Double, already normalized in DecryptPass).
+                // Rebuilt into a fresh Map here anyway rather than passing
+                // the data class through, matching this module's existing
+                // event/return marshaling style (getHistory/getSyncStats).
+                mapOf(
+                    "msgId" to d.msgId, "kind" to d.kind,
+                    "text" to d.text, "createdAt" to d.createdAt,
+                )
+            }
+        }
 
         AsyncFunction("getSyncStats") {
             val ctx = appContext.reactContext

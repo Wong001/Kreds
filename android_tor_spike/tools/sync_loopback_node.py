@@ -3,6 +3,13 @@ phone fixture, serve SyncService on 127.0.0.1, print a JSON handshake line
 ({port, fixture, expect}), then serve until killed. Driven by
 SyncLoopbackTest.kt (BB-5, the desk loopback gate).
 
+Task 6 (B.2) extension: after EVERY connection's session fully completes,
+node.maintain_own_device_grants() runs and a `{"event": "maintained"}` line
+is printed -- see main() below. This is what lets a second connection prove
+it pulls wrap_grants minted from a first connection's pushed enckey,
+deterministically (the test blocks on the signal line rather than racing
+connection timing).
+
 `expect` is computed from the node's actual store state -- never
 hardcoded -- mirroring exactly what store.messages_not_in() /
 missingBlobs-equivalent logic the phone will receive during the real
@@ -75,6 +82,36 @@ async def main(data_dir):
     node.compose_post("with pic", photos=[_tiny_png()])
 
     sync = SyncService(node)
+
+    # Task 6 (B.2): the desk decrypt gate's two-sync flow needs
+    # node.maintain_own_device_grants() (Task 2) to run AFTER the phone's
+    # first sync pushes its device-signed enckey message (via KotlinSync's
+    # `outbound`, ingested generically by hearth/sync.py's MESSAGES phase --
+    # untouched, no script-side injection needed) and BEFORE the phone's
+    # second sync pulls the resulting wrap_grants. In production this sweep
+    # rides the periodic gossip loop (hearth/sync.py _gossip_round,
+    # SyncService.gossip_loop) alongside maintain_enckey/maintain_wrap_grants
+    # -- this desk gate never starts that loop, so it is called directly
+    # here instead (spec: "for the loopback script call it directly").
+    #
+    # Wrapping _on_conn (rather than editing hearth/sync.py, which is
+    # untouchable production code) means the real, unmodified _on_conn/
+    # _session logic runs exactly as production does; this only appends the
+    # sweep once a connection's session has FULLY finished (the connection's
+    # writer already closed). The signal line printed afterward lets the
+    # test BLOCK on the sweep actually having run, rather than racing the
+    # timing of opening a second connection against this coroutine's
+    # completion on the node's event loop -- deterministic handoff, not a
+    # timing assumption.
+    orig_on_conn = sync._on_conn
+
+    async def _on_conn_then_maintain(reader, writer):
+        await orig_on_conn(reader, writer)
+        node.maintain_own_device_grants()
+        print(json.dumps({"event": "maintained"}), flush=True)
+
+    sync._on_conn = _on_conn_then_maintain
+
     port = await sync.start("127.0.0.1", 0)
     try:
         fx = mint_fixture(node)

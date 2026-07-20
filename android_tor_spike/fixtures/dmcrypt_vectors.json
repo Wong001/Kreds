@@ -1,0 +1,84 @@
+{
+  "cases": [
+    {
+      "kind": "post",
+      "author": "1111111111111111111111111111111111111111111111111111111111111111",
+      "scope": "kreds",
+      "created_at": 1752900000.123456,
+      "enc_priv": "b060c5ed3d109991147a4d737910a5ee490cecce1a279c9bdd238c4ecb74866f",
+      "wrap": {
+        "eph_pub": "1d0e6a9ed2a4923082b27c873c52802d05befe9d3247112dd976c8d9363ac129",
+        "nonce": "e68cc37655dd1cfcfe15fd82",
+        "wrapped_key": "71ec3278c73ed3117f440739a698ac5b1a4d84a3462d5123cb3df01844a8c2eadf3fae39d6dc83a49a8fadeb6d068e32"
+      },
+      "body_nonce": "e8bf8dbcd6f0c02053458903",
+      "body_ct": "ed836140b6fa10adec5617035ff1d8fe7397f47fb4589b53c057506f9e906216b7fcfa47c0b6d9826c799dfc92cdfe88c08f130d7f65ffc7249356fda17dec4170a93a704bc4dc",
+      "content_key": "d16ecc131a84a47cd5b9ba510378c53e90fbf06a9d5ced0d5b2b71b0e2dac161",
+      "plaintext": {
+        "kind": "post",
+        "text": "hello from the desk",
+        "blobs": []
+      }
+    },
+    {
+      "kind": "dm",
+      "author": "1111111111111111111111111111111111111111111111111111111111111111",
+      "to": "2222222222222222222222222222222222222222222222222222222222222222",
+      "created_at": 1752900000.123456,
+      "enc_priv": "1810a1877f5a8256c69c48823d69a2d70f6ccda1107156bf68a8a4533c1dff5b",
+      "wrap": {
+        "eph_pub": "208bccbdbca67acddec35332cd027d2163ce0115f3d2bbbff7905f5d81501034",
+        "nonce": "c4e10f7ec5b5f0b61d79c8fe",
+        "wrapped_key": "b22303e69b67ef9b1eea4bf9933827eadc523b0725ee4e77cf73ea4d7f973ee6cdd6285c9e9d7a20945810264b9d95d5"
+      },
+      "body_nonce": "47c946372856f2a5d8714e9d",
+      "body_ct": "4e54dc20c713127b92d59912bd6deb4f2d20134c6246b86abdea70448b94d20b56a9acaf7203b0dd380f8d387d2d32f8c72efae7957b0f7a1abe61c631b66aa706d4feae7eabddb5aab3ea04e2209cb3871ef7931eecfe95d927aa30cf6ce191618747b132843c0e58fe283e3c5e7cfec0f62dc344b08c36",
+      "content_key": "e156f877eb6eff0b492384aacdff7163704f5bb104f51e2a46cfe55acb828d40",
+      "plaintext": {
+        "kind": "dm",
+        "text": "secret dm",
+        "to": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    },
+    {
+      "kind": "post",
+      "author": "1111111111111111111111111111111111111111111111111111111111111111",
+      "scope": "kreds",
+      "created_at": 1752899900.123456,
+      "enc_priv": "b060c5ed3d109991147a4d737910a5ee490cecce1a279c9bdd238c4ecb74866f",
+      "wrap": {
+        "eph_pub": "daad7ea4c7a134bce093606dcf8412ba7ef0d800dd255890b451899313dcbd16",
+        "nonce": "11c98247d4a942de215f485c",
+        "wrapped_key": "b360c4bcf12ed00fc05f477c72e2b65a6eebd54e89033c951b7d66ab56914e1b7015d0928642887bfd46828ede7901c5"
+      },
+      "body_nonce": "368caf2da81b2dabe27015ab",
+      "body_ct": "a150e5e3c73380106160191ea0e3f84824785bb7be1269cf83d725fbcc7669e2c0eb408c6629ccf7d8811bec03e33788e95babec4afc5ee9f34ce915d11c55d1fd15e565d91e29000a6003",
+      "content_key": "7c615f00141542b253e07cefe51f941c7c55d5140c82af9f2e2ebc50b2b57d28",
+      "plaintext": {
+        "kind": "post",
+        "text": "older post for ordering",
+        "blobs": []
+      }
+    },
+    {
+      "kind": "post",
+      "author": "1111111111111111111111111111111111111111111111111111111111111111",
+      "scope": "kreds",
+      "created_at": 1752900100.123456,
+      "enc_priv": "b060c5ed3d109991147a4d737910a5ee490cecce1a279c9bdd238c4ecb74866f",
+      "wrap": {
+        "eph_pub": "4af4a0a3fd3f19bac1593badf8eb45b5376367f3ea7642bfd929c6e1c754da34",
+        "nonce": "c936ac09ca2f7b492cad3eb3",
+        "wrapped_key": "c0e1821cad60ee5d8d2c59b7419502cdd46685abe2840088b2d36d4dbb202115e9443904c5b039445ca655b55e8ac20e"
+      },
+      "body_nonce": "5932928a0c2bcc197238fb89",
+      "body_ct": "58b894d535da561b606712a2b91622faa8802fdfd1ac6de94efdbcaf73c6aab460a453530ea3ea27378a8694edf7d136912499336deeaa0679f5b92dde54e0c69cade34af55a6b530ba988",
+      "content_key": "2204bd81988ece8c134473dfcbf156720ef90b52c0e19ab0db7861b957589d7a",
+      "plaintext": {
+        "kind": "post",
+        "text": "newer post for ordering",
+        "blobs": []
+      }
+    }
+  ]
+}

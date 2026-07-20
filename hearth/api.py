@@ -96,6 +96,7 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
 
     node.maintain_enckey()
     node.maintain_wrap_grants()
+    node.maintain_own_device_grants()
 
     @app.middleware("http")
     async def revoked_gate(request: Request, call_next):

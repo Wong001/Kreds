@@ -2106,6 +2106,119 @@ class HearthNode:
                 self._publish(make_wrap_grant(self.device, msg.msg_id,
                                               wraps, now=now))
 
+    def maintain_own_device_grants(self, now: Optional[float] = None):
+        """Re-wrap this identity's OWN-authored content to its OWN other
+        devices' enc keys (a satellite phone), via author-signed
+        wrap_grants -- so a device-key-only device can decrypt the author's
+        existing history. Distinct from maintain_wrap_grants (friends,
+        kreds-wall only), which is left UNTOUCHED. Own devices see ALL own
+        content (journal + wall + inner + DMs): it is yours, on your device.
+
+        Guard mirrors maintain_wrap_grants: minting signs, so
+        locked/revoked/unenrolled skip entirely -- a revoked/locked node
+        must mint nothing (no signing key), so the whole sweep is skipped
+        rather than guarded per-mint.
+
+        Coverage + full-coverage minting are load-bearing for
+        store.prune_superseded_wrap_grants (store.py:490-496): the prune
+        tombstones every grant that is not the LATEST per (author, target),
+        SAFE ONLY BECAUSE the surviving grant is full-coverage. This sweep
+        shares that (author, target) keyspace with maintain_wrap_grants on
+        kreds wall posts, so it must (a) evaluate coverage against the
+        LATEST grant alone -- the one the prune keeps, NOT the per-device
+        union store.wrap_grants returns -- and (b) when it mints, re-assert
+        FULL coverage: fresh wraps to every own target device PLUS a verbatim
+        carry-forward of every other device the latest grant already covered
+        (e.g. friend devices minted by maintain_wrap_grants on the same wall
+        post). Without the carry-forward the two sweeps strip each other's
+        coverage every round (the CRITICAL the prune's invariant warns of);
+        without the latest-grant (vs union) coverage check, a friend-only
+        re-mint in the same round would leave the phone in a soon-pruned
+        older grant. The carry-forward NEVER adds a device the latest grant
+        did not already cover (friend-sweep de-grants stay de-granted)."""
+        if self.revoked or self.locked or self.device.identity_pub is None:
+            return
+        now = now if now is not None else time.time()
+        own = self.store.enckeys(self.identity_pub)
+        targets = {d: e for d, e in own.items()
+                   if d != self.device.device_pub}
+        if not targets:
+            return
+        latest = self._latest_own_wrap_grants()
+        for msg in self._own_authored_messages():
+            wrapped = set(msg.payload.get("wraps", {}))
+            # The single grant the prune keeps for this target (its wraps,
+            # incl. any enc_pub annotation) -- NOT store.wrap_grants' union,
+            # which can show a device covered only by an about-to-be-pruned
+            # older grant.
+            grant = latest.get(msg.msg_id, {})
+            grantable = {}       # every own target device NOT inline-wrapped
+                                 # -> its CURRENT enc key (full-coverage set)
+            missing = False      # any own device lacking current coverage?
+            for dpub, enc_pub in targets.items():
+                if dpub in wrapped:
+                    continue     # inline envelope wins; no grant needed
+                grantable[dpub] = enc_pub
+                g = grant.get(dpub)
+                # Covered only if the LATEST grant sealed to the device's
+                # CURRENT enc key (mirrors maintain_wrap_grants' enc_pub
+                # annotation check; a pre-annotation grant counts as covered).
+                if g is None or g.get("enc_pub", enc_pub) != enc_pub:
+                    missing = True
+            if not missing:
+                continue
+            key, aad = self._content_key(msg)
+            if key is None:                 # unhandled/unrecoverable kind:
+                continue                    # skip, never crash the sweep
+            # FULL-COVERAGE mint: wrap to ALL grantable own devices (not just
+            # the missing ones), annotate each with its current enc_pub.
+            wraps = wrap_key(key, grantable, aad)
+            for dpub in wraps:
+                wraps[dpub]["enc_pub"] = grantable[dpub]
+            # Carry the latest grant's OTHER entries forward verbatim so the
+            # prune (which keeps only this newest grant) never strips a
+            # friend device maintain_wrap_grants covered. Fresh own wraps win
+            # over any stale carried entry for the same device; nothing is
+            # added that the latest grant did not already cover.
+            for dpub, entry in grant.items():
+                if dpub not in wraps:
+                    wraps[dpub] = entry
+            if wraps:
+                self._publish(make_wrap_grant(self.device, msg.msg_id,
+                                              wraps, now=now))
+
+    def _latest_own_wrap_grants(self):
+        """target_id -> wraps of THIS identity's latest wrap_grant per
+        target, by the same (created_at, seq) tie-break
+        store.prune_superseded_wrap_grants uses -- i.e. the grant that
+        survives the prune. Built in a single pass over the author's held
+        messages (tombstoned/pruned grants are already gone from that set),
+        so the sweep's per-message coverage check reads the prune-surviving
+        grant, not store.wrap_grants' cross-grant per-device union."""
+        best: dict = {}          # target -> (rank, wraps)
+        for m in self.store.messages_by_author(self.identity_pub):
+            p = m.payload
+            if p.get("kind") != KIND_WRAP_GRANT:
+                continue
+            rank = (p.get("created_at", 0), m.seq)
+            target = p.get("target")
+            if target is None:
+                continue
+            if target not in best or rank > best[target][0]:
+                best[target] = (rank, p.get("wraps", {}))
+        return {t: w for t, (rank, w) in best.items()}
+
+    def _own_authored_messages(self):
+        """Own posts (all placements/scopes) + own DMs -- the content the
+        catch-up re-wraps to a new own device. Posts come from
+        post_messages(identity); own DMs are the KIND_DM rows this identity
+        authored (messages_by_author filtered -- there is no single own-DM
+        iterator, and dm_thread/dm_conversations are peer-scoped)."""
+        posts = self.store.post_messages(self.identity_pub)
+        dms = [m for m in self.store.messages_by_author(self.identity_pub)
+               if m.payload.get("kind") == KIND_DM]
+        return list(posts) + dms
+
     def _dm_device_pubs(self, to_identity: str) -> dict:
         theirs = self.store.enckeys(to_identity)
         if not theirs:

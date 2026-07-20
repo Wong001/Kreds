@@ -28,6 +28,15 @@ tasks.register('copyMessageVectors', Copy) {
 tasks.named('preBuild') { dependsOn 'copyMessageVectors' }
 tasks.withType(Test).configureEach { dependsOn 'copyMessageVectors' }
 
+// Task 1 (B.2): same treatment for the dmcrypt vectors -- same 4-levels-up
+// path as copyWireVectors/copyMessageVectors above.
+tasks.register('copyDmcryptVectors', Copy) {
+  from "${projectDir}/../../../../fixtures/dmcrypt_vectors.json"
+  into "${projectDir}/src/test/resources"
+}
+tasks.named('preBuild') { dependsOn 'copyDmcryptVectors' }
+tasks.withType(Test).configureEach { dependsOn 'copyDmcryptVectors' }
+
 android {
   namespace "expo.modules.tormanager"
   ndkVersion "26.3.11579264"
