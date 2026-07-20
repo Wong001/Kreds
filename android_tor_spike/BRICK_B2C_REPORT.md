@@ -1,10 +1,9 @@
 # Brick B.2c report — friends' content readable
 
-**Status: DESK-COMPLETE, on-device run PENDING.** All 4 implementation tasks
-are done and reviewed; both APKs are built and verified fresh; on-device
-install is BLOCKED on a Google Play Protect dialog that needs a physical tap
-(same failure mode B.2 hit on this device). The two-sync verification run
-itself is human-driven and has not happened yet.
+**Status: PROVEN ON HARDWARE (G20, 2026-07-20).** All 4 implementation tasks
+are done and reviewed; the release APK is installed on the G20 and the run
+passed: the feed shows readable friend content with author names and
+timestamps. All four verification points passed (see Verdict).
 
 Spec: `docs/superpowers/specs/2026-07-19-android-b2c-friends-content-design.md`
 Plan: `docs/superpowers/plans/2026-07-19-android-b2c-friends-content.md`
@@ -198,9 +197,32 @@ adb -s ZY32DLZQ2N install -r android_tor_spike\app\android\app\build\outputs\apk
 If the dialog reappears for the second install, dismiss again and re-run
 that one command.
 
+## Field finding from the run (2026-07-20)
+
+- **"Unable to load script" on first open** — the DEBUG APK had landed last
+  on the device (it expects a Metro dev server and embeds no JS bundle).
+  Fixed by installing the RELEASE APK (`adb -s ZY32DLZQ2N install -r
+  android_tor_spike\app\android\app\build\outputs\apk\release\app-release.apk`),
+  which embeds the bundle; the re-signed same-package install did NOT
+  re-trigger Play Protect this time. Run steps below now say install the
+  RELEASE apk (not debug) for an on-device run.
+
 ## Verdict
 
-**[PENDING RUN]**
+**PROVEN.**
+
+- Feed shows readable friend content with author NAMES and TIMESTAMPS
+  (August, on the G20). All four verification points passed:
+  1. Old friend DMs readable via the recipient-signed backfill, with the
+     correct friend name on each (the key new leg — desktop-only dependency).
+  2. Friends stat shows the true count (2, not the pre-fix phantom 3).
+  3. Friend wall posts render (best-effort field leg — confirmed present).
+  4. Own content intact — no B.2 regression.
+- Desk node ran this branch's hearth via `serve --tor`, unlocked via the web
+  UI (both B.2 field lessons carried in cleanly). Two-sync flow as designed.
+- Anomalies: only the debug-vs-release "Unable to load script" above,
+  resolved by installing the release APK. No decrypt or entitlement issues.
+- Overall: **PROVEN** — B.2c's definition of done met on hardware.
 
 ## Known deferred items / follow-up tickets
 
