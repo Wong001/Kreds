@@ -190,4 +190,25 @@ class SyncStoreTest {
         assertTrue("regression: post blobs still tracked", missing.contains(postBlob))
         assertFalse("field-shape trap: post's media discriminator must not appear", missing.contains("video"))
     }
+
+    // -- B.2d-4 Task 2: deviceViews (the device-binding source for
+    //    KotlinResponses' responder attribution) --
+
+    @Test fun deviceViewsReturnsDistinctDevicePubsOfIdentityAndEmptyForUnknown() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        // msg() signs every message with device priv 0x22.., so its device_pub
+        // is the pub of that key -- the same value deviceViews must surface for idPub.
+        val dvPub = KotlinWire.toHex(
+            org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(
+                KotlinWire.fromHex("22".repeat(32)), 0).generatePublicKey().encoded)
+        assertTrue(s.ingestMessage(msg(1, mapOf("kind" to "post", "text" to "a", "blobs" to emptyList<String>()))))
+        assertTrue(s.ingestMessage(msg(2, mapOf("kind" to "post", "text" to "b", "blobs" to emptyList<String>()))))
+        // Two stored messages, one device -> a single distinct device_pub.
+        assertEquals(setOf(dvPub), s.deviceViews(idPub))
+        // hearth _device_bound treats EMPTY views as permissive; an identity
+        // we hold no messages for returns an empty set (the caller's predicate
+        // then permits, matching _device_bound's `if not views: return True`).
+        assertTrue(s.deviceViews("ff".repeat(32)).isEmpty())
+    }
 }

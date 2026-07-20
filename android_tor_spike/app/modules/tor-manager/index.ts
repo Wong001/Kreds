@@ -113,11 +113,25 @@ export function getSyncStats(): Promise<SyncStats> { return native.getSyncStats(
 // The story-reply chip's ONLY consumer: resolves via getStoryImage(hash) --
 // plaintext, same as any other story media -- for the "replied to your
 // story" thumbnail on this DM's feed row.
+// `responses` (B.2d-4 Task 3): this post's aggregated engagement view --
+// mirrors TorManagerModule's getFeed marshal of DecryptPass.responsesPass's
+// per-target KotlinResponses.Responses (reactions tally + resolved comment
+// list) via the responsesByPost cache. null when this post has no valid,
+// decryptable KIND_RESPONSES record from its own author yet (no engagement,
+// or nothing attributable) -- the pass is fail-closed, so every such case
+// collapses to the same null, never a partial/wrong result. `color` is the
+// alias hue (0..359) when a comment's `display` is an anonymous alias, or
+// null when `display` is a real resolved name (see KotlinResponses.Comment/
+// resolveDisplay's own doc for the attribution rule this mirrors).
 export interface FeedItem {
   msgId: string; kind: string; author: string; text: string; createdAt: number;
   blobs: string[]; thumbs: (string | null)[];
   media: string; poster: string | null;
   storyRefMediaHash: string | null;
+  responses?: {
+    reactions: Record<string, number>;
+    comments: { body: string; display: string; color: number | null; createdAt: number }[];
+  } | null;
 }
 
 export function getFeed(): Promise<FeedItem[]> { return native.getFeed(); }

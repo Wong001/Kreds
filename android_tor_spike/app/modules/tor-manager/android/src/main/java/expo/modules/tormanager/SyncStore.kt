@@ -128,6 +128,28 @@ interface SyncStore {
      *  gated the same is_known+signature checks every stored message
      *  already passes at ingest). */
     fun profileNames(): Map<String, String>
+    /** The set of device_pubs this store has ever held a (verified-at-ingest)
+     *  message from, for `identity` (B.2d-4 Task 2). Mirrors hearth's
+     *  `store.load_views(identity_pub)` used by node._device_bound: hearth
+     *  records a DeviceView for every device it verifies a signature from
+     *  (identity.py Verifier.verify_message), and this store only ever stores
+     *  a message AFTER verifyDeviceSignature passes (ingestMessage) -- so the
+     *  distinct (device_pub) column of `identity`'s stored messages is that
+     *  same enrolled-device record, with no extra plumbing.
+     *
+     *  This is the device-binding source for KotlinResponses' responder
+     *  attribution. The production `deviceBound` predicate is
+     *  `{ id, dev -> val v = deviceViews(id); v.isEmpty() || dev in v }` --
+     *  an EMPTY set is deliberately PERMISSIVE (mirrors _device_bound's
+     *  `if not views: return True`: we simply may not have exchanged a
+     *  message with that identity yet, which is expected for a public entry
+     *  from someone who is only the AUTHOR's mutual friend, not this
+     *  viewer's -- not evidence of forgery). A NON-empty set requires
+     *  membership: a fabricated key impersonating a known friend won't be in
+     *  their view, which is exactly what catches a valid-sig-but-forged
+     *  device (sig-alone is insufficient -- an attacker controls both halves
+     *  of a sig check on a self-minted keypair). */
+    fun deviceViews(identity: String): Set<String>
     /** Unexpired KIND_STORY rows (B.2d-3 Task 1) -- `payload.expires_at as
      *  Number > nowSeconds` (strict: a story whose expires_at == nowSeconds
      *  is treated as already expired, not still-active), newest-first by
@@ -260,6 +282,12 @@ class InMemorySyncStore : SyncStore {
         }
         return best.mapValues { it.value.name }
     }
+
+    override fun deviceViews(identity: String): Set<String> =
+        messages.values
+            .filter { it.cert.identity_pub == identity }
+            .map { it.cert.device_pub }
+            .toSet()
 
     override fun activeStories(nowSeconds: Double): List<StoredStory> {
         val out = mutableListOf<StoredStory>()

@@ -797,4 +797,144 @@ class DecryptPassTest {
         assertFalse("a blob-less message must be absent from Result.keys",
             result.keys.containsKey(msg.msgId()))
     }
+
+    // -- B.2d-4 Task 3: responses decrypt pass (DecryptPass.responsesPass) --
+    // Uses the fixture's single real "responses" case (Task 1's committed
+    // KIND_RESPONSES vector -- a real hearth-aggregated record: a valid
+    // PUBLIC comment plus a PRIVATE reaction, same case KotlinResponsesTest
+    // exercises against KotlinResponses directly). These tests exercise the
+    // surrounding pass: entitlement (signer must equal the target post's
+    // own author), latest-wins selection, and fail-closed misses.
+
+    private fun responsesCase(): JSONObject {
+        val cs = cases()
+        for (i in 0 until cs.length()) {
+            val c = cs.getJSONObject(i)
+            if (c.getString("kind") == "responses") return c
+        }
+        throw AssertionError("no \"responses\" case in fixture")
+    }
+
+    private fun responsesPayload(c: JSONObject, wraps: Map<String, Any?>, createdAt: Double = c.getDouble("created_at")): Map<String, Any?> = mapOf(
+        "kind" to "responses", "target" to c.getString("target"),
+        "created_at" to createdAt,
+        "body_nonce" to c.getString("body_nonce"), "body_ct" to c.getString("body_ct"),
+        "wraps" to wraps,
+    )
+
+    /** responsesPass's entitlement check needs a stored "post" StoredMsg
+     *  whose OWN msgId equals a KIND_RESPONSES record's `target` -- but a
+     *  real post's msgId is a SHA-256 hash of its own signed envelope
+     *  (SignedMessage.msgId()), which cannot be steered to match an
+     *  arbitrary pre-baked fixture string (that would mean brute-forcing a
+     *  hash preimage). This thin SyncStore delegate injects a synthetic
+     *  "post" StoredMsg directly into what allMessages() returns instead --
+     *  everything else (wrapGrantsFor/profileNames/deviceViews/etc.) still
+     *  goes through a real, unmodified InMemorySyncStore. */
+    private class TargetInjectingStore(
+        private val backing: InMemorySyncStore, private val extraPosts: List<StoredMsg>,
+    ) : SyncStore by backing {
+        override fun allMessages(): List<StoredMsg> = backing.allMessages() + extraPosts
+    }
+
+    private fun withInjectedPost(store: InMemorySyncStore, target: String, author: String): SyncStore =
+        TargetInjectingStore(store, listOf(StoredMsg(target, "post", author, emptyMap())))
+
+    @Test fun decryptsLatestResponsesRecordForItsOwnPostAuthor() {
+        val c = responsesCase()
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, responsesPayload(c, wraps), "c3".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        val injected = withInjectedPost(store, c.getString("target"), c.getString("author"))
+
+        val out = DecryptPass.responsesPass(injected, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        val r = out[c.getString("target")]
+        assertTrue("a responses entry must be present for the post's target", r != null)
+        assertEquals(mapOf("heart" to 1), r!!.reactions)
+        assertEquals(1, r.comments.size)
+        assertEquals("nice post!", r.comments[0].body)
+        // No profile name stored for the responder -> "friend-" + prefix,
+        // same fallback DecryptPass.resolveAuthor uses for feed authors.
+        assertEquals("friend-" + c.getString("public_responder_identity").take(8), r.comments[0].display)
+        assertEquals("a real, verified+device-bound public comment resolves to a name, not an alias",
+            null, r.comments[0].aliasColor)
+    }
+
+    @Test fun latestByCreatedAtResponsesRecordWinsOverAnOlderOne() {
+        val c = responsesCase()
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+
+        // The REAL, valid vector record -- ingested FIRST (seq 1) but is
+        // the NEWER of the two candidates by created_at. If responsesPass
+        // picked "whichever was iterated last" instead of genuinely
+        // comparing created_at, it would instead try the bogus-wrapped
+        // older record below (ingested last) and fail to decrypt -- so a
+        // passing assertion here proves created_at comparison actually
+        // happened, not merely that the fixture's one real record works.
+        val realWraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val realMsg = signedMessage(c.getString("author"), 1, responsesPayload(c, realWraps), "c4".repeat(32))
+        assertTrue(store.ingestMessage(realMsg))
+
+        // An OLDER competing record for the SAME (author, target), with a
+        // syntactically-valid but semantically-bogus wrap -- created_at is
+        // strictly earlier than the real record's, so it must never even
+        // be attempted for decryption.
+        val bogusWrap = mapOf(
+            "eph_pub" to "ab".repeat(32), "nonce" to "cd".repeat(12), "wrapped_key" to "ef".repeat(48))
+        val olderMsg = signedMessage(
+            c.getString("author"), 2,
+            responsesPayload(c, mapOf(phoneDevicePub to bogusWrap), c.getDouble("created_at") - 100.0),
+            "c5".repeat(32))
+        assertTrue(store.ingestMessage(olderMsg))
+
+        val injected = withInjectedPost(store, c.getString("target"), c.getString("author"))
+        val out = DecryptPass.responsesPass(injected, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        val r = out[c.getString("target")]
+        assertTrue("the newer (real) record must be selected and decrypt", r != null)
+        assertEquals(1, r!!.comments.size)
+        assertEquals("nice post!", r.comments[0].body)
+    }
+
+    @Test fun ignoresResponsesRecordWhenSignerDiffersFromTheTargetPostsRealAuthor() {
+        // Reviewer-motivated addition: hearth's own reference
+        // (store.responses_record(target, author_identity)) is ALWAYS
+        // scoped to the target post's known author -- responsesPass must
+        // mirror that, not merely "whoever signed a wrap_grant for this
+        // responses message" (a different, already-covered question --
+        // see resolveWrap). This message is FULLY internally crypto-valid
+        // (the fixture's real author + real AAD/wrap/ciphertext, identical
+        // to the positive test above) -- the ONLY difference is that the
+        // injected "post" for this target is authored by someone else, the
+        // exact shape of a hostile known-identity claiming a target they
+        // do not own.
+        val c = responsesCase()
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, responsesPayload(c, wraps), "c6".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        val injected = withInjectedPost(store, c.getString("target"), foreignIdentityPub)
+
+        val out = DecryptPass.responsesPass(injected, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        assertTrue(
+            "a responses record signed by anyone other than the target post's real author must be ignored",
+            out[c.getString("target")] == null)
+    }
+
+    @Test fun ignoresResponsesRecordWhenTargetPostIsNotKnownToThisStore() {
+        val c = responsesCase()
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, responsesPayload(c, wraps), "c7".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+        // No injected "post" StoredMsg at all -- allMessages() has no post
+        // row for this target, so postAuthorByMsgId has nothing to match.
+
+        val out = DecryptPass.responsesPass(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
+        assertTrue("no known post for target -> no responses entry, fail-closed", out.isEmpty())
+    }
 }

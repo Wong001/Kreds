@@ -1,6 +1,7 @@
 package expo.modules.tormanager
 
 import org.json.JSONArray
+import org.json.JSONObject
 
 /** Task 5 (B.2), entitlement rule generalized in B.2c (Task 2): a decrypt
  *  pass over every stored POST/DM message this device is ENTITLED to, via
@@ -95,6 +96,89 @@ object DecryptPass {
         return Result(out.sortedByDescending { it.createdAt }, keys)
     }
 
+    /** B.2d-4 Task 3: a target post's msgId -> its aggregated engagement
+     *  view (`KotlinResponses.Responses`), one entry per post this device
+     *  knows of that has a valid, decryptable KIND_RESPONSES record signed
+     *  by that SAME post's own author.
+     *
+     *  Entitlement (the part `resolveWrap`'s existing per-kind sets do NOT
+     *  cover): hearth's own reference (`store.responses_record(target,
+     *  author_identity)`, always invoked scoped to the target post's known
+     *  author -- see node.py's `_post_responses_view`/`feed()`/
+     *  `delete_post`) never trusts a KIND_RESPONSES record for a purpose
+     *  other than "the record this post's OWN author most recently
+     *  published for it". `resolveWrap`'s per-kind `accepted` set answers a
+     *  DIFFERENT question -- who may hand this device a content-key WRAP
+     *  for a given responses message (its own signer, via the `else`
+     *  branch) -- not whether that message's `target` is one THIS device
+     *  should trust as authoritative for that target. Without an explicit
+     *  check here, a known-but-hostile identity (any mutual friend, same
+     *  threat model as wrapGrantsFor's own doc above) could sign a
+     *  KIND_RESPONSES claiming `target = <someone else's real post>`, wrap
+     *  it (self-consistently, with their OWN real device key, so it
+     *  decrypts "successfully") to this device, and inject fabricated
+     *  aliased reactions/comments onto a post they do not own. Restricting
+     *  candidates to `postAuthorByMsgId[target] == m.identityPub` closes
+     *  that off, matching hearth's own scoping exactly. `postAuthorByMsgId`
+     *  is built from this store's own stored "post" messages' cert-proven
+     *  `identityPub` (StoredMsg.identityPub) -- no decrypt needed to know
+     *  who authored a post, same as resolveWrap's own accepted-set logic.
+     *
+     *  Latest-wins per (author, target): by `created_at` ONLY -- unlike
+     *  `wrapGrantsFor` (which sorts on `(created_at, seq)` on the STORE
+     *  side, where `seq` is still attached to the underlying SignedMessage
+     *  it reads directly), `StoredMsg` -- what `allMessages()` hands this
+     *  pass -- carries no `seq` field, and adding one would mean touching
+     *  SyncStore.kt, out of this task's scope. A same-`created_at` collision
+     *  between two republishes for one target is the only case this
+     *  misorders, no more likely here than anywhere else `created_at` alone
+     *  already orders things (DecryptPass.run's own feed sort above).
+     *
+     *  Fail-closed throughout, per-target: no stored post for `target`,
+     *  wrong author, no wrap, failed unwrap/decrypt, or a missing/malformed
+     *  `entries` list -- ALL degrade to "this post has no responses entry
+     *  in the returned map", never a crash and never a fabricated
+     *  attribution. One bad or hostile record must not affect any other
+     *  target's entry. */
+    fun responsesPass(
+        store: SyncStore, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String,
+    ): Map<String, KotlinResponses.Responses> {
+        val profileNames = store.profileNames()
+        val deviceBound: (String, String) -> Boolean =
+            { id, dev -> store.deviceViews(id).let { it.isEmpty() || dev in it } }
+
+        val all = store.allMessages()
+        val postAuthorByMsgId = all.filter { it.kind == "post" }.associate { it.msgId to it.identityPub }
+
+        // Best (latest by created_at) KIND_RESPONSES StoredMsg per target,
+        // restricted to records signed by that target's own post author --
+        // see this function's doc above for why that restriction is
+        // load-bearing, not optional.
+        data class Candidate(val msg: StoredMsg, val createdAt: Double)
+        val bestByTarget = linkedMapOf<String, Candidate>()
+        for (m in all) {
+            if (m.kind != "responses") continue
+            val target = m.payload["target"] as? String ?: continue
+            if (postAuthorByMsgId[target] != m.identityPub) continue
+            val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: continue
+            val cur = bestByTarget[target]
+            if (cur == null || createdAt > cur.createdAt) bestByTarget[target] = Candidate(m, createdAt)
+        }
+
+        val out = linkedMapOf<String, KotlinResponses.Responses>()
+        for ((target, cand) in bestByTarget) {
+            val m = cand.msg
+            val aad = KotlinDmcrypt.responsesAad(m.identityPub, target, cand.createdAt)
+            val wrap = resolveWrap(store, m, phoneDevicePub, ownIdentityPub) ?: continue
+            val key = KotlinDmcrypt.unwrapKey(wrap, encPrivHex, aad) ?: continue
+            val bodyNonce = m.payload["body_nonce"] as? String ?: continue
+            val bodyCt = m.payload["body_ct"] as? String ?: continue
+            val body = KotlinDmcrypt.decryptBody(key, bodyNonce, bodyCt, aad) ?: continue
+            out[target] = KotlinResponses.aggregate(entriesList(body["entries"]), target, profileNames, deviceBound)
+        }
+        return out
+    }
+
     /** Author display-name resolution (B.2c Task 3): `profileNames`'s
      *  latest-stored-profile name for `identityPub`, if any. Own identity
      *  falls back to the literal "me" when no own profile is stored yet;
@@ -138,6 +222,30 @@ object DecryptPass {
     private fun nullableStringList(v: Any?): List<String?> = when (v) {
         is List<*> -> v.map { it as? String }
         is JSONArray -> (0 until v.length()).map { i -> if (v.isNull(i)) null else v.opt(i) as? String }
+        else -> emptyList()
+    }
+
+    /** B.2d-4 Task 3: bridges a decrypted responses body's `entries` field
+     *  into the `List<Map<String, Any?>>` shape `KotlinResponses.aggregate`
+     *  expects. Same dual-shape reasoning as `stringList`/
+     *  `nullableStringList` above -- `KotlinDmcrypt.decryptBody` only
+     *  shallow-converts its TOP-level JSONObject (see those functions' own
+     *  doc), so `entries` itself arrives as a raw `org.json.JSONArray` of
+     *  `JSONObject`s in production, never a Kotlin List of Maps; a caller-
+     *  built List<Map<...>> (e.g. a test) is accepted too. Each element is
+     *  shallow-converted ONE level (mirroring KotlinDmcrypt.decryptBody's
+     *  own top-level conversion, and KotlinResponsesTest's `map()` helper)
+     *  -- nested values (e.g. a `mutual_box` slot list) stay raw org.json,
+     *  which is exactly the shape KotlinResponses' own slot readers (
+     *  `slotStr`) already handle. A non-object element, or `entries` being
+     *  missing/wrong-shaped entirely, degrades to an empty/partial list --
+     *  never a crash -- and `KotlinResponses.validEntry` drops anything
+     *  malformed that still made it through as a Map. */
+    private fun entriesList(v: Any?): List<Map<String, Any?>> = when (v) {
+        is JSONArray -> (0 until v.length()).mapNotNull { i ->
+            (v.opt(i) as? JSONObject)?.let { o -> o.keys().asSequence().associateWith { k -> o.get(k) } }
+        }
+        is List<*> -> v.filterIsInstance<Map<String, Any?>>()
         else -> emptyList()
     }
 

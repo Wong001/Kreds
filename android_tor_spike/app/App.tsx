@@ -497,6 +497,44 @@ export default function App() {
                   ))}
                 </View>
               ) : null}
+              {/* Task 4 (B.2d-4): reaction summary + comment list, view-only --
+                  renders straight off item.responses (already aggregated/
+                  attributed upstream by DecryptPass.responsesPass + the
+                  native getFeed marshal; see FeedItem's doc). Guarded on
+                  item.responses itself (null/absent -> render nothing extra,
+                  the common case per its doc); every access below stays
+                  inside this same JSX expression (no nested function
+                  boundary) so the guard's narrowing of item.responses from
+                  possibly-null to the real object holds throughout. The
+                  reaction line is additionally guarded on count>0 entries
+                  being non-empty, so a responses record with e.g. comments
+                  but no (surviving) reactions doesn't leave a stray empty
+                  summary line -- comments are mapped unconditionally,
+                  since [].map renders nothing on its own. */}
+              {!!item.responses && (
+                <>
+                  {Object.entries(item.responses.reactions).filter(([, count]) => count > 0).length > 0 && (
+                    <Text style={styles.reactionSummary}>
+                      {Object.entries(item.responses.reactions)
+                        .filter(([, count]) => count > 0)
+                        .map(([token, count]) => `${token} ${count}`)
+                        .join("  ")}
+                    </Text>
+                  )}
+                  {item.responses.comments.map((c, i) => (
+                    // Task 4: index-keyed -- this aggregated shape carries no
+                    // per-comment msgId, and the list is a static render (no
+                    // reordering) so an index key is stable enough here.
+                    <Text key={i} style={styles.commentLine}>
+                      <Text style={c.color !== null ? { color: `hsl(${c.color}, 60%, 45%)` } : styles.commentDisplay}>
+                        {c.display}
+                      </Text>
+                      {" "}
+                      <Text style={styles.commentBody}>{c.body}</Text>
+                    </Text>
+                  ))}
+                </>
+              )}
             </View>
           )}
         />
@@ -624,4 +662,15 @@ const styles = StyleSheet.create({
   storyReplyChip: { flexDirection: "row", alignItems: "center", gap: 6 },
   storyReplyThumb: { width: 28, height: 28, borderRadius: 4 },
   storyReplyChipText: { fontSize: 12, color: "#444", fontStyle: "italic" },
+  // Task 4 (B.2d-4): reaction summary + comment list -- minimal
+  // dev-dashboard text only, no icons/avatars, matching feedItem's plain
+  // fontSize/paddingVertical idiom above rather than introducing a new look.
+  reactionSummary: { fontSize: 13, color: "#444", paddingVertical: 1 },
+  commentLine: { fontSize: 13, paddingVertical: 1 },
+  // Default (real-friend, color === null) display-name color -- distinct
+  // from feedItem's default black body text so a commenter's name still
+  // reads as a label, without hardcoding a one-off hex where no existing
+  // token fit (feedItem/state/etc. are all plain default-color text).
+  commentDisplay: { fontWeight: "600", color: "#333" },
+  commentBody: { color: "#000" },
 });
