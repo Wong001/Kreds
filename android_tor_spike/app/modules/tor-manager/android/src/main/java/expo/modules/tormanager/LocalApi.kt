@@ -45,7 +45,7 @@ class LocalApi(private val ctx: Context) {
         val (priv, _) = EncKeys.getOrCreate(store)
         val own = fx.cert.identity_pub
         val res = DecryptPass.run(store, fx.device_pub, priv, own)
-        keysCache = res.keys                                   // vp1: warm the blob-key cache
+        keysCache = postKeys(res.feed, res.keys)                // vp1: warm the blob-key cache, POSTS ONLY
         val responses = DecryptPass.responsesPass(store, fx.device_pub, priv, own)
         val arr = JSONArray()
         for (d in res.feed) {                                  // already newest-first
@@ -74,12 +74,17 @@ class LocalApi(private val ctx: Context) {
         KotlinHandshake.parseFixture(File(TorEngine.externalDir(), "spike_phone_fixture.json").readText())
     } catch (e: Exception) { null }
 
+    // hearth stories_view (node.py:836-841) keeps a group only for
+    // self/known identities -- an unfriended author's already-synced
+    // (unexpired) story must not surface here even though its row still
+    // exists in the store.
     private fun stories(): String {
         val fx = fixtureOrNull()
         val store = SqliteSyncStore(ctx)
         val own = fx?.cert?.identity_pub ?: ""
         val now = System.currentTimeMillis() / 1000.0
-        return storiesJson(store.activeStories(now), store.profileNames(), own)
+        val visible = filterVisibleStories(store.activeStories(now), own, store.knownIdentities().toSet())
+        return storiesJson(visible, store.profileNames(), own)
     }
 
     // /api/blob/{h}: raw plaintext-at-rest bytes (avatars/plaintext content),
@@ -89,10 +94,17 @@ class LocalApi(private val ctx: Context) {
         return mediaResponse(data)
     }
 
-    // /api/post-blob/{msg_id}/{h}: content-key-decrypted post/DM blob bytes,
-    // streamed decrypt-on-read. AVIF is served raw (image/avif) -- the WebView
-    // Chromium renderer decodes it (it never has our keys; we hand it already-
-    // decrypted plaintext), matching desktop exactly.
+    // /api/post-blob/{msg_id}/{h}: content-key-decrypted POST blob bytes ONLY,
+    // streamed decrypt-on-read -- mirrors hearth's post_blob (node.py:2956-
+    // 2964), which does `if msg.kind != KIND_POST: return None` before
+    // decrypting. DecryptPass.run's keys map covers both post AND dm kinds
+    // (DecryptPass.kt), so both the warm cache (feed()) and this fallback
+    // MUST be filtered through postKeys -- otherwise a DM's msgId would
+    // decrypt+serve here with the posts-only immutable Cache-Control,
+    // leaking DM media through the wrong (unauthenticated-by-kind) route.
+    // AVIF is served raw (image/avif) -- the WebView Chromium renderer
+    // decodes it (it never has our keys; we hand it already-decrypted
+    // plaintext), matching desktop exactly.
     private fun postBlob(msgId: String, hash: String): HttpResponse {
         val store = SqliteSyncStore(ctx)
         // vp1: use the cache warmed by /api/feed; only fall back to a full
@@ -103,8 +115,9 @@ class LocalApi(private val ctx: Context) {
             val fx = fixtureOrNull() ?: return notFound()
             val (priv, _) = EncKeys.getOrCreate(store)
             val res = DecryptPass.run(store, fx.device_pub, priv, fx.cert.identity_pub)
-            keysCache = res.keys
-            key = res.keys[msgId] ?: return notFound()
+            val posts = postKeys(res.feed, res.keys)
+            keysCache = posts
+            key = posts[msgId] ?: return notFound()
         }
         val cipher = store.getBlob(hash) ?: return notFound()
         val plain = KotlinBlobCrypt.decryptBlob(key, cipher) ?: return notFound()
@@ -121,6 +134,22 @@ class LocalApi(private val ctx: Context) {
     companion object {
         fun json(body: String) =
             HttpResponse(200, mapOf("Content-Type" to "application/json; charset=utf-8"), body.toByteArray())
+
+        // hearth post_blob (node.py:2956-2964) serves ONLY KIND_POST blobs
+        // (`if msg.kind != KIND_POST: return None`), even though the
+        // content-key wrap/decrypt machinery is shared with DMs. DecryptPass.
+        // run's Result.keys is keyed by msgId across BOTH kinds -- this
+        // narrows it to post-authored keys only, so a DM's msgId can never
+        // resolve a key via the /api/post-blob route.
+        fun postKeys(feed: List<DecryptPass.Decrypted>, keys: Map<String, ByteArray>): Map<String, ByteArray> =
+            feed.filter { it.kind == "post" }.mapNotNull { d -> keys[d.msgId]?.let { d.msgId to it } }.toMap()
+
+        // hearth stories_view (node.py:836-841): a story group is visible
+        // only for self or a known (friended) identity -- an unfriended
+        // author's already-synced, unexpired story row must not surface
+        // through /api/stories even though the row still exists locally.
+        fun filterVisibleStories(stories: List<StoredStory>, own: String, known: Set<String>): List<StoredStory> =
+            stories.filter { it.author == own || it.author in known }
 
         // Kotlin port of hearth api.py `_sniff` (magic-byte content-type).
         fun sniff(data: ByteArray): String {

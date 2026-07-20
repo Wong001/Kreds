@@ -174,4 +174,30 @@ class LocalApiTest {
         assertEquals(setOf("msg_id", "media_kind", "media", "poster", "caption", "created_at"),
             items.getJSONObject(0).keys().asSequence().toSet())
     }
+
+    // -- coordinator review fixes: post-blob kind gate + stories known-identity filter --
+
+    @Test fun postKeysExcludesDmIncludesPost() {
+        fun decrypted(msgId: String, kind: String) = DecryptPass.Decrypted(
+            msgId = msgId, kind = kind, author = "Cara", text = "hi", createdAt = 1.0,
+            blobs = listOf("b1"), thumbs = listOf<String?>(null),
+            media = "photo", poster = null, storyRefMediaHash = null,
+            identityPub = "cara", scope = "kreds", expiresAt = null,
+            placement = "journal", codec = null)
+        val post = decrypted("p1", "post")
+        val dm = decrypted("d1", "dm")
+        val keys = mapOf("p1" to byteArrayOf(1, 2, 3), "d1" to byteArrayOf(4, 5, 6))
+        val result = LocalApi.postKeys(listOf(post, dm), keys)
+        assertEquals(setOf("p1"), result.keys)
+        assertArrayEquals(byteArrayOf(1, 2, 3), result["p1"])
+    }
+
+    @Test fun filterVisibleStoriesKeepsSelfAndKnownDropsUnknown() {
+        val stories = listOf(
+            StoredStory("s1", "own", "photo", "h1", null, "cap1", 10.0),
+            StoredStory("s2", "known", "photo", "h2", null, "cap2", 20.0),
+            StoredStory("s3", "unknown", "photo", "h3", null, "cap3", 30.0))
+        val visible = LocalApi.filterVisibleStories(stories, own = "own", known = setOf("known"))
+        assertEquals(setOf("s1", "s2"), visible.map { it.msgId }.toSet())
+    }
 }
