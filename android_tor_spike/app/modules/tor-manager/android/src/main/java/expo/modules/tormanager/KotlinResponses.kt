@@ -55,8 +55,18 @@ object KotlinResponses {
         // shape. alias == true when this comment rendered as an anonymous alias
         // (aliasColor != null is the "not a verified real name" signal, per
         // this class's own doc). aliasSeed is the entry's validated hex32 seed.
-        // name = the resolved real display name, or null when aliased.
-        val alias: Boolean = false, val aliasSeed: String = "", val name: String? = null)
+        // name = hearth's OWN comment-name fallback (node.py:1577,
+        // `names.get(identity, identity[:8])`) -- the BARE 8-char identity
+        // prefix when unnamed, deliberately NOT `display`'s "friend-"-
+        // prefixed value (that prefix is this class's own choice for the
+        // native app's author line; the two must not be conflated). null
+        // when aliased. responder = the resolved identity_pub, present only
+        // when NOT aliased (mirrors node.py:1586-1588's `if resolved:
+        // comment["responder"] = identity`) -- web/app.js:621 keys a
+        // resolved comment's avatar color off `c.responder` via
+        // identityColor(), so an alias comment must never carry it.
+        val alias: Boolean = false, val aliasSeed: String = "", val name: String? = null,
+        val responder: String? = null)
 
     /** A post's aggregated engagement: reaction tally (token -> count) and
      *  the resolved comment list (entry order preserved). */
@@ -248,9 +258,16 @@ object KotlinResponses {
             } else {
                 val (display, color) = resolveDisplay(e, target, profileNames, deviceBound)
                 val isAlias = color != null           // a null aliasColor == verified real name
-                val name = if (isAlias) null else display
+                // vp1 fields, hearth-parity (node.py:1562-1588): `responder` is the
+                // resolved identity_pub, present only when NOT alias -- resolveDisplay
+                // already required a present, valid `identity` to attribute (else it
+                // would have returned the alias), so str(e, "identity") is non-null
+                // whenever isAlias is false. `name` is hearth's OWN fallback (bare
+                // identity[:8]), independent of `display`'s "friend-"-prefixed value.
+                val responder = if (isAlias) null else str(e, "identity")
+                val name = if (isAlias) null else (responder?.let { profileNames[it] ?: it.take(8) })
                 val seed = str(e, "alias_seed") ?: ""
-                comments.add(Comment(body, display, color, createdAt, isAlias, seed, name))
+                comments.add(Comment(body, display, color, createdAt, isAlias, seed, name, responder))
             }
         }
         return Responses(reactions, comments)

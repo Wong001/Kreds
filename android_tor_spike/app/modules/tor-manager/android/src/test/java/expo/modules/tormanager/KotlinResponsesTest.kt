@@ -214,4 +214,43 @@ class KotlinResponsesTest {
         assertTrue(r.comments.isEmpty())
         assertFalse(r.reactions.containsKey("x"))
     }
+
+    // ---- vp1 Comment.responder/name (bug fix: coordinator review of Task 4) ----
+    // hearth node.py:1562-1588: `resolved = identity is not None`; the comment
+    // dict's "name" fallback is the BARE `identity[:8]` (node.py:1577,
+    // `names.get(identity, identity[:8])`) -- NOT the "friend-"-prefixed
+    // `display` value KotlinResponses computes for the native app's own
+    // author line -- and `responder` is set on the dict ONLY `if resolved`
+    // (node.py:1586-1588). These prove `aggregate` computes both correctly,
+    // independent of the LocalApi marshal layer (LocalApiTest covers that
+    // separately with hand-built Comment values).
+
+    private fun aliasComment(body: String, seed: String): Map<String, Any?> = mapOf(
+        "rkind" to "comment", "body" to body, "created_at" to 1.0,
+        "alias_seed" to seed, "public" to false, "responder_sig" to "00".repeat(64),
+        "mutual_box" to null)
+
+    @Test fun aggregateSetsResponderAndBareIdentityNameFallbackForResolvedComment() {
+        val r = KotlinResponses.aggregate(listOf(publicEntry()), target(), emptyMap()) { _, _ -> true }
+        assertEquals(1, r.comments.size)
+        val c = r.comments[0]
+        assertFalse("a resolved comment must not be marked alias", c.alias)
+        assertEquals("responder must be the resolved identity_pub", publicIdentity(), c.responder)
+        assertEquals(
+            "name must be hearth's bare identity[:8] fallback, no \"friend-\" prefix",
+            publicIdentity().take(8), c.name)
+        assertEquals(
+            "display keeps its own \"friend-\"-prefixed value for the native app path, unchanged",
+            "friend-" + publicIdentity().take(8), c.display)
+    }
+
+    @Test fun aggregateOmitsResponderAndNameForAliasComment() {
+        val r = KotlinResponses.aggregate(
+            listOf(aliasComment("hi there", "44".repeat(16))), target(), emptyMap()) { _, _ -> true }
+        assertEquals(1, r.comments.size)
+        val c = r.comments[0]
+        assertTrue("a private (public=false) comment must render as an alias", c.alias)
+        assertNull("an alias comment must never carry a responder", c.responder)
+        assertNull("an alias comment must never carry a resolved name", c.name)
+    }
 }

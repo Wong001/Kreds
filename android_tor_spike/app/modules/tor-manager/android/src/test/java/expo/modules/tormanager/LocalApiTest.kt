@@ -60,6 +60,33 @@ class LocalApiTest {
         assertEquals("aabbccdd", c.getString("alias_seed"))
         assertFalse(c.getBoolean("mine"))
         assertEquals("nice", c.getString("body"))
+        // hearth omits `responder` for an unresolved (alias) comment
+        // (node.py:1586-1588's `if resolved:`) -- must be ABSENT, not null.
+        assertFalse(c.has("responder"))
+    }
+
+    @Test fun feedRowResolvedCommentIncludesResponderAndBareIdentityName() {
+        // Bug fix (coordinator review of Task 4): a RESOLVED (non-alias)
+        // comment must carry `responder` (hearth node.py:1586-1588) so
+        // web/app.js:621's `identityColor(c.responder)` doesn't get an
+        // undefined -> hsl(NaN...) avatar color. `name` here is hearth's own
+        // bare-identity-prefix fallback (node.py:1577), computed independently
+        // of KotlinResponses' "friend-"-prefixed `display` value.
+        val resp = KotlinResponses.Responses(
+            reactions = emptyMap(),
+            comments = listOf(
+                KotlinResponses.Comment(
+                    body = "nice", display = "Cara", aliasColor = null, createdAt = 1.0,
+                    alias = false, aliasSeed = "aabbccdd", name = "Cara", responder = "cara_identity")))
+        val o = LocalApi.feedRow(sampleDecrypted(mine = false), ownIdentityPub = "own", responses = resp)
+        val r = o.getJSONObject("responses")
+        val c = r.getJSONArray("comments").getJSONObject(0)
+        assertEquals(
+            setOf("name", "avatar", "alias", "alias_seed", "mine", "body", "created_at", "responder"),
+            c.keys().asSequence().toSet())
+        assertEquals("cara_identity", c.getString("responder"))
+        assertEquals("Cara", c.getString("name"))
+        assertFalse(c.getBoolean("alias"))
     }
 
     @Test fun bootstrapStubShape() {

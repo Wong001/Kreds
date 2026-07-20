@@ -129,15 +129,25 @@ class LocalApi(private val ctx: Context) {
             for ((k, v) in r.reactions) reactions.put(k, v)
             val comments = JSONArray()
             for (c in r.comments) {
-                comments.put(JSONObject()
+                val co = JSONObject()
                     .put("name", if (c.alias) JSONObject.NULL else (c.name ?: JSONObject.NULL))
                     .put("avatar", JSONObject.NULL)           // comment-author avatars deferred
                     .put("alias", c.alias)
                     .put("alias_seed", c.aliasSeed)
                     .put("mine", false)                        // read-only
                     .put("body", c.body)
-                    .put("created_at", c.createdAt))
-                    // NOTE: `responder` deliberately OMITTED (hearth omits it when unresolved)
+                    .put("created_at", c.createdAt)
+                // `responder` is emitted CONDITIONALLY -- present only for a
+                // resolved (non-alias) comment, mirroring hearth's own
+                // conditional assignment (node.py:1586-1588, `if resolved:
+                // comment["responder"] = identity`). An alias comment must
+                // never carry it: web/app.js:621 derives a resolved comment's
+                // avatar color via identityColor(c.responder), and an
+                // unconditional omission previously left that call as
+                // identityColor(undefined) -> hsl(NaN...) for every resolved
+                // comment served from /api/feed (bug fix, vp1).
+                if (c.responder != null) co.put("responder", c.responder)
+                comments.put(co)
             }
             return JSONObject()
                 .put("reactions", reactions)
