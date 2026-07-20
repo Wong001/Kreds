@@ -10,6 +10,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import java.io.File
 
+/** Reserved msgId for the MediaServer resolver's story branch (B.2d-3 Task 2).
+ *  Real msgIds are hex64 (a message id), so this string can never collide
+ *  with one -- getStoryVideoUrl passes it as MediaServer.urlFor's msgId
+ *  segment, and the resolver injected in ensureMediaServer branches on it
+ *  BEFORE the decrypt path to serve a story hash as plaintext (see that
+ *  resolver's doc comment for why a story must never go through
+ *  blobKeys/decryptBlob). */
+private const val STORY_MARKER = "story"
+
 class TorManagerModule : Module() {
     // recv/send/dial block on socket I/O; keep them OFF the single default
     // AsyncFunction HandlerThread (would deadlock the concurrent recv+send
@@ -91,32 +100,53 @@ class TorManagerModule : Module() {
     // interleaving where a server is started but never stopped.
     @Volatile private var destroyed = false
 
-    /** Lazily starts (once) the loopback media server getVideoUrl resolves
-     *  URLs from. The injected resolver mirrors getBlobImage's decrypt path
-     *  exactly (blobKeys -> SqliteSyncStore.getBlob -> KotlinBlobCrypt.
-     *  decryptBlob) but returns raw decrypted bytes rather than a rendered
-     *  data URI -- MediaServer streams those bytes straight to the platform
-     *  player, decrypting again on every call (a seek re-reads+re-decrypts
-     *  the whole blob then slices; acceptable at the <=5MB gate cap per the
-     *  brief -- a future large-media case could cache the decrypted bytes
-     *  for the currently-playing hash only, evicted on stop, but that's not
-     *  built here). Nothing the resolver returns is ever written to disk --
-     *  MediaServer holds it in memory only long enough to write it to the
-     *  response socket. @Synchronized: getVideoUrl runs on ioScope
-     *  (Dispatchers.IO, a thread pool), so two feed rows opening their first
-     *  video at once must not race into constructing two servers -- and (see
-     *  `destroyed`'s doc above) so a concurrent OnDestroy can't race a
-     *  server into existence after teardown either. Returns null once this
-     *  module instance has been destroyed -- getVideoUrl already treats a
-     *  null result the same as "no content key", so no new null-handling was
-     *  needed at the call site beyond widening its type. */
+    /** Lazily starts (once) the loopback media server getVideoUrl/
+     *  getStoryVideoUrl resolve URLs from. The injected resolver has two
+     *  branches (B.2d-3 Task 2 added the first):
+     *
+     *  - msgId == STORY_MARKER: a story's video blob. Stories are PLAINTEXT
+     *    by design (no content key, see StoredStory's doc) -- this branch
+     *    serves SqliteSyncStore.getBlob's raw bytes directly and MUST NEVER
+     *    consult blobKeys or call KotlinBlobCrypt.decryptBlob. Feeding a real
+     *    (non-story) post's ciphertext hash through this branch by mistake
+     *    would just serve unplayable ciphertext -- ordinary garbage, not a
+     *    plaintext leak -- but the reverse mistake (a story hash falling
+     *    through to the decrypt branch below) would silently corrupt with
+     *    AEAD failure, which is why this check is an explicit `if` gated on
+     *    the reserved, uncollidable STORY_MARKER rather than any inference
+     *    from blobKeys' contents.
+     *  - otherwise: getBlobImage's decrypt path exactly (blobKeys ->
+     *    SqliteSyncStore.getBlob -> KotlinBlobCrypt.decryptBlob) -- unchanged
+     *    from before this task.
+     *
+     *  Either way this returns raw bytes rather than a rendered data URI --
+     *  MediaServer streams those bytes straight to the platform player,
+     *  re-resolving (re-decrypting, for the non-story branch) on every call
+     *  (a seek re-reads the whole blob then slices; acceptable at the <=5MB
+     *  gate cap per the brief -- a future large-media case could cache the
+     *  resolved bytes for the currently-playing hash only, evicted on stop,
+     *  but that's not built here). Nothing the resolver returns is ever
+     *  written to disk -- MediaServer holds it in memory only long enough to
+     *  write it to the response socket. @Synchronized: getVideoUrl/
+     *  getStoryVideoUrl run on ioScope (Dispatchers.IO, a thread pool), so
+     *  two feed rows (or story views) opening their first video at once must
+     *  not race into constructing two servers -- and (see `destroyed`'s doc
+     *  above) so a concurrent OnDestroy can't race a server into existence
+     *  after teardown either. Returns null once this module instance has
+     *  been destroyed -- getVideoUrl/getStoryVideoUrl already treat a null
+     *  result the same as "no content key"/"not found", so no new null-
+     *  handling was needed at either call site beyond widening its type. */
     @Synchronized
     private fun ensureMediaServer(ctx: android.content.Context): MediaServer? {
         if (destroyed) return null
         mediaServer?.let { return it }
         val s = MediaServer { msgId, hash ->
-            blobKeys[msgId]?.let { key ->
-                SqliteSyncStore(ctx).getBlob(hash)?.let { cipher -> KotlinBlobCrypt.decryptBlob(key, cipher) }
+            if (msgId == STORY_MARKER) {
+                SqliteSyncStore(ctx).getBlob(hash)
+            } else {
+                blobKeys[msgId]?.let { key ->
+                    SqliteSyncStore(ctx).getBlob(hash)?.let { cipher -> KotlinBlobCrypt.decryptBlob(key, cipher) }
+                }
             }
         }
         s.start()
@@ -478,6 +508,69 @@ class TorManagerModule : Module() {
             // getVideoUrl already returns null for every other "can't resolve"
             // case (no content key, no reactContext).
             if (blobKeys[msgId] == null) null else ensureMediaServer(ctx)?.urlFor(msgId, hash)
+        }.runOnQueue(ioScope)
+
+        // -- B.2d-3 Task 2: plaintext story render paths --
+        // Stories carry no content key (see StoredStory's doc on SyncStore) --
+        // these three functions deliberately never touch blobKeys or call
+        // KotlinBlobCrypt.decryptBlob, unlike their post/dm counterparts
+        // (getBlobImage/getVideoUrl) just above. A story's AVIF stills still
+        // route through the isolated :imagedecode process via
+        // KotlinImageDecode.toRenderable -- that isolation is about WHO
+        // authored the bytes being decoded (a friend, for a story, same as
+        // any post), not about whether they're encrypted, so it stays even
+        // though nothing here is a decrypt.
+
+        // Resolves a story's image/poster blob hash straight to a displayable
+        // `data:<mime>;base64,<...>` URI -- no blobKeys lookup, no
+        // decryptBlob, matching getBlobImage's shape apart from that missing
+        // step. Null on any miss (not synced yet, or a format toRenderable
+        // can't render), same fail-closed-per-item contract as getBlobImage.
+        AsyncFunction("getStoryImage") { hash: String ->
+            val ctx = appContext.reactContext ?: return@AsyncFunction null
+            val bytes = SqliteSyncStore(ctx).getBlob(hash) ?: return@AsyncFunction null
+            val (mime, out) = KotlinImageDecode.toRenderable(bytes) ?: return@AsyncFunction null
+            "data:$mime;base64," + Base64.encodeToString(out, Base64.NO_WRAP)
+        }.runOnQueue(ioScope)
+
+        // Resolves a video story's full blob hash into a http://127.0.0.1 URL
+        // the platform player can stream from -- same loopback MediaServer
+        // getVideoUrl uses, but urlFor's msgId segment is STORY_MARKER
+        // instead of a real msgId, which is what routes the request into the
+        // resolver's plaintext (no-decrypt) branch above. Unlike getVideoUrl,
+        // there is no blobKeys gate to check first (stories have no content
+        // key to gate on) -- null here only means "server couldn't start" or
+        // "module already destroyed" (ensureMediaServer returning null),
+        // mirroring getVideoUrl's null handling for those same cases.
+        AsyncFunction("getStoryVideoUrl") { hash: String ->
+            val ctx = appContext.reactContext ?: return@AsyncFunction null
+            ensureMediaServer(ctx)?.urlFor(STORY_MARKER, hash)
+        }.runOnQueue(ioScope)
+
+        // The active (unexpired) story list (B.2d-3 Task 1's activeStories +
+        // profileNames), shaped for the UI. `authorName` resolves the same
+        // way DecryptPass.resolveAuthor does for feed items (own/friend
+        // display name, else "friend-" + identityPub.take(8)) -- profileNames
+        // is re-read fresh on every call (cheap: a small, indexed table scan,
+        // and stories aren't cached the way feedCache is) rather than reusing
+        // any feed-side cache, so a story from a friend with no post/dm yet
+        // in feedCache still gets a name. `now` uses System.currentTimeMillis
+        // (wall-clock seconds), matching the unit activeStories'
+        // expires_at/created_at fields are stored in (hearth's story payloads
+        // are wall-clock seconds, not monotonic).
+        AsyncFunction("getStories") {
+            val ctx = appContext.reactContext ?: return@AsyncFunction emptyList<Map<String, Any?>>()
+            val store = SqliteSyncStore(ctx)
+            val now = System.currentTimeMillis() / 1000.0
+            val names = store.profileNames()
+            store.activeStories(now).map {
+                mapOf(
+                    "msgId" to it.msgId, "author" to it.author,
+                    "authorName" to (names[it.author] ?: "friend-" + it.author.take(8)),
+                    "mediaKind" to it.mediaKind, "media" to it.media,
+                    "poster" to it.poster, "caption" to it.caption, "createdAt" to it.createdAt,
+                )
+            }
         }.runOnQueue(ioScope)
 
         AsyncFunction("getSyncStats") {

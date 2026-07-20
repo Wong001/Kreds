@@ -157,6 +157,51 @@ export function onSyncProgress(cb: (p: { phase: string; count: number }) => void
   return () => sub.remove();
 }
 
+// -- B.2d-3 Task 2: plaintext story render paths + getStories --
+// Stories carry no content key (see the Kotlin StoredStory/SyncStore doc) --
+// getStoryImage/getStoryVideoUrl never decrypt anything, unlike
+// getBlobImage/getVideoUrl above (which resolve a POST's blob through a
+// content key). A story's AVIF stills still go through the isolated
+// :imagedecode process on the native side (KotlinImageDecode.toRenderable) --
+// that isolation is about untrusted (friend-authored) image bytes, which a
+// story's media still is, independent of encryption.
+export interface StoryItem {
+  msgId: string; author: string; authorName: string;
+  mediaKind: string; media: string; poster: string | null;
+  caption: string; createdAt: number;
+}
+
+// The active (unexpired) story list, newest-first -- see the native
+// activeStories/getStories doc for the expiry rule and authorName fallback.
+// Nothing here is cached on the JS side (mirrors getFeed's own polling
+// pattern): call again to pick up a story that just expired or one a sync
+// just pulled in.
+export function getStories(): Promise<StoryItem[]> {
+  return native.getStories();
+}
+
+// Resolves a story's image/poster blob hash (StoryItem.media when
+// mediaKind === "photo", or StoryItem.poster for a video story) into a
+// displayable `data:<mime>;base64,<...>` URI, or null on any miss (not yet
+// synced, or a format the decoder can't render) -- same null-means-
+// placeholder contract as getBlobImage. Deliberately takes only `hash`, no
+// `msgId`: unlike getBlobImage there is no content key to look up, so there
+// is nothing an msgId would add.
+export function getStoryImage(hash: string): Promise<string | null> {
+  return native.getStoryImage(hash);
+}
+
+// Resolves a video story's full blob hash (StoryItem.media when
+// mediaKind === "video") into a http://127.0.0.1 URL a platform video player
+// can stream (range requests included) -- backed by the same loopback
+// MediaServer getVideoUrl uses. null if the server can't start / the module
+// has been destroyed, mirroring getVideoUrl's null handling for those cases
+// (there is no content-key gate here the way getVideoUrl has one, since
+// stories have no content key to gate on).
+export function getStoryVideoUrl(hash: string): Promise<string | null> {
+  return native.getStoryVideoUrl(hash);
+}
+
 export function onSync(cb: (r: {
   ok: boolean; messages: number; blobs: number; identities: number; reason?: string;
   // Task 7 (B.2): true iff this sync completed successfully and the decrypted
