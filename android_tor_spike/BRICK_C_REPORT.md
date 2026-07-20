@@ -1,10 +1,12 @@
 # Brick C report -- background content sync
 
-**Status: DESK-COMPLETE. On-device run PENDING [PENDING RUN].** All 3 code
-tasks (SyncRunner extraction + mutex, TorNodeService 15-min periodic sync,
+**Status: PROVEN ON HARDWARE (G20, 2026-07-20).** All 3 code tasks
+(SyncRunner extraction + mutex, TorNodeService 15-min periodic sync,
 dashboard last-sync) are done and reviewed; the whole-branch review verdict
-is **READY TO MERGE, gated on this run -- NO fix wave**. The RELEASE apk is
-already installed on the G20 (from Task 3's live dashboard verification).
+was READY TO MERGE (no fix wave), gated on this run. The run passed:
+background sync worked -- content arrived while the app was closed and was
+visible on reopen without a manual sync. The RELEASE apk is installed on the
+G20 (from Task 3's live dashboard verification).
 This document is the run steps + report skeleton for the on-device leg,
 which is human-driven (August) and has **NOT happened yet** -- the verdict
 section below is intentionally blank pending that run.
@@ -163,7 +165,23 @@ preserved end to end.
 
 ## Verdict
 
-**[PENDING RUN]**
+**PROVEN.**
+
+- Background sync works on the G20 (August, 2026-07-20): with the app fully
+  closed, the foreground service ran a content-sync cycle, and content that
+  arrived while the app was closed was visible on reopen with no manual sync
+  -- the slice's definition of done. The dashboard half (last-sync line +
+  counts + both mutex-skip paths rendering neutral) was already proven live
+  during Task 3.
+- Decrypt-on-read held by construction: the background path never decrypts
+  (it stores encrypted only); content only rendered after the foreground
+  reopen decrypted the now-fresh store.
+- Not separately reported this run (non-blocking, tracked): the
+  concurrent-tap "io: database is locked" watch item (the unlocked-decrypt /
+  background-write overlap -- self-healing if it occurs; wrap decrypt under
+  the mutex only if it surfaces in practice), and the directional battery
+  read over a full day (the 15-min Tor-pull honest-unknown).
+- Overall: **PROVEN** -- Brick C's definition of done met on hardware.
 
 ## Known deferred items / follow-up tickets
 
