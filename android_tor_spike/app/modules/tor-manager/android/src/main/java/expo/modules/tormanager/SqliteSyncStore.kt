@@ -203,19 +203,29 @@ class SqliteSyncStore(context: Context) :
         }.toString()
     }
 
-    /** Blob hashes referenced by stored POST/DM payloads, minus what we
-     *  hold. Mirrors InMemorySyncStore.missingBlobs (hearth.store.
+    /** Blob hashes referenced by stored POST/DM/STORY payloads, minus what
+     *  we hold. Mirrors InMemorySyncStore.missingBlobs (hearth.store.
      *  referenced_blobs for the KIND_POST/KIND_DM fields -- blobs list +
-     *  poster str + thumbs list, junk-guarded to strings) but reads the
-     *  refs back out of the stored msg_json instead of an in-memory
-     *  SignedMessage. */
+     *  poster str + thumbs list, junk-guarded to strings), WIDENED (B.2d-3
+     *  Task 1) to also scan `story` rows, but reads the refs back out of
+     *  the stored msg_json instead of an in-memory SignedMessage.
+     *
+     *  `kind` is selected alongside `msg_json` so the `media` extraction
+     *  below can be guarded per-row: a story's `media` is a blob hash, but
+     *  a post/dm's `media` is the "photo"/"video" DISCRIMINATOR -- reading
+     *  it unconditionally would add that literal string to missingBlobs as
+     *  a bogus hash (the field-shape trap). `poster` is already extracted
+     *  generically across kinds, so adding "story" to the IN-clause makes a
+     *  story's poster flow through it for free -- no extra guard needed
+     *  there. */
     override fun missingBlobs(): List<String> {
         val refs = linkedSetOf<String>()
         readableDatabase.rawQuery(
-            "SELECT msg_json FROM messages WHERE kind IN ('post', 'dm')", null
+            "SELECT kind, msg_json FROM messages WHERE kind IN ('post', 'dm', 'story')", null
         ).use { c ->
             while (c.moveToNext()) {
-                val payload = JSONObject(c.getString(0)).optJSONObject("payload") ?: continue
+                val kind = c.getString(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
                 (payload.opt("blobs") as? JSONArray)?.let { arr ->
                     for (i in 0 until arr.length()) (arr.opt(i) as? String)?.let { refs.add(it) }
                 }
@@ -223,6 +233,8 @@ class SqliteSyncStore(context: Context) :
                 (payload.opt("thumbs") as? JSONArray)?.let { arr ->
                     for (i in 0 until arr.length()) (arr.opt(i) as? String)?.let { refs.add(it) }
                 }
+                if (kind == "story")
+                    (payload.opt("media") as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
             }
         }
         val held = mutableSetOf<String>()
@@ -425,5 +437,38 @@ class SqliteSyncStore(context: Context) :
             }
         }
         return best.mapValues { it.value.name }
+    }
+
+    /** Unexpired KIND_STORY rows (B.2d-3 Task 1) -- see the SyncStore
+     *  interface doc for the strict `expires_at > nowSeconds` filter (a row
+     *  with expires_at == nowSeconds is expired, not active). Reads
+     *  msg_json the same way missingBlobs()/wrapGrantsFor()/profileNames()
+     *  above do; `identity_pub` IS a real column, read directly as
+     *  `author` rather than re-parsed from JSON (a story payload carries no
+     *  author field of its own). Sorted newest-first by created_at in
+     *  application code (no index needed -- this scans only `story` rows,
+     *  a small, TTL-bounded set). */
+    override fun activeStories(nowSeconds: Double): List<StoredStory> {
+        val out = mutableListOf<StoredStory>()
+        readableDatabase.rawQuery(
+            "SELECT msg_id, identity_pub, msg_json FROM messages WHERE kind = ?", arrayOf("story")
+        ).use { c ->
+            while (c.moveToNext()) {
+                val msgId = c.getString(0)
+                val author = c.getString(1)
+                val payload = JSONObject(c.getString(2)).optJSONObject("payload") ?: continue
+                if (!payload.has("expires_at")) continue
+                val expiresAt = payload.optDouble("expires_at", Double.NEGATIVE_INFINITY)
+                if (expiresAt <= nowSeconds) continue
+                val mediaKind = payload.opt("media_kind") as? String ?: continue
+                val media = payload.opt("media") as? String ?: continue
+                out.add(StoredStory(
+                    msgId = msgId, author = author, mediaKind = mediaKind, media = media,
+                    poster = payload.opt("poster") as? String,
+                    caption = (payload.opt("caption") as? String) ?: "",
+                    createdAt = payload.optDouble("created_at", 0.0)))
+            }
+        }
+        return out.sortedByDescending { it.createdAt }
     }
 }

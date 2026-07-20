@@ -683,6 +683,101 @@ class DecryptPassTest {
         assertEquals(null, out[0].poster)
     }
 
+    // -- B.2d-3 Task 3 (gap fix): DM story_ref surfacing --
+    // story_ref is a PLAINTEXT OUTER PAYLOAD field, DM-only (hearth
+    // messages.py's make_dm: `"story_ref": story_ref` -- `_valid_story_ref`
+    // shape-guards {"story_id", "media_hash"}), never inside the encrypted
+    // body -- same disclosure class as media/poster above. This was
+    // referenced only in a comment before this task (no field on
+    // Decrypted); App.tsx's story-reply chip (Task 3) needs media_hash to
+    // fetch the thumbnail, so it is added here following the exact same
+    // pattern as the media/poster tests above.
+
+    @Test fun surfacesStoryRefMediaHashFromDmOuterPayload() {
+        val c = cases().getJSONObject(1)
+        assertEquals("dm", c.getString("kind"))
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val mediaHash = "cd".repeat(32)
+        val payload = dmPayload(c, wraps).toMutableMap().apply {
+            put("story_ref", mapOf("story_id" to "s-" + "11".repeat(8), "media_hash" to mediaHash))
+        }
+        val msg = signedMessage(c.getString("author"), 1, payload, "f1".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
+        assertEquals(1, out.size)
+        assertEquals(mediaHash, out[0].storyRefMediaHash)
+    }
+
+    @Test fun nullStoryRefMediaHashWhenAbsentFromOrdinaryDm() {
+        val c = cases().getJSONObject(1)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        // dmPayload(c, wraps) carries no "story_ref" key at all -- the
+        // ordinary (non-story-reply) DM shape.
+        val msg = signedMessage(c.getString("author"), 1, dmPayload(c, wraps), "f2".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
+        assertEquals(1, out.size)
+        assertEquals(null, out[0].storyRefMediaHash)
+    }
+
+    @Test fun postNeverSurfacesStoryRefEvenIfPresentInOuterPayload() {
+        // Defensive regression, mirroring the media-field-shape-trap
+        // caution elsewhere in this slice: story_ref is DM-only by
+        // construction (hearth's make_post never sets it), but DecryptPass
+        // must not surface it even if a payload somehow carried the key
+        // under kind == "post" -- the m.kind == "dm" gate in decryptOne
+        // must never be bypassed.
+        val c = cases().getJSONObject(0)
+        assertEquals("post", c.getString("kind"))
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val payload = postPayload(c, wraps).toMutableMap().apply {
+            put("story_ref", mapOf("story_id" to "s1", "media_hash" to "ab".repeat(32)))
+        }
+        val msg = signedMessage(c.getString("author"), 1, payload, "f3".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
+        assertEquals(1, out.size)
+        assertEquals("story_ref is DM-only -- a post payload carrying one must never surface it",
+            null, out[0].storyRefMediaHash)
+    }
+
+    @Test fun nullStoryRefMediaHashWhenMediaHashIsNotHex64() {
+        // Review follow-up (2026-07-20): storyRefMediaHash's shape guard must
+        // genuinely mirror hearth's `_valid_story_ref` (messages.py:241-255)
+        // for media_hash, not just check "non-empty string" -- media_hash is
+        // the literal blob-store lookup key getStoryImage feeds it into, so
+        // a wrong-shaped value here should fail closed to null, same as a
+        // missing field. This value is the sneaky case: right length (64),
+        // valid hex digits, but UPPERCASE -- `_is_hex64` requires lowercase
+        // only, and a naive case-insensitive check would wrongly accept it.
+        val c = cases().getJSONObject(1)
+        assertEquals("dm", c.getString("kind"))
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val notHex64MediaHash = "AB".repeat(32)   // 64 chars, valid hex digits, wrong case
+        assertEquals("test precondition: exactly 64 chars", 64, notHex64MediaHash.length)
+        val payload = dmPayload(c, wraps).toMutableMap().apply {
+            put("story_ref", mapOf("story_id" to "s-" + "11".repeat(8), "media_hash" to notHex64MediaHash))
+        }
+        val msg = signedMessage(c.getString("author"), 1, payload, "f4".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author")).feed
+        assertEquals(1, out.size)
+        assertEquals("a non-hex64 media_hash must fail the shape guard, even at the right length",
+            null, out[0].storyRefMediaHash)
+    }
+
     @Test fun blobLessMessageIsAbsentFromResultKeys() {
         // Case 0's body carries "blobs": [] -- a message with genuinely no
         // blobs must still decrypt into the feed (with an empty blobs
