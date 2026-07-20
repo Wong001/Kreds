@@ -91,9 +91,28 @@ Older posts may legitimately show **no responses**. That's expected, not a bug.
 - [ ] (Boundary) a post with no decryptable responses simply shows nothing
       extra (no crash, no error row).
 
-### Verdict (August to fill)
+### Verdict — PASS (G20, 2026-07-20)
 
-> _(pass / partial / fail + notes — what rendered, any surprises)_
+Reactions (counts) and comments render under the post on the phone. A private
+reaction/comment shows as its **colored alias** (observed: "Steady Badger"),
+never a real name — correct, since `public_engagement` is off by default and
+its HTTP toggle isn't wired yet, so every response is private → aliased. The
+desktop web feed showed the same post's `❤️ 1` + `Comments (1)`, confirming the
+aggregate record was built correctly.
+
+**Root cause of the initial "nothing renders":** the phone was running a
+**stale build** that predated the working responses render. The whole phone
+decrypt/validate/render path audited clean end-to-end (ingest stores every
+kind; `responsesPass` decrypts + author-scopes + aggregates; `validEntry`/
+`validMutualBox` mirror hearth; the marshal + `App.tsx` render are correct),
+and rebuilding + installing the current-branch RELEASE apk made it render
+immediately. Reinforces the standing field lesson: **install the freshly-built
+RELEASE apk** — a stale/old apk silently lacks the slice under test.
+
+**Diagnostic detour (resolved):** a temporary `println("B2D4DIAG: …")`
+instrumentation was added to `responsesPass` (counts + short hash prefixes
+only, no plaintext/keys) to localize the drop-off, then **reverted** once the
+fresh build proved the render. Branch tree is clean; no diagnostic code merges.
 
 ---
 
