@@ -1,5 +1,8 @@
 package expo.modules.tormanager
 
+import org.json.JSONArray
+import org.json.JSONObject
+
 /** B.2d-4 Task 2 -- the SECURITY CORE of the reactions+comments slice.
  *
  *  Ports hearth's `_post_responses_view` verification (node.py) for a
@@ -26,10 +29,11 @@ package expo.modules.tormanager
  *  what catches that, so it is MANDATORY, not an optimization.
  *
  *  Byte-for-byte parity points with hearth:
- *   - `_valid_response_entry` (node.py:93-131) -> [validEntry] (minus the
- *     single `_valid_mutual_box` line -- mutual_box is never consumed in
- *     this slice, so a private entry's box is not shape-checked; it renders
- *     an alias regardless).
+ *   - `_valid_response_entry` (node.py:93-131) -> [validEntry], including
+ *     its `_valid_mutual_box` shape check (node.py:62-90) -> [validMutualBox]
+ *     -- the box's SHAPE is validated (so phone/desktop drop the same
+ *     entries, and the box is well-formed before the deferred private/
+ *     seal_slots branch ever opens it), but it is NEVER opened in this slice.
  *   - `_response_sig_payload` (node.py) -> [responseSigPayload]: the 5
  *     fields `{target, rkind, body, created_at, responder}` canonicalized,
  *     with `created_at` wrapped in `KotlinWire.PyFloat` so it renders as a
@@ -54,6 +58,8 @@ object KotlinResponses {
     // hearth/messages.py: REACTION_TOKENS + MAX_COMMENT.
     private val REACTION_TOKENS = setOf("heart", "laugh", "wow", "sad", "up", "fire")
     private const val MAX_COMMENT = 500
+    // hearth/node.py:59 -- ct hex-length cap for a sealed mutual_box slot.
+    private const val MUTUAL_BOX_CT_HEX_MAX = 4096
 
     // web/app.js ALIAS_ADJECTIVES / ALIAS_ANIMALS -- kept in the SAME order
     // (the index derivation below is order-sensitive; a reorder changes every
@@ -75,6 +81,49 @@ object KotlinResponses {
     // missing field degrades to null, never a cast crash.
     private fun str(e: Map<String, Any?>, k: String): String? = e[k] as? String
     private fun num(e: Map<String, Any?>, k: String): Double? = (e[k] as? Number)?.toDouble()
+
+    /** Read a string field from one mutual_box slot, which may be a plain
+     *  Kotlin Map (caller-built) or a raw org.json JSONObject (a decrypted
+     *  body is only shallow-converted, so its nested slots stay org.json --
+     *  same dual-shape reason as DecryptPass.stringList). */
+    private fun slotStr(slot: Any?, k: String): String? = when (slot) {
+        is Map<*, *> -> slot[k] as? String
+        is JSONObject -> slot.opt(k) as? String
+        else -> null
+    }
+
+    /** Shape-check ONLY (never open) a mutual_box, mirroring hearth
+     *  `_valid_mutual_box` (node.py:62-90). None (a public entry carries no
+     *  box) is valid -- both Kotlin null and org.json's NULL sentinel (a
+     *  shallow-converted body leaves a JSON null as `JSONObject.NULL`, not
+     *  Kotlin null). Otherwise it must be a list (Kotlin List OR org.json
+     *  JSONArray) of dicts, every slot well-shaped: `eph_pub` a 64-hex
+     *  X25519 pub, `nonce` a 24-hex ChaCha20-Poly1305 nonce, `ct` a
+     *  non-empty lowercase-hex string bounded by MUTUAL_BOX_CT_HEX_MAX. A
+     *  single malformed slot fails the whole box (hearth's "a partially-
+     *  hostile mutual_box is exactly the close-enough heuristic hostile
+     *  input slips through"). Fail-closed: any wrong shape -> false. This
+     *  slice never trial-opens the box (that private/seal_slots branch is
+     *  deferred) -- but validating its shape here keeps phone/desktop drop
+     *  decisions identical AND ensures the box is already well-formed the
+     *  moment that deferred branch lands and does open it. */
+    private fun validMutualBox(v: Any?): Boolean {
+        if (v == null || v == JSONObject.NULL) return true
+        val slots: List<Any?> = when (v) {
+            is List<*> -> v
+            is JSONArray -> (0 until v.length()).map { v.opt(it) }
+            else -> return false
+        }
+        for (s in slots) {
+            if (s !is Map<*, *> && s !is JSONObject) return false
+            if (!isHexN(slotStr(s, "eph_pub"), 64)) return false
+            if (!isHexN(slotStr(s, "nonce"), 24)) return false
+            val ct = slotStr(s, "ct")
+            if (ct == null || ct.isEmpty() || ct.length > MUTUAL_BOX_CT_HEX_MAX ||
+                !ct.all { it in "0123456789abcdef" }) return false
+        }
+        return true
+    }
 
     /** web/app.js `aliasName`: adjective from seed byte 0, animal from seed
      *  byte 1. Requires `seed` to be valid hex of length >= 4 (guaranteed by
@@ -126,9 +175,13 @@ object KotlinResponses {
         if (!isHexN(str(e, "alias_seed"), 32)) return false
         val public = e["public"] as? Boolean ?: return false
         if (!isHexN(str(e, "responder_sig"), 128)) return false
-        // mutual_box validation deliberately omitted (deferred slice): the
-        // private-resolution branch never opens it here, so its shape is not
-        // load-bearing -- a private entry renders an alias regardless.
+        // Shape-check the mutual_box (never open it) at hearth's position --
+        // node.py:126, after responder_sig, before the public identity/
+        // device_pub check. Matching hearth's drop decision here keeps
+        // phone/desktop parity (an entry hearth drops for a garbage box must
+        // not render as an alias on the phone) and guarantees the box is
+        // well-formed before the deferred private/seal_slots branch opens it.
+        if (!validMutualBox(e["mutual_box"])) return false
         if (public && !(isHexN(str(e, "identity"), 64) && isHexN(str(e, "device_pub"), 64))) return false
         return true
     }

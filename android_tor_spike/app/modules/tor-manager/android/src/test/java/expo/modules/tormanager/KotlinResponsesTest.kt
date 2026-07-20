@@ -106,6 +106,17 @@ class KotlinResponsesTest {
         assertFalse(KotlinResponses.validEntry(e))
     }
 
+    @Test fun validEntryRejectsMalformedMutualBox() {
+        // hearth _valid_mutual_box (node.py:62-90): a slot's nonce must be
+        // 24-hex; "bad" is not -> the whole box (and entry) is dropped. The
+        // real private entry's mutual_box (validEntryAcceptsGoodComment...)
+        // still passes, so this proves the shape check is real, not a reject-all.
+        val e = privateEntry().toMutableMap()
+        e["mutual_box"] = listOf(mapOf(
+            "eph_pub" to "aa".repeat(32), "nonce" to "bad", "ct" to "cc"))
+        assertFalse(KotlinResponses.validEntry(e))
+    }
+
     // ---- responseSigPayload (5 fields, PyFloat created_at, canonical) ----
 
     @Test fun responseSigPayloadByteMatchesHearth() {
