@@ -53,6 +53,47 @@ class TorManagerModule : Module() {
     // the reference is replaced.
     @Volatile private var blobKeys: Map<String, ByteArray> = emptyMap()
 
+    // Task 3 (B.2d-2): the loopback media server getVideoUrl streams decrypted
+    // video bytes through. Lazily constructed by ensureMediaServer() below --
+    // NOT in OnCreate -- so a phone that never opens a video post never spins
+    // up the accept-loop thread at all. Constructed at most ONCE per module
+    // instance (ensureMediaServer is @Synchronized and checks this field
+    // first) and reused for every subsequent getVideoUrl call, matching
+    // MediaServer.start()'s own idempotency (a second start() on the same
+    // instance is a no-op returning the existing port) -- the point of this
+    // field is avoiding a SECOND MediaServer instance (a different token, a
+    // second accept-loop thread) if two feed rows race to open their first
+    // video concurrently. Torn down in OnDestroy so its daemon accept-loop
+    // thread never outlives this module instance.
+    @Volatile private var mediaServer: MediaServer? = null
+
+    /** Lazily starts (once) the loopback media server getVideoUrl resolves
+     *  URLs from. The injected resolver mirrors getBlobImage's decrypt path
+     *  exactly (blobKeys -> SqliteSyncStore.getBlob -> KotlinBlobCrypt.
+     *  decryptBlob) but returns raw decrypted bytes rather than a rendered
+     *  data URI -- MediaServer streams those bytes straight to the platform
+     *  player, decrypting again on every call (a seek re-reads+re-decrypts
+     *  the whole blob then slices; acceptable at the <=5MB gate cap per the
+     *  brief -- a future large-media case could cache the decrypted bytes
+     *  for the currently-playing hash only, evicted on stop, but that's not
+     *  built here). Nothing the resolver returns is ever written to disk --
+     *  MediaServer holds it in memory only long enough to write it to the
+     *  response socket. @Synchronized: getVideoUrl runs on ioScope
+     *  (Dispatchers.IO, a thread pool), so two feed rows opening their first
+     *  video at once must not race into constructing two servers. */
+    @Synchronized
+    private fun ensureMediaServer(ctx: android.content.Context): MediaServer {
+        mediaServer?.let { return it }
+        val s = MediaServer { msgId, hash ->
+            blobKeys[msgId]?.let { key ->
+                SqliteSyncStore(ctx).getBlob(hash)?.let { cipher -> KotlinBlobCrypt.decryptBlob(key, cipher) }
+            }
+        }
+        s.start()
+        mediaServer = s
+        return s
+    }
+
     /** B.2c Task 3: the phone's real friend count -- `store.knownIdentities()`
      *  minus the phone's OWN identity. Both `getSyncStats` and `syncNow`'s
      *  success path previously surfaced the identities-table's raw row
@@ -123,7 +164,16 @@ class TorManagerModule : Module() {
             else ctx.registerReceiver(rx, filter)
             nodeReceiver = rx
         }
-        OnDestroy { appContext.reactContext?.let { c -> nodeReceiver?.let { c.unregisterReceiver(it) } } }
+        OnDestroy {
+            appContext.reactContext?.let { c -> nodeReceiver?.let { c.unregisterReceiver(it) } }
+            // Task 3 (B.2d-2): stop the loopback media server's daemon
+            // accept-loop thread (MediaServer.start(), see its class doc) so
+            // it doesn't outlive this module instance. stop() is
+            // @Synchronized and safe to call even if getVideoUrl was never
+            // invoked (mediaServer stays null -> no-op).
+            mediaServer?.stop()
+            mediaServer = null
+        }
 
         AsyncFunction("bootstrap") { promise: Promise ->
             TorEngine.bootstrap(
@@ -357,6 +407,23 @@ class TorManagerModule : Module() {
             val plain = KotlinBlobCrypt.decryptBlob(key, cipher) ?: return@AsyncFunction null
             val (mime, bytes) = KotlinImageDecode.toRenderable(plain) ?: return@AsyncFunction null
             "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+        }.runOnQueue(ioScope)
+
+        // Task 3 (B.2d-2): resolves a video post's full blob hash (a
+        // FeedItem's `blobs[0]` when `media === "video"`) into a
+        // http://127.0.0.1 URL the platform player (expo-video) can stream
+        // from, range requests included -- see MediaServer's class doc. null
+        // when there's no content key for msgId (same "not entitled/not
+        // synced yet" miss getBlobImage returns null for) -- this is checked
+        // BEFORE ever starting the server, so a miss never spins one up.
+        // Store/AVIF-decode I/O happen later, per request, on MediaServer's
+        // own accept-loop/handler threads, not here -- this call only starts
+        // the server (if not already running) and formats a URL string, so
+        // it's cheap, but stays on ioScope/ensureMediaServer for consistency
+        // with every other store-touching AsyncFunction in this module.
+        AsyncFunction("getVideoUrl") { msgId: String, hash: String ->
+            val ctx = appContext.reactContext ?: return@AsyncFunction null
+            if (blobKeys[msgId] == null) null else ensureMediaServer(ctx).urlFor(msgId, hash)
         }.runOnQueue(ioScope)
 
         AsyncFunction("getSyncStats") {

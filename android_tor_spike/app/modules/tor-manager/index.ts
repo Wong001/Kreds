@@ -125,6 +125,19 @@ export function getBlobImage(msgId: string, hash: string): Promise<string | null
   return native.getBlobImage(msgId, hash);
 }
 
+// Task 3 (B.2d-2): resolves a video post's full blob hash (FeedItem.blobs[0]
+// when media === "video") into a http://127.0.0.1 URL a platform video
+// player can stream (range requests included) -- backed by TorManagerModule's
+// lazily-started, token-guarded loopback MediaServer (see its Kotlin class
+// doc). null on the same misses getBlobImage returns null for (no content
+// key for msgId -- not yet synced / not entitled), checked BEFORE the server
+// is ever started. Nothing is cached on the JS side, same as getBlobImage --
+// each call re-resolves the URL (the server itself, once started, is reused
+// across calls for this module's lifetime).
+export function getVideoUrl(msgId: string, hash: string): Promise<string | null> {
+  return native.getVideoUrl(msgId, hash);
+}
+
 // Task 6 (B.2d): live sync-progress feedback -- the sync takes 1-2 min
 // on-device with no visible activity otherwise. Forwards KotlinSync.run's
 // phase-boundary callbacks (fired from the native side as they happen,

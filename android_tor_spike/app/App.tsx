@@ -3,10 +3,11 @@ import {
   Button, FlatList, Image, Modal, Pressable, SafeAreaView, StyleSheet, Text,
   TouchableOpacity, View,
 } from "react-native";
+import { useVideoPlayer, VideoView } from "expo-video";
 import {
-  Beat, beatNow, FeedItem, getBlobImage, getFeed, getHistory, getSyncStats, isBatteryExempt,
-  onBeat, onState, onSync, onSyncProgress, requestBatteryExemption, startNode, stopNode,
-  syncNow, SyncStats,
+  Beat, beatNow, FeedItem, getBlobImage, getFeed, getHistory, getSyncStats, getVideoUrl,
+  isBatteryExempt, onBeat, onState, onSync, onSyncProgress, requestBatteryExemption, startNode,
+  stopNode, syncNow, SyncStats,
 } from "./modules/tor-manager";
 
 // Task 7 (B.2d): one feed-row thumbnail. Fetches its own (msgId, displayHash)
@@ -54,6 +55,45 @@ function Thumbnail({ msgId, displayHash, fullHash, onOpen }: {
   );
 }
 
+// Task 3 (B.2d-2): mounts the actual expo-video player -- ONLY once a real
+// getVideoUrl() URL is known (the parent FullscreenVideo below gates this).
+// useVideoPlayer's underlying useReleasingSharedObject releases the player
+// both when its `source` dependency changes AND on unmount (verified against
+// expo-modules-core's implementation) -- so this component intentionally
+// stays as thin as possible: mounted only while the fullscreen viewer shows
+// this exact video, unmounted (releasing the player) the instant it
+// doesn't, whether that's the user closing the modal (fullscreen -> null in
+// App) or switching to a different item.
+function VideoPlayerView({ uri }: { uri: string }) {
+  const player = useVideoPlayer(uri, (p) => { p.play(); });
+  return (
+    <VideoView player={player} style={styles.fullscreenImage} nativeControls contentFit="contain" />
+  );
+}
+
+// Task 3 (B.2d-2): resolves (msgId, videoHash) -> a getVideoUrl() URL, lazily
+// and per-pair, same shape as the Thumbnail/fullImage effects above --
+// undefined = loading, null = resolved but unavailable (no content key /
+// server couldn't start), matching getVideoUrl's own null-on-any-miss
+// contract. VideoPlayerView (and therefore the player it owns) is only ever
+// mounted once a non-null uri is in hand.
+function FullscreenVideo({ msgId, hash }: { msgId: string; hash: string }) {
+  const [uri, setUri] = useState<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    setUri(undefined);
+    getVideoUrl(msgId, hash)
+      .then((r) => { if (!cancelled) setUri(r); })
+      .catch(() => { if (!cancelled) setUri(null); });
+    return () => { cancelled = true; };
+  }, [msgId, hash]);
+
+  if (uri === undefined) return <Text style={styles.fullscreenState}>Loading…</Text>;
+  if (uri === null) return <Text style={styles.fullscreenState}>Media unavailable</Text>;
+  return <VideoPlayerView uri={uri} />;
+}
+
 export default function App() {
   const [state, setState] = useState("stopped");
   const [beats, setBeats] = useState<Beat[]>([]);
@@ -82,7 +122,12 @@ export default function App() {
   const [progressCounts, setProgressCounts] = useState<Record<string, number>>({});
   // Task 7 (B.2d): the thumbnail currently open in the fullscreen viewer, if
   // any -- holds the FULL blob hash (never the thumb), per the brief.
-  const [fullscreen, setFullscreen] = useState<{ msgId: string; hash: string } | null>(null);
+  // isVideo (B.2d-2 Task 3): distinguishes a video post's fullscreen open
+  // (hash is the video blob -- blobs[0] -- for getVideoUrl) from a photo's
+  // (hash is the full-res blob for getBlobImage, unchanged) -- the Modal
+  // body below renders the expo-video player for the former, the existing
+  // Image path for the latter.
+  const [fullscreen, setFullscreen] = useState<{ msgId: string; hash: string; isVideo: boolean } | null>(null);
   const [fullImage, setFullImage] = useState<string | null | undefined>(undefined);
 
   const refresh = useCallback(async () => setBeats(await getHistory()), []);
@@ -98,8 +143,8 @@ export default function App() {
     syncNow();
   }, []);
 
-  const openFullscreen = useCallback((msgId: string, hash: string) => {
-    setFullscreen({ msgId, hash });
+  const openFullscreen = useCallback((msgId: string, hash: string, isVideo: boolean) => {
+    setFullscreen({ msgId, hash, isVideo });
   }, []);
 
   useEffect(() => {
@@ -150,8 +195,13 @@ export default function App() {
   // Task 7 (B.2d): fetch the FULL blob (never the thumb) only while the
   // fullscreen viewer is open for it -- lazy, and re-fires per (msgId,
   // hash) pair via the effect dependency array.
+  // isVideo guard (B.2d-2 Task 3): a video's fullscreen open is handled
+  // entirely by <FullscreenVideo> below (getVideoUrl, not getBlobImage) --
+  // skip this fetch so opening a video never wastes a pointless
+  // decrypt-blob-as-image attempt (it would fail to decode and resolve to
+  // null anyway, since KotlinImageDecode can't render an mp4).
   useEffect(() => {
-    if (!fullscreen) return;
+    if (!fullscreen || fullscreen.isVideo) return;
     let cancelled = false;
     setFullImage(undefined);
     getBlobImage(fullscreen.msgId, fullscreen.hash)
@@ -229,7 +279,33 @@ export default function App() {
               <Text style={styles.feedItem}>
                 {item.author} · {item.kind} · {new Date(item.createdAt * 1000).toLocaleString()} — {item.text}
               </Text>
-              {item.blobs.length > 0 && (
+              {/* Task 3 (B.2d-2): a video post (media === "video", always
+                  carrying exactly one blob -- the video file -- per hearth's
+                  validate_payload) renders its `poster` still through the
+                  SAME Thumbnail/getBlobImage path as any other image (the
+                  poster is just another blob hash under this message's same
+                  content key) but with fullHash wired to the VIDEO blob
+                  (blobs[0]), not the poster -- tapping it opens the
+                  fullscreen viewer against the video, not the still. A play
+                  overlay marks it as playable. A photo post (media !==
+                  "video", or no poster) is UNCHANGED: the original
+                  blobs.map(Thumbnail) loop below, untouched. */}
+              {item.media === "video" && item.poster ? (
+                <View style={styles.thumbRow}>
+                  <View style={styles.videoThumbWrap}>
+                    <Thumbnail
+                      key={`${item.blobs[0]}-video`}
+                      msgId={item.msgId}
+                      displayHash={item.poster}
+                      fullHash={item.blobs[0]}
+                      onOpen={(msgId, hash) => openFullscreen(msgId, hash, true)}
+                    />
+                    <View style={styles.playOverlay} pointerEvents="none">
+                      <Text style={styles.playOverlayText}>▶</Text>
+                    </View>
+                  </View>
+                </View>
+              ) : item.blobs.length > 0 ? (
                 <View style={styles.thumbRow}>
                   {item.blobs.map((hash, i) => (
                     <Thumbnail
@@ -237,11 +313,11 @@ export default function App() {
                       msgId={item.msgId}
                       displayHash={item.thumbs[i] ?? hash}
                       fullHash={hash}
-                      onOpen={openFullscreen}
+                      onOpen={(msgId, hash) => openFullscreen(msgId, hash, false)}
                     />
                   ))}
                 </View>
-              )}
+              ) : null}
             </View>
           )}
         />
@@ -275,10 +351,20 @@ export default function App() {
         onRequestClose={() => setFullscreen(null)}
       >
         <Pressable style={styles.fullscreenBackdrop} onPress={() => setFullscreen(null)}>
-          {fullImage === undefined && <Text style={styles.fullscreenState}>Loading…</Text>}
-          {fullImage === null && <Text style={styles.fullscreenState}>Media unavailable</Text>}
-          {!!fullImage && (
-            <Image source={{ uri: fullImage }} style={styles.fullscreenImage} resizeMode="contain" />
+          {/* Task 3 (B.2d-2): fullscreen.isVideo routes to the expo-video
+              player (FullscreenVideo, mounted/unmounted with this branch --
+              see its doc for why that alone releases the player on close);
+              everything below is the pre-existing photo path, unchanged. */}
+          {fullscreen?.isVideo ? (
+            <FullscreenVideo msgId={fullscreen.msgId} hash={fullscreen.hash} />
+          ) : (
+            <>
+              {fullImage === undefined && <Text style={styles.fullscreenState}>Loading…</Text>}
+              {fullImage === null && <Text style={styles.fullscreenState}>Media unavailable</Text>}
+              {!!fullImage && (
+                <Image source={{ uri: fullImage }} style={styles.fullscreenImage} resizeMode="contain" />
+              )}
+            </>
           )}
         </Pressable>
       </Modal>
@@ -305,6 +391,13 @@ const styles = StyleSheet.create({
   thumbLoading: { backgroundColor: "#e0e0e0" },
   thumbPlaceholder: { backgroundColor: "#e0e0e0", alignItems: "center", justifyContent: "center", padding: 4 },
   thumbPlaceholderText: { fontSize: 10, color: "#666", textAlign: "center" },
+  // Task 3 (B.2d-2): the ▶ play-overlay badge on a video post's poster tile.
+  videoThumbWrap: { position: "relative" },
+  playOverlay: {
+    position: "absolute", top: 0, left: 0, right: 0, bottom: 0,
+    alignItems: "center", justifyContent: "center",
+  },
+  playOverlayText: { color: "#fff", fontSize: 22, textShadowColor: "rgba(0,0,0,0.7)", textShadowRadius: 3 },
   fullscreenBackdrop: {
     flex: 1, backgroundColor: "rgba(0,0,0,0.92)", alignItems: "center", justifyContent: "center",
   },
