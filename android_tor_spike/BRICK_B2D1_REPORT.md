@@ -1,11 +1,10 @@
 # Brick B.2d-1 report — photos + live sync progress
 
-**Status: DESK-COMPLETE. On-device run PENDING.** All 7 code tasks are done
-and reviewed; the whole-branch review verdict is **READY TO MERGE, gated on
-this on-device run, no fix wave**. Both APKs are built and the RELEASE apk
-is already installed on the G20 (Task 7). This report supplies the run
-steps for the human-driven on-device session; the Verdict section below is
-intentionally blank pending that run.
+**Status: PROVEN ON HARDWARE (G20, 2026-07-20).** All 7 code tasks are done
+and reviewed; the whole-branch review verdict was READY TO MERGE (no fix
+wave), gated on this run. The run passed: real photos render as thumbnails
+in the feed and tapping opens the full-size image. Both APKs are built and
+the RELEASE apk is installed on the G20.
 
 Spec: `docs/superpowers/specs/2026-07-20-android-b2d-photos-sync-progress-design.md`
 Plan: `docs/superpowers/plans/2026-07-20-android-b2d-photos-sync-progress.md`
@@ -155,7 +154,27 @@ closed to the placeholder rather than surfacing bad output.
 
 ## Verdict
 
-**[PENDING RUN]**
+**PROVEN.**
+
+- Photos render as THUMBNAILS in the feed, and tapping a thumbnail opens the
+  FULL-size image full-screen (August, on the G20). This is the slice's
+  definition of done — AVIF decoded on the phone in the isolated
+  `:imagedecode` process, decrypted with the per-message content key.
+- The isolated-process AVIF decode was independently proven earlier by the
+  Task 3 instrumented gate on this same device (`connectedDebugAndroidTest`
+  3/3: real AVIF fixture -> 48x32 PNG, garbage fails closed,
+  rebindsAfterTeardown), and the whole-branch review verified the decoder is
+  linked ONLY in the isolated service (single import, no keys/store/network/
+  files) -- so the sandbox isolation is proven by the gate + code review,
+  independent of a live `ps` snapshot.
+- Not separately reported this run (non-blocking, all fail-closed by
+  design): the live sync-status-line tick, the non-image placeholder, and
+  the live `adb shell ps | grep imagedecode` snapshot. The desk gates +
+  Task-3 instrumented run already cover the decode/isolation; these are
+  observational nice-to-haves for a follow-up glance.
+- Own + friend text/DMs (B.2/B.2c) continued to render (the run built on the
+  same store; no regression observed).
+- Overall: **PROVEN** — B.2d-1's definition of done met on hardware.
 
 ## Known deferred items / follow-up tickets
 
