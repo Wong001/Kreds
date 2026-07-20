@@ -49,7 +49,14 @@ object KotlinResponses {
      *  when it did not. `aliasColor` is the alias hue (0..359) when `display`
      *  is an alias, and null when `display` is a real name -- so a null color
      *  is itself the "this responder was verified" signal. */
-    data class Comment(val body: String, val display: String, val aliasColor: Int?, val createdAt: Double)
+    data class Comment(
+        val body: String, val display: String, val aliasColor: Int?, val createdAt: Double,
+        // vp1 (additive): let the /api/feed marshal reproduce hearth's comment
+        // shape. alias == true when this comment rendered as an anonymous alias
+        // (aliasColor != null is the "not a verified real name" signal, per
+        // this class's own doc). aliasSeed is the entry's validated hex32 seed.
+        // name = the resolved real display name, or null when aliased.
+        val alias: Boolean = false, val aliasSeed: String = "", val name: String? = null)
 
     /** A post's aggregated engagement: reaction tally (token -> count) and
      *  the resolved comment list (entry order preserved). */
@@ -240,7 +247,10 @@ object KotlinResponses {
                 reactions[body] = (reactions[body] ?: 0) + 1
             } else {
                 val (display, color) = resolveDisplay(e, target, profileNames, deviceBound)
-                comments.add(Comment(body, display, color, createdAt))
+                val isAlias = color != null           // a null aliasColor == verified real name
+                val name = if (isAlias) null else display
+                val seed = str(e, "alias_seed") ?: ""
+                comments.add(Comment(body, display, color, createdAt, isAlias, seed, name))
             }
         }
         return Responses(reactions, comments)

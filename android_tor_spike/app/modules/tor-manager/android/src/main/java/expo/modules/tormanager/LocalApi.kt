@@ -12,14 +12,39 @@ import java.io.File
  *  already validated by LocalWebServer before handle() runs. */
 class LocalApi(private val ctx: Context) {
 
+    // vp1: msgId -> content key, populated by the /api/feed decrypt pass and
+    // reused by /api/post-blob so an image request does NOT re-run a full
+    // DecryptPass.run over every message (which would be O(images x messages)).
+    // In-memory only; refreshed each /api/feed; postBlob falls back to a fresh
+    // run if a hash is requested before any feed() populated the cache.
+    @Volatile private var keysCache: Map<String, ByteArray> = emptyMap()
+
     fun handle(method: String, path: String): HttpResponse? {
         if (method != "GET") return null
         return when (path) {
             "/api/bootstrap" -> json(bootstrapJson())
             "/api/applock" -> json(applockJson())
             "/api/state" -> json(state())
+            "/api/feed" -> json(feed())
             else -> null
         }
+    }
+
+    private fun feed(): String {
+        val fx = fixtureOrNull() ?: return "[]"
+        val store = SqliteSyncStore(ctx)
+        val (priv, _) = EncKeys.getOrCreate(store)
+        val own = fx.cert.identity_pub
+        val res = DecryptPass.run(store, fx.device_pub, priv, own)
+        keysCache = res.keys                                   // vp1: warm the blob-key cache
+        val responses = DecryptPass.responsesPass(store, fx.device_pub, priv, own)
+        val arr = JSONArray()
+        for (d in res.feed) {                                  // already newest-first
+            if (d.kind != "post") continue                     // journal feed = posts only
+            if ((d.placement ?: "journal") != "journal") continue
+            arr.put(feedRow(d, own, responses[d.msgId]))
+        }
+        return arr.toString()
     }
 
     private fun state(): String {
@@ -73,6 +98,52 @@ class LocalApi(private val ctx: Context) {
                     JSONObject().put("available", false).put("kind", JSONObject.NULL).put("version", JSONObject.NULL))
                 .put("readonly", true)
                 .toString()
+        }
+
+        fun feedRow(d: DecryptPass.Decrypted, ownIdentityPub: String, responses: KotlinResponses.Responses?): JSONObject {
+            val blobs = JSONArray(); d.blobs.forEach { blobs.put(it) }
+            val thumbs: Any = if (d.thumbs.isEmpty()) JSONObject.NULL
+                else JSONArray().also { arr -> d.thumbs.forEach { arr.put(it ?: JSONObject.NULL) } }
+            return JSONObject()
+                .put("msg_id", d.msgId)
+                .put("identity_pub", d.identityPub)
+                .put("author_name", d.author)
+                .put("author_avatar", JSONObject.NULL)        // avatars deferred (slice 1)
+                .put("text", d.text)
+                .put("blobs", blobs)
+                .put("scope", d.scope ?: JSONObject.NULL)
+                .put("created_at", d.createdAt)
+                .put("expires_at", d.expiresAt ?: JSONObject.NULL)
+                .put("mine", d.identityPub == ownIdentityPub)
+                .put("placement", d.placement ?: "journal")
+                .put("media", d.media)
+                .put("poster", d.poster ?: JSONObject.NULL)
+                .put("codec", d.codec ?: JSONObject.NULL)
+                .put("thumbs", thumbs)
+                .put("responses", responsesJson(responses))
+        }
+
+        private fun responsesJson(r: KotlinResponses.Responses?): Any {
+            if (r == null) return JSONObject.NULL
+            val reactions = JSONObject()
+            for ((k, v) in r.reactions) reactions.put(k, v)
+            val comments = JSONArray()
+            for (c in r.comments) {
+                comments.put(JSONObject()
+                    .put("name", if (c.alias) JSONObject.NULL else (c.name ?: JSONObject.NULL))
+                    .put("avatar", JSONObject.NULL)           // comment-author avatars deferred
+                    .put("alias", c.alias)
+                    .put("alias_seed", c.aliasSeed)
+                    .put("mine", false)                        // read-only
+                    .put("body", c.body)
+                    .put("created_at", c.createdAt))
+                    // NOTE: `responder` deliberately OMITTED (hearth omits it when unresolved)
+            }
+            return JSONObject()
+                .put("reactions", reactions)
+                .put("my_reaction", JSONObject.NULL)          // read-only
+                .put("comments", comments)
+                .put("can_moderate", false)                    // read-only
         }
     }
 }
