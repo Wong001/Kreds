@@ -59,7 +59,12 @@ export default function App() {
   const [beats, setBeats] = useState<Beat[]>([]);
   const [exempt, setExempt] = useState(true);
   const [syncStats, setSyncStats] = useState<SyncStats>({ messages: 0, blobs: 0, identities: 0 });
-  const [lastSync, setLastSync] = useState<string>("");
+  // Task 3 (Brick C): the outcome text of the last MANUAL "Sync now" tap
+  // specifically (via the nodeSync terminal event) -- distinct from the
+  // "last sync" line below, which reflects the latest sync overall
+  // (background-service or manual) via getHistory. Named syncNowResult
+  // (not lastSync) to keep that distinction visible in the code.
+  const [syncNowResult, setSyncNowResult] = useState<string>("");
   // null = not yet fetched this mount (loading); [] = fetched, nothing decrypted yet
   // (distinct empty-state, see the getFeed() render below).
   const [feed, setFeed] = useState<FeedItem[] | null>(null);
@@ -98,17 +103,35 @@ export default function App() {
     refreshSyncStats();
     refreshFeed();
     const offState = onState(setState);
-    const offBeat = onBeat((b) => setBeats((prev) => [b, ...prev].slice(0, 50)));
+    // Task 3 (Brick C): re-fetch getHistory() on every live beat rather than
+    // splicing the raw broadcast payload into state. The background service
+    // (every 15 min) and "Beat now" both now run a full content sync, and
+    // HeartbeatStore.record() persists the pulled counts BEFORE the
+    // broadcast fires -- so by the time this listener runs, getHistory()
+    // already has the fully-populated (counts-included) entry. The live
+    // "nodeBeat" payload itself still carries only ts/ok/latencyMs/reason
+    // (Task 2 left it unchanged), so trusting it directly would show 0
+    // msgs/blobs for every freshly-arriving beat until some later refresh.
+    const offBeat = onBeat(() => { refresh(); });
     const offProgress = onSyncProgress(({ phase, count }) => {
       setProgressPhase(phase);
       setProgressCounts((prev) => ({ ...prev, [phase]: count }));
     });
     const offSync = onSync((r) => {
-      setSyncStats({ messages: r.messages, blobs: r.blobs, identities: r.identities });
-      setLastSync(r.ok
-        ? `synced: ${r.messages} msgs, ${r.blobs} blobs, ${r.identities} friends`
-        : `sync failed: ${r.reason}`);
-      // Terminal event: the live progress line resolves into lastSync above.
+      if (r.ok) {
+        setSyncStats({ messages: r.messages, blobs: r.blobs, identities: r.identities });
+        setSyncNowResult(`synced: ${r.messages} msgs, ${r.blobs} blobs, ${r.identities} friends`);
+      } else if (r.reason === "sync already in progress") {
+        // Task 3: a concurrent sync (almost certainly the 15-min background
+        // one) already held the mutex -- this is a skip, not a failure, so
+        // it gets a neutral note rather than the red fail styling, and
+        // leaves syncStats alone (r's counts are meaningless zeros here).
+        setSyncNowResult("sync already in progress - the background sync is running, try again shortly");
+      } else {
+        setSyncStats({ messages: r.messages, blobs: r.blobs, identities: r.identities });
+        setSyncNowResult(`sync failed: ${r.reason}`);
+      }
+      // Terminal event: the live progress line resolves into syncNowResult above.
       setProgressPhase(null);
       setProgressCounts({});
       if (r.feedUpdated) refreshFeed();
@@ -134,6 +157,20 @@ export default function App() {
     <SafeAreaView style={styles.container}>
       <Text style={styles.title}>Kreds node</Text>
       <Text style={styles.state}>state: {state}</Text>
+      {/* Task 3 (Brick C): the latest sync overall (background-service or
+          manual), sourced from getHistory via `beats` -- NOT syncNowResult
+          below, which is scoped to this device's own manual "Sync now" tap.
+          beats[0] is newest-first (HeartbeatStore prepends), kept fresh by
+          the onBeat->refresh() wiring in the effect above. */}
+      {beats[0] ? (
+        <Text style={beats[0].ok ? styles.ok : styles.fail}>
+          last sync: {new Date(beats[0].ts).toLocaleTimeString()} — {beats[0].ok
+            ? `ok, ${beats[0].messages ?? 0} msgs / ${beats[0].blobs ?? 0} blobs`
+            : (beats[0].reason ?? "failed")}
+        </Text>
+      ) : (
+        <Text style={styles.state}>last sync: none yet</Text>
+      )}
       {!exempt && (
         <View style={styles.warn}>
           <Text style={styles.warnText}>Battery optimization may kill the node.</Text>
@@ -158,7 +195,13 @@ export default function App() {
       <Text style={styles.state}>
         messages: {syncStats.messages} / blobs: {syncStats.blobs} / friends: {syncStats.identities}
       </Text>
-      {!!lastSync && <Text style={lastSync.startsWith("sync failed") ? styles.fail : styles.ok}>{lastSync}</Text>}
+      {!!syncNowResult && (
+        <Text style={
+          syncNowResult.startsWith("sync failed") ? styles.fail
+          : syncNowResult.startsWith("sync already in progress") ? styles.neutral
+          : styles.ok
+        }>{syncNowResult}</Text>
+      )}
       <Text style={styles.subtitle}>Feed ({feed === null ? "..." : feed.length})</Text>
       {feed === null && <Text style={styles.state}>Loading feed...</Text>}
       {feed !== null && feed.length === 0 && (
@@ -191,14 +234,21 @@ export default function App() {
           )}
         />
       )}
-      <Text style={styles.subtitle}>Heartbeats ({beats.length})</Text>
+      {/* Task 3 (Brick C): renamed from "Heartbeats" -- the background
+          service now runs a full content sync on this cadence (was a bare
+          AUTH heartbeat pre-Brick-C), so each row is a sync result. Ok rows
+          show the pulled counts (now on every getHistory() entry) in place
+          of the old raw latencyMs. */}
+      <Text style={styles.subtitle}>Recent syncs ({beats.length})</Text>
       <FlatList
         style={styles.list}
         data={beats}
         keyExtractor={(b) => String(b.ts)}
         renderItem={({ item }) => (
           <Text style={item.ok ? styles.ok : styles.fail}>
-            {new Date(item.ts).toLocaleTimeString()} {item.ok ? `OK ${item.latencyMs}ms` : `FAIL ${item.reason}`}
+            {new Date(item.ts).toLocaleTimeString()} {item.ok
+              ? `OK ${item.messages ?? 0} msgs / ${item.blobs ?? 0} blobs`
+              : `FAIL ${item.reason}`}
           </Text>
         )}
       />
@@ -229,6 +279,9 @@ const styles = StyleSheet.create({
   list: { flex: 1 },
   ok: { fontSize: 14, color: "#1a7f37", paddingVertical: 2 },
   fail: { fontSize: 14, color: "#b00020", paddingVertical: 2 },
+  // Task 3 (Brick C): "sync already in progress" is a skip, not a failure --
+  // gray, distinct from both ok (green) and fail (red).
+  neutral: { fontSize: 14, color: "#666666", paddingVertical: 2 },
   feedItem: { fontSize: 14, paddingVertical: 2 },
   feedRow: { paddingVertical: 2, gap: 4 },
   thumbRow: { flexDirection: "row", gap: 6, flexWrap: "wrap" },

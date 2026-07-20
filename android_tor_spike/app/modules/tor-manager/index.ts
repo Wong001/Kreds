@@ -42,7 +42,20 @@ export function suspendTor(): Promise<void> {
   return native.suspendTor();
 }
 
-export interface Beat { ts: number; ok: boolean; latencyMs: number; reason: string | null }
+// `messages`/`blobs`/`identities` (Brick C Task 3): the pulled counts
+// HeartbeatStore now persists alongside each Beat (Task 2). Present on every
+// getHistory() entry -- the native mapping defaults them to 0 for pre-Brick-C
+// history and always includes the keys, see TorManagerModule.getHistory --
+// but ABSENT on the live "nodeBeat" broadcast/event, which Task 2 left
+// unchanged (ts/ok/latencyMs/reason only). Optional here so both shapes
+// typecheck under the one Beat type the `beats` dashboard state mixes them
+// into; App.tsx's onBeat handler re-runs getHistory() on every live beat
+// rather than trusting the (count-less) live payload, so the dashboard's
+// derived "last sync" line always reads from the count-carrying source.
+export interface Beat {
+  ts: number; ok: boolean; latencyMs: number; reason: string | null;
+  messages?: number; blobs?: number; identities?: number;
+}
 
 export function startNode(): void { native.startNode(); }
 export function stopNode(): void { native.stopNode(); }

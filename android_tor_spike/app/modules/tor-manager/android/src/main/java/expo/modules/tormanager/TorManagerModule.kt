@@ -162,7 +162,15 @@ class TorManagerModule : Module() {
         AsyncFunction("getHistory") {
             val ctx = appContext.reactContext ?: return@AsyncFunction emptyList<Map<String, Any?>>()
             HeartbeatStore.history(ctx).map {
-                mapOf("ts" to it.ts, "ok" to it.ok, "latencyMs" to it.latencyMs, "reason" to it.reason)
+                // Brick C Task 3: surface the pulled counts Task 2 added to the
+                // persisted Beat (messages/blobs/identities) -- defaulted to 0
+                // on the Kotlin side for pre-Brick-C entries, so every history
+                // item always carries them here regardless of when it was
+                // recorded. The live "nodeBeat" broadcast/event is UNCHANGED
+                // (ts/ok/latencyMs/reason only) -- these three fields exist
+                // ONLY on this getHistory() result, per index.ts's Beat type.
+                mapOf("ts" to it.ts, "ok" to it.ok, "latencyMs" to it.latencyMs, "reason" to it.reason,
+                    "messages" to it.messages, "blobs" to it.blobs, "identities" to it.identities)
             }
         }
 
