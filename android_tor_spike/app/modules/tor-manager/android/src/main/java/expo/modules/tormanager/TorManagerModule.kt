@@ -67,6 +67,30 @@ class TorManagerModule : Module() {
     // thread never outlives this module instance.
     @Volatile private var mediaServer: MediaServer? = null
 
+    // Review fix (B.2d-2 Task 3): closes a construct/destroy race that the
+    // plain @Volatile teardown in OnDestroy left open. ensureMediaServer and
+    // teardownMediaServer are BOTH @Synchronized on the same monitor
+    // (`this`), so they mutually exclude -- but mutual exclusion of the two
+    // METHOD BODIES alone isn't enough: if OnDestroy's teardown runs to
+    // completion BEFORE a concurrently-invoked getVideoUrl even calls
+    // ensureMediaServer (e.g. RN Fast Refresh / a bridge reload landing
+    // right after a first video tap, on ioScope, which is never cancelled),
+    // the teardown seeing mediaServer==null would no-op, and the LATER
+    // ensureMediaServer call would happily start a fresh server that then
+    // outlives this already-destroyed module instance -- exactly the
+    // listener-thread leak this module exists to avoid. `destroyed` closes
+    // that window: teardownMediaServer sets it (still inside the
+    // synchronized block, before nulling mediaServer), and ensureMediaServer
+    // checks it FIRST, inside its own synchronized block, and refuses to
+    // start anything once it's true. Combined with the shared monitor, this
+    // guarantees one of exactly two outcomes for any interleaving: either
+    // ensureMediaServer's construction fully happens-before teardown (and
+    // teardown then stops the real, assigned server), or teardown fully
+    // happens-before ensureMediaServer (and ensureMediaServer sees
+    // destroyed==true and never starts a server at all). There is no third
+    // interleaving where a server is started but never stopped.
+    @Volatile private var destroyed = false
+
     /** Lazily starts (once) the loopback media server getVideoUrl resolves
      *  URLs from. The injected resolver mirrors getBlobImage's decrypt path
      *  exactly (blobKeys -> SqliteSyncStore.getBlob -> KotlinBlobCrypt.
@@ -80,9 +104,15 @@ class TorManagerModule : Module() {
      *  MediaServer holds it in memory only long enough to write it to the
      *  response socket. @Synchronized: getVideoUrl runs on ioScope
      *  (Dispatchers.IO, a thread pool), so two feed rows opening their first
-     *  video at once must not race into constructing two servers. */
+     *  video at once must not race into constructing two servers -- and (see
+     *  `destroyed`'s doc above) so a concurrent OnDestroy can't race a
+     *  server into existence after teardown either. Returns null once this
+     *  module instance has been destroyed -- getVideoUrl already treats a
+     *  null result the same as "no content key", so no new null-handling was
+     *  needed at the call site beyond widening its type. */
     @Synchronized
-    private fun ensureMediaServer(ctx: android.content.Context): MediaServer {
+    private fun ensureMediaServer(ctx: android.content.Context): MediaServer? {
+        if (destroyed) return null
         mediaServer?.let { return it }
         val s = MediaServer { msgId, hash ->
             blobKeys[msgId]?.let { key ->
@@ -92,6 +122,21 @@ class TorManagerModule : Module() {
         s.start()
         mediaServer = s
         return s
+    }
+
+    /** Review fix (B.2d-2 Task 3): the OnDestroy-side half of the
+     *  construct/destroy race fix -- see `destroyed`'s doc comment above for
+     *  the full reasoning. @Synchronized on the SAME monitor as
+     *  ensureMediaServer (this is what makes the fix work: without a shared
+     *  monitor, "check destroyed" and "check/assign mediaServer" could still
+     *  interleave). Idempotent: a second call (shouldn't happen in practice,
+     *  OnDestroy fires once) just re-sets destroyed=true and no-ops the
+     *  already-null mediaServer?.stop(). */
+    @Synchronized
+    private fun teardownMediaServer() {
+        destroyed = true
+        mediaServer?.stop()
+        mediaServer = null
     }
 
     /** B.2c Task 3: the phone's real friend count -- `store.knownIdentities()`
@@ -168,11 +213,15 @@ class TorManagerModule : Module() {
             appContext.reactContext?.let { c -> nodeReceiver?.let { c.unregisterReceiver(it) } }
             // Task 3 (B.2d-2): stop the loopback media server's daemon
             // accept-loop thread (MediaServer.start(), see its class doc) so
-            // it doesn't outlive this module instance. stop() is
-            // @Synchronized and safe to call even if getVideoUrl was never
-            // invoked (mediaServer stays null -> no-op).
-            mediaServer?.stop()
-            mediaServer = null
+            // it doesn't outlive this module instance. Routed through the
+            // @Synchronized teardownMediaServer() (review fix) rather than a
+            // bare `mediaServer?.stop(); mediaServer = null` -- the bare
+            // version raced against a concurrent ensureMediaServer() call
+            // (see `destroyed`'s doc comment for the exact interleaving) and
+            // could leak a server started just after this ran. Safe to call
+            // even if getVideoUrl was never invoked (mediaServer stays null
+            // -> no-op stop).
+            teardownMediaServer()
         }
 
         AsyncFunction("bootstrap") { promise: Promise ->
@@ -423,7 +472,12 @@ class TorManagerModule : Module() {
         // with every other store-touching AsyncFunction in this module.
         AsyncFunction("getVideoUrl") { msgId: String, hash: String ->
             val ctx = appContext.reactContext ?: return@AsyncFunction null
-            if (blobKeys[msgId] == null) null else ensureMediaServer(ctx).urlFor(msgId, hash)
+            // ensureMediaServer(ctx)?.let { ... } (review fix): ensureMediaServer
+            // now returns null once the module is destroyed (see its doc) -- the
+            // ?. here is the only call-site change that widening required, since
+            // getVideoUrl already returns null for every other "can't resolve"
+            // case (no content key, no reactContext).
+            if (blobKeys[msgId] == null) null else ensureMediaServer(ctx)?.urlFor(msgId, hash)
         }.runOnQueue(ioScope)
 
         AsyncFunction("getSyncStats") {
