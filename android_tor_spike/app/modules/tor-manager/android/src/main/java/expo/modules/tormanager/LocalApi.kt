@@ -496,6 +496,139 @@ class LocalApi(private val ctx: Context) {
         // hearth's own boundary.
         fun notExpired(expiresAt: Double?, now: Double): Boolean = expiresAt == null || expiresAt > now
 
+        // vp3: text_style defaults = each TEXT_STYLE_ENUMS tuple's first value
+        // (messages.py:30-37) plus color="default" (node.py profile_view sets
+        // it separately). A pure-text wall block's text_style is these defaults
+        // merged with the layout's per-block override (layout.texts[msgId]).
+        val TEXT_STYLE_DEFAULTS = linkedMapOf(
+            "h" to "left", "v" to "top", "size" to "auto",
+            "font" to "sans", "weight" to "normal", "style" to "normal",
+            "color" to "default")
+
+        // vp3: a plain Kotlin map -> JSONObject (null values -> JSON null).
+        fun mapToJson(m: Map<String, Any?>): JSONObject {
+            val o = JSONObject()
+            for ((k, v) in m) o.put(k, v ?: JSONObject.NULL)
+            return o
+        }
+
+        // vp3: port of hearth _fold_album_members (node.py:1178-1195). For each
+        // album_id in SORTED order, the first album to claim a member keeps it
+        // (Python setdefault) -- so the smallest album_id wins a member that two
+        // albums list. An explicit `!in` check (not Map.putIfAbsent, which is
+        // API 24+) keeps this min-SDK-safe. Returns member msgId -> album_id.
+        fun foldAlbumMembers(albums: Map<String, List<String>>): Map<String, String> {
+            val memberOf = linkedMapOf<String, String>()
+            for (aid in albums.keys.sorted())
+                for (mid in albums[aid] ?: emptyList())
+                    if (mid !in memberOf) memberOf[mid] = aid
+            return memberOf
+        }
+
+        // vp3: port of hearth profile_view's _default_span (node.py:1272-1279).
+        // size = sizes[msgId] or "full"; small -> 1x1; wide -> 2x2; full ->
+        // 4x2 when the post has media (blobs non-empty OR media=="video"),
+        // else 4x1.
+        fun defaultSpan(d: DecryptPass.Decrypted, sizes: Map<String, String>): JSONObject {
+            val size = sizes[d.msgId] ?: "full"
+            if (size == "small") return JSONObject().put("w", 1).put("h", 1)
+            if (size == "wide") return JSONObject().put("w", 2).put("h", 2)
+            val hasMedia = d.blobs.isNotEmpty() || d.media == "video"
+            return if (hasMedia) JSONObject().put("w", 4).put("h", 2)
+                   else JSONObject().put("w", 4).put("h", 1)
+        }
+
+        // vp3: a post wall-block = the feedRow shape + pin/span/text_style
+        // (node.py profile_view's per-post annotation loop). responses is null
+        // on wall rows (renderBlock never reads it). pin = layout.pins[msgId]
+        // or null; span = (pin ? {pin.w,pin.h} : layout.spans[msgId] ?:
+        // defaultSpan); text_style only on pure-text blocks (no blobs, not
+        // video), defaults merged with layout.texts[msgId].
+        fun wallBlockJson(d: DecryptPass.Decrypted, ownIdentityPub: String, layout: ProfileLayout): JSONObject {
+            val o = feedRow(d, ownIdentityPub, null)
+            val pin = layout.pins[d.msgId]
+            o.put("pin", if (pin != null) mapToJson(pin) else JSONObject.NULL)
+            val span: JSONObject = when {
+                pin != null -> JSONObject().put("w", pin["w"]).put("h", pin["h"])
+                layout.spans[d.msgId] != null -> mapToJson(layout.spans[d.msgId]!!)
+                else -> defaultSpan(d, layout.sizes)
+            }
+            o.put("span", span)
+            if (d.blobs.isEmpty() && d.media != "video") {
+                val ts = JSONObject()
+                for ((k, v) in TEXT_STYLE_DEFAULTS) ts.put(k, v)
+                layout.texts[d.msgId]?.let { for ((k, v) in it) ts.put(k, v ?: JSONObject.NULL) }
+                o.put("text_style", ts)
+            }
+            return o
+        }
+
+        // vp3: an album pseudo-block (node.py profile_view's album-fold append)
+        // -- a REDUCED shape, NOT the post fields. count = photos.length().
+        fun albumBlockJson(
+            albumId: String, mine: Boolean, photos: JSONArray, createdAt: Double,
+            scopeNewest: String, pin: Map<String, Any?>?, span: JSONObject,
+        ): JSONObject = JSONObject()
+            .put("album", true)
+            .put("msg_id", albumId)
+            .put("mine", mine)
+            .put("photos", photos)
+            .put("count", photos.length())
+            .put("created_at", createdAt)
+            .put("scope_newest", scopeNewest)
+            .put("pin", if (pin != null) mapToJson(pin) else JSONObject.NULL)
+            .put("span", span)
+
+        // vp3: the whole wall list, reproducing node.py profile_view's
+        // annotate-then-album-fold. `wall` is this identity's placement==
+        // "profile" posts, ALREADY newest-first. Posts whose msgId is an album
+        // member are removed; each album with >=1 photo becomes an album-block
+        // (photos = {m,h,t} per member's blobs, video members skipped;
+        // created_at = newest member's; scope_newest = newest member's scope;
+        // span defaults to 2x2). The folded list is re-sorted created_at DESC
+        // (stable -> ties keep wall order).
+        fun wallJson(
+            wall: List<DecryptPass.Decrypted>, layout: ProfileLayout,
+            albums: Map<String, List<String>>, ownIdentityPub: String, mine: Boolean,
+        ): JSONArray {
+            val byId = wall.associateBy { it.msgId }
+            val memberOf = foldAlbumMembers(albums)
+            val folded = mutableListOf<Pair<Double, JSONObject>>()
+            for (d in wall)
+                if (d.msgId !in memberOf)
+                    folded.add(d.createdAt to wallBlockJson(d, ownIdentityPub, layout))
+            for (aid in albums.keys.sorted()) {
+                val photos = JSONArray()
+                var newest: Double? = null
+                var scopeNewest = "kreds"
+                for (mid in albums[aid] ?: emptyList()) {
+                    val p = byId[mid] ?: continue
+                    if (memberOf[mid] != aid) continue
+                    if (p.media == "video") continue
+                    for ((i, h) in p.blobs.withIndex())
+                        photos.put(JSONObject().put("m", mid).put("h", h)
+                            .put("t", p.thumbs.getOrNull(i) ?: JSONObject.NULL))
+                    val cur = newest
+                    if (cur == null || p.createdAt > cur) {
+                        newest = p.createdAt
+                        scopeNewest = p.scope ?: "kreds"
+                    }
+                }
+                if (photos.length() == 0) continue
+                val at = newest ?: continue
+                val pin = layout.pins[aid]
+                val span: JSONObject = when {
+                    pin != null -> JSONObject().put("w", pin["w"]).put("h", pin["h"])
+                    layout.spans[aid] != null -> mapToJson(layout.spans[aid]!!)
+                    else -> JSONObject().put("w", 2).put("h", 2)
+                }
+                folded.add(at to albumBlockJson(aid, mine, photos, at, scopeNewest, pin, span))
+            }
+            val out = JSONArray()
+            for ((_, obj) in folded.sortedByDescending { it.first }) out.put(obj)
+            return out
+        }
+
         fun feedRow(d: DecryptPass.Decrypted, ownIdentityPub: String, responses: KotlinResponses.Responses?): JSONObject {
             val blobs = JSONArray(); d.blobs.forEach { blobs.put(it) }
             val thumbs: Any = if (d.thumbs.isEmpty()) JSONObject.NULL

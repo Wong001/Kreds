@@ -1,5 +1,6 @@
 package expo.modules.tormanager
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -385,5 +386,127 @@ class LocalApiTest {
         // `if msg.kind != KIND_DM: return None`).
         assertEquals(setOf("dm1"), out.keys)
         assertArrayEquals(byteArrayOf(2), out["dm1"])
+    }
+
+    // -- vp3 slice 3 Task 2: pure wall-assembly builders --
+
+    private fun wallPost(
+        msgId: String, createdAt: Double, blobs: List<String> = emptyList(),
+        thumbs: List<String?> = emptyList(), media: String = "photo", scope: String = "kreds",
+    ) = DecryptPass.Decrypted(
+        msgId = msgId, kind = "post", author = "Me", text = "t", createdAt = createdAt,
+        blobs = blobs, thumbs = thumbs, media = media, poster = null, storyRefMediaHash = null,
+        identityPub = "own", scope = scope, expiresAt = null, placement = "profile", codec = null)
+
+    private val emptyLayout = ProfileLayout(emptyMap(), emptyMap(), emptyMap(), emptyMap())
+
+    @Test fun defaultSpanBranches() {
+        val text = wallPost("t", 1.0)                                      // no blobs, photo
+        val photo = wallPost("p", 1.0, blobs = listOf("b"))
+        val video = wallPost("v", 1.0, media = "video")                    // no blobs but video
+        // full (default size) -> 4x1 for pure text, 4x2 for media / video
+        assertSpan(1, 1, LocalApi.defaultSpan(text, mapOf("t" to "small")))
+        assertSpan(2, 2, LocalApi.defaultSpan(text, mapOf("t" to "wide")))
+        assertSpan(4, 1, LocalApi.defaultSpan(text, emptyMap()))           // full + no media
+        assertSpan(4, 2, LocalApi.defaultSpan(photo, emptyMap()))          // full + blobs
+        assertSpan(4, 2, LocalApi.defaultSpan(video, emptyMap()))          // full + video (has_media)
+    }
+
+    private fun assertSpan(w: Int, h: Int, o: JSONObject) {
+        assertEquals(w, o.getInt("w")); assertEquals(h, o.getInt("h"))
+    }
+
+    @Test fun foldAlbumMembersSmallestAlbumIdWins() {
+        // "m1" is in both album "A" and album "B"; sorted iteration hits "A"
+        // first, setdefault keeps it -> "A" wins the conflict.
+        val member = LocalApi.foldAlbumMembers(mapOf(
+            "B" to listOf("m1", "m2"), "A" to listOf("m1", "m3")))
+        assertEquals("A", member["m1"])
+        assertEquals("B", member["m2"])
+        assertEquals("A", member["m3"])
+    }
+
+    @Test fun wallBlockJsonPinnedMirrorsPinAndOmitsTextStyleForMedia() {
+        val d = wallPost("p", 5.0, blobs = listOf("b"), thumbs = listOf<String?>("th"))
+        val layout = ProfileLayout(
+            pins = mapOf("p" to mapOf("x" to 1, "y" to 2, "w" to 3, "h" to 2)),
+            spans = emptyMap(), sizes = emptyMap(), texts = emptyMap())
+        val o = LocalApi.wallBlockJson(d, "own", layout)
+        // base feedRow fields present + the three added fields
+        assertEquals("p", o.getString("msg_id"))
+        assertTrue(o.getBoolean("mine"))                       // identity == own
+        assertTrue(o.isNull("responses"))                      // wall rows: responses null
+        val pin = o.getJSONObject("pin")
+        assertEquals(1, pin.getInt("x")); assertEquals(3, pin.getInt("w"))
+        assertSpan(3, 2, o.getJSONObject("span"))              // span mirrors pin w/h
+        assertFalse("media block has no text_style", o.has("text_style"))
+    }
+
+    @Test fun wallBlockJsonUnpinnedTextHasDefaultedTextStyleWithOverride() {
+        val d = wallPost("t", 5.0)                              // pure text
+        val layout = ProfileLayout(
+            pins = emptyMap(), spans = emptyMap(), sizes = emptyMap(),
+            texts = mapOf("t" to mapOf("h" to "center", "size" to "xl")))
+        val o = LocalApi.wallBlockJson(d, "own", layout)
+        assertTrue(o.isNull("pin"))                            // unpinned -> null
+        assertSpan(4, 1, o.getJSONObject("span"))              // default span, full + no media
+        val ts = o.getJSONObject("text_style")
+        assertEquals("center", ts.getString("h"))              // override
+        assertEquals("xl", ts.getString("size"))               // override
+        assertEquals("top", ts.getString("v"))                 // default
+        assertEquals("sans", ts.getString("font"))             // default
+        assertEquals("default", ts.getString("color"))         // hearth's color default
+    }
+
+    @Test fun albumBlockJsonShape() {
+        val photos = JSONArray().put(JSONObject().put("m", "m1").put("h", "h1").put("t", "t1"))
+        val o = LocalApi.albumBlockJson(
+            albumId = "A", mine = false, photos = photos, createdAt = 9.0,
+            scopeNewest = "inner", pin = null, span = JSONObject().put("w", 2).put("h", 2))
+        assertEquals(setOf("album", "msg_id", "mine", "photos", "count",
+            "created_at", "scope_newest", "pin", "span"), o.keys().asSequence().toSet())
+        assertTrue(o.getBoolean("album"))
+        assertEquals("A", o.getString("msg_id"))
+        assertFalse(o.getBoolean("mine"))
+        assertEquals(1, o.getInt("count"))
+        assertEquals("inner", o.getString("scope_newest"))
+        assertTrue(o.isNull("pin"))
+        assertSpan(2, 2, o.getJSONObject("span"))
+        val ph = o.getJSONArray("photos").getJSONObject(0)
+        assertEquals("m1", ph.getString("m")); assertEquals("t1", ph.getString("t"))
+    }
+
+    @Test fun wallJsonFoldsAlbumsRemovesMembersAndSortsDesc() {
+        // p1 (loose, newest), a1+a2 (album A members), p0 (loose, oldest)
+        val wall = listOf(
+            wallPost("p1", 30.0, blobs = listOf("bp1")),
+            wallPost("a1", 20.0, blobs = listOf("ba1"), thumbs = listOf<String?>("ta1"), scope = "inner"),
+            wallPost("a2", 25.0, blobs = listOf("ba2"), thumbs = listOf<String?>(null)),
+            wallPost("p0", 5.0))
+        val albums = mapOf("A" to listOf("a1", "a2"))
+        val arr = LocalApi.wallJson(wall, emptyLayout, albums, "own", mine = true)
+        // 3 blocks: p1, album A, p0 -- a1/a2 folded away; sorted created_at DESC
+        assertEquals(3, arr.length())
+        assertEquals("p1", arr.getJSONObject(0).getString("msg_id"))     // 30
+        val album = arr.getJSONObject(1)                                  // A: newest member 25
+        assertTrue(album.getBoolean("album"))
+        assertEquals("A", album.getString("msg_id"))
+        assertTrue(album.getBoolean("mine"))
+        assertEquals(2, album.getInt("count"))                           // ba1 + ba2
+        assertEquals("kreds", album.getString("scope_newest"))           // a2 (25) is newest -> its scope
+        assertSpan(2, 2, album.getJSONObject("span"))                    // album default span
+        val ph0 = album.getJSONArray("photos").getJSONObject(0)
+        assertEquals("a1", ph0.getString("m")); assertEquals("ta1", ph0.getString("t"))
+        val ph1 = album.getJSONArray("photos").getJSONObject(1)
+        assertEquals("a2", ph1.getString("m")); assertTrue(ph1.isNull("t"))   // null thumb
+        assertEquals("p0", arr.getJSONObject(2).getString("msg_id"))     // 5
+    }
+
+    @Test fun wallJsonSkipsVideoMembersAndEmptyAlbums() {
+        // album with only a video member yields NO photos -> album dropped;
+        // the video member is still folded out of the loose list (member_of).
+        val wall = listOf(wallPost("v1", 10.0, media = "video", blobs = listOf("bv")))
+        val arr = LocalApi.wallJson(wall, emptyLayout, mapOf("A" to listOf("v1")), "own", mine = true)
+        assertEquals(0, arr.length())
     }
 }
