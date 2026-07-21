@@ -161,6 +161,14 @@ export function getVideoUrl(msgId: string, hash: string): Promise<string | null>
   return native.getVideoUrl(msgId, hash);
 }
 
+// vp1 (Task 3): resolves the loopback web server's one-time-token URL
+// (http://127.0.0.1:<port>/?__t=<token>) that WebShell loads into its
+// WebView -- see TorManagerModule.getWebUrl (Task 2) for the server/token
+// lifecycle. null if the server isn't available.
+export function getWebUrl(): Promise<string | null> {
+  return native.getWebUrl();
+}
+
 // Task 6 (B.2d): live sync-progress feedback -- the sync takes 1-2 min
 // on-device with no visible activity otherwise. Forwards KotlinSync.run's
 // phase-boundary callbacks (fired from the native side as they happen,

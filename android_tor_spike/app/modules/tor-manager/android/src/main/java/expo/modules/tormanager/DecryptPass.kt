@@ -59,7 +59,19 @@ object DecryptPass {
         // to shape-guard (see storyRefMediaHash() below), not exposed.
         // null for an ordinary DM, a DM whose story_ref fails the shape
         // guard, or any post (story_ref is DM-only by construction).
-        val storyRefMediaHash: String?)
+        val storyRefMediaHash: String?,
+        // vp1 (additive): hearth's /api/feed shape carries these; the native
+        // getFeed marshal reads Decrypted by name and ignores them, so adding
+        // them is safe. identityPub = the message author's cert.identity_pub
+        // (StoredMsg.identityPub) -- used for `mine` + `identity_pub`. scope/
+        // expires_at/placement/codec ride in the plaintext OUTER payload
+        // (messages.make_post signs them there). Defaults keep incidental
+        // constructions (e.g. tests) compiling; decryptOne always sets them.
+        val identityPub: String = "",
+        val scope: String? = null,
+        val expiresAt: Double? = null,
+        val placement: String? = null,
+        val codec: String? = null)
 
     /** run()'s result (Task 4, B.2d): the decrypted feed, newest-first
      *  (unchanged from the pre-Task-4 shape), alongside the per-message
@@ -305,7 +317,13 @@ object DecryptPass {
         // this key) -- the explicit gate documents the DM-only contract at
         // the call site rather than leaving it implicit in the helper.
         val storyRefMediaHash = if (m.kind == "dm") storyRefMediaHash(p["story_ref"]) else null
-        return Decrypted(m.msgId, m.kind, author, text, createdAt, blobs, thumbs, media, poster, storyRefMediaHash) to key
+        val scopeField = p["scope"] as? String
+        val expiresAt = (p["expires_at"] as? Number)?.toDouble()
+        val placement = p["placement"] as? String
+        val codec = p["codec"] as? String
+        return Decrypted(
+            m.msgId, m.kind, author, text, createdAt, blobs, thumbs, media, poster, storyRefMediaHash,
+            m.identityPub, scopeField, expiresAt, placement, codec) to key
     }
 
     /** Shape-guards a DM's optional outer-payload `story_ref` value (see

@@ -4754,6 +4754,10 @@ async function refresh() {
   // fetch background" from the call site. Every refresh() - WS-driven or
   // user-triggered - fetches the same way.
   STATE = await j("/api/state");
+  // vp1: read-only mirror seam. A phone's /api/state returns readonly:true; the
+  // desktop node omits the field (=> falsy => desktop never read-only). This is
+  // the single toggle the future outbound slice flips off to re-enable writes.
+  document.body.classList.toggle("readonly", !!STATE.readonly);
   // re-nudge on a genuinely new version even if a prior banner was dismissed
   if (STATE.update_status && STATE.update_status.available
       && STATE.update_status.version !== LAST_SEEN_UPDATE_VERSION) {
