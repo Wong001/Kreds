@@ -167,3 +167,28 @@ polish / theme) or the composing/outbound arc.
 - **Profile-header + comment-author avatars.** Still deferred (no avatar-blob
   accessor threaded through the wall/rail; the wall's own photos work via
   `/api/post-blob`).
+
+---
+
+## On-device field fixes (2026-07-21, post-merge-review, proven on G20)
+
+The first G20 run surfaced three visual defects; root-caused via on-device
+instrumentation (since reverted) and fixed. **All proven on the G20** (Claude
+drove the profile view over adb): profile renders complete — banner photo,
+avatar, full wall of photos + albums, no broken icons, text auto-fitting.
+
+| Symptom | Root cause | Fix |
+|---------|-----------|-----|
+| Banner + profile pic broken | `missingBlobs()` scanned POST/DM/STORY but not KIND_PROFILE, so avatar/banner blobs were never requested during sync (hearth `referenced_blobs` scans KIND_PROFILE) | `08d558a` — add KIND_PROFILE avatar/banner scan to both store impls (+JVM test) |
+| Wall text clipped on small cells | `.block-text-*` font sizes tuned for desktop cells; the wall keeps 4 cols on every viewport, so phone cells overflow `overflow:hidden` | `9ce91f4` — `fitWallText()` shrink-to-fit (9px floor), only ever shrinks so desktop unchanged |
+| Big images slow to arrive | hearth sends blobs smallest-first up to a ~15 MiB per-round budget, leftover next round; phone did one round per 15-min cycle | `b8ab161` — `runSync` drains rounds back-to-back until nothing missing (gated on `missingBlobs()`, so steady state = 1 round) |
+| Big images broken (no server trace) | every `/api` request built a fresh `SqliteSyncStore` (SQLiteOpenHelper), never closed → leaked SQLiteConnections; a ~20-image wall burst exhausted the pool → later requests threw pre-serve | `553f1a0` — one shared thread-safe helper in LocalApi; close SyncRunner's per-round stores |
+| **Banner + >2 MiB photos broken** | **Android SQLite `CursorWindow` caps a fetched row at ~2 MiB — `getBlob`'s `SELECT data` threw "Row too big to fit into CursorWindow" for the banner (2.07 MiB) + large photos (2.87–4.19 MiB); smaller blobs read fine** | `4d07c6a` — read `length()` then pull the BLOB in ≤1 MiB `substr` slices and stitch |
+
+**Field lesson:** any blob > ~2 MiB must be read from Android SQLite in chunks
+(`substr`), never as a single `SELECT data` row. The 10 MiB blob cap means blobs
+routinely exceed the CursorWindow limit.
+
+**Follow-up ticket:** the `getBlob` chunked read is `SqliteSyncStore`-only
+(needs Robolectric, not JVM-testable); covered on-device here, add a Robolectric
+pass with the other SQL-mirror hardening tickets.
