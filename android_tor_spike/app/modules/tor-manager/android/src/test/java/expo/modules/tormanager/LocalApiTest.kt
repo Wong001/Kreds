@@ -311,4 +311,62 @@ class LocalApiTest {
         // no profile name -> first-8 fallback (identity strings here are short)
         assertEquals("bob", rows[0].name)
     }
+
+    // ---- slice 2 (vp2) Task 2: golden JSON shapes ----
+
+    @Test fun conversationsJsonGoldenShape() {
+        val rows = listOf(
+            LocalApi.Companion.ConvRow("cara", "Cara", lastText = null, lastFromMe = false, lastAt = 30.0, count = 3),
+            LocalApi.Companion.ConvRow("bob", "bob01234", lastText = "hey", lastFromMe = true, lastAt = 10.0, count = 1))
+        val arr = org.json.JSONArray(LocalApi.conversationsJson(rows))
+        assertEquals(2, arr.length())
+        val c0 = arr.getJSONObject(0)
+        assertEquals(setOf("identity_pub", "name", "last_text", "last_from_me", "last_at", "count"),
+            c0.keys().asSequence().toSet())
+        assertEquals("cara", c0.getString("identity_pub"))
+        assertEquals("Cara", c0.getString("name"))
+        assertTrue(c0.isNull("last_text"))            // undecryptable newest -> null
+        assertFalse(c0.getBoolean("last_from_me"))
+        assertEquals(30.0, c0.getDouble("last_at"), 0.0)
+        assertEquals(3, c0.getInt("count"))
+        val c1 = arr.getJSONObject(1)
+        assertEquals("hey", c1.getString("last_text"))
+        assertTrue(c1.getBoolean("last_from_me"))
+    }
+
+    @Test fun dmThreadJsonGoldenShape() {
+        val msgs = listOf(
+            LocalApi.Companion.DmMsg(
+                msgId = "m1", fromMe = true, createdAt = 10.0, expiresAt = null,
+                text = "hi", blobs = listOf("b1"), undecryptable = false,
+                storyRef = null, partner = "cara"),
+            LocalApi.Companion.DmMsg(
+                msgId = "m2", fromMe = false, createdAt = 20.0, expiresAt = 99.0,
+                text = null, blobs = emptyList(), undecryptable = true,
+                storyRef = mapOf("story_id" to "s9", "media_hash" to "ab12"),
+                partner = "cara"))
+        val arr = org.json.JSONArray(LocalApi.dmThreadJson(msgs))
+        assertEquals(2, arr.length())
+        val a = arr.getJSONObject(0)
+        assertEquals(setOf("msg_id", "from_me", "created_at", "expires_at", "text",
+            "blobs", "undecryptable", "story_ref"), a.keys().asSequence().toSet())
+        assertEquals("m1", a.getString("msg_id"))
+        assertTrue(a.getBoolean("from_me"))
+        assertEquals(10.0, a.getDouble("created_at"), 0.0)
+        assertTrue(a.isNull("expires_at"))
+        assertEquals("hi", a.getString("text"))
+        assertEquals("b1", a.getJSONArray("blobs").getString(0))
+        assertFalse(a.getBoolean("undecryptable"))
+        assertTrue(a.isNull("story_ref"))
+        // undecryptable row: text null, blobs empty array (not null), story_ref
+        // passed through as a dict from the plaintext outer payload.
+        val b = arr.getJSONObject(1)
+        assertTrue(b.getBoolean("undecryptable"))
+        assertTrue(b.isNull("text"))
+        assertEquals(0, b.getJSONArray("blobs").length())
+        assertEquals(99.0, b.getDouble("expires_at"), 0.0)
+        val sr = b.getJSONObject("story_ref")
+        assertEquals("s9", sr.getString("story_id"))
+        assertEquals("ab12", sr.getString("media_hash"))
+    }
 }
