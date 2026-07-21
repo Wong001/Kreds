@@ -119,6 +119,17 @@ class LocalApiTest {
         assertEquals(0, o.getInt("throttle_wait"))
     }
 
+    @Test fun kredsJsonRowShape() {
+        val arr = org.json.JSONArray(LocalApi.kredsJson(listOf("cc" to "Cara", "dd" to "dd")))
+        assertEquals(2, arr.length())
+        val r0 = arr.getJSONObject(0)
+        assertEquals(setOf("identity_pub", "name", "ring", "since"), r0.keys().asSequence().toSet())
+        assertEquals("cc", r0.getString("identity_pub"))
+        assertEquals("Cara", r0.getString("name"))
+        assertEquals("kreds", r0.getString("ring"))
+        assertEquals(0, r0.getInt("since"))
+    }
+
     @Test fun stateShapeHasAllKeysAndReadonly() {
         val json = LocalApi.stateJson(
             identityPub = "aa", devicePub = "bb", deviceName = "phone",

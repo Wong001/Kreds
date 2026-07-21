@@ -27,6 +27,7 @@ class LocalApi(private val ctx: Context) {
             path == "/api/state" -> json(state())
             path == "/api/feed" -> json(feed())
             path == "/api/stories" -> json(stories())
+            path == "/api/kreds" -> json(kreds())
             path.startsWith("/api/post-blob/") -> {
                 val seg = path.removePrefix("/api/post-blob/").split("/")
                 if (seg.size != 2 || seg[0].isEmpty() || seg[1].isEmpty()) notFound() else postBlob(seg[0], seg[1])
@@ -78,6 +79,23 @@ class LocalApi(private val ctx: Context) {
     private fun fixtureOrNull(): KotlinHandshake.Fixture? = try {
         KotlinHandshake.parseFixture(File(TorEngine.externalDir(), "spike_phone_fixture.json").readText())
     } catch (e: Exception) { null }
+
+    // hearth /api/kreds (node.kreds_list, node.py:801-813): known identities
+    // (excluding self) as {identity_pub, name, ring, since}. LOAD-BEARING for
+    // the journal: app.js's refresh() does `KREDS = await j("/api/kreds")`
+    // (app.js:4780) BEFORE renderJournal(), and j() throws on a non-2xx, so a
+    // missing /api/kreds aborts the entire journal render (chipbar + feed +
+    // stories). ring/since default to "kreds"/0 -- the phone doesn't process
+    // KIND_RING yet, so accurate ring membership + the circle view are a later
+    // slice; the default is enough to render the journal + a flat chip bar.
+    private fun kreds(): String {
+        val fx = fixtureOrNull()
+        val store = SqliteSyncStore(ctx)
+        val names = store.profileNames()
+        val own = fx?.cert?.identity_pub ?: ""
+        val friends = store.knownIdentities().filter { it != own }.map { it to (names[it] ?: it.take(8)) }
+        return kredsJson(friends)
+    }
 
     // hearth stories_view (node.py:836-841) keeps a group only for
     // self/known identities -- an unfriended author's already-synced
@@ -139,6 +157,19 @@ class LocalApi(private val ctx: Context) {
     companion object {
         fun json(body: String) =
             HttpResponse(200, mapOf("Content-Type" to "application/json; charset=utf-8"), body.toByteArray())
+
+        // hearth kreds_list (node.py:801-813) row shape: {identity_pub, name,
+        // ring, since}. Slice-1 defaults ring="kreds"/since=0 (see kreds()).
+        fun kredsJson(friends: List<Pair<String, String>>): String {
+            val arr = JSONArray()
+            for ((ipub, name) in friends)
+                arr.put(JSONObject()
+                    .put("identity_pub", ipub)
+                    .put("name", name)
+                    .put("ring", "kreds")
+                    .put("since", 0))
+            return arr.toString()
+        }
 
         // hearth post_blob (node.py:2956-2964) serves ONLY KIND_POST blobs
         // (`if msg.kind != KIND_POST: return None`), even though the
