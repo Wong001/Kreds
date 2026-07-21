@@ -20,11 +20,12 @@ const HIDDEN_SELECTORS = [
   "#profile-cog",
   "#profile-arrange",
   "#profile-addfriend",
+  "#dm-compose",            // vp2: the DM composer bar (Photo + textarea + Send)
 ];
 
 // The subset where a dropped `display: none` (not just a dropped selector)
 // is worth guarding against explicitly - the highest-traffic write doors.
-const LOAD_BEARING_SELECTORS = [".composer", ".comment-composer", ".rx-open", ".comment-x"];
+const LOAD_BEARING_SELECTORS = [".composer", ".comment-composer", ".rx-open", ".comment-x", "#dm-compose"];
 
 function escapeSelector(sel: string): string {
   // Space-separated compound selectors (e.g. ".story-tile .story-ring.add")
@@ -79,5 +80,10 @@ describe("vp1 read-only seam", () => {
     // also guard against .rx-count-chip riding along in a shared selector
     // list that resolves to display:none anywhere under body.readonly
     expect(css).not.toMatch(selectorHiddenRegex(".rx-count-chip"));
+  });
+
+  it("index.html mobile tab bar has a Messages entry (vp2)", () => {
+    const html = web("index.html");
+    expect(html).toMatch(/<button[^>]*data-tab=["']messages["'][^>]*>/);
   });
 });

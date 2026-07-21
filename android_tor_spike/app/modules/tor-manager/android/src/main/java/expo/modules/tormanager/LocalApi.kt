@@ -19,6 +19,13 @@ class LocalApi(private val ctx: Context) {
     // run if a hash is requested before any feed() populated the cache.
     @Volatile private var keysCache: Map<String, ByteArray> = emptyMap()
 
+    // vp2: msgId -> content key for DM blobs, warmed by loadDms() (the pass the
+    // conversations/dm-thread routes already run) and reused by dmBlob() so a
+    // DM image request does NOT re-run a full DecryptPass.run. Separate from
+    // keysCache (posts) so the two blob routes stay kind-isolated. In-memory
+    // only; never persisted (decrypt-on-read).
+    @Volatile private var dmKeysCache: Map<String, ByteArray> = emptyMap()
+
     fun handle(method: String, path: String): HttpResponse? {
         if (method != "GET") return null
         return when {
@@ -28,6 +35,19 @@ class LocalApi(private val ctx: Context) {
             path == "/api/feed" -> json(feed())
             path == "/api/stories" -> json(stories())
             path == "/api/kreds" -> json(kreds())
+            path == "/api/conversations" -> json(conversations())
+            // vp2 Task 3: placed ahead of the /api/dm/ branch so the longer
+            // prefix wins clearly, though there is no actual collision --
+            // "/api/dm-blob/..." never starts with "/api/dm/" (the char after
+            // "dm" is "-", not "/"); ordering here is for readability only.
+            path.startsWith("/api/dm-blob/") -> {
+                val seg = path.removePrefix("/api/dm-blob/").split("/")
+                if (seg.size != 2 || seg[0].isEmpty() || seg[1].isEmpty()) notFound() else dmBlob(seg[0], seg[1])
+            }
+            path.startsWith("/api/dm/") -> {
+                val id = path.removePrefix("/api/dm/")
+                if (id.isEmpty() || id.contains("/")) notFound() else json(dmThread(id))
+            }
             path.startsWith("/api/post-blob/") -> {
                 val seg = path.removePrefix("/api/post-blob/").split("/")
                 if (seg.size != 2 || seg[0].isEmpty() || seg[1].isEmpty()) notFound() else postBlob(seg[0], seg[1])
@@ -60,6 +80,37 @@ class LocalApi(private val ctx: Context) {
             arr.put(feedRow(d, own, responses[d.msgId]))
         }
         return arr.toString()
+    }
+
+    // vp2: one decrypt pass feeding BOTH the conversations and dm-thread routes.
+    // Warms dmKeysCache. Returns null only when the fixture is missing (the
+    // routes then serve an empty list, keeping the load-bearing 2xx contract:
+    // app.js's j() throws on any non-2xx and refresh() awaits the conversations
+    // route every tick). rawDms carries EVERY stored DM (incl. undecryptable);
+    // decryptedById is the subset this device could decrypt.
+    private data class DmLoad(val msgs: List<DmMsg>, val names: Map<String, String>, val own: String)
+
+    private fun loadDms(): DmLoad? {
+        val fx = fixtureOrNull() ?: return null
+        val store = SqliteSyncStore(ctx)
+        val (priv, _) = EncKeys.getOrCreate(store)
+        val own = fx.cert.identity_pub
+        val res = DecryptPass.run(store, fx.device_pub, priv, own)
+        dmKeysCache = dmKeys(res.feed, res.keys)                 // warm DM blob-key cache
+        val decryptedById = res.feed.filter { it.kind == "dm" }.associateBy { it.msgId }
+        val rawDms = store.allMessages().filter { it.kind == "dm" }
+        val msgs = extractDmMsgs(rawDms, decryptedById, own)
+        return DmLoad(msgs, store.profileNames(), own)
+    }
+
+    private fun conversations(): String {
+        val d = loadDms() ?: return "[]"
+        return conversationsJson(conversationsFrom(d.msgs, d.names, d.own))
+    }
+
+    private fun dmThread(identityPub: String): String {
+        val d = loadDms() ?: return "[]"
+        return dmThreadJson(threadFor(d.msgs, identityPub))
     }
 
     private fun state(): String {
@@ -152,6 +203,35 @@ class LocalApi(private val ctx: Context) {
         "X-Content-Type-Options" to "nosniff",
         "Cache-Control" to "private, max-age=31536000, immutable"), bytes)
 
+    // vp2: content-key-decrypted DM blob bytes ONLY, streamed decrypt-on-read.
+    // Mirrors postBlob's cache+fallback but keyed off dmKeysCache (DM-only), so
+    // a post's msgId is never decryptable here (kind gate). The response OMITS
+    // Cache-Control -- hearth's dm_blob route sets NONE (contrast post_blob/
+    // blob, which set immutable) -- so it uses dmMediaResponse, not
+    // mediaResponse (which hardcodes the immutable Cache-Control).
+    private fun dmBlob(msgId: String, hash: String): HttpResponse {
+        val store = SqliteSyncStore(ctx)
+        var key = dmKeysCache[msgId]
+        if (key == null) {
+            val fx = fixtureOrNull() ?: return notFound()
+            val (priv, _) = EncKeys.getOrCreate(store)
+            val res = DecryptPass.run(store, fx.device_pub, priv, fx.cert.identity_pub)
+            val dms = dmKeys(res.feed, res.keys)
+            dmKeysCache = dms
+            key = dms[msgId] ?: return notFound()
+        }
+        val cipher = store.getBlob(hash) ?: return notFound()
+        val plain = KotlinBlobCrypt.decryptBlob(key, cipher) ?: return notFound()
+        return dmMediaResponse(plain)
+    }
+
+    // vp2: DM blob response headers -- Content-Type (sniffed) + nosniff, and
+    // deliberately NO Cache-Control (hearth dm_blob sets none; do not reuse
+    // mediaResponse's immutable header for a DM).
+    private fun dmMediaResponse(bytes: ByteArray) = HttpResponse(200, mapOf(
+        "Content-Type" to sniff(bytes),
+        "X-Content-Type-Options" to "nosniff"), bytes)
+
     private fun notFound() = HttpResponse(404, mapOf("Content-Type" to "text/plain"), "not found".toByteArray())
 
     companion object {
@@ -171,6 +251,128 @@ class LocalApi(private val ctx: Context) {
             return arr.toString()
         }
 
+        // vp2 slice 2: one DM thread message, built by joining a RAW stored DM
+        // (StoredMsg, which survives even when this device cannot decrypt it)
+        // with the msgId->Decrypted map from DecryptPass.run. `undecryptable`
+        // is true exactly when the raw DM had no Decrypted entry -- reproducing
+        // hearth dm_thread's one-entry-per-stored-row-including-undecryptable
+        // behavior. storyRef rides the plaintext outer payload, so it is
+        // present even for an undecryptable row (hearth messages.py:139-150).
+        data class DmMsg(
+            val msgId: String, val fromMe: Boolean, val createdAt: Double, val expiresAt: Double?,
+            val text: String?, val blobs: List<String>, val undecryptable: Boolean,
+            val storyRef: Map<*, *>?, val partner: String)
+
+        // vp2: one conversation-list summary row (hearth node.conversations()).
+        data class ConvRow(
+            val identityPub: String, val name: String, val lastText: String?,
+            val lastFromMe: Boolean?, val lastAt: Double?, val count: Int)
+
+        // vp2: build the flat DM message list from RAW DMs joined with the
+        // decrypted map. Partner derivation mirrors hearth dm_conversations:
+        // sender = StoredMsg.identityPub, recipient = payload["to"]; the partner
+        // is whichever of {sender, recipient} is NOT own. A DM missing a
+        // created_at or a `to` in its plaintext payload is malformed (a valid
+        // signed DM always carries both) and is skipped. Stable sort by
+        // created_at ASC: same-created_at ties keep allMessages()' scan order,
+        // approximating hearth's `created_at ASC, rowid ASC` tiebreak (rowid is
+        // not exposed on StoredMsg -- flagged as a follow-up, not fixed here).
+        fun extractDmMsgs(
+            rawDms: List<StoredMsg>,
+            decryptedById: Map<String, DecryptPass.Decrypted>,
+            ownIdentityPub: String,
+        ): List<DmMsg> =
+            rawDms.mapNotNull { m ->
+                val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: return@mapNotNull null
+                val to = m.payload["to"] as? String ?: return@mapNotNull null
+                val sender = m.identityPub
+                val fromMe = sender == ownIdentityPub
+                val partner = if (fromMe) to else sender
+                val d = decryptedById[m.msgId]
+                DmMsg(
+                    msgId = m.msgId,
+                    fromMe = fromMe,
+                    createdAt = createdAt,
+                    expiresAt = (m.payload["expires_at"] as? Number)?.toDouble(),
+                    text = d?.text,
+                    blobs = d?.blobs ?: emptyList(),
+                    undecryptable = d == null,
+                    storyRef = m.payload["story_ref"] as? Map<*, *>,
+                    partner = partner)
+            }.sortedBy { it.createdAt }
+
+        // vp2: the ascending thread for one partner. extractDmMsgs already
+        // collapsed both directions onto a single `partner` per message and
+        // sorted ASC, so this is a stable filter preserving that order.
+        fun threadFor(all: List<DmMsg>, partner: String): List<DmMsg> =
+            all.filter { it.partner == partner }
+
+        // vp2: conversation summary rows (hearth node.conversations()). Group by
+        // partner (only partners WITH history appear -- friends are unioned in
+        // client-side by renderConversations, NOT added here). `last` = the
+        // newest message (the ASC list's last element); last_text/last_from_me/
+        // last_at come from it, including when it is undecryptable (text null,
+        // but from_me/created_at still populated -- matching hearth's unread
+        // semantics). count includes undecryptable rows. Sorted by last_at DESC
+        // (a null/empty last_at sorts as 0); the stable sort keeps
+        // first-appearance order among equal last_at.
+        fun conversationsFrom(
+            all: List<DmMsg>, names: Map<String, String>, ownIdentityPub: String,
+        ): List<ConvRow> {
+            val byPartner = linkedMapOf<String, MutableList<DmMsg>>()
+            for (m in all) byPartner.getOrPut(m.partner) { mutableListOf() }.add(m)
+            return byPartner.map { (partner, msgs) ->
+                val last = msgs.last()
+                ConvRow(
+                    identityPub = partner,
+                    name = names[partner] ?: partner.take(8),
+                    lastText = last.text,
+                    lastFromMe = last.fromMe,
+                    lastAt = last.createdAt,
+                    count = msgs.size)
+            }.sortedByDescending { it.lastAt ?: 0.0 }
+        }
+
+        // vp2: hearth node.conversations() row list. last_text/last_from_me/
+        // last_at are null only for an empty thread -- which never occurs here
+        // (a partner is listed only if it has >=1 message), but the null-coalesce
+        // keeps the shape faithful to hearth's field types.
+        fun conversationsJson(rows: List<ConvRow>): String {
+            val arr = JSONArray()
+            for (c in rows) arr.put(JSONObject()
+                .put("identity_pub", c.identityPub)
+                .put("name", c.name)
+                .put("last_text", c.lastText ?: JSONObject.NULL)
+                .put("last_from_me", (c.lastFromMe as Boolean?) ?: JSONObject.NULL)
+                .put("last_at", c.lastAt ?: JSONObject.NULL)
+                .put("count", c.count))
+            return arr.toString()
+        }
+
+        // vp2: hearth node.dm_thread() flat list (NOT wrapped in {messages,
+        // partner}). blobs is always an array ([] when undecryptable, never
+        // null). story_ref passes the plaintext outer-payload dict through
+        // key-for-key (or null), matching hearth's msg.payload.get("story_ref").
+        fun dmThreadJson(msgs: List<DmMsg>): String {
+            val arr = JSONArray()
+            for (m in msgs) {
+                val blobs = JSONArray(); m.blobs.forEach { blobs.put(it) }
+                val storyRef: Any = m.storyRef?.let { sr ->
+                    JSONObject().also { o -> for ((k, v) in sr) o.put(k.toString(), v ?: JSONObject.NULL) }
+                } ?: JSONObject.NULL
+                arr.put(JSONObject()
+                    .put("msg_id", m.msgId)
+                    .put("from_me", m.fromMe)
+                    .put("created_at", m.createdAt)
+                    .put("expires_at", m.expiresAt ?: JSONObject.NULL)
+                    .put("text", m.text ?: JSONObject.NULL)
+                    .put("blobs", blobs)
+                    .put("undecryptable", m.undecryptable)
+                    .put("story_ref", storyRef))
+            }
+            return arr.toString()
+        }
+
         // hearth post_blob (node.py:2956-2964) serves ONLY KIND_POST blobs
         // (`if msg.kind != KIND_POST: return None`), even though the
         // content-key wrap/decrypt machinery is shared with DMs. DecryptPass.
@@ -179,6 +381,17 @@ class LocalApi(private val ctx: Context) {
         // resolve a key via the /api/post-blob route.
         fun postKeys(feed: List<DecryptPass.Decrypted>, keys: Map<String, ByteArray>): Map<String, ByteArray> =
             feed.filter { it.kind == "post" }.mapNotNull { d -> keys[d.msgId]?.let { d.msgId to it } }.toMap()
+
+        // vp2: hearth dm_blob (node.py:2946-2954) serves ONLY KIND_DM blobs,
+        // even though the content-key machinery is shared with posts. Result.
+        // keys is keyed by msgId across BOTH kinds -- this narrows it to
+        // dm-authored keys only, so a post's msgId can never resolve a key via
+        // the dm-blob route (the reverse of postKeys' post-only narrowing).
+        // Added here (ahead of Task 3's dmBlob route) because loadDms() -- this
+        // task's own decrypt pass -- must warm dmKeysCache; the route consuming
+        // the cache is Task 3's, not this task's.
+        fun dmKeys(feed: List<DecryptPass.Decrypted>, keys: Map<String, ByteArray>): Map<String, ByteArray> =
+            feed.filter { it.kind == "dm" }.mapNotNull { d -> keys[d.msgId]?.let { d.msgId to it } }.toMap()
 
         // hearth stories_view (node.py:836-841): a story group is visible
         // only for self or a known (friended) identity -- an unfriended
