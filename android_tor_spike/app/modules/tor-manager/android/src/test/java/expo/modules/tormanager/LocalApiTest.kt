@@ -369,4 +369,21 @@ class LocalApiTest {
         assertEquals("s9", sr.getString("story_id"))
         assertEquals("ab12", sr.getString("media_hash"))
     }
+
+    // ---- slice 2 (vp2) Task 3: dm blob key filtering (kind gate) ----
+
+    @Test fun dmKeysExcludesPostKeys() {
+        val feed = listOf(
+            DecryptPass.Decrypted("post1", "post", "a", "t", 1.0, listOf("pb"), emptyList(),
+                "photo", null, null),
+            DecryptPass.Decrypted("dm1", "dm", "a", "t", 2.0, listOf("db"), emptyList(),
+                "photo", null, null))
+        val keys = mapOf("post1" to byteArrayOf(1), "dm1" to byteArrayOf(2))
+        val out = LocalApi.dmKeys(feed, keys)
+        // only the DM's key survives -- a post's msgId can never resolve a key
+        // via the dm-blob route (the kind gate, mirroring hearth's dm_blob
+        // `if msg.kind != KIND_DM: return None`).
+        assertEquals(setOf("dm1"), out.keys)
+        assertArrayEquals(byteArrayOf(2), out["dm1"])
+    }
 }

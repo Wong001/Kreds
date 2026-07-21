@@ -36,6 +36,14 @@ class LocalApi(private val ctx: Context) {
             path == "/api/stories" -> json(stories())
             path == "/api/kreds" -> json(kreds())
             path == "/api/conversations" -> json(conversations())
+            // vp2 Task 3: placed ahead of the /api/dm/ branch so the longer
+            // prefix wins clearly, though there is no actual collision --
+            // "/api/dm-blob/..." never starts with "/api/dm/" (the char after
+            // "dm" is "-", not "/"); ordering here is for readability only.
+            path.startsWith("/api/dm-blob/") -> {
+                val seg = path.removePrefix("/api/dm-blob/").split("/")
+                if (seg.size != 2 || seg[0].isEmpty() || seg[1].isEmpty()) notFound() else dmBlob(seg[0], seg[1])
+            }
             path.startsWith("/api/dm/") -> {
                 val id = path.removePrefix("/api/dm/")
                 if (id.isEmpty() || id.contains("/")) notFound() else json(dmThread(id))
@@ -194,6 +202,35 @@ class LocalApi(private val ctx: Context) {
         "Content-Type" to sniff(bytes),
         "X-Content-Type-Options" to "nosniff",
         "Cache-Control" to "private, max-age=31536000, immutable"), bytes)
+
+    // vp2: content-key-decrypted DM blob bytes ONLY, streamed decrypt-on-read.
+    // Mirrors postBlob's cache+fallback but keyed off dmKeysCache (DM-only), so
+    // a post's msgId is never decryptable here (kind gate). The response OMITS
+    // Cache-Control -- hearth's dm_blob route sets NONE (contrast post_blob/
+    // blob, which set immutable) -- so it uses dmMediaResponse, not
+    // mediaResponse (which hardcodes the immutable Cache-Control).
+    private fun dmBlob(msgId: String, hash: String): HttpResponse {
+        val store = SqliteSyncStore(ctx)
+        var key = dmKeysCache[msgId]
+        if (key == null) {
+            val fx = fixtureOrNull() ?: return notFound()
+            val (priv, _) = EncKeys.getOrCreate(store)
+            val res = DecryptPass.run(store, fx.device_pub, priv, fx.cert.identity_pub)
+            val dms = dmKeys(res.feed, res.keys)
+            dmKeysCache = dms
+            key = dms[msgId] ?: return notFound()
+        }
+        val cipher = store.getBlob(hash) ?: return notFound()
+        val plain = KotlinBlobCrypt.decryptBlob(key, cipher) ?: return notFound()
+        return dmMediaResponse(plain)
+    }
+
+    // vp2: DM blob response headers -- Content-Type (sniffed) + nosniff, and
+    // deliberately NO Cache-Control (hearth dm_blob sets none; do not reuse
+    // mediaResponse's immutable header for a DM).
+    private fun dmMediaResponse(bytes: ByteArray) = HttpResponse(200, mapOf(
+        "Content-Type" to sniff(bytes),
+        "X-Content-Type-Options" to "nosniff"), bytes)
 
     private fun notFound() = HttpResponse(404, mapOf("Content-Type" to "text/plain"), "not found".toByteArray())
 
