@@ -509,4 +509,43 @@ class LocalApiTest {
         val arr = LocalApi.wallJson(wall, emptyLayout, mapOf("A" to listOf("v1")), "own", mine = true)
         assertEquals(0, arr.length())
     }
+
+    // -- vp3 slice 3 Task 3: profileJson top-level shape + own-default record --
+
+    @Test fun profileJsonTopLevelShapeOwn() {
+        val rec = mapOf(
+            "name" to "Me", "bio" to "hi", "accent" to "#2743d6", "avatar" to null,
+            "avatar_shape" to "circle", "avatar_size" to "m", "avatar_align" to "left",
+            "banner" to null, "banner_pos" to 50,
+            "kind" to "profile", "created_at" to 1.0)                 // extra keys must NOT leak
+        val wall = JSONArray().put(JSONObject().put("msg_id", "m1"))
+        val o = JSONObject(LocalApi.profileJson(rec, "own", true, "kreds", null, wall, JSONArray()))
+        assertEquals(setOf(
+            "name", "bio", "accent", "avatar", "avatar_shape", "avatar_size",
+            "avatar_align", "banner", "banner_pos", "identity_pub", "mine",
+            "ring", "since", "wall", "journal"), o.keys().asSequence().toSet())
+        assertEquals("Me", o.getString("name"))
+        assertEquals("own", o.getString("identity_pub"))
+        assertTrue(o.getBoolean("mine"))
+        assertEquals("kreds", o.getString("ring"))
+        assertTrue(o.isNull("since"))                                 // own -> null
+        assertTrue(o.isNull("avatar"))
+        assertEquals(50, o.getInt("banner_pos"))
+        assertEquals(1, o.getJSONArray("wall").length())
+    }
+
+    @Test fun profileJsonSinceZeroForOtherAndDefaultRecord() {
+        val rec = LocalApi.defaultProfileRecord("bob01234")
+        val o = JSONObject(LocalApi.profileJson(rec, "bob", false, "kreds", 0, JSONArray(), JSONArray()))
+        assertEquals("bob01234", o.getString("name"))
+        assertFalse(o.getBoolean("mine"))
+        assertEquals(0, o.getInt("since"))                            // other -> 0
+        assertEquals("#2743d6", o.getString("accent"))
+        assertEquals("circle", o.getString("avatar_shape"))
+        assertEquals("m", o.getString("avatar_size"))
+        assertEquals("left", o.getString("avatar_align"))
+        assertTrue(o.isNull("avatar")); assertTrue(o.isNull("banner"))
+        assertEquals(50, o.getInt("banner_pos"))
+        assertEquals("", o.getString("bio"))
+    }
 }

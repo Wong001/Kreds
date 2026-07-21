@@ -35,6 +35,11 @@ class LocalApi(private val ctx: Context) {
             path == "/api/feed" -> json(feed())
             path == "/api/stories" -> json(stories())
             path == "/api/kreds" -> json(kreds())
+            path.startsWith("/api/profile/") -> {
+                val id = path.removePrefix("/api/profile/")
+                if (id.isEmpty() || id.contains("/")) notFound()
+                else profile(id)?.let { json(it) } ?: notFound()
+            }
             path == "/api/conversations" -> json(conversations())
             // vp2 Task 3: placed ahead of the /api/dm/ branch so the longer
             // prefix wins clearly, though there is no actual collision --
@@ -80,6 +85,42 @@ class LocalApi(private val ctx: Context) {
             arr.put(feedRow(d, own, responses[d.msgId]))
         }
         return arr.toString()
+    }
+
+    // vp3: the profile route body. Returns null in exactly hearth's 404 cases
+    // (node.py:1262-1265): no fixture; identity is neither own nor known; or
+    // identity is known-but-not-own with no stored profile record. A null
+    // return -> the server 404s -> app.js's openProfile try/catch degrades to
+    // fallbackProfile (it does NOT blank the page). When identity == own with
+    // no record, hearth's hardcoded default is used instead of 404ing.
+    private fun profile(identityPub: String): String? {
+        val fx = fixtureOrNull() ?: return null
+        val store = SqliteSyncStore(ctx)
+        val own = fx.cert.identity_pub
+        val isOwn = identityPub == own
+        if (!isOwn && identityPub !in store.knownIdentities()) return null
+        val names = store.profileNames()
+        val record = store.profileRecord(identityPub)
+            ?: (if (isOwn) defaultProfileRecord(names[own] ?: own.take(8)) else return null)
+        val (priv, _) = EncKeys.getOrCreate(store)
+        val res = DecryptPass.run(store, fx.device_pub, priv, own)
+        keysCache = postKeys(res.feed, res.keys)                 // warm blob cache (same as feed())
+        val responses = DecryptPass.responsesPass(store, fx.device_pub, priv, own)
+        val now = System.currentTimeMillis() / 1000.0
+        // res.feed is already newest-first; both filters preserve that order.
+        val wallPosts = res.feed.filter {
+            it.kind == "post" && it.identityPub == identityPub &&
+                it.placement == "profile" && notExpired(it.expiresAt, now)
+        }
+        val railPosts = res.feed.filter {
+            it.kind == "post" && it.identityPub == identityPub &&
+                (it.placement ?: "journal") == "journal" && notExpired(it.expiresAt, now)
+        }
+        val wall = wallJson(wallPosts, store.profileLayout(identityPub), store.albums(identityPub), own, isOwn)
+        val journal = JSONArray()
+        for (d in railPosts) journal.put(feedRow(d, own, responses[d.msgId]))
+        val since: Any? = if (isOwn) null else 0
+        return profileJson(record, identityPub, isOwn, "kreds", since, wall, journal)
     }
 
     // vp2: one decrypt pass feeding BOTH the conversations and dm-thread routes.
@@ -628,6 +669,42 @@ class LocalApi(private val ctx: Context) {
             for ((_, obj) in folded.sortedByDescending { it.first }) out.put(obj)
             return out
         }
+
+        // vp3: hearth's hardcoded own-profile default (node.py:1266-1270) used
+        // when identity == own and NO KIND_PROFILE record exists yet -- so the
+        // own profile always renders something instead of 404ing. name =
+        // profileNames[own] or own[:8] (the caller supplies the resolved name).
+        fun defaultProfileRecord(name: String): Map<String, Any?> = linkedMapOf(
+            "name" to name, "bio" to "", "accent" to "#2743d6", "avatar" to null,
+            "avatar_shape" to "circle", "avatar_size" to "m", "avatar_align" to "left",
+            "banner" to null, "banner_pos" to 50)
+
+        // vp3: the profile route's top-level JSON (node.py profile_view's
+        // return). The nine display fields come from `record` (selected BY
+        // NAME so a record's incidental kind/created_at keys never leak into
+        // the response), each with hearth's default as a fallback; then
+        // identity_pub/mine/ring/since/wall/journal. `since` is null (own) or
+        // an Int (others); pass JSONObject.NULL-safe via `since ?: NULL`.
+        fun profileJson(
+            record: Map<String, Any?>, identityPub: String, mine: Boolean,
+            ring: String, since: Any?, wall: JSONArray, journal: JSONArray,
+        ): String = JSONObject()
+            .put("name", record["name"] ?: "")
+            .put("bio", record["bio"] ?: "")
+            .put("accent", record["accent"] ?: "#2743d6")
+            .put("avatar", record["avatar"] ?: JSONObject.NULL)
+            .put("avatar_shape", record["avatar_shape"] ?: "circle")
+            .put("avatar_size", record["avatar_size"] ?: "m")
+            .put("avatar_align", record["avatar_align"] ?: "left")
+            .put("banner", record["banner"] ?: JSONObject.NULL)
+            .put("banner_pos", record["banner_pos"] ?: 50)
+            .put("identity_pub", identityPub)
+            .put("mine", mine)
+            .put("ring", ring)
+            .put("since", since ?: JSONObject.NULL)
+            .put("wall", wall)
+            .put("journal", journal)
+            .toString()
 
         fun feedRow(d: DecryptPass.Decrypted, ownIdentityPub: String, responses: KotlinResponses.Responses?): JSONObject {
             val blobs = JSONArray(); d.blobs.forEach { blobs.put(it) }
