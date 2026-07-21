@@ -100,9 +100,41 @@ functional. Avatars are deferred (feed shows names, no avatar images).
       stay visible.
 - [ ] No token/CSP/403 errors in `adb logcat` during a full scroll.
 
-### Verdict (August to fill)
+### Verdict — PASS (G20, 2026-07-21), after two on-device root-cause fixes
 
-> _(pass / partial / fail + notes — what rendered, any surprises)_
+The journal renders the desktop UI on the phone, read-only: the `kreds` chrome,
+the stories strip, the scope chips (Everyone / Inner kreds / per-friend), the
+date "space line" separators, and posts with reaction chips (❤️ 1, 😂 1) +
+comment counts — pixel-faithful to the desktop, served entirely from the
+phone's loopback server. Tor bootstrapped + synced fine under the new NDK r27.1
+(362 msgs in store). The Me/profile view degrades gracefully ("Profile
+unavailable yet.") since `/api/profile` is a later slice. Navigation works. No
+composer / no write affordances (read-only confirmed).
+
+**Two bugs found + fixed on-device (both committed):**
+
+1. **Blank journal → `/api/kreds` (`f0fd497`).** app.js's `refresh()` does
+   `KREDS = await j("/api/kreds")` (app.js:4780) *before* `renderJournal()`, and
+   `j()` throws on any non-2xx. `/api/kreds` wasn't in the slice-1 scope, so it
+   404'd and the throw aborted the whole render (feed + stories + chips) while
+   the chrome (rendered earlier) stayed. `/api/kreds` is **load-bearing** for
+   the journal, not optional — implemented it (known friends as
+   `{identity_pub, name, ring, since}`, ring/since defaulted since the phone
+   doesn't process KIND_RING yet). Feed rendered immediately after.
+
+2. **Mobile tab bar under the Android nav bar → safe-area inset (`8bf0fbe`).**
+   The WebView drew edge-to-edge, so the desktop UI's sticky mobile tab bar sat
+   under the system nav buttons (unreachable). Added `react-native-safe-area-
+   context` and inset the WebView by the bottom safe area (with a theme-matched
+   surface background). Tab bar now clears the nav bar; Circle/Journal/Me are
+   reachable.
+
+**Not exercised on-device (build + desk-tested, needs a journal media post):**
+photo/video rendering via `/api/post-blob` — the two synced journal posts are
+text-only (your photo/video posts are wall/profile placement, correctly
+filtered out of the journal feed). Posting a photo/video to the **kreds
+journal** would exercise the media path; the pipeline itself is built and
+JVM-tested.
 
 ## After the run
 
