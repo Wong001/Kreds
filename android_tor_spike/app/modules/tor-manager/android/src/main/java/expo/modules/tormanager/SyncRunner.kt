@@ -87,11 +87,39 @@ object SyncRunner {
             return SyncOutcome(ran = false, ok = false, 0, 0, 0, false, "sync already in progress")
         }
         try {
-            return runTransport(ctx, fx, onProgress)
+            // One sync DRAINS all pending blobs. hearth sends blobs
+            // smallest-first up to a ~15 MiB per-round budget and leaves the
+            // rest "for the next round" (sync.py BLOB_GIVE_BUDGET), so a
+            // profile's large banner + wall photos need several rounds. Rather
+            // than dripping one batch per 15-min background cycle (leaving big
+            // images broken for up to an hour), loop rounds back-to-back until
+            // nothing is missing, a round pulls no new blobs (the peer doesn't
+            // hold the rest), or a safety cap. In steady state missingBlobs()
+            // is empty after round 1, so this is a single round -- the extra
+            // rounds happen only when there is a real backlog to drain.
+            var last = runTransport(ctx, fx, onProgress)
+            if (!last.ran || !last.ok) return last
+            var rounds = 1
+            while (rounds < MAX_DRAIN_ROUNDS && runCatching {
+                    SqliteSyncStore(ctx).missingBlobs().isNotEmpty() }.getOrDefault(false)) {
+                val before = last.blobs
+                val next = runTransport(ctx, fx, onProgress)
+                rounds++
+                if (!next.ran || !next.ok) return last   // keep the last good outcome; next cycle retries
+                last = next
+                if (next.blobs <= before) break          // no new blobs this round -> peer holds no more
+            }
+            return last
         } finally {
             syncLock.unlock()
         }
     }
+
+    // Hard cap on blob-drain rounds per sync (see runSync). 12 rounds x the
+    // ~15 MiB per-round budget is ~180 MiB -- far beyond any profile's blob
+    // set, and the loop normally exits well before this via the missingBlobs/
+    // no-progress conditions. The cap only backstops a pathological peer.
+    private const val MAX_DRAIN_ROUNDS = 12
 
     /** The transport block, moved verbatim from `TorManagerModule.syncNow`.
      *  Every fragile step closes the Tor stream on failure: `authOnlyOverStream`
