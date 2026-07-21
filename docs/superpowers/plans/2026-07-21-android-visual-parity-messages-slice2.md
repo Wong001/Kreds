@@ -512,9 +512,11 @@ Add to `LocalApiTest.kt`:
 Run: `./gradlew :tor-manager:testDebugUnitTest --tests "expo.modules.tormanager.LocalApiTest"`
 Expected: FAIL / compile error — `LocalApi.dmKeys` is unresolved.
 
-- [ ] **Step 3: Add `dmKeys`, `dmBlob`, `dmMediaResponse`, and wire the route**
+- [ ] **Step 3: Add `dmBlob` + `dmMediaResponse`, and wire the route**
 
-In `LocalApi.kt` companion, add (place next to `postKeys`):
+**[AMENDED post-Task-2 review]: `dmKeys` and the `@Volatile dmKeysCache` field were ALREADY added in Task 2 (its `loadDms()` warms the cache, so they had to exist to compile). Do NOT re-add `dmKeys` or `dmKeysCache` — they already exist in `LocalApi.kt`. Verify they're present (the `dmKeys` companion below is shown only so you know its exact signature to consume; the `dmBlob` reader uses the existing `dmKeysCache`). Skip straight to adding `dmBlob`/`dmMediaResponse`/the route + the `dmKeysExcludesPostKeys` test.**
+
+The already-present `dmKeys` (from Task 2, for reference — do NOT re-add):
 
 ```kotlin
         // vp2: hearth dm_blob (node.py:2946-2954) serves ONLY KIND_DM blobs,
