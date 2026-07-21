@@ -1218,7 +1218,8 @@ body.readonly .comment-x,
 body.readonly .story-tile .story-ring.add,
 body.readonly #profile-cog,
 body.readonly #profile-arrange,
-body.readonly #profile-addfriend {
+body.readonly #profile-addfriend,
+body.readonly #dm-compose {
   display: none !important;
 }
 /* keep the story-add tile's label from leaving an empty column */
