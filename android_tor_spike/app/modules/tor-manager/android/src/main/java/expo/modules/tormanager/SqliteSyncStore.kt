@@ -262,10 +262,31 @@ class SqliteSyncStore(context: Context) :
     /** Read counterpart to putBlob (Task 4, B.2d) -- see the SyncStore
      *  interface doc for why a missing hash returns null rather than
      *  throwing. */
-    override fun getBlob(hash: String): ByteArray? =
-        readableDatabase.rawQuery(
-            "SELECT data FROM blobs WHERE hash = ? LIMIT 1", arrayOf(hash)
-        ).use { c -> if (c.moveToFirst()) c.getBlob(0) else null }
+    // Android's SQLite CursorWindow caps a single fetched row at ~2 MiB, so
+    // `SELECT data ...` THROWS "Row too big to fit into CursorWindow" for any
+    // blob over that size -- exactly the profile banner (2.07 MiB) and large
+    // photos (up to the 10 MiB blob cap). Read the length first, then pull the
+    // BLOB in <=1 MiB slices via SQL substr (1-indexed) so no single row ever
+    // exceeds the window, and stitch them back together.
+    override fun getBlob(hash: String): ByteArray? {
+        val db = readableDatabase
+        val len = db.rawQuery(
+            "SELECT length(data) FROM blobs WHERE hash = ? LIMIT 1", arrayOf(hash)
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else return null }
+        val out = ByteArray(len)
+        var off = 0
+        val chunk = 1024 * 1024   // 1 MiB, comfortably under the CursorWindow limit
+        while (off < len) {
+            val n = minOf(chunk, len - off)
+            val slice = db.rawQuery(
+                "SELECT substr(data, ?, ?) FROM blobs WHERE hash = ? LIMIT 1",
+                arrayOf((off + 1).toString(), n.toString(), hash)
+            ).use { c -> if (c.moveToFirst()) c.getBlob(0) else return null }
+            System.arraycopy(slice, 0, out, off, slice.size)
+            off += slice.size
+        }
+        return out
+    }
 
     override fun stats(): SyncStats {
         fun count(table: String): Int = readableDatabase.rawQuery(
