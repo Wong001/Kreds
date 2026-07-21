@@ -7,10 +7,21 @@ import java.io.File
 
 /** Read-only /api provider for the WebView shell (slice 1). Pure JSON
  *  builders live in the companion (JVM-testable); the instance methods do the
- *  Android store I/O. A fresh SqliteSyncStore(ctx) is constructed per request
- *  (the existing "new instance per op, cheap at ~253 msgs" pattern). Token is
- *  already validated by LocalWebServer before handle() runs. */
+ *  Android store I/O over a SINGLE shared SqliteSyncStore (see `sharedStore`).
+ *  Token is already validated by LocalWebServer before handle() runs. */
 class LocalApi(private val ctx: Context) {
+
+    // ONE store for every request. SqliteSyncStore is a SQLiteOpenHelper --
+    // designed to be a long-lived singleton whose internal connection pool
+    // serves concurrent reads. Constructing a fresh one per request (the old
+    // pattern) leaked a SQLiteConnection each time ("SQLiteConnection ... was
+    // leaked!"); a profile wall fires ~20 concurrent /api/post-blob requests,
+    // so the pool got exhausted mid-burst and later (larger, lower-in-the-wall)
+    // images failed to serve -- their requests threw before responding, so
+    // they showed broken with no server-side trace. A shared helper is both
+    // the leak fix and the correct SQLiteOpenHelper usage. Lazy + thread-safe:
+    // first request opens it, all others reuse it.
+    private val sharedStore: SqliteSyncStore by lazy { SqliteSyncStore(ctx) }
 
     // vp1: msgId -> content key, populated by the /api/feed decrypt pass and
     // reused by /api/post-blob so an image request does NOT re-run a full
@@ -67,7 +78,7 @@ class LocalApi(private val ctx: Context) {
 
     private fun feed(): String {
         val fx = fixtureOrNull() ?: return "[]"
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val (priv, _) = EncKeys.getOrCreate(store)
         val own = fx.cert.identity_pub
         val res = DecryptPass.run(store, fx.device_pub, priv, own)
@@ -95,7 +106,7 @@ class LocalApi(private val ctx: Context) {
     // no record, hearth's hardcoded default is used instead of 404ing.
     private fun profile(identityPub: String): String? {
         val fx = fixtureOrNull() ?: return null
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val own = fx.cert.identity_pub
         val isOwn = identityPub == own
         if (!isOwn && identityPub !in store.knownIdentities()) return null
@@ -139,7 +150,7 @@ class LocalApi(private val ctx: Context) {
 
     private fun loadDms(): DmLoad? {
         val fx = fixtureOrNull() ?: return null
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val (priv, _) = EncKeys.getOrCreate(store)
         val own = fx.cert.identity_pub
         val res = DecryptPass.run(store, fx.device_pub, priv, own)
@@ -162,7 +173,7 @@ class LocalApi(private val ctx: Context) {
 
     private fun state(): String {
         val fx = fixtureOrNull()
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val names = store.profileNames()
         val own = fx?.cert?.identity_pub ?: ""
         val friends = store.knownIdentities().filter { it != own }.map { it to (names[it] ?: it.take(8)) }
@@ -188,7 +199,7 @@ class LocalApi(private val ctx: Context) {
     // slice; the default is enough to render the journal + a flat chip bar.
     private fun kreds(): String {
         val fx = fixtureOrNull()
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val names = store.profileNames()
         val own = fx?.cert?.identity_pub ?: ""
         val friends = store.knownIdentities().filter { it != own }.map { it to (names[it] ?: it.take(8)) }
@@ -201,7 +212,7 @@ class LocalApi(private val ctx: Context) {
     // exists in the store.
     private fun stories(): String {
         val fx = fixtureOrNull()
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val own = fx?.cert?.identity_pub ?: ""
         val now = System.currentTimeMillis() / 1000.0
         val visible = filterVisibleStories(store.activeStories(now), own, store.knownIdentities().toSet())
@@ -211,7 +222,7 @@ class LocalApi(private val ctx: Context) {
     // /api/blob/{h}: raw plaintext-at-rest bytes (avatars/plaintext content),
     // NO content-key decrypt -- mirrors getStoryImage's decrypt-skipping path.
     private fun blob(hash: String): HttpResponse {
-        val data = SqliteSyncStore(ctx).getBlob(hash) ?: return notFound()
+        val data = sharedStore.getBlob(hash) ?: return notFound()
         return mediaResponse(data)
     }
 
@@ -227,7 +238,7 @@ class LocalApi(private val ctx: Context) {
     // decodes it (it never has our keys; we hand it already-decrypted
     // plaintext), matching desktop exactly.
     private fun postBlob(msgId: String, hash: String): HttpResponse {
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         // vp1: use the cache warmed by /api/feed; only fall back to a full
         // DecryptPass.run if this blob's key isn't cached yet (first paint before
         // any feed(), or a key that aged out).
@@ -257,7 +268,7 @@ class LocalApi(private val ctx: Context) {
     // blob, which set immutable) -- so it uses dmMediaResponse, not
     // mediaResponse (which hardcodes the immutable Cache-Control).
     private fun dmBlob(msgId: String, hash: String): HttpResponse {
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         var key = dmKeysCache[msgId]
         if (key == null) {
             val fx = fixtureOrNull() ?: return notFound()

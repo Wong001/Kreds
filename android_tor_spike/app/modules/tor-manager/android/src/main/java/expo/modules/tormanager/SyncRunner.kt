@@ -100,8 +100,8 @@ object SyncRunner {
             var last = runTransport(ctx, fx, onProgress)
             if (!last.ran || !last.ok) return last
             var rounds = 1
-            while (rounds < MAX_DRAIN_ROUNDS && runCatching {
-                    SqliteSyncStore(ctx).missingBlobs().isNotEmpty() }.getOrDefault(false)) {
+            while (rounds < MAX_DRAIN_ROUNDS &&
+                    runCatching { anyBlobsMissing(ctx) }.getOrDefault(false)) {
                 val before = last.blobs
                 val next = runTransport(ctx, fx, onProgress)
                 rounds++
@@ -120,6 +120,14 @@ object SyncRunner {
     // set, and the loop normally exits well before this via the missingBlobs/
     // no-progress conditions. The cap only backstops a pathological peer.
     private const val MAX_DRAIN_ROUNDS = 12
+
+    // Drain-gate helper: open a throwaway store JUST to check whether any blobs
+    // are still missing, and CLOSE it (SQLiteOpenHelper leaks its connection
+    // otherwise -- the same leak class the LocalApi shared-store fix addresses).
+    private fun anyBlobsMissing(ctx: Context): Boolean {
+        val s = SqliteSyncStore(ctx)
+        return try { s.missingBlobs().isNotEmpty() } finally { s.close() }
+    }
 
     /** The transport block, moved verbatim from `TorManagerModule.syncNow`.
      *  Every fragile step closes the Tor stream on failure: `authOnlyOverStream`
@@ -187,12 +195,19 @@ object SyncRunner {
                 prepareEncKeyOutbound(fx, store)
             } catch (e: Exception) {
                 stream.close()
+                store.close()   // SQLiteOpenHelper leaks its connection if not closed
                 return SyncOutcome(true, false, 0, 0, 0, false, "enckey: ${e.message}")
             }
 
-            return mapSyncResult(
+            // Close the round's store once its result is mapped -- each drain
+            // round opens a fresh one, and an unclosed SQLiteOpenHelper leaks a
+            // SQLiteConnection (the leak class the LocalApi shared-store fix
+            // addresses). mapSyncResult reads store.stats() first, so map before close.
+            val outcome = mapSyncResult(
                 KotlinSync.run(stream, store, fx.device_pub, prep.outbound, onProgress),
                 prep, store)
+            store.close()
+            return outcome
         } catch (e: Exception) {
             return SyncOutcome(true, false, 0, 0, 0, false, "io: ${e.message}")
         }
