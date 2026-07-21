@@ -119,6 +119,12 @@ class LocalApi(private val ctx: Context) {
         val wall = wallJson(wallPosts, store.profileLayout(identityPub), store.albums(identityPub), own, isOwn)
         val journal = JSONArray()
         for (d in railPosts) journal.put(feedRow(d, own, responses[d.msgId]))
+        // vp3: ring/since are a DELIBERATE dashboard simplification (same as the
+        // kreds() route): the phone doesn't process KIND_RING yet, so a friend's
+        // ring is hardcoded "kreds" and since is 0 (falsy -> app.js omits the
+        // "since <month year>" line). Own profile is exact (hearth also uses
+        // ("kreds", None) for self). Real ring membership needs new rings()/
+        // ring_since() SyncStore accessors -- a later slice (report ticket T3).
         val since: Any? = if (isOwn) null else 0
         return profileJson(record, identityPub, isOwn, "kreds", since, wall, journal)
     }
