@@ -7,10 +7,21 @@ import java.io.File
 
 /** Read-only /api provider for the WebView shell (slice 1). Pure JSON
  *  builders live in the companion (JVM-testable); the instance methods do the
- *  Android store I/O. A fresh SqliteSyncStore(ctx) is constructed per request
- *  (the existing "new instance per op, cheap at ~253 msgs" pattern). Token is
- *  already validated by LocalWebServer before handle() runs. */
+ *  Android store I/O over a SINGLE shared SqliteSyncStore (see `sharedStore`).
+ *  Token is already validated by LocalWebServer before handle() runs. */
 class LocalApi(private val ctx: Context) {
+
+    // ONE store for every request. SqliteSyncStore is a SQLiteOpenHelper --
+    // designed to be a long-lived singleton whose internal connection pool
+    // serves concurrent reads. Constructing a fresh one per request (the old
+    // pattern) leaked a SQLiteConnection each time ("SQLiteConnection ... was
+    // leaked!"); a profile wall fires ~20 concurrent /api/post-blob requests,
+    // so the pool got exhausted mid-burst and later (larger, lower-in-the-wall)
+    // images failed to serve -- their requests threw before responding, so
+    // they showed broken with no server-side trace. A shared helper is both
+    // the leak fix and the correct SQLiteOpenHelper usage. Lazy + thread-safe:
+    // first request opens it, all others reuse it.
+    private val sharedStore: SqliteSyncStore by lazy { SqliteSyncStore(ctx) }
 
     // vp1: msgId -> content key, populated by the /api/feed decrypt pass and
     // reused by /api/post-blob so an image request does NOT re-run a full
@@ -35,6 +46,11 @@ class LocalApi(private val ctx: Context) {
             path == "/api/feed" -> json(feed())
             path == "/api/stories" -> json(stories())
             path == "/api/kreds" -> json(kreds())
+            path.startsWith("/api/profile/") -> {
+                val id = path.removePrefix("/api/profile/")
+                if (id.isEmpty() || id.contains("/")) notFound()
+                else profile(id)?.let { json(it) } ?: notFound()
+            }
             path == "/api/conversations" -> json(conversations())
             // vp2 Task 3: placed ahead of the /api/dm/ branch so the longer
             // prefix wins clearly, though there is no actual collision --
@@ -62,7 +78,7 @@ class LocalApi(private val ctx: Context) {
 
     private fun feed(): String {
         val fx = fixtureOrNull() ?: return "[]"
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val (priv, _) = EncKeys.getOrCreate(store)
         val own = fx.cert.identity_pub
         val res = DecryptPass.run(store, fx.device_pub, priv, own)
@@ -82,6 +98,48 @@ class LocalApi(private val ctx: Context) {
         return arr.toString()
     }
 
+    // vp3: the profile route body. Returns null in exactly hearth's 404 cases
+    // (node.py:1262-1265): no fixture; identity is neither own nor known; or
+    // identity is known-but-not-own with no stored profile record. A null
+    // return -> the server 404s -> app.js's openProfile try/catch degrades to
+    // fallbackProfile (it does NOT blank the page). When identity == own with
+    // no record, hearth's hardcoded default is used instead of 404ing.
+    private fun profile(identityPub: String): String? {
+        val fx = fixtureOrNull() ?: return null
+        val store = sharedStore
+        val own = fx.cert.identity_pub
+        val isOwn = identityPub == own
+        if (!isOwn && identityPub !in store.knownIdentities()) return null
+        val names = store.profileNames()
+        val record = store.profileRecord(identityPub)
+            ?: (if (isOwn) defaultProfileRecord(names[own] ?: own.take(8)) else return null)
+        val (priv, _) = EncKeys.getOrCreate(store)
+        val res = DecryptPass.run(store, fx.device_pub, priv, own)
+        keysCache = postKeys(res.feed, res.keys)                 // warm blob cache (same as feed())
+        val responses = DecryptPass.responsesPass(store, fx.device_pub, priv, own)
+        val now = System.currentTimeMillis() / 1000.0
+        // res.feed is already newest-first; both filters preserve that order.
+        val wallPosts = res.feed.filter {
+            it.kind == "post" && it.identityPub == identityPub &&
+                it.placement == "profile" && notExpired(it.expiresAt, now)
+        }
+        val railPosts = res.feed.filter {
+            it.kind == "post" && it.identityPub == identityPub &&
+                (it.placement ?: "journal") == "journal" && notExpired(it.expiresAt, now)
+        }
+        val wall = wallJson(wallPosts, store.profileLayout(identityPub), store.albums(identityPub), own, isOwn)
+        val journal = JSONArray()
+        for (d in railPosts) journal.put(feedRow(d, own, responses[d.msgId]))
+        // vp3: ring/since are a DELIBERATE dashboard simplification (same as the
+        // kreds() route): the phone doesn't process KIND_RING yet, so a friend's
+        // ring is hardcoded "kreds" and since is 0 (falsy -> app.js omits the
+        // "since <month year>" line). Own profile is exact (hearth also uses
+        // ("kreds", None) for self). Real ring membership needs new rings()/
+        // ring_since() SyncStore accessors -- a later slice (report ticket T3).
+        val since: Any? = if (isOwn) null else 0
+        return profileJson(record, identityPub, isOwn, "kreds", since, wall, journal)
+    }
+
     // vp2: one decrypt pass feeding BOTH the conversations and dm-thread routes.
     // Warms dmKeysCache. Returns null only when the fixture is missing (the
     // routes then serve an empty list, keeping the load-bearing 2xx contract:
@@ -92,7 +150,7 @@ class LocalApi(private val ctx: Context) {
 
     private fun loadDms(): DmLoad? {
         val fx = fixtureOrNull() ?: return null
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val (priv, _) = EncKeys.getOrCreate(store)
         val own = fx.cert.identity_pub
         val res = DecryptPass.run(store, fx.device_pub, priv, own)
@@ -115,7 +173,7 @@ class LocalApi(private val ctx: Context) {
 
     private fun state(): String {
         val fx = fixtureOrNull()
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val names = store.profileNames()
         val own = fx?.cert?.identity_pub ?: ""
         val friends = store.knownIdentities().filter { it != own }.map { it to (names[it] ?: it.take(8)) }
@@ -141,7 +199,7 @@ class LocalApi(private val ctx: Context) {
     // slice; the default is enough to render the journal + a flat chip bar.
     private fun kreds(): String {
         val fx = fixtureOrNull()
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val names = store.profileNames()
         val own = fx?.cert?.identity_pub ?: ""
         val friends = store.knownIdentities().filter { it != own }.map { it to (names[it] ?: it.take(8)) }
@@ -154,7 +212,7 @@ class LocalApi(private val ctx: Context) {
     // exists in the store.
     private fun stories(): String {
         val fx = fixtureOrNull()
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         val own = fx?.cert?.identity_pub ?: ""
         val now = System.currentTimeMillis() / 1000.0
         val visible = filterVisibleStories(store.activeStories(now), own, store.knownIdentities().toSet())
@@ -164,7 +222,7 @@ class LocalApi(private val ctx: Context) {
     // /api/blob/{h}: raw plaintext-at-rest bytes (avatars/plaintext content),
     // NO content-key decrypt -- mirrors getStoryImage's decrypt-skipping path.
     private fun blob(hash: String): HttpResponse {
-        val data = SqliteSyncStore(ctx).getBlob(hash) ?: return notFound()
+        val data = sharedStore.getBlob(hash) ?: return notFound()
         return mediaResponse(data)
     }
 
@@ -180,7 +238,7 @@ class LocalApi(private val ctx: Context) {
     // decodes it (it never has our keys; we hand it already-decrypted
     // plaintext), matching desktop exactly.
     private fun postBlob(msgId: String, hash: String): HttpResponse {
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         // vp1: use the cache warmed by /api/feed; only fall back to a full
         // DecryptPass.run if this blob's key isn't cached yet (first paint before
         // any feed(), or a key that aged out).
@@ -210,7 +268,7 @@ class LocalApi(private val ctx: Context) {
     // blob, which set immutable) -- so it uses dmMediaResponse, not
     // mediaResponse (which hardcodes the immutable Cache-Control).
     private fun dmBlob(msgId: String, hash: String): HttpResponse {
-        val store = SqliteSyncStore(ctx)
+        val store = sharedStore
         var key = dmKeysCache[msgId]
         if (key == null) {
             val fx = fixtureOrNull() ?: return notFound()
@@ -495,6 +553,175 @@ class LocalApi(private val ctx: Context) {
         // Exactly-equal-to-now is treated as expired (`<=`, not `<`), matching
         // hearth's own boundary.
         fun notExpired(expiresAt: Double?, now: Double): Boolean = expiresAt == null || expiresAt > now
+
+        // vp3: text_style defaults = each TEXT_STYLE_ENUMS tuple's first value
+        // (messages.py:30-37) plus color="default" (node.py profile_view sets
+        // it separately). A pure-text wall block's text_style is these defaults
+        // merged with the layout's per-block override (layout.texts[msgId]).
+        val TEXT_STYLE_DEFAULTS = linkedMapOf(
+            "h" to "left", "v" to "top", "size" to "auto",
+            "font" to "sans", "weight" to "normal", "style" to "normal",
+            "color" to "default")
+
+        // vp3: a plain Kotlin map -> JSONObject (null values -> JSON null).
+        fun mapToJson(m: Map<String, Any?>): JSONObject {
+            val o = JSONObject()
+            for ((k, v) in m) o.put(k, v ?: JSONObject.NULL)
+            return o
+        }
+
+        // vp3: port of hearth _fold_album_members (node.py:1178-1195). For each
+        // album_id in SORTED order, the first album to claim a member keeps it
+        // (Python setdefault) -- so the smallest album_id wins a member that two
+        // albums list. An explicit `!in` check (not Map.putIfAbsent, which is
+        // API 24+) keeps this min-SDK-safe. Returns member msgId -> album_id.
+        fun foldAlbumMembers(albums: Map<String, List<String>>): Map<String, String> {
+            val memberOf = linkedMapOf<String, String>()
+            for (aid in albums.keys.sorted())
+                for (mid in albums[aid] ?: emptyList())
+                    if (mid !in memberOf) memberOf[mid] = aid
+            return memberOf
+        }
+
+        // vp3: port of hearth profile_view's _default_span (node.py:1272-1279).
+        // size = sizes[msgId] or "full"; small -> 1x1; wide -> 2x2; full ->
+        // 4x2 when the post has media (blobs non-empty OR media=="video"),
+        // else 4x1.
+        fun defaultSpan(d: DecryptPass.Decrypted, sizes: Map<String, String>): JSONObject {
+            val size = sizes[d.msgId] ?: "full"
+            if (size == "small") return JSONObject().put("w", 1).put("h", 1)
+            if (size == "wide") return JSONObject().put("w", 2).put("h", 2)
+            val hasMedia = d.blobs.isNotEmpty() || d.media == "video"
+            return if (hasMedia) JSONObject().put("w", 4).put("h", 2)
+                   else JSONObject().put("w", 4).put("h", 1)
+        }
+
+        // vp3: a post wall-block = the feedRow shape + pin/span/text_style
+        // (node.py profile_view's per-post annotation loop). responses is null
+        // on wall rows (renderBlock never reads it). pin = layout.pins[msgId]
+        // or null; span = (pin ? {pin.w,pin.h} : layout.spans[msgId] ?:
+        // defaultSpan); text_style only on pure-text blocks (no blobs, not
+        // video), defaults merged with layout.texts[msgId].
+        fun wallBlockJson(d: DecryptPass.Decrypted, ownIdentityPub: String, layout: ProfileLayout): JSONObject {
+            val o = feedRow(d, ownIdentityPub, null)
+            val pin = layout.pins[d.msgId]
+            o.put("pin", if (pin != null) mapToJson(pin) else JSONObject.NULL)
+            val span: JSONObject = when {
+                pin != null -> JSONObject().put("w", pin["w"]).put("h", pin["h"])
+                layout.spans[d.msgId] != null -> mapToJson(layout.spans[d.msgId]!!)
+                else -> defaultSpan(d, layout.sizes)
+            }
+            o.put("span", span)
+            if (d.blobs.isEmpty() && d.media != "video") {
+                val ts = JSONObject()
+                for ((k, v) in TEXT_STYLE_DEFAULTS) ts.put(k, v)
+                layout.texts[d.msgId]?.let { for ((k, v) in it) ts.put(k, v ?: JSONObject.NULL) }
+                o.put("text_style", ts)
+            }
+            return o
+        }
+
+        // vp3: an album pseudo-block (node.py profile_view's album-fold append)
+        // -- a REDUCED shape, NOT the post fields. count = photos.length().
+        fun albumBlockJson(
+            albumId: String, mine: Boolean, photos: JSONArray, createdAt: Double,
+            scopeNewest: String, pin: Map<String, Any?>?, span: JSONObject,
+        ): JSONObject = JSONObject()
+            .put("album", true)
+            .put("msg_id", albumId)
+            .put("mine", mine)
+            .put("photos", photos)
+            .put("count", photos.length())
+            .put("created_at", createdAt)
+            .put("scope_newest", scopeNewest)
+            .put("pin", if (pin != null) mapToJson(pin) else JSONObject.NULL)
+            .put("span", span)
+
+        // vp3: the whole wall list, reproducing node.py profile_view's
+        // annotate-then-album-fold. `wall` is this identity's placement==
+        // "profile" posts, ALREADY newest-first. Posts whose msgId is an album
+        // member are removed; each album with >=1 photo becomes an album-block
+        // (photos = {m,h,t} per member's blobs, video members skipped;
+        // created_at = newest member's; scope_newest = newest member's scope;
+        // span defaults to 2x2). The folded list is re-sorted created_at DESC
+        // (stable -> ties keep wall order).
+        fun wallJson(
+            wall: List<DecryptPass.Decrypted>, layout: ProfileLayout,
+            albums: Map<String, List<String>>, ownIdentityPub: String, mine: Boolean,
+        ): JSONArray {
+            val byId = wall.associateBy { it.msgId }
+            val memberOf = foldAlbumMembers(albums)
+            val folded = mutableListOf<Pair<Double, JSONObject>>()
+            for (d in wall)
+                if (d.msgId !in memberOf)
+                    folded.add(d.createdAt to wallBlockJson(d, ownIdentityPub, layout))
+            for (aid in albums.keys.sorted()) {
+                val photos = JSONArray()
+                var newest: Double? = null
+                var scopeNewest = "kreds"
+                for (mid in albums[aid] ?: emptyList()) {
+                    val p = byId[mid] ?: continue
+                    if (memberOf[mid] != aid) continue
+                    if (p.media == "video") continue
+                    for ((i, h) in p.blobs.withIndex())
+                        photos.put(JSONObject().put("m", mid).put("h", h)
+                            .put("t", p.thumbs.getOrNull(i) ?: JSONObject.NULL))
+                    val cur = newest
+                    if (cur == null || p.createdAt > cur) {
+                        newest = p.createdAt
+                        scopeNewest = p.scope ?: "kreds"
+                    }
+                }
+                if (photos.length() == 0) continue
+                val at = newest ?: continue
+                val pin = layout.pins[aid]
+                val span: JSONObject = when {
+                    pin != null -> JSONObject().put("w", pin["w"]).put("h", pin["h"])
+                    layout.spans[aid] != null -> mapToJson(layout.spans[aid]!!)
+                    else -> JSONObject().put("w", 2).put("h", 2)
+                }
+                folded.add(at to albumBlockJson(aid, mine, photos, at, scopeNewest, pin, span))
+            }
+            val out = JSONArray()
+            for ((_, obj) in folded.sortedByDescending { it.first }) out.put(obj)
+            return out
+        }
+
+        // vp3: hearth's hardcoded own-profile default (node.py:1266-1270) used
+        // when identity == own and NO KIND_PROFILE record exists yet -- so the
+        // own profile always renders something instead of 404ing. name =
+        // profileNames[own] or own[:8] (the caller supplies the resolved name).
+        fun defaultProfileRecord(name: String): Map<String, Any?> = linkedMapOf(
+            "name" to name, "bio" to "", "accent" to "#2743d6", "avatar" to null,
+            "avatar_shape" to "circle", "avatar_size" to "m", "avatar_align" to "left",
+            "banner" to null, "banner_pos" to 50)
+
+        // vp3: the profile route's top-level JSON (node.py profile_view's
+        // return). The nine display fields come from `record` (selected BY
+        // NAME so a record's incidental kind/created_at keys never leak into
+        // the response), each with hearth's default as a fallback; then
+        // identity_pub/mine/ring/since/wall/journal. `since` is null (own) or
+        // an Int (others); pass JSONObject.NULL-safe via `since ?: NULL`.
+        fun profileJson(
+            record: Map<String, Any?>, identityPub: String, mine: Boolean,
+            ring: String, since: Any?, wall: JSONArray, journal: JSONArray,
+        ): String = JSONObject()
+            .put("name", record["name"] ?: "")
+            .put("bio", record["bio"] ?: "")
+            .put("accent", record["accent"] ?: "#2743d6")
+            .put("avatar", record["avatar"] ?: JSONObject.NULL)
+            .put("avatar_shape", record["avatar_shape"] ?: "circle")
+            .put("avatar_size", record["avatar_size"] ?: "m")
+            .put("avatar_align", record["avatar_align"] ?: "left")
+            .put("banner", record["banner"] ?: JSONObject.NULL)
+            .put("banner_pos", record["banner_pos"] ?: 50)
+            .put("identity_pub", identityPub)
+            .put("mine", mine)
+            .put("ring", ring)
+            .put("since", since ?: JSONObject.NULL)
+            .put("wall", wall)
+            .put("journal", journal)
+            .toString()
 
         fun feedRow(d: DecryptPass.Decrypted, ownIdentityPub: String, responses: KotlinResponses.Responses?): JSONObject {
             val blobs = JSONArray(); d.blobs.forEach { blobs.put(it) }

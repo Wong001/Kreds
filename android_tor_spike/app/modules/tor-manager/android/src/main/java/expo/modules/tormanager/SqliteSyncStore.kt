@@ -203,12 +203,13 @@ class SqliteSyncStore(context: Context) :
         }.toString()
     }
 
-    /** Blob hashes referenced by stored POST/DM/STORY payloads, minus what
-     *  we hold. Mirrors InMemorySyncStore.missingBlobs (hearth.store.
+    /** Blob hashes referenced by stored POST/DM/STORY/PROFILE payloads, minus
+     *  what we hold. Mirrors InMemorySyncStore.missingBlobs (hearth.store.
      *  referenced_blobs for the KIND_POST/KIND_DM fields -- blobs list +
      *  poster str + thumbs list, junk-guarded to strings), WIDENED (B.2d-3
-     *  Task 1) to also scan `story` rows, but reads the refs back out of
-     *  the stored msg_json instead of an in-memory SignedMessage.
+     *  Task 1) to also scan `story` rows and (vp3 profile-blob fix) `profile`
+     *  rows for avatar/banner, but reads the refs back out of the stored
+     *  msg_json instead of an in-memory SignedMessage.
      *
      *  `kind` is selected alongside `msg_json` so the `media` extraction
      *  below can be guarded per-row: a story's `media` is a blob hash, but
@@ -221,7 +222,7 @@ class SqliteSyncStore(context: Context) :
     override fun missingBlobs(): List<String> {
         val refs = linkedSetOf<String>()
         readableDatabase.rawQuery(
-            "SELECT kind, msg_json FROM messages WHERE kind IN ('post', 'dm', 'story')", null
+            "SELECT kind, msg_json FROM messages WHERE kind IN ('post', 'dm', 'story', 'profile')", null
         ).use { c ->
             while (c.moveToNext()) {
                 val kind = c.getString(0)
@@ -235,6 +236,13 @@ class SqliteSyncStore(context: Context) :
                 }
                 if (kind == "story")
                     (payload.opt("media") as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
+                // vp3 profile-blob fix: a KIND_PROFILE's avatar/banner are
+                // blob-hash references (hearth referenced_blobs scans
+                // KIND_PROFILE for exactly these); without this the profile
+                // header images never sync and render broken.
+                if (kind == "profile")
+                    for (f in listOf("avatar", "banner"))
+                        (payload.opt(f) as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
             }
         }
         val held = mutableSetOf<String>()
@@ -254,10 +262,31 @@ class SqliteSyncStore(context: Context) :
     /** Read counterpart to putBlob (Task 4, B.2d) -- see the SyncStore
      *  interface doc for why a missing hash returns null rather than
      *  throwing. */
-    override fun getBlob(hash: String): ByteArray? =
-        readableDatabase.rawQuery(
-            "SELECT data FROM blobs WHERE hash = ? LIMIT 1", arrayOf(hash)
-        ).use { c -> if (c.moveToFirst()) c.getBlob(0) else null }
+    // Android's SQLite CursorWindow caps a single fetched row at ~2 MiB, so
+    // `SELECT data ...` THROWS "Row too big to fit into CursorWindow" for any
+    // blob over that size -- exactly the profile banner (2.07 MiB) and large
+    // photos (up to the 10 MiB blob cap). Read the length first, then pull the
+    // BLOB in <=1 MiB slices via SQL substr (1-indexed) so no single row ever
+    // exceeds the window, and stitch them back together.
+    override fun getBlob(hash: String): ByteArray? {
+        val db = readableDatabase
+        val len = db.rawQuery(
+            "SELECT length(data) FROM blobs WHERE hash = ? LIMIT 1", arrayOf(hash)
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else return null }
+        val out = ByteArray(len)
+        var off = 0
+        val chunk = 1024 * 1024   // 1 MiB, comfortably under the CursorWindow limit
+        while (off < len) {
+            val n = minOf(chunk, len - off)
+            val slice = db.rawQuery(
+                "SELECT substr(data, ?, ?) FROM blobs WHERE hash = ? LIMIT 1",
+                arrayOf((off + 1).toString(), n.toString(), hash)
+            ).use { c -> if (c.moveToFirst()) c.getBlob(0) else return null }
+            System.arraycopy(slice, 0, out, off, slice.size)
+            off += slice.size
+        }
+        return out
+    }
 
     override fun stats(): SyncStats {
         fun count(table: String): Int = readableDatabase.rawQuery(
@@ -485,5 +514,76 @@ class SqliteSyncStore(context: Context) :
             }
         }
         return out.sortedByDescending { it.createdAt }
+    }
+
+    /** See the SyncStore interface doc: latest KIND_PROFILE payload by
+     *  (created_at, seq). Reads msg_json + the real `seq` column the same way
+     *  profileNames() above does; identity_pub is filtered in SQL. */
+    override fun profileRecord(identityPub: String): Map<String, Any?>? {
+        data class Cand(val createdAt: Double, val seq: Int, val payload: Map<String, Any?>)
+        var best: Cand? = null
+        readableDatabase.rawQuery(
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("profile", identityPub)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val seq = c.getInt(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
+                val createdAt = payload.optDouble("created_at", 0.0)
+                val cur = best
+                if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
+                    best = Cand(createdAt, seq, jsonToMap(payload))
+            }
+        }
+        return best?.payload
+    }
+
+    /** Latest KIND_PROFILE_LAYOUT by (created_at, seq), reduced to
+     *  pins/spans/sizes/texts (order/grids dropped). Empty maps when none. */
+    override fun profileLayout(identityPub: String): ProfileLayout {
+        data class Cand(val createdAt: Double, val seq: Int, val payload: Map<String, Any?>)
+        var best: Cand? = null
+        readableDatabase.rawQuery(
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("profile_layout", identityPub)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val seq = c.getInt(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
+                val createdAt = payload.optDouble("created_at", 0.0)
+                val cur = best
+                if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
+                    best = Cand(createdAt, seq, jsonToMap(payload))
+            }
+        }
+        val p = best?.payload ?: return ProfileLayout(emptyMap(), emptyMap(), emptyMap(), emptyMap())
+        return ProfileLayout(
+            pins = layoutSubMaps(p["pins"]), spans = layoutSubMaps(p["spans"]),
+            sizes = layoutSizes(p["sizes"]), texts = layoutSubMaps(p["texts"]))
+    }
+
+    /** album_id -> members for `identityPub`, latest-wins PER album_id by
+     *  (created_at, seq). Same per-key newest fold pattern as wrapGrantsFor,
+     *  keyed by album_id. */
+    override fun albums(identityPub: String): Map<String, List<String>> {
+        data class Cand(val createdAt: Double, val seq: Int, val members: List<String>)
+        val best = linkedMapOf<String, Cand>()
+        readableDatabase.rawQuery(
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("album", identityPub)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val seq = c.getInt(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
+                val albumId = payload.opt("album_id") as? String ?: continue
+                val membersArr = payload.optJSONArray("members") ?: continue
+                val members = (0 until membersArr.length()).mapNotNull { membersArr.opt(it) as? String }
+                val createdAt = payload.optDouble("created_at", 0.0)
+                val cur = best[albumId]
+                if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
+                    best[albumId] = Cand(createdAt, seq, members)
+            }
+        }
+        return best.mapValues { it.value.members }
     }
 }

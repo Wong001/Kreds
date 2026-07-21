@@ -3,6 +3,7 @@ package expo.modules.tormanager
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.MessageDigest
@@ -191,6 +192,35 @@ class SyncStoreTest {
         assertFalse("field-shape trap: post's media discriminator must not appear", missing.contains("video"))
     }
 
+    @Test fun missingBlobsIncludesProfileAvatarAndBannerNotNulls() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val avatar = "a1".repeat(32)
+        val banner = "b2".repeat(32)
+        val postBlob = "cc".repeat(32)
+        // A KIND_PROFILE's avatar/banner are blob-hash references (hearth
+        // referenced_blobs scans KIND_PROFILE for exactly these), so the phone
+        // must request them or the profile header images render broken.
+        val profile = msg(1, mapOf(
+            "kind" to "profile", "name" to "Me", "bio" to "b",
+            "avatar" to avatar, "banner" to banner, "avatar_shape" to "circle",
+            "avatar_size" to "m", "avatar_align" to "left", "banner_pos" to 50, "created_at" to 1.0))
+        // A KIND_PROFILE with NO avatar/banner (nulls) must add no bogus refs.
+        val bare = msg(2, mapOf(
+            "kind" to "profile", "name" to "You", "bio" to "",
+            "avatar" to null, "banner" to null, "created_at" to 2.0))
+        val post = msg(3, mapOf("kind" to "post", "text" to "p", "blobs" to listOf(postBlob)))
+        assertTrue(s.ingestMessage(profile))
+        assertTrue(s.ingestMessage(bare))
+        assertTrue(s.ingestMessage(post))
+
+        val missing = s.missingBlobs()
+        assertTrue("profile avatar missing", missing.contains(avatar))
+        assertTrue("profile banner missing", missing.contains(banner))
+        assertTrue("regression: post blobs still tracked", missing.contains(postBlob))
+        assertEquals("null avatar/banner add no bogus refs", 3, missing.size)
+    }
+
     // -- B.2d-4 Task 2: deviceViews (the device-binding source for
     //    KotlinResponses' responder attribution) --
 
@@ -210,5 +240,72 @@ class SyncStoreTest {
         // we hold no messages for returns an empty set (the caller's predicate
         // then permits, matching _device_bound's `if not views: return True`).
         assertTrue(s.deviceViews("ff".repeat(32)).isEmpty())
+    }
+
+    // -- vp3 slice 3 Task 1: profileRecord / profileLayout / albums (plaintext) --
+
+    @Test fun profileRecordLatestWinsAndReadsPlaintextFields() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        s.ingestMessage(msg(1, mapOf(
+            "kind" to "profile", "name" to "Old", "bio" to "b0", "accent" to "#111111",
+            "avatar" to null, "avatar_shape" to "circle", "avatar_size" to "m",
+            "avatar_align" to "left", "banner" to null, "banner_pos" to 50, "created_at" to 100.0)))
+        s.ingestMessage(msg(2, mapOf(
+            "kind" to "profile", "name" to "New", "bio" to "b1", "accent" to "#2743d6",
+            "avatar" to "aa".repeat(32), "avatar_shape" to "squircle", "avatar_size" to "l",
+            "avatar_align" to "center", "banner" to "bb".repeat(32), "banner_pos" to 30,
+            "created_at" to 200.0)))
+        val rec = s.profileRecord(idPub)!!
+        assertEquals("New", rec["name"])                 // newer created_at wins
+        assertEquals("b1", rec["bio"])
+        assertEquals("squircle", rec["avatar_shape"])
+        assertEquals("bb".repeat(32), rec["banner"])
+        assertEquals(30, (rec["banner_pos"] as Number).toInt())
+        assertNull("unknown identity -> null (drives hearth's 404)", s.profileRecord("ff".repeat(32)))
+    }
+
+    @Test fun profileRecordSameCreatedAtHigherSeqWins() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        s.ingestMessage(msg(1, mapOf("kind" to "profile", "name" to "A", "created_at" to 100.0)))
+        s.ingestMessage(msg(2, mapOf("kind" to "profile", "name" to "B", "created_at" to 100.0)))
+        assertEquals("B", s.profileRecord(idPub)!!["name"])   // seq tie-break
+    }
+
+    @Test fun profileLayoutLatestWinsWithPinsSpansSizesTexts() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        s.ingestMessage(msg(1, mapOf(
+            "kind" to "profile_layout",
+            "pins" to mapOf("m1" to mapOf("x" to 0, "y" to 0, "w" to 2, "h" to 2)),
+            "spans" to mapOf("m2" to mapOf("w" to 1, "h" to 1)),
+            "sizes" to mapOf("m3" to "wide"),
+            "texts" to mapOf("m4" to mapOf("h" to "center", "size" to "l")),
+            "order" to emptyList<String>(), "grids" to emptyMap<String, Any?>(),
+            "created_at" to 100.0)))
+        val layout = s.profileLayout(idPub)
+        assertEquals(2, (layout.pins["m1"]?.get("w") as Number).toInt())
+        assertEquals(1, (layout.spans["m2"]?.get("h") as Number).toInt())
+        assertEquals("wide", layout.sizes["m3"])
+        assertEquals("center", layout.texts["m4"]?.get("h"))
+        val empty = s.profileLayout("ff".repeat(32))     // never null; empty maps
+        assertTrue(empty.pins.isEmpty() && empty.spans.isEmpty() &&
+            empty.sizes.isEmpty() && empty.texts.isEmpty())
+    }
+
+    @Test fun albumsLatestWinsPerAlbumId() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        s.ingestMessage(msg(1, mapOf("kind" to "album", "album_id" to "A",
+            "members" to listOf("m1", "m2"), "created_at" to 100.0)))
+        s.ingestMessage(msg(2, mapOf("kind" to "album", "album_id" to "A",
+            "members" to listOf("m1", "m2", "m3"), "created_at" to 200.0)))   // newer A
+        s.ingestMessage(msg(3, mapOf("kind" to "album", "album_id" to "B",
+            "members" to listOf("m9"), "created_at" to 150.0)))
+        val albums = s.albums(idPub)
+        assertEquals(listOf("m1", "m2", "m3"), albums["A"])   // newest A wins, per-album
+        assertEquals(listOf("m9"), albums["B"])               // B unaffected by A's re-publish
+        assertTrue(s.albums("ff".repeat(32)).isEmpty())
     }
 }

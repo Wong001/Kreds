@@ -2160,6 +2160,7 @@ function renderWall(p) {
   if (!p.wall.length) flow.append(el("div", "hint",
     p.mine ? "Your profile is a blank canvas - post something above." : "Nothing here yet."));
   measureWallCell();
+  fitWallText();
   if (p.mine && unpinned.length) {
     const who = p.identity_pub;   // snapshot: whose wall this migration was fired for
     fetch("/api/wall-autoplace", {method: "POST"}).then(async (r) => {
@@ -2191,6 +2192,36 @@ function measureWallCell() {
   document.documentElement.style.setProperty("--cell", cell.toFixed(2) + "px");
 }
 window.addEventListener("resize", measureWallCell);
+
+// Auto-fit wall text to its block. The .block-text-* CSS font sizes are
+// tuned for desktop-sized cells, but the wall keeps 4 columns on every
+// viewport (locked density), so on a phone the square cells (--cell) are
+// much smaller and a longer text block overflows .block's overflow:hidden
+// and gets clipped ("cut off"). Shrink each text body's font-size until it
+// fits its block, down to a 9px floor. This ONLY ever shrinks -- a block
+// whose text already fits (the common desktop case) is left untouched, so
+// desktop rendering is unchanged except where it was already clipping.
+// Runs after measureWallCell (needs the final --cell-driven block heights)
+// and on resize/orientation change.
+function fitWallText() {
+  const wraps = document.querySelectorAll(
+    "#profile-wall .block-text-wrap, #profile-wall-flow .block-text-wrap");
+  for (const wrap of wraps) {
+    const block = wrap.closest(".block");
+    if (block && block.classList.contains("has-deck")) continue;  // deck clamps text to 0
+    const body = wrap.querySelector(".block-text-body");
+    if (!body) continue;
+    body.style.fontSize = "";   // reset to the CSS-class size, then shrink to fit
+    if (wrap.scrollHeight <= wrap.clientHeight) continue;   // already fits: leave the class size
+    let size = parseFloat(getComputedStyle(body).fontSize) || 15;
+    let guard = 60;   // hard cap on iterations (size - floor is well under this)
+    while (size > 9 && wrap.scrollHeight > wrap.clientHeight && guard-- > 0) {
+      size -= 1;
+      body.style.fontSize = size + "px";
+    }
+  }
+}
+window.addEventListener("resize", fitWallText);
 
 function renderProfilePage(p) {
   // IMPORTANT-3 (whole-branch review): a re-render of the SAME person (heal,
@@ -2271,7 +2302,7 @@ function renderProfilePage(p) {
     meta.append(ring);
     const msg = el("button", "btn-accent", "Message");
     msg.onclick = () => { goView("messages"); openThread(p.identity_pub, p.name); };
-    const move = el("button", "", p.ring === "inner" ? "Move to kreds" : "Move to inner kreds");
+    const move = el("button", "ring-move", p.ring === "inner" ? "Move to kreds" : "Move to inner kreds");
     move.onclick = async () => {
       const next = p.ring === "inner" ? "kreds" : "inner";
       await j("/api/ring", {method: "POST", headers: {"Content-Type": "application/json"},

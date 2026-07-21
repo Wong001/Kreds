@@ -87,10 +87,46 @@ object SyncRunner {
             return SyncOutcome(ran = false, ok = false, 0, 0, 0, false, "sync already in progress")
         }
         try {
-            return runTransport(ctx, fx, onProgress)
+            // One sync DRAINS all pending blobs. hearth sends blobs
+            // smallest-first up to a ~15 MiB per-round budget and leaves the
+            // rest "for the next round" (sync.py BLOB_GIVE_BUDGET), so a
+            // profile's large banner + wall photos need several rounds. Rather
+            // than dripping one batch per 15-min background cycle (leaving big
+            // images broken for up to an hour), loop rounds back-to-back until
+            // nothing is missing, a round pulls no new blobs (the peer doesn't
+            // hold the rest), or a safety cap. In steady state missingBlobs()
+            // is empty after round 1, so this is a single round -- the extra
+            // rounds happen only when there is a real backlog to drain.
+            var last = runTransport(ctx, fx, onProgress)
+            if (!last.ran || !last.ok) return last
+            var rounds = 1
+            while (rounds < MAX_DRAIN_ROUNDS &&
+                    runCatching { anyBlobsMissing(ctx) }.getOrDefault(false)) {
+                val before = last.blobs
+                val next = runTransport(ctx, fx, onProgress)
+                rounds++
+                if (!next.ran || !next.ok) return last   // keep the last good outcome; next cycle retries
+                last = next
+                if (next.blobs <= before) break          // no new blobs this round -> peer holds no more
+            }
+            return last
         } finally {
             syncLock.unlock()
         }
+    }
+
+    // Hard cap on blob-drain rounds per sync (see runSync). 12 rounds x the
+    // ~15 MiB per-round budget is ~180 MiB -- far beyond any profile's blob
+    // set, and the loop normally exits well before this via the missingBlobs/
+    // no-progress conditions. The cap only backstops a pathological peer.
+    private const val MAX_DRAIN_ROUNDS = 12
+
+    // Drain-gate helper: open a throwaway store JUST to check whether any blobs
+    // are still missing, and CLOSE it (SQLiteOpenHelper leaks its connection
+    // otherwise -- the same leak class the LocalApi shared-store fix addresses).
+    private fun anyBlobsMissing(ctx: Context): Boolean {
+        val s = SqliteSyncStore(ctx)
+        return try { s.missingBlobs().isNotEmpty() } finally { s.close() }
     }
 
     /** The transport block, moved verbatim from `TorManagerModule.syncNow`.
@@ -159,12 +195,19 @@ object SyncRunner {
                 prepareEncKeyOutbound(fx, store)
             } catch (e: Exception) {
                 stream.close()
+                store.close()   // SQLiteOpenHelper leaks its connection if not closed
                 return SyncOutcome(true, false, 0, 0, 0, false, "enckey: ${e.message}")
             }
 
-            return mapSyncResult(
+            // Close the round's store once its result is mapped -- each drain
+            // round opens a fresh one, and an unclosed SQLiteOpenHelper leaks a
+            // SQLiteConnection (the leak class the LocalApi shared-store fix
+            // addresses). mapSyncResult reads store.stats() first, so map before close.
+            val outcome = mapSyncResult(
                 KotlinSync.run(stream, store, fx.device_pub, prep.outbound, onProgress),
                 prep, store)
+            store.close()
+            return outcome
         } catch (e: Exception) {
             return SyncOutcome(true, false, 0, 0, 0, false, "io: ${e.message}")
         }

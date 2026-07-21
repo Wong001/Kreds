@@ -25,6 +25,50 @@ data class StoredStory(
     val msgId: String, val author: String, val mediaKind: String,
     val media: String, val poster: String?, val caption: String, val createdAt: Double)
 
+/** Latest-wins profile-layout view (vp3 slice 3): the subset of a
+ *  KIND_PROFILE_LAYOUT payload the wall renderer actually consumes.
+ *  order/grids are intentionally dropped (legacy, unused by rendering).
+ *  Empty maps (not null) when the identity has never published a layout,
+ *  so wall assembly can always index without a null guard. pins/spans/texts
+ *  are msgId -> a sub-map (pins: {x,y,w,h}; spans: {w,h}; texts: a subset of
+ *  {h,v,size,font,weight,style,color}); sizes is msgId -> "small"|"wide"|"full". */
+data class ProfileLayout(
+    val pins: Map<String, Map<String, Any?>>,
+    val spans: Map<String, Map<String, Any?>>,
+    val sizes: Map<String, String>,
+    val texts: Map<String, Map<String, Any?>>)
+
+/** Parse a layout payload's pins/spans/texts field (a JSON object of
+ *  msgId -> sub-object) into a plain Kotlin map, dropping any entry whose
+ *  key isn't a String or whose value isn't itself a map. Shared by both
+ *  store impls (module-`internal` so SqliteSyncStore, a separate file, can
+ *  use it); both feed it already-plain Kotlin maps (InMemory: native
+ *  payloads; SQLite: jsonToMap output), so a plain `as?` cast is enough. */
+@Suppress("UNCHECKED_CAST")
+internal fun layoutSubMaps(v: Any?): Map<String, Map<String, Any?>> {
+    val m = v as? Map<*, *> ?: return emptyMap()
+    val out = linkedMapOf<String, Map<String, Any?>>()
+    for ((k, sub) in m) {
+        val key = k as? String ?: continue
+        val subMap = sub as? Map<String, Any?> ?: continue
+        out[key] = subMap
+    }
+    return out
+}
+
+/** Parse a layout payload's `sizes` field (msgId -> "small"|"wide"|"full")
+ *  into a plain String map, dropping non-String keys/values. */
+internal fun layoutSizes(v: Any?): Map<String, String> {
+    val m = v as? Map<*, *> ?: return emptyMap()
+    val out = linkedMapOf<String, String>()
+    for ((k, sv) in m) {
+        val key = k as? String ?: continue
+        val value = sv as? String ?: continue
+        out[key] = value
+    }
+    return out
+}
+
 interface SyncStore {
     fun summary(): Map<String, Map<String, Map<String, Any>>>
     fun knownIdentities(): List<String>
@@ -158,6 +202,25 @@ interface SyncStore {
      *  desktop's job; this accessor only decides what the phone SHOWS.
      *  Stories are plaintext (see StoredStory's doc) -- no decrypt step. */
     fun activeStories(nowSeconds: Double): List<StoredStory>
+    /** The latest (by created_at, then seq) KIND_PROFILE payload for
+     *  `identityPub`, or null if none is stored. PLAINTEXT: hearth's
+     *  make_profile signs a plain dict with no wraps/body_ct (messages.py:
+     *  104-115), so this is a JSON read, no decrypt -- same provenance basis
+     *  as profileNames (a message can only ever claim its own author's
+     *  profile). The whole payload is returned (incl. kind/created_at); the
+     *  caller selects the display fields it wants. A null return is what
+     *  drives the profile route's 404 for an unknown/record-less identity. */
+    fun profileRecord(identityPub: String): Map<String, Any?>?
+    /** The latest (by created_at, then seq) KIND_PROFILE_LAYOUT for
+     *  `identityPub`, reduced to the pins/spans/sizes/texts the wall renderer
+     *  uses (order/grids dropped). Empty maps (never null) when never
+     *  published. PLAINTEXT (make_profile_layout signs a plain dict). */
+    fun profileLayout(identityPub: String): ProfileLayout
+    /** album_id -> member msgIds for `identityPub`, latest-wins PER album_id
+     *  (by created_at, then seq -- the same per-key newest fold wrapGrantsFor
+     *  uses, keyed by album_id here). Empty map when none. PLAINTEXT
+     *  (make_album signs a plain dict). */
+    fun albums(identityPub: String): Map<String, List<String>>
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -202,10 +265,11 @@ class InMemorySyncStore : SyncStore {
         return true
     }
 
-    /** Blob hashes referenced by stored POST/DM/STORY payloads, minus what
-     *  we hold. Mirrors hearth.store.referenced_blobs for the KIND_POST/
+    /** Blob hashes referenced by stored POST/DM/STORY/PROFILE payloads, minus
+     *  what we hold. Mirrors hearth.store.referenced_blobs for the KIND_POST/
      *  KIND_DM fields (blobs list + poster str + thumbs list), junk-guarded
-     *  to strings, WIDENED (B.2d-3 Task 1) to also scan `story` rows.
+     *  to strings, WIDENED (B.2d-3 Task 1) to also scan `story` rows and
+     *  (vp3 profile-blob fix) `profile` rows.
      *
      *  The `poster` extraction below is already generic across kinds, so
      *  adding "story" to the scanned kinds makes a story's poster flow
@@ -213,16 +277,23 @@ class InMemorySyncStore : SyncStore {
      *  ONLY: a story's `media` is a blob hash (single hex64 string), but a
      *  POST's `media` is the "photo"/"video" DISCRIMINATOR -- extracting it
      *  unconditionally would add the literal string "photo"/"video" to
-     *  missingBlobs as a bogus hash (the field-shape trap). */
+     *  missingBlobs as a bogus hash (the field-shape trap). Likewise
+     *  `avatar`/`banner` are guarded to `kind=="profile"` -- a KIND_PROFILE's
+     *  avatar/banner are blob-hash references (hearth referenced_blobs scans
+     *  KIND_PROFILE for exactly these), and without this the profile header
+     *  images are never requested during sync so they render broken. */
     override fun missingBlobs(): List<String> {
         val refs = linkedSetOf<String>()
         for (m in messages.values) {
-            if (m.kind != "post" && m.kind != "dm" && m.kind != "story") continue
+            if (m.kind != "post" && m.kind != "dm" && m.kind != "story" && m.kind != "profile") continue
             (m.payload["blobs"] as? List<*>)?.forEach { if (it is String) refs.add(it) }
             (m.payload["poster"] as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
             (m.payload["thumbs"] as? List<*>)?.forEach { if (it is String) refs.add(it) }
             if (m.kind == "story")
                 (m.payload["media"] as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
+            if (m.kind == "profile")
+                for (f in listOf("avatar", "banner"))
+                    (m.payload[f] as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
         }
         return refs.filter { it !in blobs }
     }
@@ -304,5 +375,49 @@ class InMemorySyncStore : SyncStore {
                 caption = (m.payload["caption"] as? String) ?: "", createdAt = createdAt))
         }
         return out.sortedByDescending { it.createdAt }
+    }
+
+    override fun profileRecord(identityPub: String): Map<String, Any?>? {
+        data class Cand(val createdAt: Double, val seq: Int, val payload: Map<String, Any?>)
+        var best: Cand? = null
+        for (m in messages.values) {
+            if (m.kind != "profile" || m.cert.identity_pub != identityPub) continue
+            val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: 0.0
+            val cur = best
+            if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && m.seq > cur.seq))
+                best = Cand(createdAt, m.seq, m.payload)
+        }
+        return best?.payload
+    }
+
+    override fun profileLayout(identityPub: String): ProfileLayout {
+        data class Cand(val createdAt: Double, val seq: Int, val payload: Map<String, Any?>)
+        var best: Cand? = null
+        for (m in messages.values) {
+            if (m.kind != "profile_layout" || m.cert.identity_pub != identityPub) continue
+            val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: 0.0
+            val cur = best
+            if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && m.seq > cur.seq))
+                best = Cand(createdAt, m.seq, m.payload)
+        }
+        val p = best?.payload ?: return ProfileLayout(emptyMap(), emptyMap(), emptyMap(), emptyMap())
+        return ProfileLayout(
+            pins = layoutSubMaps(p["pins"]), spans = layoutSubMaps(p["spans"]),
+            sizes = layoutSizes(p["sizes"]), texts = layoutSubMaps(p["texts"]))
+    }
+
+    override fun albums(identityPub: String): Map<String, List<String>> {
+        data class Cand(val createdAt: Double, val seq: Int, val members: List<String>)
+        val best = linkedMapOf<String, Cand>()
+        for (m in messages.values) {
+            if (m.kind != "album" || m.cert.identity_pub != identityPub) continue
+            val albumId = m.payload["album_id"] as? String ?: continue
+            val members = (m.payload["members"] as? List<*>)?.mapNotNull { it as? String } ?: continue
+            val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: 0.0
+            val cur = best[albumId]
+            if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && m.seq > cur.seq))
+                best[albumId] = Cand(createdAt, m.seq, members)
+        }
+        return best.mapValues { it.value.members }
     }
 }
