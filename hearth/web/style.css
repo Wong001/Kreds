@@ -1204,10 +1204,9 @@ body.lb-open { overflow: hidden; }   /* lock background scroll behind the lightb
 /* vp1: read-only mirror. Hides the write affordances reachable in the
    journal (feed) view and the self-profile chrome doors, while keeping
    read content (reaction count chips, comments, posts) fully visible.
-   Desktop never sets body.readonly, so this is inert there. Friend-profile
-   controls (Unfriend, ring-move) aren't covered yet - those views aren't
-   reachable until slice 3 wires /api/profile; that's a slice-3 follow-up,
-   not an oversight here. */
+   Desktop never sets body.readonly, so this is inert there. vp3 closed the
+   gap: friend-profile controls (Unfriend, ring-move) now hidden under
+   body.readonly. */
 body.readonly .composer,
 body.readonly .comment-composer,
 body.readonly .rx-open,
@@ -1219,7 +1218,9 @@ body.readonly .story-tile .story-ring.add,
 body.readonly #profile-cog,
 body.readonly #profile-arrange,
 body.readonly #profile-addfriend,
-body.readonly #dm-compose {
+body.readonly #dm-compose,
+body.readonly #profile-actions .ring-move,
+body.readonly #profile-actions .btn-danger {
   display: none !important;
 }
 /* keep the story-add tile's label from leaving an empty column */

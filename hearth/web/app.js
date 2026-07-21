@@ -2271,7 +2271,7 @@ function renderProfilePage(p) {
     meta.append(ring);
     const msg = el("button", "btn-accent", "Message");
     msg.onclick = () => { goView("messages"); openThread(p.identity_pub, p.name); };
-    const move = el("button", "", p.ring === "inner" ? "Move to kreds" : "Move to inner kreds");
+    const move = el("button", "ring-move", p.ring === "inner" ? "Move to kreds" : "Move to inner kreds");
     move.onclick = async () => {
       const next = p.ring === "inner" ? "kreds" : "inner";
       await j("/api/ring", {method: "POST", headers: {"Content-Type": "application/json"},

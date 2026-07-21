@@ -21,6 +21,8 @@ const HIDDEN_SELECTORS = [
   "#profile-arrange",
   "#profile-addfriend",
   "#dm-compose",            // vp2: the DM composer bar (Photo + textarea + Send)
+  "#profile-actions .ring-move",   // vp3: friend-profile ring-move (POST write)
+  "#profile-actions .btn-danger",  // vp3: friend-profile Unfriend (POST write), scoped
 ];
 
 // The subset where a dropped `display: none` (not just a dropped selector)
@@ -85,5 +87,10 @@ describe("vp1 read-only seam", () => {
   it("index.html mobile tab bar has a Messages entry (vp2)", () => {
     const html = web("index.html");
     expect(html).toMatch(/<button[^>]*data-tab=["']messages["'][^>]*>/);
+  });
+
+  it("app.js gives the friend-profile move button a ring-move class (vp3)", () => {
+    const js = web("app.js");
+    expect(js).toMatch(/el\(\s*["']button["']\s*,\s*["']ring-move["']/);
   });
 });
