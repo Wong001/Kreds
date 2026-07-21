@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, StyleSheet, Text, View, useColorScheme } from "react-native";
+import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import { bootstrap, startNode, syncNow, getWebUrl } from "./modules/tor-manager";
 
@@ -7,8 +8,16 @@ import { bootstrap, startNode, syncNow, getWebUrl } from "./modules/tor-manager"
  *  server. For slice 1 this component also owns the engine bootstrap (Tor +
  *  node) so a fresh launch has content to render; background sync (Brick C)
  *  keeps it current. The WebView loads getWebUrl() -- the one-time-token URL --
- *  with cookies enabled so app.js's same-origin /api fetches authenticate. */
-export default function WebShell() {
+ *  with cookies enabled so app.js's same-origin /api fetches authenticate.
+ *
+ *  The WebView is inset by the bottom safe area (useSafeAreaInsets) so the
+ *  desktop UI's sticky mobile tab bar sits ABOVE the Android system navigation
+ *  bar instead of underneath it. The inset area is painted the web UI's
+ *  --surface colour (light/dark) so it reads as an extension of the tab bar. */
+function Shell() {
+  const insets = useSafeAreaInsets();
+  const scheme = useColorScheme();
+  const surface = scheme === "dark" ? "#1C1E20" : "#FFFFFF";
   const [uri, setUri] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -35,18 +44,28 @@ export default function WebShell() {
   if (!uri) return (<View style={styles.center}><ActivityIndicator size="large" /></View>);
 
   return (
-    <WebView
-      source={{ uri }}
-      style={styles.web}
-      originWhitelist={["http://127.0.0.1*"]}
-      sharedCookiesEnabled
-      thirdPartyCookiesEnabled
-      javaScriptEnabled
-      domStorageEnabled
-      mediaPlaybackRequiresUserAction={false}
-      allowsInlineMediaPlayback
-      onShouldStartLoadWithRequest={(req) => req.url.startsWith("http://127.0.0.1")}
-    />
+    <View style={{ flex: 1, paddingBottom: insets.bottom, backgroundColor: surface }}>
+      <WebView
+        source={{ uri }}
+        style={styles.web}
+        originWhitelist={["http://127.0.0.1*"]}
+        sharedCookiesEnabled
+        thirdPartyCookiesEnabled
+        javaScriptEnabled
+        domStorageEnabled
+        mediaPlaybackRequiresUserAction={false}
+        allowsInlineMediaPlayback
+        onShouldStartLoadWithRequest={(req) => req.url.startsWith("http://127.0.0.1")}
+      />
+    </View>
+  );
+}
+
+export default function WebShell() {
+  return (
+    <SafeAreaProvider>
+      <Shell />
+    </SafeAreaProvider>
   );
 }
 
