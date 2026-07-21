@@ -468,6 +468,31 @@ class SqliteSyncStore(context: Context) :
         return best.mapValues { it.value.name }
     }
 
+    /** See the SyncStore interface doc: device_pub -> enc_pub over
+     *  `identityPub`'s KIND_ENCKEY messages, latest-wins per device by
+     *  (created_at, seq). Reads msg_json + the real `device_pub`/`seq`
+     *  columns the same way profileNames() above does; identity_pub and
+     *  kind are filtered in SQL. */
+    override fun enckeys(identityPub: String): Map<String, String> {
+        data class Cand(val createdAt: Double, val seq: Int, val encPub: String)
+        val best = linkedMapOf<String, Cand>()
+        readableDatabase.rawQuery(
+            "SELECT device_pub, seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("enckey", identityPub)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val dev = c.getString(0); val seq = c.getInt(1)
+                val payload = JSONObject(c.getString(2)).optJSONObject("payload") ?: continue
+                val enc = payload.opt("enc_pub") as? String ?: continue
+                val ca = (payload.opt("created_at") as? Number)?.toDouble() ?: continue
+                val cur = best[dev]
+                if (cur == null || ca > cur.createdAt || (ca == cur.createdAt && seq > cur.seq))
+                    best[dev] = Cand(ca, seq, enc)
+            }
+        }
+        return best.mapValues { it.value.encPub }
+    }
+
     /** Distinct device_pubs of `identity`'s stored (verified-at-ingest)
      *  messages (B.2d-4 Task 2) -- the SQLite mirror of InMemorySyncStore.
      *  deviceViews and of hearth's store.load_views; see the SyncStore

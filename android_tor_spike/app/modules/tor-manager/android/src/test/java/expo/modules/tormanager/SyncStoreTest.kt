@@ -308,4 +308,23 @@ class SyncStoreTest {
         assertEquals(listOf("m9"), albums["B"])               // B unaffected by A's re-publish
         assertTrue(s.albums("ff".repeat(32)).isEmpty())
     }
+
+    // -- outbound Task 1: enckeys (recipient device resolution) --
+
+    @Test fun enckeysLatestWinsPerDeviceOverEnckeyMessages() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        // msg() signs with device priv 0x22.. -> a single device_pub for idPub.
+        // Two enckey messages from that device: newer created_at wins.
+        assertTrue(s.ingestMessage(msg(1, mapOf(
+            "kind" to "enckey", "enc_pub" to "aa".repeat(32), "created_at" to 100.0))))
+        assertTrue(s.ingestMessage(msg(2, mapOf(
+            "kind" to "enckey", "enc_pub" to "bb".repeat(32), "created_at" to 200.0))))
+        val dvPub = KotlinWire.toHex(
+            org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(
+                KotlinWire.fromHex("22".repeat(32)), 0).generatePublicKey().encoded)
+        val ks = s.enckeys(idPub)
+        assertEquals(mapOf(dvPub to "bb".repeat(32)), ks)                 // latest enc_pub
+        assertTrue("unknown identity -> empty", s.enckeys("ff".repeat(32)).isEmpty())
+    }
 }

@@ -172,6 +172,11 @@ interface SyncStore {
      *  gated the same is_known+signature checks every stored message
      *  already passes at ingest). */
     fun profileNames(): Map<String, String>
+    /** device_pub -> enc_pub over this identity's KIND_ENCKEY messages,
+     *  latest-wins per device by (created_at, seq). Mirrors hearth
+     *  store.enckeys, EXCEPT it cannot exclude revoked devices (the Kotlin
+     *  store models no revocations) -- a documented outbound limitation. */
+    fun enckeys(identityPub: String): Map<String, String>
     /** The set of device_pubs this store has ever held a (verified-at-ingest)
      *  message from, for `identity` (B.2d-4 Task 2). Mirrors hearth's
      *  `store.load_views(identity_pub)` used by node._device_bound: hearth
@@ -352,6 +357,21 @@ class InMemorySyncStore : SyncStore {
                 best[m.cert.identity_pub] = Candidate(createdAt, m.seq, name)
         }
         return best.mapValues { it.value.name }
+    }
+
+    override fun enckeys(identityPub: String): Map<String, String> {
+        data class Cand(val createdAt: Double, val seq: Int, val encPub: String)
+        val best = linkedMapOf<String, Cand>()
+        for (m in messages.values) {
+            if (m.kind != "enckey" || m.cert.identity_pub != identityPub) continue
+            val enc = m.payload["enc_pub"] as? String ?: continue
+            val ca = (m.payload["created_at"] as? Number)?.toDouble() ?: continue
+            val dev = m.cert.device_pub
+            val cur = best[dev]
+            if (cur == null || ca > cur.createdAt || (ca == cur.createdAt && m.seq > cur.seq))
+                best[dev] = Cand(ca, m.seq, enc)
+        }
+        return best.mapValues { it.value.encPub }
     }
 
     override fun deviceViews(identity: String): Set<String> =
