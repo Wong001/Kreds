@@ -486,4 +486,75 @@ class SqliteSyncStore(context: Context) :
         }
         return out.sortedByDescending { it.createdAt }
     }
+
+    /** See the SyncStore interface doc: latest KIND_PROFILE payload by
+     *  (created_at, seq). Reads msg_json + the real `seq` column the same way
+     *  profileNames() above does; identity_pub is filtered in SQL. */
+    override fun profileRecord(identityPub: String): Map<String, Any?>? {
+        data class Cand(val createdAt: Double, val seq: Int, val payload: Map<String, Any?>)
+        var best: Cand? = null
+        readableDatabase.rawQuery(
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("profile", identityPub)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val seq = c.getInt(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
+                val createdAt = payload.optDouble("created_at", 0.0)
+                val cur = best
+                if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
+                    best = Cand(createdAt, seq, jsonToMap(payload))
+            }
+        }
+        return best?.payload
+    }
+
+    /** Latest KIND_PROFILE_LAYOUT by (created_at, seq), reduced to
+     *  pins/spans/sizes/texts (order/grids dropped). Empty maps when none. */
+    override fun profileLayout(identityPub: String): ProfileLayout {
+        data class Cand(val createdAt: Double, val seq: Int, val payload: Map<String, Any?>)
+        var best: Cand? = null
+        readableDatabase.rawQuery(
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("profile_layout", identityPub)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val seq = c.getInt(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
+                val createdAt = payload.optDouble("created_at", 0.0)
+                val cur = best
+                if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
+                    best = Cand(createdAt, seq, jsonToMap(payload))
+            }
+        }
+        val p = best?.payload ?: return ProfileLayout(emptyMap(), emptyMap(), emptyMap(), emptyMap())
+        return ProfileLayout(
+            pins = layoutSubMaps(p["pins"]), spans = layoutSubMaps(p["spans"]),
+            sizes = layoutSizes(p["sizes"]), texts = layoutSubMaps(p["texts"]))
+    }
+
+    /** album_id -> members for `identityPub`, latest-wins PER album_id by
+     *  (created_at, seq). Same per-key newest fold pattern as wrapGrantsFor,
+     *  keyed by album_id. */
+    override fun albums(identityPub: String): Map<String, List<String>> {
+        data class Cand(val createdAt: Double, val seq: Int, val members: List<String>)
+        val best = linkedMapOf<String, Cand>()
+        readableDatabase.rawQuery(
+            "SELECT seq, msg_json FROM messages WHERE kind = ? AND identity_pub = ?",
+            arrayOf("album", identityPub)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val seq = c.getInt(0)
+                val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
+                val albumId = payload.opt("album_id") as? String ?: continue
+                val membersArr = payload.optJSONArray("members") ?: continue
+                val members = (0 until membersArr.length()).mapNotNull { membersArr.opt(it) as? String }
+                val createdAt = payload.optDouble("created_at", 0.0)
+                val cur = best[albumId]
+                if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
+                    best[albumId] = Cand(createdAt, seq, members)
+            }
+        }
+        return best.mapValues { it.value.members }
+    }
 }
