@@ -47,10 +47,15 @@ class LocalApi(private val ctx: Context) {
         val res = DecryptPass.run(store, fx.device_pub, priv, own)
         keysCache = postKeys(res.feed, res.keys)                // vp1: warm the blob-key cache, POSTS ONLY
         val responses = DecryptPass.responsesPass(store, fx.device_pub, priv, own)
+        val now = System.currentTimeMillis() / 1000.0
         val arr = JSONArray()
         for (d in res.feed) {                                  // already newest-first
             if (d.kind != "post") continue                     // journal feed = posts only
             if ((d.placement ?: "journal") != "journal") continue
+            // hearth _decrypt_post_row (node.py:1594-1598) drops an expired
+            // post before it ever reaches the client -- an expired journal
+            // post must never render on the phone either.
+            if (!notExpired(d.expiresAt, now)) continue
             arr.put(feedRow(d, own, responses[d.msgId]))
         }
         return arr.toString()
@@ -239,6 +244,13 @@ class LocalApi(private val ctx: Context) {
                 .put("readonly", true)
                 .toString()
         }
+
+        // hearth _decrypt_post_row (node.py:1594-1598): `if p.get("expires_at")
+        // is not None and p["expires_at"] <= now: return None` -- keep a post
+        // iff it has no expiry, or its expiry is strictly in the future.
+        // Exactly-equal-to-now is treated as expired (`<=`, not `<`), matching
+        // hearth's own boundary.
+        fun notExpired(expiresAt: Double?, now: Double): Boolean = expiresAt == null || expiresAt > now
 
         fun feedRow(d: DecryptPass.Decrypted, ownIdentityPub: String, responses: KotlinResponses.Responses?): JSONObject {
             val blobs = JSONArray(); d.blobs.forEach { blobs.put(it) }

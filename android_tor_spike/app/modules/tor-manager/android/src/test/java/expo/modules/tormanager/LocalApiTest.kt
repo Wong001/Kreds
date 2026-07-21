@@ -89,6 +89,19 @@ class LocalApiTest {
         assertFalse(c.getBoolean("alias"))
     }
 
+    @Test fun notExpiredMatchesHearthBoundary() {
+        // hearth _decrypt_post_row (node.py:1594-1598): drop a post iff
+        // expires_at is present AND <= now. So keep iff no expiry, or expiry
+        // is strictly in the future; exactly-equal-to-now is EXPIRED (`<=`,
+        // not `<`). feed() itself is instance/on-device (needs a real store +
+        // fixture); this pure helper is the JVM-testable unit it delegates to.
+        val now = 1784568399.5
+        assertTrue("no expiry -> never expires", LocalApi.notExpired(null, now))
+        assertTrue("future expiry -> not yet expired", LocalApi.notExpired(now + 100.0, now))
+        assertFalse("past expiry -> expired", LocalApi.notExpired(now - 100.0, now))
+        assertFalse("exactly == now -> expired (hearth's <=, not <)", LocalApi.notExpired(now, now))
+    }
+
     @Test fun bootstrapStubShape() {
         val o = JSONObject(LocalApi.bootstrapJson())
         assertTrue(o.getBoolean("initialized"))
