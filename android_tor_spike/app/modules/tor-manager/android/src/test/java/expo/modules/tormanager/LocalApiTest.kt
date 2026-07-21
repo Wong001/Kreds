@@ -224,4 +224,91 @@ class LocalApiTest {
         val visible = LocalApi.filterVisibleStories(stories, own = "own", known = setOf("known"))
         assertEquals(setOf("s1", "s2"), visible.map { it.msgId }.toSet())
     }
+
+    // ---- slice 2 (vp2) Task 1: pure DM grouping ----
+
+    // A raw stored DM: sender=identityPub, payload carries plaintext outer
+    // fields (to / created_at / expires_at / story_ref) present regardless of
+    // whether THIS device can decrypt the body.
+    private fun rawDm(
+        msgId: String, sender: String, to: String, createdAt: Double,
+        expiresAt: Double? = null, storyRef: Map<String, Any?>? = null,
+    ): StoredMsg {
+        val p = HashMap<String, Any?>()
+        p["to"] = to; p["created_at"] = createdAt
+        if (expiresAt != null) p["expires_at"] = expiresAt
+        if (storyRef != null) p["story_ref"] = storyRef
+        return StoredMsg(msgId, "dm", sender, p)
+    }
+
+    // A decrypted-join entry for a DM (only msgId/kind/text/blobs are read by
+    // the grouping join; the rest are incidental constructor args).
+    private fun decDm(msgId: String, text: String, blobs: List<String> = emptyList()) =
+        DecryptPass.Decrypted(
+            msgId = msgId, kind = "dm", author = "x", text = text, createdAt = 0.0,
+            blobs = blobs, thumbs = emptyList(), media = "photo", poster = null,
+            storyRefMediaHash = null)
+
+    @Test fun extractDmMsgsDerivesPartnerAndFromMe() {
+        val raw = listOf(
+            rawDm("m1", sender = "own", to = "cara", createdAt = 10.0),   // I sent
+            rawDm("m2", sender = "cara", to = "own", createdAt = 20.0))   // I received
+        val dec = mapOf("m1" to decDm("m1", "hi"), "m2" to decDm("m2", "yo"))
+        val out = LocalApi.extractDmMsgs(raw, dec, ownIdentityPub = "own")
+        val m1 = out.first { it.msgId == "m1" }
+        val m2 = out.first { it.msgId == "m2" }
+        assertEquals("cara", m1.partner); assertTrue(m1.fromMe)
+        assertEquals("cara", m2.partner); assertFalse(m2.fromMe)
+    }
+
+    @Test fun extractDmMsgsKeepsUndecryptableRow() {
+        val raw = listOf(rawDm("m1", sender = "cara", to = "own", createdAt = 10.0))
+        val out = LocalApi.extractDmMsgs(raw, emptyMap(), ownIdentityPub = "own")
+        assertEquals(1, out.size)
+        assertTrue(out[0].undecryptable)
+        assertNull(out[0].text)
+        assertTrue(out[0].blobs.isEmpty())
+    }
+
+    @Test fun extractDmMsgsOrdersByCreatedAtAscStable() {
+        val raw = listOf(
+            rawDm("late", sender = "own", to = "cara", createdAt = 30.0),
+            rawDm("tieA", sender = "own", to = "cara", createdAt = 10.0),
+            rawDm("tieB", sender = "cara", to = "own", createdAt = 10.0),
+            rawDm("mid", sender = "cara", to = "own", createdAt = 20.0))
+        val dec = raw.associate { it.msgId to decDm(it.msgId, "t") }
+        val out = LocalApi.extractDmMsgs(raw, dec, ownIdentityPub = "own")
+        // created_at asc; the two created_at==10 ties keep input (scan) order.
+        assertEquals(listOf("tieA", "tieB", "mid", "late"), out.map { it.msgId })
+    }
+
+    @Test fun conversationsFromPicksNewestAsLastAndCountsUndecryptable() {
+        val raw = listOf(
+            rawDm("m1", sender = "own", to = "cara", createdAt = 10.0),
+            rawDm("m2", sender = "cara", to = "own", createdAt = 30.0),   // newest, undecryptable
+            rawDm("m3", sender = "cara", to = "own", createdAt = 20.0))
+        val dec = mapOf("m1" to decDm("m1", "hi"), "m3" to decDm("m3", "middle"))
+        val msgs = LocalApi.extractDmMsgs(raw, dec, ownIdentityPub = "own")
+        val rows = LocalApi.conversationsFrom(msgs, mapOf("cara" to "Cara"), ownIdentityPub = "own")
+        assertEquals(1, rows.size)
+        val c = rows[0]
+        assertEquals("cara", c.identityPub)
+        assertEquals("Cara", c.name)
+        assertEquals(3, c.count)                 // includes the undecryptable m2
+        assertNull(c.lastText)                   // newest (m2) is undecryptable -> null text
+        assertFalse(c.lastFromMe!!)              // m2 was received
+        assertEquals(30.0, c.lastAt!!, 0.0)      // newest created_at
+    }
+
+    @Test fun conversationsFromSortsByLastAtDesc() {
+        val raw = listOf(
+            rawDm("a1", sender = "own", to = "alice", createdAt = 5.0),
+            rawDm("b1", sender = "own", to = "bob", createdAt = 50.0))
+        val dec = raw.associate { it.msgId to decDm(it.msgId, "t") }
+        val msgs = LocalApi.extractDmMsgs(raw, dec, ownIdentityPub = "own")
+        val rows = LocalApi.conversationsFrom(msgs, emptyMap(), ownIdentityPub = "own")
+        assertEquals(listOf("bob", "alice"), rows.map { it.identityPub })  // bob newer -> first
+        // no profile name -> first-8 fallback (identity strings here are short)
+        assertEquals("bob", rows[0].name)
+    }
 }

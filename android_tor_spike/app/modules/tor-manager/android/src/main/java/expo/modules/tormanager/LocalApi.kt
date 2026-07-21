@@ -171,6 +171,88 @@ class LocalApi(private val ctx: Context) {
             return arr.toString()
         }
 
+        // vp2 slice 2: one DM thread message, built by joining a RAW stored DM
+        // (StoredMsg, which survives even when this device cannot decrypt it)
+        // with the msgId->Decrypted map from DecryptPass.run. `undecryptable`
+        // is true exactly when the raw DM had no Decrypted entry -- reproducing
+        // hearth dm_thread's one-entry-per-stored-row-including-undecryptable
+        // behavior. storyRef rides the plaintext outer payload, so it is
+        // present even for an undecryptable row (hearth messages.py:139-150).
+        data class DmMsg(
+            val msgId: String, val fromMe: Boolean, val createdAt: Double, val expiresAt: Double?,
+            val text: String?, val blobs: List<String>, val undecryptable: Boolean,
+            val storyRef: Map<*, *>?, val partner: String)
+
+        // vp2: one conversation-list summary row (hearth node.conversations()).
+        data class ConvRow(
+            val identityPub: String, val name: String, val lastText: String?,
+            val lastFromMe: Boolean?, val lastAt: Double?, val count: Int)
+
+        // vp2: build the flat DM message list from RAW DMs joined with the
+        // decrypted map. Partner derivation mirrors hearth dm_conversations:
+        // sender = StoredMsg.identityPub, recipient = payload["to"]; the partner
+        // is whichever of {sender, recipient} is NOT own. A DM missing a
+        // created_at or a `to` in its plaintext payload is malformed (a valid
+        // signed DM always carries both) and is skipped. Stable sort by
+        // created_at ASC: same-created_at ties keep allMessages()' scan order,
+        // approximating hearth's `created_at ASC, rowid ASC` tiebreak (rowid is
+        // not exposed on StoredMsg -- flagged as a follow-up, not fixed here).
+        fun extractDmMsgs(
+            rawDms: List<StoredMsg>,
+            decryptedById: Map<String, DecryptPass.Decrypted>,
+            ownIdentityPub: String,
+        ): List<DmMsg> =
+            rawDms.mapNotNull { m ->
+                val createdAt = (m.payload["created_at"] as? Number)?.toDouble() ?: return@mapNotNull null
+                val to = m.payload["to"] as? String ?: return@mapNotNull null
+                val sender = m.identityPub
+                val fromMe = sender == ownIdentityPub
+                val partner = if (fromMe) to else sender
+                val d = decryptedById[m.msgId]
+                DmMsg(
+                    msgId = m.msgId,
+                    fromMe = fromMe,
+                    createdAt = createdAt,
+                    expiresAt = (m.payload["expires_at"] as? Number)?.toDouble(),
+                    text = d?.text,
+                    blobs = d?.blobs ?: emptyList(),
+                    undecryptable = d == null,
+                    storyRef = m.payload["story_ref"] as? Map<*, *>,
+                    partner = partner)
+            }.sortedBy { it.createdAt }
+
+        // vp2: the ascending thread for one partner. extractDmMsgs already
+        // collapsed both directions onto a single `partner` per message and
+        // sorted ASC, so this is a stable filter preserving that order.
+        fun threadFor(all: List<DmMsg>, partner: String): List<DmMsg> =
+            all.filter { it.partner == partner }
+
+        // vp2: conversation summary rows (hearth node.conversations()). Group by
+        // partner (only partners WITH history appear -- friends are unioned in
+        // client-side by renderConversations, NOT added here). `last` = the
+        // newest message (the ASC list's last element); last_text/last_from_me/
+        // last_at come from it, including when it is undecryptable (text null,
+        // but from_me/created_at still populated -- matching hearth's unread
+        // semantics). count includes undecryptable rows. Sorted by last_at DESC
+        // (a null/empty last_at sorts as 0); the stable sort keeps
+        // first-appearance order among equal last_at.
+        fun conversationsFrom(
+            all: List<DmMsg>, names: Map<String, String>, ownIdentityPub: String,
+        ): List<ConvRow> {
+            val byPartner = linkedMapOf<String, MutableList<DmMsg>>()
+            for (m in all) byPartner.getOrPut(m.partner) { mutableListOf() }.add(m)
+            return byPartner.map { (partner, msgs) ->
+                val last = msgs.last()
+                ConvRow(
+                    identityPub = partner,
+                    name = names[partner] ?: partner.take(8),
+                    lastText = last.text,
+                    lastFromMe = last.fromMe,
+                    lastAt = last.createdAt,
+                    count = msgs.size)
+            }.sortedByDescending { it.lastAt ?: 0.0 }
+        }
+
         // hearth post_blob (node.py:2956-2964) serves ONLY KIND_POST blobs
         // (`if msg.kind != KIND_POST: return None`), even though the
         // content-key wrap/decrypt machinery is shared with DMs. DecryptPass.
