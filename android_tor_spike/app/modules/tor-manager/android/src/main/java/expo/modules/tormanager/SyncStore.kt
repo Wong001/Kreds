@@ -265,10 +265,11 @@ class InMemorySyncStore : SyncStore {
         return true
     }
 
-    /** Blob hashes referenced by stored POST/DM/STORY payloads, minus what
-     *  we hold. Mirrors hearth.store.referenced_blobs for the KIND_POST/
+    /** Blob hashes referenced by stored POST/DM/STORY/PROFILE payloads, minus
+     *  what we hold. Mirrors hearth.store.referenced_blobs for the KIND_POST/
      *  KIND_DM fields (blobs list + poster str + thumbs list), junk-guarded
-     *  to strings, WIDENED (B.2d-3 Task 1) to also scan `story` rows.
+     *  to strings, WIDENED (B.2d-3 Task 1) to also scan `story` rows and
+     *  (vp3 profile-blob fix) `profile` rows.
      *
      *  The `poster` extraction below is already generic across kinds, so
      *  adding "story" to the scanned kinds makes a story's poster flow
@@ -276,16 +277,23 @@ class InMemorySyncStore : SyncStore {
      *  ONLY: a story's `media` is a blob hash (single hex64 string), but a
      *  POST's `media` is the "photo"/"video" DISCRIMINATOR -- extracting it
      *  unconditionally would add the literal string "photo"/"video" to
-     *  missingBlobs as a bogus hash (the field-shape trap). */
+     *  missingBlobs as a bogus hash (the field-shape trap). Likewise
+     *  `avatar`/`banner` are guarded to `kind=="profile"` -- a KIND_PROFILE's
+     *  avatar/banner are blob-hash references (hearth referenced_blobs scans
+     *  KIND_PROFILE for exactly these), and without this the profile header
+     *  images are never requested during sync so they render broken. */
     override fun missingBlobs(): List<String> {
         val refs = linkedSetOf<String>()
         for (m in messages.values) {
-            if (m.kind != "post" && m.kind != "dm" && m.kind != "story") continue
+            if (m.kind != "post" && m.kind != "dm" && m.kind != "story" && m.kind != "profile") continue
             (m.payload["blobs"] as? List<*>)?.forEach { if (it is String) refs.add(it) }
             (m.payload["poster"] as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
             (m.payload["thumbs"] as? List<*>)?.forEach { if (it is String) refs.add(it) }
             if (m.kind == "story")
                 (m.payload["media"] as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
+            if (m.kind == "profile")
+                for (f in listOf("avatar", "banner"))
+                    (m.payload[f] as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
         }
         return refs.filter { it !in blobs }
     }

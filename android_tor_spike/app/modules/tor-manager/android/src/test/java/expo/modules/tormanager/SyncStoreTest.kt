@@ -192,6 +192,35 @@ class SyncStoreTest {
         assertFalse("field-shape trap: post's media discriminator must not appear", missing.contains("video"))
     }
 
+    @Test fun missingBlobsIncludesProfileAvatarAndBannerNotNulls() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val avatar = "a1".repeat(32)
+        val banner = "b2".repeat(32)
+        val postBlob = "cc".repeat(32)
+        // A KIND_PROFILE's avatar/banner are blob-hash references (hearth
+        // referenced_blobs scans KIND_PROFILE for exactly these), so the phone
+        // must request them or the profile header images render broken.
+        val profile = msg(1, mapOf(
+            "kind" to "profile", "name" to "Me", "bio" to "b",
+            "avatar" to avatar, "banner" to banner, "avatar_shape" to "circle",
+            "avatar_size" to "m", "avatar_align" to "left", "banner_pos" to 50, "created_at" to 1.0))
+        // A KIND_PROFILE with NO avatar/banner (nulls) must add no bogus refs.
+        val bare = msg(2, mapOf(
+            "kind" to "profile", "name" to "You", "bio" to "",
+            "avatar" to null, "banner" to null, "created_at" to 2.0))
+        val post = msg(3, mapOf("kind" to "post", "text" to "p", "blobs" to listOf(postBlob)))
+        assertTrue(s.ingestMessage(profile))
+        assertTrue(s.ingestMessage(bare))
+        assertTrue(s.ingestMessage(post))
+
+        val missing = s.missingBlobs()
+        assertTrue("profile avatar missing", missing.contains(avatar))
+        assertTrue("profile banner missing", missing.contains(banner))
+        assertTrue("regression: post blobs still tracked", missing.contains(postBlob))
+        assertEquals("null avatar/banner add no bogus refs", 3, missing.size)
+    }
+
     // -- B.2d-4 Task 2: deviceViews (the device-binding source for
     //    KotlinResponses' responder attribution) --
 

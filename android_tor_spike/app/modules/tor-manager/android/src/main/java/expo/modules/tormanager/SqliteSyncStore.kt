@@ -203,12 +203,13 @@ class SqliteSyncStore(context: Context) :
         }.toString()
     }
 
-    /** Blob hashes referenced by stored POST/DM/STORY payloads, minus what
-     *  we hold. Mirrors InMemorySyncStore.missingBlobs (hearth.store.
+    /** Blob hashes referenced by stored POST/DM/STORY/PROFILE payloads, minus
+     *  what we hold. Mirrors InMemorySyncStore.missingBlobs (hearth.store.
      *  referenced_blobs for the KIND_POST/KIND_DM fields -- blobs list +
      *  poster str + thumbs list, junk-guarded to strings), WIDENED (B.2d-3
-     *  Task 1) to also scan `story` rows, but reads the refs back out of
-     *  the stored msg_json instead of an in-memory SignedMessage.
+     *  Task 1) to also scan `story` rows and (vp3 profile-blob fix) `profile`
+     *  rows for avatar/banner, but reads the refs back out of the stored
+     *  msg_json instead of an in-memory SignedMessage.
      *
      *  `kind` is selected alongside `msg_json` so the `media` extraction
      *  below can be guarded per-row: a story's `media` is a blob hash, but
@@ -221,7 +222,7 @@ class SqliteSyncStore(context: Context) :
     override fun missingBlobs(): List<String> {
         val refs = linkedSetOf<String>()
         readableDatabase.rawQuery(
-            "SELECT kind, msg_json FROM messages WHERE kind IN ('post', 'dm', 'story')", null
+            "SELECT kind, msg_json FROM messages WHERE kind IN ('post', 'dm', 'story', 'profile')", null
         ).use { c ->
             while (c.moveToNext()) {
                 val kind = c.getString(0)
@@ -235,6 +236,13 @@ class SqliteSyncStore(context: Context) :
                 }
                 if (kind == "story")
                     (payload.opt("media") as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
+                // vp3 profile-blob fix: a KIND_PROFILE's avatar/banner are
+                // blob-hash references (hearth referenced_blobs scans
+                // KIND_PROFILE for exactly these); without this the profile
+                // header images never sync and render broken.
+                if (kind == "profile")
+                    for (f in listOf("avatar", "banner"))
+                        (payload.opt(f) as? String)?.let { if (it.isNotEmpty()) refs.add(it) }
             }
         }
         val held = mutableSetOf<String>()
