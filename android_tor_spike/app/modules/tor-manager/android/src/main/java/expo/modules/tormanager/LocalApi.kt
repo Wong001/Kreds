@@ -170,6 +170,10 @@ class LocalApi(private val ctx: Context) {
         val json = readJsonBody(body) ?: return badRequest("bad json body")
         val msgId = json.optString("msg_id", "")
         if (msgId.isEmpty() || !json.has("created_at")) return badRequest("msg_id and created_at required")
+        // pyStr throws IllegalArgumentException on a non-numeric created_at
+        // (fix wave: was a silent v.toString() catch-all before -- caught
+        // here the same way respondWithCompose catches ComposeResponse's own
+        // IllegalArgumentExceptions, so both map to 400 through one idiom.
         val retractBody = try { pyStr(json.get("created_at")) } catch (e: Exception) { return badRequest("bad created_at") }
         return respondWithCompose("retract", msgId, retractBody)
     }
@@ -177,30 +181,6 @@ class LocalApi(private val ctx: Context) {
     private fun readJsonBody(body: ByteArray?): JSONObject? {
         val bytes = body ?: return null
         return try { JSONObject(String(bytes, Charsets.UTF_8)) } catch (e: Exception) { null }
-    }
-
-    // hearth/api.py's /api/retract does `str(body["created_at"])` on
-    // whatever Python's json.loads decoded the JSON number as: an int for a
-    // decimal-point-free literal (JS's JSON.stringify of a whole-number
-    // float omits the ".0", so e.g. "5" round-trips to Python int 5 and
-    // str() gives "5"), a float otherwise (str() via CPython's repr-
-    // equivalent formatting -- matched here through KotlinWire.PyFloat's
-    // pyFloatRepr, the exact port ComposeResponse itself already uses for
-    // created_at). org.json parses JSON numbers the same way -- Long/
-    // Integer for a bare-integer literal, Double once a '.' or exponent is
-    // present -- so mirroring the parsed value's runtime TYPE (not
-    // unconditionally converting through Double) reproduces Python's str()
-    // output for both shapes. This match matters: hearth's
-    // _rebuild_responses_record (node.py:2648-2653, 2681) folds a retract
-    // by exact-matching (responder, str(created_at)) against
-    // str(entry["created_at"]) -- a wrong string form makes the retract
-    // silently inert (accepted 200 OK, but never actually withdraws
-    // anything).
-    private fun pyStr(v: Any): String = when (v) {
-        is Int -> v.toString()
-        is Long -> v.toString()
-        is Double -> KotlinWire.dumps(KotlinWire.PyFloat(v))
-        else -> v.toString()
     }
 
     private fun respondWithCompose(rkind: String, msgId: String, body: String): HttpResponse {
@@ -591,6 +571,55 @@ class LocalApi(private val ctx: Context) {
         // the cache is Task 3's, not this task's.
         fun dmKeys(feed: List<DecryptPass.Decrypted>, keys: Map<String, ByteArray>): Map<String, ByteArray> =
             feed.filter { it.kind == "dm" }.mapNotNull { d -> keys[d.msgId]?.let { d.msgId to it } }.toMap()
+
+        // Task 5 (outbound-responses), fix wave: hearth/api.py's /api/retract
+        // does `str(body["created_at"])` on whatever Python's json.loads
+        // decoded the JSON number as. This function reproduces that str()
+        // output on the values org.json:json:20240303 (the pinned version)
+        // ACTUALLY hands back from JSONObject.get() -- verified by
+        // decompiling JSONObject.stringToNumber (org.json's own number
+        // parser), not assumed:
+        //   - a DECIMAL-notation literal (contains '.', 'e', or 'E') is
+        //     parsed via `new BigDecimal(string)` and returned AS a
+        //     BigDecimal (the "-0" literal is special-cased to the Double
+        //     -0.0, org.json's one exception -- harmless here since -0.0
+        //     never occurs in a real created_at). This is the SAME BB-5
+        //     desk-gate finding KotlinSync.unwrap() (KotlinSync.kt:108-118)
+        //     and MsgJson.unwrapJson() (MsgJson.kt:133) already document and
+        //     handle for exactly this reason -- a fractional created_at from
+        //     a real node/client is BigDecimal, never Double, and code that
+        //     only branches on `is Double` silently falls through to
+        //     whatever the `else` case does.
+        //   - an INTEGER-notation literal is parsed via `new
+        //     BigInteger(string)`, then narrowed to Integer if its bit
+        //     length fits (<=31 bits), Long if it fits in 63 bits, else left
+        //     as BigInteger. A realistic created_at like 1752900000 (~31
+        //     bits) actually comes back as Integer, not Long -- confirmed by
+        //     decompiling the same method.
+        // pyFloatRepr (via KotlinWire.PyFloat) already reproduces Python's
+        // str(float) formatting byte-for-byte within its supported range --
+        // routing BOTH Double and BigDecimal through v.toDouble() then that
+        // same port (rather than trusting BigDecimal.toString(), whose
+        // scientific-notation threshold differs from Python's) is the fix:
+        // BigDecimal.toDouble() is a correctly-rounded decimal -> IEEE754
+        // conversion (the same contract Double.parseDouble uses), so it
+        // recovers the identical double bit pattern Python's own float
+        // parse would have produced from the same JSON literal, and
+        // pyFloatRepr then formats THAT the way Python's str() would.
+        // Anything outside these four numeric shapes (bool, string, null,
+        // JSONObject/JSONArray) is not a value a real created_at could ever
+        // take -- reject it as a 400 (via the IllegalArgumentException the
+        // caller already catches) rather than silently stringifying garbage
+        // into a retract body hearth's fold logic would just as silently
+        // never match against anything.
+        fun pyStr(v: Any): String = when (v) {
+            is Int -> v.toString()
+            is Long -> v.toString()
+            is java.math.BigInteger -> v.toString()
+            is Double -> KotlinWire.dumps(KotlinWire.PyFloat(v))
+            is java.math.BigDecimal -> KotlinWire.dumps(KotlinWire.PyFloat(v.toDouble()))
+            else -> throw IllegalArgumentException("bad created_at")
+        }
 
         // hearth stories_view (node.py:836-841): a story group is visible
         // only for self or a known (friended) identity -- an unfriended
