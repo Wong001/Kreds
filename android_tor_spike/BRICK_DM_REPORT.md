@@ -226,10 +226,13 @@ once onto the pending-outbound queue.
 
 ## On-device DoD — G20 (August drives)
 
-**Status: PENDING.** The checklist below is copied verbatim from
-`.superpowers/sdd/task-5-brief.md` Step 3 / the design spec's testing
-section. No behavioral checks beyond confirming install `Success` were run
-this session — August drives the run.
+**Status: PASSED — confirmed by August 2026-07-22** ("I've already sent a
+DM over the phone, so good work") with the fix-wave build installed. What
+was explicitly confirmed: composing + sending a DM from the phone works
+end-to-end (items a/b/f in substance). Remaining items were not
+individually reported; no issues raised. Item (e) was already desk-proven
+(see the Final-review fix wave section). The checklist below is preserved
+as run documentation.
 
 Desktop `serve --tor`, unlocked, with a friend synced. From the phone:
 
