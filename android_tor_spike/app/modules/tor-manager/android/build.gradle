@@ -37,6 +37,17 @@ tasks.register('copyDmcryptVectors', Copy) {
 tasks.named('preBuild') { dependsOn 'copyDmcryptVectors' }
 tasks.withType(Test).configureEach { dependsOn 'copyDmcryptVectors' }
 
+// Task 1 review fix (B.2d-4): a hearth-sealed mutual-box vector, so
+// KotlinSealTest proves tryOpenSlots against genuinely Python-sealed slots
+// (not just Kotlin-sealed-Kotlin-opened round trips) -- same 4-levels-up
+// path as the other copy*Vectors tasks above.
+tasks.register('copySealVector', Copy) {
+  from "${projectDir}/../../../../fixtures/seal_vector.json"
+  into "${projectDir}/src/test/resources"
+}
+tasks.named('preBuild') { dependsOn 'copySealVector' }
+tasks.withType(Test).configureEach { dependsOn 'copySealVector' }
+
 android {
   namespace "expo.modules.tormanager"
   ndkVersion "26.3.11579264"
