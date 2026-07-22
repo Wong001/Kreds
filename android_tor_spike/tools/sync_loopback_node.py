@@ -312,6 +312,17 @@ def _decrypt_response_event(node, friend, msg):
     created_at = body.get("created_at")
     responder = body.get("responder")
     responder_sig = body.get("responder_sig")
+    # Integrity check (mirrors hearth's own _response_event, node.py:
+    # 2525-2533 -- itself a reviewer-caught Critical there): body
+    # ["responder"] is attacker-controlled plaintext (it lives inside the
+    # encrypted body, not the signed envelope), while msg.cert.identity_pub
+    # is the one fact ingest_message's Verifier actually proved. A
+    # response whose body lies about who sent it must never be attributed
+    # to the identity it claims -- fail closed the same return-None way
+    # hearth's real fold does, before the claimed responder ever reaches
+    # sig_payload/_sig_ok below.
+    if responder != msg.cert.identity_pub:
+        return None
     sig_payload = HearthNode._response_sig_payload(
         p["target"], rkind, rbody, created_at, responder)
     # responder_sig is a DEVICE-key signature (self.device.sign_raw in
