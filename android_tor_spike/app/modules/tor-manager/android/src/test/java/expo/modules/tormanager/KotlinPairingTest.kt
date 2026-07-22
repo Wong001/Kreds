@@ -419,4 +419,216 @@ class KotlinPairingTest {
         assertThrows(Exception::class.java) { PairingStore.readFixture(internalDir, legacyFile) }
         assertNull(PairingStore.readFixtureOrNull(internalDir, legacyFile))
     }
+
+    // =======================================================================
+    // KotlinPairing.runCeremony
+    // =======================================================================
+    //
+    // No pre-existing "fake Stream" precedent in this module's tests to
+    // mirror: KotlinSyncTest exercises composeEncKey only (no Stream at
+    // all), and SyncLoopbackTest's SocketStream drives a REAL spawned hearth
+    // node over a REAL TCP socket (a desk gate, not a JVM-only fake). So
+    // ScriptedStream/HangingStream below are a fresh, minimal fake built
+    // for exactly runCeremony's one-request/one-reply contract, not a port
+    // of anything already in the tree.
+
+    /** Captures the single request frame runCeremony writes (there is
+     *  exactly one -- buildRequestFrame's hearth-pair-request), decodes it,
+     *  and hands it to `onRequest` to build the reply frame bytes on the
+     *  spot -- needed because the reply's cert.device_pub must match the
+     *  Ed25519 keypair runCeremony generates INTERNALLY (installPackage
+     *  requires an exact match, see installPackageDevicePubMismatchThrows),
+     *  which no test-side code can predict ahead of time. */
+    private class ScriptedStream(private val onRequest: (JSONObject) -> Map<String, Any?>) : Stream {
+        lateinit var request: JSONObject
+            private set
+        private var replyBytes: ByteArray = ByteArray(0)
+        private var pos = 0
+        var closed = false
+
+        override fun write(bytes: ByteArray) {
+            val n = (((bytes[0].toInt() and 0xff) shl 24) or ((bytes[1].toInt() and 0xff) shl 16) or
+                     ((bytes[2].toInt() and 0xff) shl 8) or (bytes[3].toInt() and 0xff))
+            request = JSONObject(String(bytes, 4, n, Charsets.US_ASCII))
+            replyBytes = KotlinWire.writeFrameBytes(onRequest(request))
+        }
+        override fun readExactSync(n: Int): ByteArray {
+            check(pos + n <= replyBytes.size) { "ScriptedStream exhausted (wanted $n more bytes)" }
+            val out = replyBytes.copyOfRange(pos, pos + n)
+            pos += n
+            return out
+        }
+        override fun close() { closed = true }
+    }
+
+    /** A reply frame whose body is well-formed JSON but not a recognized
+     *  pairing reply -- runCeremony's "garbage reply" case (Task 4 brief).
+     *  Reused (rather than a one-off literal) so both the plain-garbage test
+     *  and any future variant build it the same way. */
+    private class FixedReplyStream(reply: Map<String, Any?>) : Stream {
+        private val replyBytes = KotlinWire.writeFrameBytes(reply)
+        private var pos = 0
+        var closed = false
+        override fun write(bytes: ByteArray) {}
+        override fun readExactSync(n: Int): ByteArray {
+            check(pos + n <= replyBytes.size) { "FixedReplyStream exhausted" }
+            val out = replyBytes.copyOfRange(pos, pos + n); pos += n; return out
+        }
+        override fun close() { closed = true }
+    }
+
+    /** Never produces enough reply bytes -- sleeps well past any reasonable
+     *  test timeoutMs on every read. Cheap simulated hang: the test uses a
+     *  tiny timeoutMs (tens of ms), so runCeremony's Future.get times out
+     *  and returns long before this finishes sleeping; executor.shutdownNow()
+     *  then interrupts the still-sleeping background thread immediately
+     *  (Thread.sleep is interruptible), so the hang never actually costs the
+     *  test suite real wall-clock time beyond the timeoutMs itself. */
+    private class HangingStream(private val sleepMs: Long) : Stream {
+        var closed = false
+        override fun write(bytes: ByteArray) {}
+        override fun readExactSync(n: Int): ByteArray {
+            Thread.sleep(sleepMs)
+            throw IllegalStateException("HangingStream: should never actually reach here in a passing test")
+        }
+        override fun close() { closed = true }
+    }
+
+    private fun packageReplyMap(
+        cert: KotlinWire.CertDict, identityPriv: String,
+        friends: List<String> = emptyList(), myAddr: String? = "selfreported.onion:9999",
+    ): Map<String, Any?> = mapOf(
+        "t" to "hearth-pair-package",
+        "protocol" to KotlinWire.PROTOCOL,
+        "cert" to mapOf(
+            "identity_pub" to cert.identity_pub, "device_pub" to cert.device_pub,
+            "device_name" to cert.device_name, "enrolled_at" to cert.enrolled_at,
+            "signature" to cert.signature,
+        ),
+        "identity_priv" to identityPriv,
+        "friends" to friends,
+        "my_addr" to myAddr,
+    )
+
+    // Vector 2 from the decodeLink tests above: a real hearth-encoded pair
+    // link, decodes to addr "192.168.1.50:9997", code "A-LONGER-PAIRING-CODE-42".
+    private val VALID_LINK = "3AL8mxN8DV459gfJ7VMMZvxoZYDnup9hDMqE9d1uKmUUEb3tpk6kzGfgkBfV675wf"
+
+    @Test fun runCeremonyPackageReplyLinksAndPersists() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-linked").toFile()
+        val (identityPriv, identityPub) = genKeypair()
+        val friend = "77".repeat(32)
+        var dialedHost: String? = null; var dialedPort: Int? = null
+        var stream: ScriptedStream? = null
+
+        val dial: (String, Int) -> Stream = { host, port ->
+            dialedHost = host; dialedPort = port
+            ScriptedStream { req ->
+                assertEquals("hearth-pair-request", req.getString("t"))
+                assertEquals(KotlinWire.PROTOCOL, req.getString("protocol"))
+                assertEquals("My Phone", req.getString("device_name"))
+                assertEquals("A-LONGER-PAIRING-CODE-42", req.getString("code"))
+                val cert = signedCert(identityPriv, identityPub, req.getString("device_pub"))
+                packageReplyMap(cert, identityPriv, friends = listOf(friend), myAddr = "selfreported.onion:9999")
+            }.also { stream = it }
+        }
+
+        val result = KotlinPairing.runCeremony(dial, VALID_LINK, "My Phone", 5000, store, dir)
+
+        assertEquals("192.168.1.50", dialedHost); assertEquals(9997, dialedPort)
+        assertTrue("expected Linked, got $result", result is KotlinPairing.CeremonyResult.Linked)
+        val identity = (result as KotlinPairing.CeremonyResult.Linked).identity
+        assertEquals(identityPub, identity.cert.identity_pub)
+        assertEquals(stream!!.request.getString("device_pub"), identity.device_pub)
+        // Pinned to the DIALED address (the link's own addr), NOT the
+        // package's self-reported my_addr ("selfreported.onion:9999").
+        assertEquals("192.168.1.50:9997", identity.onion_addr)
+
+        assertTrue(store.knownIdentities().contains(identityPub))
+        assertTrue(store.knownIdentities().contains(friend))
+        val loaded = PairingStore.load(dir)
+        assertEquals(identity, loaded)
+        assertTrue("stream must be closed", stream!!.closed)
+    }
+
+    @Test fun runCeremonyDeniedReplyReturnsDenied() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-denied").toFile()
+        val stream = FixedReplyStream(mapOf("t" to "pair-denied"))
+        val result = KotlinPairing.runCeremony({ _, _ -> stream }, VALID_LINK, "My Phone", 5000, store, dir)
+        assertEquals(KotlinPairing.CeremonyResult.Denied, result)
+        assertTrue(stream.closed)
+        assertNull("must not persist anything on denial", PairingStore.load(dir))
+        assertTrue(store.knownIdentities().isEmpty())
+    }
+
+    @Test fun runCeremonyExpiredReplyReturnsExpired() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-expired").toFile()
+        val stream = FixedReplyStream(mapOf("t" to "pair-expired"))
+        val result = KotlinPairing.runCeremony({ _, _ -> stream }, VALID_LINK, "My Phone", 5000, store, dir)
+        assertEquals(KotlinPairing.CeremonyResult.Expired, result)
+        assertTrue(stream.closed)
+        assertNull(PairingStore.load(dir))
+    }
+
+    @Test fun runCeremonyUnrecognizedReplyIsUnreachable() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-garbage").toFile()
+        val stream = FixedReplyStream(mapOf("t" to "some-nonsense-reply"))
+        val result = KotlinPairing.runCeremony({ _, _ -> stream }, VALID_LINK, "My Phone", 5000, store, dir)
+        assertTrue("expected Unreachable, got $result", result is KotlinPairing.CeremonyResult.Unreachable)
+        assertTrue(stream.closed)
+        assertNull(PairingStore.load(dir))
+    }
+
+    @Test fun runCeremonyRejectedPackageIsUnreachableStoreUntouched() {
+        // A validly-framed hearth-pair-package whose cert is tampered
+        // (signature won't verify) -- installPackage throws
+        // IllegalArgumentException, which runCeremony must fold to
+        // Unreachable rather than letting it escape or claiming Linked.
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-rejected").toFile()
+        val (identityPriv, identityPub) = genKeypair()
+        val stream = ScriptedStream { req ->
+            val goodCert = signedCert(identityPriv, identityPub, req.getString("device_pub"))
+            val tampered = goodCert.copy(device_name = "Tampered")
+            packageReplyMap(tampered, identityPriv)
+        }
+        val result = KotlinPairing.runCeremony({ _, _ -> stream }, VALID_LINK, "My Phone", 5000, store, dir)
+        assertTrue("expected Unreachable, got $result", result is KotlinPairing.CeremonyResult.Unreachable)
+        assertTrue(store.knownIdentities().isEmpty())
+        assertNull(PairingStore.load(dir))
+    }
+
+    @Test fun runCeremonyMalformedLinkIsBadLinkAndNeverDials() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-badlink").toFile()
+        var dialed = false
+        val dial: (String, Int) -> Stream = { _, _ -> dialed = true; throw AssertionError("dial must not be called for a malformed link") }
+        val result = KotlinPairing.runCeremony(dial, "not a valid pairing link!", "My Phone", 5000, store, dir)
+        assertEquals(KotlinPairing.CeremonyResult.BadLink, result)
+        assertFalse("dial lambda must never run for a malformed link", dialed)
+    }
+
+    @Test fun runCeremonyTimeoutIsUnreachable() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-timeout").toFile()
+        val stream = HangingStream(sleepMs = 5000)
+        val start = System.currentTimeMillis()
+        val result = KotlinPairing.runCeremony({ _, _ -> stream }, VALID_LINK, "My Phone", 50, store, dir)
+        val elapsed = System.currentTimeMillis() - start
+        assertTrue("expected Unreachable, got $result", result is KotlinPairing.CeremonyResult.Unreachable)
+        assertTrue("must return promptly after timeoutMs, not wait for the hang (took ${elapsed}ms)", elapsed < 3000)
+        assertTrue(stream.closed)
+    }
+
+    @Test fun runCeremonyDialExceptionIsUnreachable() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-dialfail").toFile()
+        val dial: (String, Int) -> Stream = { _, _ -> throw java.io.IOException("connection refused") }
+        val result = KotlinPairing.runCeremony(dial, VALID_LINK, "My Phone", 5000, store, dir)
+        assertTrue("expected Unreachable, got $result", result is KotlinPairing.CeremonyResult.Unreachable)
+    }
 }

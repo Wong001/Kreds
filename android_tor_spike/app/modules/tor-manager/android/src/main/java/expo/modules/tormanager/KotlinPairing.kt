@@ -4,7 +4,12 @@ import org.bouncycastle.crypto.digests.SHA3Digest
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.json.JSONException
 import org.json.JSONObject
+import java.io.File
 import java.math.BigInteger
+import java.security.SecureRandom
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /** Android first-load pairing (spec 2026-07-22-android-first-load-pairing-
  *  design), Task 3: the phone-side counterpart to hearth's `invitecodec.py`
@@ -261,4 +266,128 @@ object KotlinPairing {
             Ed25519PrivateKeyParameters(KotlinWire.fromHex(privHex), 0).generatePublicKey().encoded)
         derived == pubHex
     } catch (e: Exception) { false }
+
+    // -- frame I/O (Task 4) ------------------------------------------------
+    // Mirrors KotlinHandshake's and KotlinSync's own private readFrame/
+    // writeFrame byte-for-byte (4-byte big-endian length prefix, ASCII-only
+    // body) rather than a shared call -- neither of those is a public
+    // function this file could call instead, and the brief for this task is
+    // "same length-prefix mechanics, do NOT hand-roll [something different]",
+    // not "extract a shared helper" (an out-of-scope refactor of two other
+    // files this task doesn't touch).
+    private fun writeFrame(s: Stream, obj: Map<String, Any?>) =
+        s.write(KotlinWire.writeFrameBytes(obj))
+
+    private fun readFrame(s: Stream): JSONObject {
+        val header = s.readExactSync(4)
+        val n = (((header[0].toLong() and 0xff) shl 24) or ((header[1].toLong() and 0xff) shl 16) or
+                 ((header[2].toLong() and 0xff) shl 8) or (header[3].toLong() and 0xff))
+        require(n <= KotlinWire.MAX_FRAME) { "frame too large" }
+        val body = s.readExactSync(n.toInt())
+        for (b in body) require((b.toInt() and 0xff) <= 0x7e) { "non-ascii frame byte" }
+        return JSONObject(String(body, Charsets.US_ASCII))
+    }
+
+    /** Task 4: the phone-side pairing CEREMONY -- decodeLink -> generate a
+     *  fresh device Ed25519 keypair -> dial the link's address -> send
+     *  `hearth-pair-request` -> read exactly ONE reply frame (bound by
+     *  `timeoutMs`) -> dispatch on the reply, mirroring the Task 2 wire
+     *  contract (client sends one request, server sends EXACTLY ONE of
+     *  hearth-pair-package / pair-denied / pair-expired, then closes).
+     *
+     *  `store`/`dir` are explicit params rather than read off a Context, so
+     *  this stays JVM-testable with no Android runtime -- the bridge
+     *  (TorManagerModule.pairWithNode) passes the real SqliteSyncStore and
+     *  ctx.filesDir; tests pass an InMemorySyncStore and a temp dir.
+     *
+     *  `dial` is not called at all for a malformed link -- decodeLink's null
+     *  short-circuits to BadLink before `dial` is ever referenced, so a
+     *  caller can prove "no network attempt on a bad link" by asserting
+     *  their dial lambda never ran.
+     *
+     *  The persisted identity's onion_addr is PINNED to the address this
+     *  ceremony actually dialed (the link's own addr, from decodeLink) --
+     *  NOT installPackage's pkg.my_addr passthrough. The link is what the
+     *  user/QR code vouched for; a package's self-reported my_addr is only
+     *  ever server say-so (could be stale, misconfigured, or -- since the
+     *  ceremony has not yet proven this peer controls the identity the cert
+     *  names, only that it answered on the dialed address -- untrustworthy)
+     *  and every subsequent dial to this identity (KotlinHandshake/
+     *  SyncRunner) should keep using the address this ceremony itself
+     *  proved reachable.
+     *
+     *  Bounding: `timeoutMs` wraps the write+read of the single reply frame
+     *  in a Future.get(timeoutMs) (the same bounded-blocking-call idiom
+     *  ImageDecodeClient uses for its isolated-process IPC) -- Stream has no
+     *  built-in per-call timeout knob, so this is the generic way to bound
+     *  an arbitrary Stream impl (TorStream, a JVM test fake, ...) uniformly.
+     *  A timeout, any other I/O failure, an unrecognized reply `t`, or a
+     *  rejected (IllegalArgumentException) package all fold to
+     *  Unreachable -- the ceremony has exactly three "good" outcomes
+     *  (Linked/Denied/Expired) and everything else is "could not complete
+     *  the ceremony", with `reason` carrying detail for logging/debugging
+     *  only (never parsed by a caller). */
+    sealed class CeremonyResult {
+        data class Linked(val identity: PairingStore.Identity) : CeremonyResult()
+        object Denied : CeremonyResult()
+        object Expired : CeremonyResult()
+        data class Unreachable(val reason: String) : CeremonyResult()
+        object BadLink : CeremonyResult()
+    }
+
+    fun runCeremony(
+        dial: (host: String, port: Int) -> Stream,
+        link: String,
+        deviceName: String,
+        timeoutMs: Long,
+        store: SyncStore,
+        dir: File,
+    ): CeremonyResult {
+        val (addr, code) = decodeLink(link) ?: return CeremonyResult.BadLink
+        val (host, port) = KotlinHandshake.splitAddr(addr)
+
+        val stream = try {
+            dial(host, port)
+        } catch (e: Exception) {
+            return CeremonyResult.Unreachable("dial: ${e.message}")
+        }
+
+        val devicePriv = Ed25519PrivateKeyParameters(SecureRandom())
+        val devicePrivHex = KotlinWire.toHex(devicePriv.encoded)
+        val devicePubHex = KotlinWire.toHex(devicePriv.generatePublicKey().encoded)
+        val requestFrame = buildRequestFrame(devicePubHex, deviceName, code)
+
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val reply: JSONObject = try {
+                executor.submit<JSONObject> {
+                    writeFrame(stream, requestFrame)
+                    readFrame(stream)
+                }.get(timeoutMs, TimeUnit.MILLISECONDS)
+            } catch (e: TimeoutException) {
+                return CeremonyResult.Unreachable("timeout")
+            } catch (e: Exception) {
+                return CeremonyResult.Unreachable("io: ${e.message}")
+            }
+
+            return when (reply.optString("t")) {
+                "hearth-pair-package" -> {
+                    val identity = try {
+                        installPackage(store, reply.toString(), devicePrivHex, devicePubHex, deviceName)
+                    } catch (e: IllegalArgumentException) {
+                        return CeremonyResult.Unreachable(e.message ?: "bad package")
+                    }
+                    val pinned = identity.copy(onion_addr = addr)
+                    PairingStore.save(dir, pinned)
+                    CeremonyResult.Linked(pinned)
+                }
+                "pair-denied" -> CeremonyResult.Denied
+                "pair-expired" -> CeremonyResult.Expired
+                else -> CeremonyResult.Unreachable("unexpected reply t=${reply.optString("t")}")
+            }
+        } finally {
+            executor.shutdownNow()
+            try { stream.close() } catch (e: Exception) {}
+        }
+    }
 }

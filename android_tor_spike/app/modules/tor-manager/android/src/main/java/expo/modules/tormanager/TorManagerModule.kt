@@ -19,6 +19,14 @@ import kotlinx.coroutines.SupervisorJob
  *  blobKeys/decryptBlob). */
 private const val STORY_MARKER = "story"
 
+/** Task 4 (first-load pairing): bounds pairWithNode's single request/reply
+ *  round trip (KotlinPairing.runCeremony's timeoutMs). Independent of
+ *  TorEngine.dial's own onion-circuit-build blocking (Socks.kt's 120s
+ *  soTimeout, already spent by the time runCeremony's timeout clock even
+ *  starts) -- this only bounds the pairing frame exchange itself, which a
+ *  live home node should answer quickly once connected. */
+private const val PAIR_TIMEOUT_MS = 30_000L
+
 class TorManagerModule : Module() {
     // recv/send/dial block on socket I/O; keep them OFF the single default
     // AsyncFunction HandlerThread (would deadlock the concurrent recv+send
@@ -331,6 +339,57 @@ class TorManagerModule : Module() {
         Function("closeConn") { id: Int -> TorEngine.close(id) }
 
         AsyncFunction("suspendTor") { TorEngine.suspend() }
+
+        // -- Task 4 (first-load pairing): ceremony client bridge --
+        // hasIdentity is a quick local file check (PairingStore.hasIdentity,
+        // via the same internal-then-legacy dual read every other fixture
+        // call site uses) -- a plain Function, same shape as isBatteryExempt
+        // below, not an AsyncFunction: no network I/O, just a small file
+        // read/parse, cheap enough for the default queue.
+        Function("hasIdentity") {
+            val ctx = appContext.reactContext ?: return@Function false
+            PairingStore.hasIdentity(ctx)
+        }
+
+        // pairWithNode runs the full ceremony (dial -> pair-request ->
+        // ONE bounded reply -> install+persist on a package) off the main
+        // thread -- mirrors syncNow's ioScope + TorEngine.dial wiring and
+        // its "Tor must be bootstrapped first" guard (dial blocks on a real
+        // SOCKS connect, same reasoning as syncNow's dial inside
+        // SyncRunner.runTransport). Resolves a single {"status": ...} map --
+        // never throws/rejects for an ordinary ceremony outcome (ceremony
+        // failures are VALUES, status="unreachable"/"bad_link"/etc, not
+        // promise rejections) so the JS side has one flat switch instead of
+        // a try/catch-plus-switch.
+        AsyncFunction("pairWithNode") { link: String, deviceName: String ->
+            val ctx = appContext.reactContext
+                ?: return@AsyncFunction mapOf("status" to "unreachable")
+            if (!TorEngine.isUp)
+                return@AsyncFunction mapOf("status" to "unreachable")
+
+            val store = SqliteSyncStore(ctx)
+            val result = try {
+                KotlinPairing.runCeremony(
+                    dial = { host, port -> TorStream(TorEngine.dial(host, port)) },
+                    link = link,
+                    deviceName = deviceName,
+                    timeoutMs = PAIR_TIMEOUT_MS,
+                    store = store,
+                    dir = ctx.filesDir,
+                )
+            } finally {
+                store.close()   // SQLiteOpenHelper leaks its connection if not closed
+            }
+
+            val status = when (result) {
+                is KotlinPairing.CeremonyResult.Linked -> "linked"
+                is KotlinPairing.CeremonyResult.Denied -> "denied"
+                is KotlinPairing.CeremonyResult.Expired -> "expired"
+                is KotlinPairing.CeremonyResult.Unreachable -> "unreachable"
+                is KotlinPairing.CeremonyResult.BadLink -> "bad_link"
+            }
+            mapOf("status" to status)
+        }.runOnQueue(ioScope)
 
         // -- Brick A: background node control --
         Function("startNode") { appContext.reactContext?.let { TorNodeService.start(it) } }
