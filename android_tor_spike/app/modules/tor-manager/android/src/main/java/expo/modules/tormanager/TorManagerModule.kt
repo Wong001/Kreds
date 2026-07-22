@@ -201,7 +201,10 @@ class TorManagerModule : Module() {
         val api = LocalApi(ctx)
         val s = LocalWebServer(
             assets = { path -> LocalAssets.provide(ctx, path) },
-            api = { method, path, _, _, _ -> api.handle(method, path) },
+            // Task 6: threads contentType/body through to LocalApi.handle,
+            // which accepts and ignores them for now (still GET-only) --
+            // Task 7 wires the compose POST route that reads them.
+            api = { method, path, _, _, _, contentType, body -> api.handle(method, path, contentType, body) },
         )
         s.start()
         localServer = s

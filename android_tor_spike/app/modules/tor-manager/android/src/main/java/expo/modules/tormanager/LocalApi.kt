@@ -37,7 +37,10 @@ class LocalApi(private val ctx: Context) {
     // only; never persisted (decrypt-on-read).
     @Volatile private var dmKeysCache: Map<String, ByteArray> = emptyMap()
 
-    fun handle(method: String, path: String): HttpResponse? {
+    // contentType/body: accepted here (Task 6, loopback body-reading plumbing)
+    // but IGNORED -- every route below is still GET-only. Task 7 wires the
+    // compose POST route and starts reading them.
+    fun handle(method: String, path: String, contentType: String? = null, body: ByteArray? = null): HttpResponse? {
         if (method != "GET") return null
         return when {
             path == "/api/bootstrap" -> json(bootstrapJson())

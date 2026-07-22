@@ -23,7 +23,7 @@ class LocalWebServerTest {
                 else -> null
             }
         }
-        val api: (String, String, String?, String?, String?) -> HttpResponse? = { _, path, _, _, _ ->
+        val api: (String, String, String?, String?, String?, String?, ByteArray?) -> HttpResponse? = { _, path, _, _, _, _, _ ->
             if (path == "/api/state")
                 HttpResponse(200, mapOf("Content-Type" to "application/json"), "{\"ok\":true}".toByteArray())
             else null
