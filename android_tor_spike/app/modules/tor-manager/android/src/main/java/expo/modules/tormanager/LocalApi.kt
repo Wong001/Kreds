@@ -3,7 +3,6 @@ package expo.modules.tormanager
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.File
 
 /** Read-only /api provider for the WebView shell (slice 1). Pure JSON
  *  builders live in the companion (JVM-testable); the instance methods do the
@@ -359,9 +358,10 @@ class LocalApi(private val ctx: Context) {
             friends = friends)
     }
 
-    private fun fixtureOrNull(): KotlinHandshake.Fixture? = try {
-        KotlinHandshake.parseFixture(File(TorEngine.externalDir(), "spike_phone_fixture.json").readText())
-    } catch (e: Exception) { null }
+    // Dual-read (Task 3, first-load pairing): internal pairing.json first,
+    // else the legacy external spike_phone_fixture.json exactly as before.
+    // See PairingStore.readFixtureOrNull.
+    private fun fixtureOrNull(): KotlinHandshake.Fixture? = PairingStore.readFixtureOrNull(ctx)
 
     // hearth /api/kreds (node.kreds_list, node.py:801-813): known identities
     // (excluding self) as {identity_pub, name, ring, since}. LOAD-BEARING for

@@ -1,5 +1,6 @@
 package expo.modules.tormanager
 
+import android.content.Context
 import android.os.Build
 import android.util.Base64
 import expo.modules.kotlin.Promise
@@ -8,7 +9,6 @@ import expo.modules.kotlin.modules.ModuleDefinition
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import java.io.File
 
 /** Reserved msgId for the MediaServer resolver's story branch (B.2d-3 Task 2).
  *  Real msgIds are hex64 (a message id), so this string can never collide
@@ -241,12 +241,11 @@ class TorManagerModule : Module() {
      *  function exists to fix). A caller seeing 0 friends when the fixture
      *  is temporarily unreadable is the safe failure shape; seeing an
      *  inflated count never is. */
-    private fun friendsCount(store: SyncStore): Int {
-        val ownIdentityPub = try {
-            KotlinHandshake.parseFixture(
-                File(TorEngine.externalDir(), "spike_phone_fixture.json").readText()
-            ).cert.identity_pub
-        } catch (e: Exception) { return 0 }
+    // Dual-read (Task 3, first-load pairing): internal pairing.json first,
+    // else the legacy external spike_phone_fixture.json exactly as before.
+    // See PairingStore.readFixtureOrNull.
+    private fun friendsCount(ctx: Context, store: SyncStore): Int {
+        val ownIdentityPub = PairingStore.readFixtureOrNull(ctx)?.cert?.identity_pub ?: return 0
         return store.knownIdentities().count { it != ownIdentityPub }
     }
 
@@ -391,10 +390,12 @@ class TorManagerModule : Module() {
             }
             // Fixture read stays foreground (SyncRunner takes an already-parsed
             // Fixture). A read/parse failure emits the same "io:" nodeSync the
-            // pre-refactor single outer try/catch did.
+            // pre-refactor single outer try/catch did. Dual-read (Task 3):
+            // internal pairing.json first, else the legacy external
+            // spike_phone_fixture.json exactly as before -- see
+            // PairingStore.readFixture.
             val fx = try {
-                KotlinHandshake.parseFixture(
-                    File(TorEngine.externalDir(), "spike_phone_fixture.json").readText())
+                PairingStore.readFixture(ctx)
             } catch (e: Exception) {
                 emit(false, 0, 0, 0, "io: ${e.message}", false)
                 return@AsyncFunction Unit
@@ -479,7 +480,7 @@ class TorManagerModule : Module() {
                     // the sync) -- see friendsCount's doc for why that's the
                     // wrong number to label "friends" downstream. Preserves the
                     // exact value the pre-refactor success branch emitted.
-                    emit(true, outcome.messages, outcome.blobs, friendsCount(store), null, true)
+                    emit(true, outcome.messages, outcome.blobs, friendsCount(ctx, store), null, true)
                 } catch (e: Exception) {
                     emit(false, 0, 0, 0, "io: ${e.message}", false)
                 }
@@ -674,7 +675,7 @@ class TorManagerModule : Module() {
                 ?: return@AsyncFunction mapOf("messages" to 0, "blobs" to 0, "identities" to 0)
             val store = SqliteSyncStore(ctx)
             val st = store.stats()
-            mapOf("messages" to st.messages, "blobs" to st.blobs, "identities" to friendsCount(store))
+            mapOf("messages" to st.messages, "blobs" to st.blobs, "identities" to friendsCount(ctx, store))
         }
 
         Function("isBatteryExempt") {
