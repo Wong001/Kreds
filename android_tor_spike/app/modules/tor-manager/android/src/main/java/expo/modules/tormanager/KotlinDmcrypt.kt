@@ -57,7 +57,18 @@ object KotlinDmcrypt {
 
         val mac = HMac(SHA256Digest())
         mac.init(KeyParameter(subkeyOut))
-        mac.update(target.toByteArray(Charsets.UTF_8), 0, target.length)
+        // Pre-merge nit (final review): `target.length` is a UTF-16 CHAR
+        // count, not a BYTE count -- for a non-ASCII target those diverge
+        // and mac.update would silently under-read the encoded array
+        // (target is always a hex64 msg_id in production, where char count
+        // == byte count, so this was dormant, never a live bug). Encode
+        // once and pass the encoded array's own .size so the two can never
+        // drift apart, regardless of target's contents. Pinned-hex tests
+        // (KotlinDmcryptTest) stay byte-identical for every real hex64
+        // target -- this only changes behavior for a target that could
+        // never legitimately occur.
+        val targetBytes = target.toByteArray(Charsets.UTF_8)
+        mac.update(targetBytes, 0, targetBytes.size)
         val out = ByteArray(mac.getMacSize())
         mac.doFinal(out, 0)
 
