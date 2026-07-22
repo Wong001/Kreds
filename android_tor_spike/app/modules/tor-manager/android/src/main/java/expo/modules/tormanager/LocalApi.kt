@@ -927,7 +927,14 @@ class LocalApi(private val ctx: Context) {
                     .put("avatar", JSONObject.NULL)           // comment-author avatars deferred
                     .put("alias", c.alias)
                     .put("alias_seed", c.aliasSeed)
-                    .put("mine", false)                        // read-only
+                    // Finding 1 (final review): was hardcoded false -- now
+                    // KotlinResponses.Comment.mine, resolved via aggregate's
+                    // step-1 own-raw-response match (DecryptPass.
+                    // responsesPass' ownRawByCreatedAt). Lights up
+                    // web/app.js:640's retract "x" for THIS device's own
+                    // comment (app.js:649's POST /api/retract body uses
+                    // `c.created_at`, unaffected -- already correct above).
+                    .put("mine", c.mine)
                     .put("body", c.body)
                     .put("created_at", c.createdAt)
                 // `responder` is emitted CONDITIONALLY -- present only for a
@@ -944,9 +951,14 @@ class LocalApi(private val ctx: Context) {
             }
             return JSONObject()
                 .put("reactions", reactions)
-                .put("my_reaction", JSONObject.NULL)          // read-only
+                // Finding 1 (final review): was hardcoded null -- now
+                // KotlinResponses.Responses.myReaction, resolved the same
+                // step-1 way as Comment.mine above. Lights up web/app.js's
+                // `.on` reaction-picker state (app.js:540/543/574) and the
+                // retract-via-"clear" POST path (app.js:587).
+                .put("my_reaction", r.myReaction ?: JSONObject.NULL)
                 .put("comments", comments)
-                .put("can_moderate", false)                    // read-only
+                .put("can_moderate", false)                    // still unimplemented (see composeReact's own note)
         }
     }
 }

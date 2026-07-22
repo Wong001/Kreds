@@ -1,13 +1,16 @@
 package expo.modules.tormanager
 
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.security.SecureRandom
 
 /** JVM tests for DecryptPass (B.2 Task 5): decrypts own POST/DM messages via
  *  either an inline `wraps[phoneDevicePub]` entry or a backfilled
@@ -936,5 +939,264 @@ class DecryptPassTest {
 
         val out = DecryptPass.responsesPass(store, phoneDevicePub, c.getString("enc_priv"), c.getString("author"))
         assertTrue("no known post for target -> no responses entry, fail-closed", out.isEmpty())
+    }
+
+    // -- Finding 1 (final review): own-response read-side (mine/my_reaction)
+    // via responsesPass' new ownRawByCreatedAt step -- end-to-end, real
+    // crypto throughout (encryptBody/wrapKey/responseAad/responsesAad), NOT
+    // via ComposeResponse.compose: that call would put a raw
+    // KotlinWire.PyFloat into an InMemorySyncStore's payload["created_at"]
+    // (no JSON round-trip happens for this store impl, unlike the real
+    // on-device SqliteSyncStore, which always round-trips through
+    // MsgJson.serialize/jsonToMap -- see ownRawByCreatedAt's own doc for why
+    // that round-trip is what makes `payload["created_at"] as? Number`
+    // safe in production), which would make `ownRawByCreatedAt`'s own outer-
+    // payload read silently find nothing. Hand-building with a plain Double
+    // sidesteps that InMemorySyncStore-only artifact and is, if anything,
+    // MORE representative of what responsesPass actually sees on-device.
+
+    private fun genEncKeyPair(): Pair<String, String> {   // (privHex, pubHex)
+        val p = X25519PrivateKeyParameters(SecureRandom())
+        return KotlinWire.toHex(p.encoded) to KotlinWire.toHex(p.generatePublicKey().encoded)
+    }
+
+    /** A real own journal post (kind="post", placement="journal", authored
+     *  by `identityPub`) -- ingested so its REAL msgId (a hash of its own
+     *  signed envelope) is available as a response target, the same
+     *  seedOwnJournalPost idiom ComposeResponseTest.kt uses. */
+    private fun journalPost(store: InMemorySyncStore, identityPub: String, devPrivHex: String): String {
+        val msg = signedMessage(identityPub, store.nextSeq(),
+            mapOf("kind" to "post", "placement" to "journal", "created_at" to 1752900000.0), devPrivHex)
+        assertTrue(store.ingestMessage(msg))
+        return msg.msgId()
+    }
+
+    /** Hand-builds ONE raw kind="response" (singular -- ComposeResponse's
+     *  own envelope shape) SignedMessage, wrapped to `phoneDevicePub` (this
+     *  class's own test constant for "the reading device") via a real
+     *  X25519 wrap -- mirrors ComposeResponse.kt's own self-readable-wrap
+     *  construction, minus the author/mutual-box wrapping this test doesn't
+     *  need (ownRawByCreatedAt only ever reads the phoneDevicePub wrap).
+     *  Deliberately WRAPPED-TO, not SIGNED-BY, `phoneDevicePub` -- the
+     *  message's cert.device_pub is whatever `devPrivHex` derives (via
+     *  `signedMessage`), decoupled from the wrap-map key, same as every
+     *  other wraps-map test in this file (e.g. decryptsPostViaInlineWrap's
+     *  `mapOf(phoneDevicePub to ...)` alongside a message signed by a
+     *  DIFFERENT device key). `mutualBox` defaults to null (a public=false
+     *  entry's box is never opened by step 1, so an unopenable/absent box
+     *  is fine here; validEntry still requires it be shape-valid, and null
+     *  passes that). */
+    private fun rawResponseMessage(
+        identityPub: String, devPrivHex: String, phoneEncPub: String,
+        target: String, rkind: String, body: String, createdAt: Double, seq: Int,
+        mutualBox: Any? = null,
+    ): SignedMessage {
+        val aad = KotlinDmcrypt.responseAad(identityPub, target, createdAt)
+        val key = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val (nonceHex, ctHex) = KotlinDmcrypt.encryptBody(key, mapOf(
+            "rkind" to rkind, "body" to body,
+            "alias_seed" to "ab".repeat(16), "public" to false,
+            "responder" to identityPub, "responder_sig" to "00".repeat(64),
+            "mutual_box" to mutualBox, "created_at" to createdAt), aad)
+        val wraps = KotlinDmcrypt.wrapKey(key, mapOf(phoneDevicePub to phoneEncPub), aad)
+        val payload: Map<String, Any?> = mapOf(
+            "kind" to "response", "target" to target,
+            "body_nonce" to nonceHex, "body_ct" to ctHex, "wraps" to wraps,
+            "created_at" to createdAt)
+        return signedMessage(identityPub, seq, payload, devPrivHex)
+    }
+
+    /** Hand-builds a folded kind="responses" (plural -- the aggregate
+     *  record) SignedMessage carrying exactly `entries`, wrapped to
+     *  `phoneDevicePub` (see rawResponseMessage's doc for the same
+     *  wrapped-to/signed-by decoupling) -- mirrors hearth's
+     *  `_rebuild_responses_record` entry shape (node.py:2707-2722): a
+     *  private (public=false) entry carries no cleartext identity/
+     *  device_pub, only rkind/body/created_at/alias_seed/public/
+     *  responder_sig/mutual_box. */
+    private fun foldedResponsesRecord(
+        authorIdentityPub: String, devPrivHex: String, phoneEncPub: String,
+        target: String, entries: List<Map<String, Any?>>, createdAt: Double, seq: Int,
+    ): SignedMessage {
+        val aad = KotlinDmcrypt.responsesAad(authorIdentityPub, target, createdAt)
+        val key = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val (nonceHex, ctHex) = KotlinDmcrypt.encryptBody(key, mapOf("entries" to entries), aad)
+        val wraps = KotlinDmcrypt.wrapKey(key, mapOf(phoneDevicePub to phoneEncPub), aad)
+        val payload: Map<String, Any?> = mapOf(
+            "kind" to "responses", "target" to target,
+            "body_nonce" to nonceHex, "body_ct" to ctHex, "wraps" to wraps,
+            "created_at" to createdAt)
+        return signedMessage(authorIdentityPub, seq, payload, devPrivHex)
+    }
+
+    private fun privateEntryShape(rkind: String, body: String, createdAt: Double): Map<String, Any?> = mapOf(
+        "rkind" to rkind, "body" to body, "created_at" to createdAt,
+        "alias_seed" to "ab".repeat(16), "public" to false,
+        "responder_sig" to "00".repeat(64), "mutual_box" to null)
+
+    @Test fun ownRawReactionResolvesMyReactionAndMineTrue() {
+        val store = InMemorySyncStore()
+        store.addIdentity(phoneOwnIdentityPub)
+        val (encPriv, encPub) = genEncKeyPair()
+        val target = journalPost(store, phoneOwnIdentityPub, "e1".repeat(32))
+
+        // The raw response THIS device composed (mirrors ComposeResponse's
+        // self-readable wrap).
+        val raw = rawResponseMessage(
+            phoneOwnIdentityPub, "e1".repeat(32), encPub, target, "reaction", "fire", 1752900100.0, store.nextSeq())
+        assertTrue(store.ingestMessage(raw))
+
+        // The folded record the post's own author (same identity, e.g. a
+        // desktop device) would eventually republish, carrying the SAME
+        // created_at for this responder's reaction -- see
+        // _rebuild_responses_record's entry construction.
+        val entries = listOf(privateEntryShape("reaction", "fire", 1752900100.0))
+        val record = foldedResponsesRecord(
+            phoneOwnIdentityPub, "f1".repeat(32), encPub, target, entries, 1752900200.0, store.nextSeq())
+        assertTrue(store.ingestMessage(record))
+
+        val out = DecryptPass.responsesPass(store, phoneDevicePub, encPriv, phoneOwnIdentityPub)
+        val r = out[target]
+        assertTrue("a responses entry must be present", r != null)
+        assertEquals(mapOf("fire" to 1), r!!.reactions)
+        assertEquals("own reaction must resolve via step 1 -> my_reaction", "fire", r.myReaction)
+    }
+
+    @Test fun ownRawCommentResolvesMineNonAliasDisplayAndCreatedAt() {
+        val store = InMemorySyncStore()
+        store.addIdentity(phoneOwnIdentityPub)
+        val (encPriv, encPub) = genEncKeyPair()
+        val target = journalPost(store, phoneOwnIdentityPub, "e2".repeat(32))
+
+        val raw = rawResponseMessage(
+            phoneOwnIdentityPub, "e2".repeat(32), encPub, target, "comment", "my own comment", 1752900300.0, store.nextSeq())
+        assertTrue(store.ingestMessage(raw))
+
+        val entries = listOf(privateEntryShape("comment", "my own comment", 1752900300.0))
+        val record = foldedResponsesRecord(
+            phoneOwnIdentityPub, "f2".repeat(32), encPub, target, entries, 1752900400.0, store.nextSeq())
+        assertTrue(store.ingestMessage(record))
+
+        val out = DecryptPass.responsesPass(store, phoneDevicePub, encPriv, phoneOwnIdentityPub)
+        val r = out[target]!!
+        assertEquals(1, r.comments.size)
+        val c = r.comments[0]
+        assertTrue("own comment must resolve mine=true via step 1", c.mine)
+        assertFalse("a resolved (step-1-matched) comment must never render as an alias", c.alias)
+        assertEquals("my own comment", c.body)
+        // The exact created_at app.js's retract POST needs (web/app.js:649,
+        // `created_at: c.created_at`) -- unaffected by this fix, but proven
+        // here alongside mine/alias since retract only works if BOTH hold.
+        assertEquals(1752900300.0, c.createdAt, 0.0)
+        // No profile name stored -> hearth's own bare identity[:8] fallback
+        // (node.py:1577), same as every other resolved comment -- Finding 1
+        // does not special-case "you" for the API-facing `name` field (see
+        // KotlinResponses' own doc: the "you" override only ever touches
+        // `display`, a separate native-app-only field LocalApi does not
+        // serialize).
+        assertEquals(phoneOwnIdentityPub.take(8), c.name)
+        assertEquals(phoneOwnIdentityPub, c.responder)
+    }
+
+    @Test fun ownRawClearComposeDoesNotClearMyReactionBeforeTheNextFold() {
+        // Finding 1's documented boundary: hearth's own reference
+        // (_post_responses_view) only ever reflects a FOLDED record's
+        // entries -- a "clear" reaction never becomes an entry (it REMOVES
+        // one during the fold, node.py:2698-2699), so composing "clear"
+        // locally does nothing to my_reaction until the post's author
+        // re-folds and republishes a record that omits the entry. This
+        // proves that fold-dependency is preserved: the folded record here
+        // is STALE (still carries the pre-clear "fire" entry -- exactly
+        // what a real record looks like before the next fold sweep), even
+        // though this device's own store ALSO already holds a later
+        // "reaction: clear" raw response for the same target.
+        val store = InMemorySyncStore()
+        store.addIdentity(phoneOwnIdentityPub)
+        val (encPriv, encPub) = genEncKeyPair()
+        val target = journalPost(store, phoneOwnIdentityPub, "e3".repeat(32))
+
+        val originalReaction = rawResponseMessage(
+            phoneOwnIdentityPub, "e3".repeat(32), encPub, target, "reaction", "fire", 1752900500.0, store.nextSeq())
+        assertTrue(store.ingestMessage(originalReaction))
+        // A later "clear" compose -- ingested locally (mirrors
+        // ComposeResponse.compose's own immediate local ingest), but the
+        // folded record below has NOT caught up with it yet.
+        val clearReaction = rawResponseMessage(
+            phoneOwnIdentityPub, "e3".repeat(32), encPub, target, "reaction", "clear", 1752900600.0, store.nextSeq())
+        assertTrue(store.ingestMessage(clearReaction))
+
+        val staleEntries = listOf(privateEntryShape("reaction", "fire", 1752900500.0))
+        val staleRecord = foldedResponsesRecord(
+            phoneOwnIdentityPub, "f3".repeat(32), encPub, target, staleEntries, 1752900550.0, store.nextSeq())
+        assertTrue(store.ingestMessage(staleRecord))
+
+        val out = DecryptPass.responsesPass(store, phoneDevicePub, encPriv, phoneOwnIdentityPub)
+        assertEquals(
+            "my_reaction must stay stuck at the pre-clear value until the author's NEXT fold omits the entry -- " +
+                "there is no raw-path bypass for a cleared reaction, matching hearth's own fold-only semantics",
+            "fire", out[target]!!.myReaction)
+    }
+
+    @Test fun myReactionClearsOnceANewerFoldOmitsTheEntry() {
+        // The other half of the fold-dependency proof above: once a NEWER
+        // (by created_at) folded record arrives that simply has no reaction
+        // entry for this responder at all -- exactly what the author's next
+        // process_responses sweep would publish after honoring the "clear"
+        // -- my_reaction correctly goes back to null.
+        val store = InMemorySyncStore()
+        store.addIdentity(phoneOwnIdentityPub)
+        val (encPriv, encPub) = genEncKeyPair()
+        val target = journalPost(store, phoneOwnIdentityPub, "e4".repeat(32))
+
+        val originalReaction = rawResponseMessage(
+            phoneOwnIdentityPub, "e4".repeat(32), encPub, target, "reaction", "fire", 1752900700.0, store.nextSeq())
+        assertTrue(store.ingestMessage(originalReaction))
+
+        // The NEXT fold: newer created_at, entries list omits the (now
+        // cleared) reaction entirely.
+        val freshRecord = foldedResponsesRecord(
+            phoneOwnIdentityPub, "f4".repeat(32), encPub, target, emptyList(), 1752900800.0, store.nextSeq())
+        assertTrue(store.ingestMessage(freshRecord))
+
+        val out = DecryptPass.responsesPass(store, phoneDevicePub, encPriv, phoneOwnIdentityPub)
+        assertNull("the fresh fold omits the entry -> my_reaction is null again", out[target]!!.myReaction)
+        assertTrue(out[target]!!.reactions.isEmpty())
+    }
+
+    @Test fun ownRawByCreatedAtNeverCreditsAnotherIdentitysComposedResponse() {
+        // Direct regression test of Finding 1's own documented scope limit
+        // ("cert.identity_pub == own identity"): a DIFFERENT known
+        // identity's raw "response" row, sharing this store (e.g. this
+        // device is the post's author and also received a friend's raw
+        // response via routing), must NEVER be credited to `mine` just
+        // because its created_at happens to match a folded entry -- only
+        // THIS identity's own composed rows populate ownRawByCreatedAt.
+        val store = InMemorySyncStore()
+        store.addIdentity(phoneOwnIdentityPub)
+        val friendIdentity = "cd".repeat(32)
+        store.addIdentity(friendIdentity)
+        val (encPriv, encPub) = genEncKeyPair()
+        val target = journalPost(store, phoneOwnIdentityPub, "e5".repeat(32))
+
+        // A friend's raw response, ALSO wrapped to this phone's device (the
+        // shape it would carry if this device were the post's author and
+        // therefore routed every raw response) -- but authored by
+        // friendIdentity, not phoneOwnIdentityPub.
+        val friendRaw = rawResponseMessage(
+            friendIdentity, "d5".repeat(32), encPub, target, "reaction", "wow", 1752900900.0, store.nextSeq())
+        assertTrue(store.ingestMessage(friendRaw))
+
+        val entries = listOf(privateEntryShape("reaction", "wow", 1752900900.0))
+        val record = foldedResponsesRecord(
+            phoneOwnIdentityPub, "f5".repeat(32), encPub, target, entries, 1752901000.0, store.nextSeq())
+        assertTrue(store.ingestMessage(record))
+
+        val out = DecryptPass.responsesPass(store, phoneDevicePub, encPriv, phoneOwnIdentityPub)
+        val r = out[target]!!
+        assertEquals(mapOf("wow" to 1), r.reactions)
+        assertNull(
+            "a friend's own composed response must never resolve to MY my_reaction, even though it decrypts " +
+                "successfully via the same self/author wrap shape",
+            r.myReaction)
     }
 }

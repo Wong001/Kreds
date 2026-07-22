@@ -454,4 +454,118 @@ class KotlinResponsesTest {
         assertEquals(own.take(8), c.name)
         assertEquals(own, c.responder)
     }
+
+    // ---- Finding 1 (final review): step-1 raw match (rawByCreatedAt) ----
+    //
+    // hearth node.py:1510-1521/1532-1533's `raw_by_created_at` -- tried
+    // FIRST, unconditionally (before even checking e["public"]), and needs
+    // no sig/device-bound re-check (the identity already came from this
+    // device's own cert-proven store, not from inside the untrusted entry).
+    // DecryptPass.responsesPass populates this, per this task's scope, with
+    // ONLY the viewer's own composed comment/reaction responses -- these
+    // tests exercise [resolve]/[aggregate]'s pure logic directly with a
+    // hand-built rawByCreatedAt map, independent of that store-scanning
+    // wiring (covered separately, end-to-end, by DecryptPassTest.kt).
+
+    @Test fun rawMatchResolvesOwnIdentityToYouAndSetsMine() {
+        val own = "ee".repeat(32)
+        val e = reaction("fire", "66".repeat(16)).toMutableMap().also { it["created_at"] = 5.0 }
+        val (display, color) = KotlinResponses.resolveDisplay(
+            e, target(), emptyMap(), { _, _ -> true }, "", own, mapOf(5.0 to own))
+        assertEquals("a step-1 match to the viewer's own identity displays \"you\"", "you", display)
+        assertNull("resolved -> no alias color", color)
+    }
+
+    @Test fun rawMatchOutranksThePublicAndMutualBoxBranches() {
+        // Even a WELL-FORMED public entry (real responder identity, valid
+        // shape) must defer to a step-1 raw match on the SAME created_at --
+        // hearth tries raw_by_created_at BEFORE ever looking at e["public"].
+        // publicEntry()'s own createdAt (from the fixture) is reused here so
+        // the raw map's key genuinely lines up with the entry under test.
+        val e = publicEntry()
+        val entryCreatedAt = (e["created_at"] as Number).toDouble()
+        val rawIdentity = "ff".repeat(32)   // deliberately NOT publicIdentity()
+        val (display, color) = KotlinResponses.resolveDisplay(
+            e, target(), mapOf(publicIdentity() to "Alice", rawIdentity to "Bob"),
+            { _, _ -> true }, "", "", mapOf(entryCreatedAt to rawIdentity))
+        assertEquals("step 1 wins over the public branch's own claimed identity", "Bob", display)
+        assertNull(color)
+    }
+
+    @Test fun rawMatchOnADifferentCreatedAtDoesNotAffectAnUnrelatedEntry() {
+        // A friend's ordinary public entry, unaffected by a rawByCreatedAt
+        // map that is non-empty but keyed on a DIFFERENT created_at (the
+        // viewer's own, unrelated response elsewhere on the same post) --
+        // proves step 1 is a targeted per-created_at match, not a blanket
+        // override once any own response exists on the post.
+        val (display, color) = KotlinResponses.resolveDisplay(
+            publicEntry(), target(), mapOf(publicIdentity() to "Alice"), { _, _ -> true },
+            "", "", mapOf(999.0 to "ee".repeat(32)))
+        assertEquals("Alice", display)
+        assertNull(color)
+    }
+
+    @Test fun aggregateReactionMatchedByRawSetsMyReactionAndCommentMine() {
+        val own = "12".repeat(32)
+        val entries = listOf(
+            reaction("heart", "33".repeat(16)).toMutableMap().also { it["created_at"] = 10.0 },
+            reaction("fire", "44".repeat(16)).toMutableMap().also { it["created_at"] = 20.0 })
+        val r = KotlinResponses.aggregate(
+            entries, target(), emptyMap(), { _, _ -> true }, "", own, mapOf(20.0 to own))
+        assertEquals(mapOf("heart" to 1, "fire" to 1), r.reactions)
+        assertEquals("the entry matching rawByCreatedAt is mine -> my_reaction", "fire", r.myReaction)
+    }
+
+    @Test fun aggregateWithoutRawMatchLeavesMyReactionNullRegressionCheck() {
+        // Pre-Finding-1 behavior (no rawByCreatedAt supplied at all) stays
+        // byte-identical: myReaction defaults null, unaffected.
+        val entries = listOf(reaction("heart", "55".repeat(16)))
+        val r = KotlinResponses.aggregate(entries, target(), emptyMap(), { _, _ -> true })
+        assertNull(r.myReaction)
+    }
+
+    @Test fun aggregateCommentMatchedByRawSetsMineAndNonAliasName() {
+        val own = "34".repeat(32)
+        val e = aliasComment("hello", "66".repeat(16)).toMutableMap().also { it["created_at"] = 7.0 }
+        val r = KotlinResponses.aggregate(
+            listOf(e), target(), emptyMap(), { _, _ -> true }, "", own, mapOf(7.0 to own))
+        assertEquals(1, r.comments.size)
+        val c = r.comments[0]
+        assertTrue("step-1-matched comment must never render as an alias", c.mine)
+        assertFalse(c.alias)
+        assertEquals(own.take(8), c.name)
+        assertEquals(own, c.responder)
+    }
+
+    @Test fun aggregateOtherResponderCommentIsNeverMine() {
+        // A friend's resolved (public) comment, with rawByCreatedAt non-empty
+        // but keyed to the VIEWER's own unrelated created_at -- proves
+        // `mine` stays false for every entry that doesn't itself match
+        // step 1, not just that the display/alias fields are unaffected.
+        val own = "56".repeat(32)
+        val r = KotlinResponses.aggregate(
+            listOf(publicEntry()), target(), mapOf(publicIdentity() to "Alice"), { _, _ -> true },
+            "", own, mapOf(999.0 to own))
+        assertEquals(1, r.comments.size)
+        val c = r.comments[0]
+        assertFalse("a friend's own comment must never be marked mine", c.mine)
+        assertEquals("Alice", c.name)
+    }
+
+    @Test fun aClearBodiedReactionEntryIsNeverValidRegardlessOfRawMatch() {
+        // Documents WHY the fold-dependency (DecryptPassTest.kt's
+        // ownRawClearComposeDoesNotClearMyReactionBeforeTheNextFold) is the
+        // only possible outcome: a folded record can never even CONTAIN a
+        // "clear"-bodied reaction entry in the first place (validEntry's own
+        // REACTION_TOKENS gate rejects it), matching hearth's own
+        // _valid_response_entry -- "clear" only ever appears in a RAW
+        // KIND_RESPONSE, never in a folded entries list, by construction.
+        val own = "78".repeat(32)
+        val e = reaction("clear", "99".repeat(16)).toMutableMap().also { it["created_at"] = 3.0 }
+        val r = KotlinResponses.aggregate(
+            listOf(e), target(), emptyMap(), { _, _ -> true }, "", own, mapOf(3.0 to own))
+        assertTrue("a clear-bodied reaction entry must be dropped by validEntry, never tallied or matched",
+            r.reactions.isEmpty())
+        assertNull(r.myReaction)
+    }
 }

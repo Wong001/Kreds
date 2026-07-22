@@ -90,6 +90,36 @@ class LocalApiTest {
         assertFalse(c.getBoolean("alias"))
     }
 
+    // -- Finding 1 (final review): responsesJson wires KotlinResponses.
+    // Comment.mine / Responses.myReaction through instead of hardcoding
+    // false/null -- these prove the MARSHALLING layer specifically (the
+    // resolution logic itself is KotlinResponsesTest's/DecryptPassTest's
+    // job); a KotlinResponses.Comment/Responses value with mine=true /
+    // myReaction set is hand-built here, independent of how it got resolved.
+
+    @Test fun feedRowSurfacesMyReactionWhenResponsesCarriesIt() {
+        val resp = KotlinResponses.Responses(
+            reactions = linkedMapOf("fire" to 1), comments = emptyList(), myReaction = "fire")
+        val o = LocalApi.feedRow(sampleDecrypted(mine = true), ownIdentityPub = "own", responses = resp)
+        val r = o.getJSONObject("responses")
+        assertEquals("fire", r.getString("my_reaction"))
+    }
+
+    @Test fun feedRowSurfacesMineTrueForAnOwnComment() {
+        val resp = KotlinResponses.Responses(
+            reactions = emptyMap(),
+            comments = listOf(
+                KotlinResponses.Comment(
+                    body = "my own comment", display = "you", aliasColor = null, createdAt = 5.0,
+                    alias = false, aliasSeed = "aabbccdd", name = "own01234", responder = "own",
+                    mine = true)))
+        val o = LocalApi.feedRow(sampleDecrypted(mine = true), ownIdentityPub = "own", responses = resp)
+        val r = o.getJSONObject("responses")
+        val c = r.getJSONArray("comments").getJSONObject(0)
+        assertTrue("an own-resolved comment must surface mine=true, not the old hardcoded false", c.getBoolean("mine"))
+        assertEquals(5.0, c.getDouble("created_at"), 0.0)   // what app.js's retract POST sends back
+    }
+
     @Test fun notExpiredMatchesHearthBoundary() {
         // hearth _decrypt_post_row (node.py:1594-1598): drop a post iff
         // expires_at is present AND <= now. So keep iff no expiry, or expiry
