@@ -6,6 +6,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -83,5 +84,42 @@ class KotlinDmcryptTest {
             assertTrue("private reaction entry missing", sawPrivateReaction)
         }
         assertTrue("no \"responses\" case found in fixture", found)
+    }
+
+    @Test fun encryptBodyRoundTripsThroughDecryptBody() {
+        val key = ByteArray(32) { (it + 1).toByte() }
+        val aad = KotlinDmcrypt.postAad("id".repeat(32), "kreds", 1752900000.5)
+        val body = mapOf("text" to "hello world", "blobs" to listOf("ab".repeat(32)))
+        val (nonceHex, ctHex) = KotlinDmcrypt.encryptBody(key, body, aad)
+        assertEquals("24-hex nonce", 24, nonceHex.length)
+        assertTrue("hex ct", ctHex.isNotEmpty() && ctHex.all { it in "0123456789abcdef" })
+        val back = KotlinDmcrypt.decryptBody(key, nonceHex, ctHex, aad)!!
+        assertEquals("hello world", back["text"])
+        // decryptBody returns JSON arrays as org.json.JSONArray (see
+        // responsesRecordDecrypts), not a Kotlin List, so compare element-wise.
+        val blobsBack = back["blobs"] as JSONArray
+        assertEquals(1, blobsBack.length())
+        assertEquals("ab".repeat(32), blobsBack.getString(0))
+        // wrong AAD -> null (binding holds)
+        val badAad = KotlinDmcrypt.postAad("id".repeat(32), "inner", 1752900000.5)
+        assertNull(KotlinDmcrypt.decryptBody(key, nonceHex, ctHex, badAad))
+    }
+
+    @Test fun wrapKeyRoundTripsThroughUnwrapKey() {
+        // recipient X25519 keypair via EncKeys' generator shape
+        val recipPriv = org.bouncycastle.crypto.params.X25519PrivateKeyParameters(java.security.SecureRandom())
+        val recipPrivHex = KotlinWire.toHex(recipPriv.encoded)
+        val recipPubHex = KotlinWire.toHex(recipPriv.generatePublicKey().encoded)
+        val key = ByteArray(32) { (it + 7).toByte() }
+        val aad = KotlinDmcrypt.postAad("id".repeat(32), "kreds", 1752900000.5)
+        val wraps = KotlinDmcrypt.wrapKey(key, mapOf("dev01234" to recipPubHex), aad)
+        val w = wraps["dev01234"]!!
+        assertEquals(64, w["eph_pub"]!!.length); assertEquals(24, w["nonce"]!!.length)
+        assertTrue(w["wrapped_key"]!!.isNotEmpty())
+        // unwrapKey (already-proven inverse) recovers the key
+        val recovered = KotlinDmcrypt.unwrapKey(w, recipPrivHex, aad)!!
+        assertArrayEquals(key, recovered)
+        // malformed enc_pub is skipped, not thrown
+        assertTrue(KotlinDmcrypt.wrapKey(key, mapOf("bad" to "zz"), aad).isEmpty())
     }
 }

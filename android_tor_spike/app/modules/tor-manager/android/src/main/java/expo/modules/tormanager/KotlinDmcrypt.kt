@@ -53,6 +53,19 @@ object KotlinDmcrypt {
         if (len == out.size) out else out.copyOf(len)
     } catch (e: Exception) { null }
 
+    // encrypt counterpart of chachaOpen (init(true,...)); returns nonce-less ct+tag.
+    private fun chachaSeal(key: ByteArray, nonce: ByteArray, plain: ByteArray, aad: ByteArray): ByteArray {
+        val c = ChaCha20Poly1305()
+        c.init(true, AEADParameters(KeyParameter(key), 128, nonce, aad))
+        val out = ByteArray(c.getOutputSize(plain.size))
+        val n = c.processBytes(plain, 0, plain.size, out, 0)
+        c.doFinal(out, n)
+        return out
+    }
+
+    private fun randomBytes(n: Int): ByteArray =
+        ByteArray(n).also { java.security.SecureRandom().nextBytes(it) }
+
     fun unwrapKey(wrap: Map<String, Any?>, encPrivHex: String, aad: ByteArray): ByteArray? {
         return try {
             val ephPub = KotlinWire.fromHex(wrap["eph_pub"] as String)
@@ -71,5 +84,36 @@ object KotlinDmcrypt {
             ?: return null
         val o = JSONObject(String(plain, Charsets.UTF_8))
         return o.keys().asSequence().associateWith { o.get(it) }
+    }
+
+    /** Inverse of decryptBody: plaintext = canonical(body). */
+    fun encryptBody(contentKey: ByteArray, body: Map<String, Any?>, aad: ByteArray): Pair<String, String> {
+        val nonce = randomBytes(12)
+        val ct = chachaSeal(contentKey, nonce, KotlinWire.canonical(body), aad)
+        return KotlinWire.toHex(nonce) to KotlinWire.toHex(ct)
+    }
+
+    /** Inverse of unwrapKey: {device_pub -> {eph_pub, nonce, wrapped_key}}, one
+     *  fresh ephemeral X25519 per device; wrap AAD == the body AAD (post_aad).
+     *  Shared-secret computation mirrors unwrapKey exactly (X25519Agreement),
+     *  just with the ephemeral key as the local private and the device's
+     *  published enc key as the peer public. */
+    fun wrapKey(contentKey: ByteArray, deviceEncPubs: Map<String, String>, aad: ByteArray): Map<String, Map<String, String>> {
+        val out = linkedMapOf<String, Map<String, String>>()
+        for ((devicePub, encPubHex) in deviceEncPubs) {
+            val peer = try {
+                X25519PublicKeyParameters(KotlinWire.fromHex(encPubHex), 0)
+            } catch (e: Exception) { continue }        // skip malformed enc keys
+            val eph = X25519PrivateKeyParameters(java.security.SecureRandom())
+            val shared = ByteArray(32)
+            X25519Agreement().apply { init(eph) }.calculateAgreement(peer, shared, 0)
+            val kek = deriveKek(shared)
+            val nonce = randomBytes(12)
+            out[devicePub] = mapOf(
+                "eph_pub" to KotlinWire.toHex(eph.generatePublicKey().encoded),
+                "nonce" to KotlinWire.toHex(nonce),
+                "wrapped_key" to KotlinWire.toHex(chachaSeal(kek, nonce, contentKey, aad)))
+        }
+        return out
     }
 }
