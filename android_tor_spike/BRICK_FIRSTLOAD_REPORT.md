@@ -284,7 +284,8 @@ started by this slice.
   *pre-existing* flow as a regression check, not the new panel — this
   ticket is about giving it a home in the new UI, not about it being
   broken.
-- **`/api/pair/accept`'s exception path never fires the pending-request
+- **RANKED #2 (operationally, per the final whole-branch review):**
+  **`/api/pair/accept`'s exception path never fires the pending-request
   event** (Task 2). If `accept_pairing` itself raises, the held
   connection has no signal and looks dead until the code's TTL expires
   rather than failing fast with a clear error.
@@ -298,14 +299,18 @@ started by this slice.
   length-prefix frame read/write implementation (byte-identical by
   construction, verified, but not shared code). Future DRY candidate, not
   a correctness gap.
-- **Prebuild config plugins for the remaining hand-held customizations**
-  (Task 7). Only the CAMERA permission got a proper Expo config plugin
-  this slice; the tor-android AAR reference, arm64 ABI pins, and the
-  network-security-config remain hand-restored-on-prebuild
-  customizations (verified byte-identical after Task 7's clean prebuild,
-  but still fragile to any *future* prebuild by someone who doesn't know
-  to re-diff). Candidate: small local config plugins following the
-  `withHearthWebAssets` pattern already used elsewhere in this module.
+- **RANKED #1 (operationally, per the final whole-branch review) — do
+  before the next Expo-touching slice:** **Prebuild config plugins for
+  the remaining hand-held customizations** (Task 7). Only the CAMERA
+  permission got a proper Expo config plugin this slice; the tor-android
+  AAR reference, arm64 ABI pins, and the network-security-config remain
+  hand-restored-on-prebuild customizations (verified byte-identical
+  after Task 7's clean prebuild, but still fragile to any *future*
+  prebuild by someone who doesn't know to re-diff). A future `expo
+  prebuild --clean` silently breaks Tor + video + camera all at once if
+  this isn't done first. Candidate: small local config plugins following
+  the `withHearthWebAssets` pattern already used elsewhere in this
+  module.
 - **`PairingStore`'s atomic write has no fallback if `ATOMIC_MOVE` isn't
   supported** (Task 3). The NIO atomic-move re-pair-overwrite path is
   reasoned to be safe on the target filesystems, but there's no fallback
@@ -316,6 +321,51 @@ started by this slice.
   direction** (spec "Out of scope," see "Honest boundary" above).
   Explicitly deferred to a later arc — August's direction is an opt-in
   panic-wipe alongside an App-lock analog, its own design conversation.
+
+**Final whole-branch review (this session) added five more findings,
+none blocking merge** (existing tickets above are unchanged and keep
+their original numbering/order; the two RANKED tags above were added by
+this same review pass):
+
+- **Desktop panel's pending state is terminal.** The Add-device panel
+  polls `/api/pair/pending` while waiting, but once a pending ceremony
+  resolves and `pending` goes back to `null`, the panel doesn't
+  distinguish "never happened" from "just resolved" -- there's no
+  UI transition to an expired/resolved view, so a human who missed the
+  Accept/Deny moment has no discoverable way to recover except manually
+  restarting Add-device. Candidate: keep polling and flip to an expired
+  view when `pending` goes null without a prior local Accept/Deny click.
+- **Ghost-device enroll on accept-after-phone-gone.** If the desktop
+  operator clicks Accept after the phone has already dropped the
+  connection (crashed, lost Tor, walked away), `node.accept_pairing`
+  still runs and enrolls a device that will never come back to claim its
+  package -- an enrolled-but-unreachable "ghost" device sitting in the
+  identity's device list. This is inherent to the protocol's shape (the
+  accept decision and the connection's liveness are checked
+  independently, not atomically) rather than a bug in this slice;
+  existing device revocation is the cleanup path. Recorded here as a
+  report line, not a fix.
+- **Client protocol field is silently rebuilt server-side.** The pairing
+  package's protocol-version field isn't trusted from the phone as sent
+  -- the server rebuilds it from its own constant rather than validating
+  the client's. A version-skewed phone can therefore complete pairing
+  successfully and only fail later, at AUTH, rather than getting a clear
+  version-mismatch error at pairing time. Not urgent today (single
+  protocol version in the field), but check this the next time `PROTOCOL`
+  bumps -- that's when the deferred failure becomes reachable.
+- **Portless type-4 link surfaces as "unreachable" not "bad_link".**
+  A pairing link missing its port (a type-4 link malformed in that
+  specific way) is reported to the human as a generic "unreachable"
+  connection failure rather than a more specific "bad_link" parse error.
+  Cosmetic -- the ceremony still correctly fails closed, just with a
+  less precise message.
+- The two RANKED tags above (prebuild config plugins = #1, do before the
+  next Expo-touching slice; `/api/pair/accept`'s exception-path event gap
+  = #2) are this review's operational priority call across the whole
+  ticket list, not new findings.
+
+**Final review verdict:** READY TO MERGE pending DoD, zero blocking
+findings.
 
 Additional minor/cosmetic items carried in the ledger but not blocking
 and not itemized above: Task 4's unrecognized-reply `t` string is
