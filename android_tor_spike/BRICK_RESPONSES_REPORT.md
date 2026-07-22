@@ -193,9 +193,9 @@ check).
 
 ## On-device DoD — G20 (August drives)
 
-**Status: PENDING.** Not run by Claude — per this task's instructions, only
-the install was verified (see below). This checklist is copied verbatim from
-`.superpowers/sdd/task-9-brief.md` Step 3.
+**Status: PASSED — confirmed by August 2026-07-22** ("It works") after
+driving the run below on the G20 with the fix-wave build installed. The
+checklist is copied verbatim from `.superpowers/sdd/task-9-brief.md` Step 3.
 
 **Field lessons (do these first, carried from outbound-1 + this slice's
 gotchas — see "Run gotchas" below):**
@@ -229,7 +229,8 @@ the phone: react + comment on a friend's post AND your own; verify:
 
 ### Verdict (August to fill)
 
-> _(pass / partial / fail + notes)_
+> **PASS** — August, 2026-07-22: "It works" (on-device run on the G20,
+> fix-wave build). No issues reported.
 
 ## Install confirmation (this session, final-review fix wave)
 
