@@ -938,8 +938,15 @@ h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
 #ceremony button { margin-top: 6px; margin-right: 6px; font-size: 12px; }
 #ceremony > .btn-accent { width: 100%; }
 .ceremony-panel { margin-top: 10px; }
-#qr-img { display: block; margin: 8px 0; background: #fff; padding: 8px; border: 1px solid var(--line);
+#qr-img, .qr-code { display: block; margin: 8px 0; background: #fff; padding: 8px; border: 1px solid var(--line);
   border-radius: 10px; max-width: 190px; }
+
+/* Desktop Add-device screen (Task 5): same panel idiom as #ceremony right
+   above - the QR reuses #qr-img's box treatment via the shared .qr-code
+   class, the link field reuses .friendadd-code's readonly styling, and
+   the countdown reuses .friendadd-countdown's weight. */
+#add-device button { margin-top: 6px; margin-right: 6px; font-size: 12px; }
+#add-device > .btn-accent { width: 100%; }
 
 /* Easier friend-add (Task 3): Share/Enter tabs are the default view inside
    .ceremony-panel; the original 4-box copy-paste ceremony (buildManualCeremony)
