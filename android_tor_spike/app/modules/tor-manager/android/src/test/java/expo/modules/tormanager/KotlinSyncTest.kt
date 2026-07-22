@@ -104,4 +104,46 @@ class KotlinSyncTest {
         assertTrue("signature must verify against the real vector device key", msg.verifyDeviceSignature())
         assertEquals("enckey", msg.kind)
     }
+
+    /** Task 8 (outbound blob push): Base64Portable.encode is new -- the BLOBS
+     *  phase now uses it to serialize held blobs for the wire, and the SAME
+     *  object's `decode` (already proven against real hearth-sent blobs by
+     *  SyncLoopbackTest) must recover exactly what `encode` produced, for
+     *  arbitrary bytes including the edge cases a naive codec gets wrong:
+     *  empty input, high bytes (0xff, sign-extension bugs), zero bytes, and
+     *  lengths that land on each of the three byte-count-mod-3 padding
+     *  cases (0/1/2 trailing bytes -> 0/2/1 '=' pad chars). This is a pure
+     *  self round-trip (no node involved) -- the actual wire-format parity
+     *  with Python's base64.b64encode/hearth's decoder is asserted by
+     *  inspection of the shared standard alphabet + padding (see
+     *  Base64Portable's doc comment) and exercised live by
+     *  SyncLoopbackTest's real node exchanges. */
+    @Test fun base64PortableEncodeRoundTripsThroughDecode() {
+        val cases = listOf(
+            ByteArray(0),
+            byteArrayOf(0),
+            byteArrayOf(0, 0, 0),
+            byteArrayOf(-1),                          // 0xff
+            byteArrayOf(-1, -1),                       // 0xff 0xff
+            byteArrayOf(-1, -1, -1),                   // 0xff 0xff 0xff
+            byteArrayOf(0, -1, 127, -128, 1, 2, 3),
+            ByteArray(256) { it.toByte() },            // every byte value 0..255
+        )
+        for (bytes in cases) {
+            val encoded = Base64Portable.encode(bytes)
+            // Padding shape must match standard base64: encoded length is a
+            // multiple of 4, '=' only ever at the end.
+            if (bytes.isNotEmpty()) assertEquals(0, encoded.length % 4)
+            val decoded = Base64Portable.decode(encoded)
+            assertTrue(
+                "round trip must recover the original bytes exactly for ${bytes.toList()}",
+                bytes.contentEquals(decoded))
+        }
+
+        // Pin against a known standard-base64 vector (padding included) so
+        // this isn't merely internally self-consistent.
+        assertEquals("Zm9vYmFy", Base64Portable.encode("foobar".toByteArray(Charsets.US_ASCII)))
+        assertEquals("Zm9v", Base64Portable.encode("foo".toByteArray(Charsets.US_ASCII)))
+        assertEquals("Zg==", Base64Portable.encode("f".toByteArray(Charsets.US_ASCII)))
+    }
 }

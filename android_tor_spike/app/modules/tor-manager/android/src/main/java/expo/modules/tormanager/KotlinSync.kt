@@ -11,17 +11,20 @@ sealed class SyncResult {
 
 private const val MAX_BLOB_BYTES = 10 * 1024 * 1024   // hearth/messages.py:56
 
-/** RFC-4648 standard-alphabet base64 decoder, hand-rolled instead of either
+/** RFC-4648 standard-alphabet base64 codec, hand-rolled instead of either
  *  android.util.Base64 (Android-only, breaks the BB-5 JVM desk gate) or
  *  java.util.Base64 (API 26+, this module's minSdkVersion is 24 -- would
  *  NoSuchMethodError on API 24/25 devices, uncaught by assembleDebug since
  *  lintOptions.abortOnError is false). Works on any API level and on a
- *  plain JVM. The node encodes blobs with Python's base64.b64encode,
- *  which uses this same standard alphabet. */
+ *  plain JVM. The node encodes/decodes blobs with Python's
+ *  base64.b64encode/b64decode, which uses this same standard alphabet
+ *  (with `=` padding) -- `encode` (Task 8, outbound blob push) is the
+ *  exact mirror of `decode` below, so round-tripping through either side
+ *  (this <-> this, or this <-> hearth's base64.b64encode) is symmetric. */
 object Base64Portable {
+    private const val ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     private val DEC = IntArray(128) { -1 }.also {
-        val a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        for (i in a.indices) it[a[i].code] = i
+        for (i in ALPHABET.indices) it[ALPHABET[i].code] = i
     }
     fun decode(s: String): ByteArray {
         val out = java.io.ByteArrayOutputStream()
@@ -34,6 +37,26 @@ object Base64Portable {
             if (bits >= 8) { bits -= 8; out.write((buf shr bits) and 0xff) }
         }
         return out.toByteArray()
+    }
+
+    /** Standard-alphabet base64 encode, WITH `=` padding -- byte-for-byte
+     *  what Python's base64.b64encode(data).decode() produces (hearth/
+     *  sync.py:654), and what `decode` above accepts. Used by the BLOBS
+     *  phase (KotlinSync.run) to push held blobs the node wants. */
+    fun encode(data: ByteArray): String {
+        val out = StringBuilder(((data.size + 2) / 3) * 4)
+        var i = 0
+        while (i < data.size) {
+            val b0 = data[i].toInt() and 0xff
+            val b1 = if (i + 1 < data.size) data[i + 1].toInt() and 0xff else 0
+            val b2 = if (i + 2 < data.size) data[i + 2].toInt() and 0xff else 0
+            out.append(ALPHABET[b0 shr 2])
+            out.append(ALPHABET[((b0 and 0x3) shl 4) or (b1 shr 4)])
+            out.append(if (i + 1 < data.size) ALPHABET[((b1 and 0xf) shl 2) or (b2 shr 6)] else '=')
+            out.append(if (i + 2 < data.size) ALPHABET[b2 and 0x3f] else '=')
+            i += 3
+        }
+        return out.toString()
     }
 }
 
@@ -208,8 +231,16 @@ object KotlinSync {
 
             // -- BLOBS -- (want swap, then blobs swap)
             writeFrame(stream, mapOf("t" to "blob_want", "hashes" to store.missingBlobs()))
-            readFrame(stream)   // node's want; we give nothing
-            writeFrame(stream, mapOf("t" to "blobs", "blobs" to emptyMap<String, Any>()))
+            val peerWant = readFrame(stream)   // node's want -- NOW honored (Task 8, outbound push)
+            val give = linkedMapOf<String, String>()
+            peerWant.optJSONArray("hashes")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val h = arr.optString(i)
+                    val data = store.getBlob(h) ?: continue
+                    give[h] = Base64Portable.encode(data)
+                }
+            }
+            writeFrame(stream, mapOf("t" to "blobs", "blobs" to give))
             val blobs = readFrame(stream)
             val given = blobs.optJSONObject("blobs") ?: JSONObject()
             var storedBlobs = 0
