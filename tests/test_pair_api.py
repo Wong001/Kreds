@@ -203,6 +203,46 @@ def test_pair_accept_false_denies_without_enrolling(tmp_path):
     assert req["device_pub"] not in n.store.load_views(n.identity_pub)
 
 
+def test_pair_accept_400_when_already_decided_deny_then_accept(tmp_path):
+    """Whole-branch review: pair_accept must mirror pair_begin's 'never
+    flip a decided verdict' guard. A denied ceremony (verdict already
+    set) must refuse a second, later Accept -- e.g. a stale second tab
+    racing the wire coroutine in the near-nil window before it consumes
+    the verdict -- rather than flipping a real deny into a real
+    enrollment."""
+    n = _fresh(tmp_path)
+    req = _stub_pending(n, tmp_path)
+    c = TestClient(build_app(n))
+    r1 = c.post("/api/pair/accept",
+               json={"device_pub": req["device_pub"], "accept": False})
+    assert r1.status_code == 200
+    assert n.pending_pair["verdict"] is False
+    r2 = c.post("/api/pair/accept",
+               json={"device_pub": req["device_pub"], "accept": True})
+    assert r2.status_code == 400
+    assert n.pending_pair["verdict"] is False
+    assert "package" not in n.pending_pair
+    assert req["device_pub"] not in n.store.load_views(n.identity_pub)
+
+
+def test_pair_accept_400_when_already_decided_accept_then_deny(tmp_path):
+    """And the mirror direction: an already-accepted (enrolled) ceremony
+    must refuse a later Deny -- the enrollment must not be silently
+    un-recorded by overwriting the verdict."""
+    n = _fresh(tmp_path)
+    req = _stub_pending(n, tmp_path)
+    c = TestClient(build_app(n))
+    r1 = c.post("/api/pair/accept",
+               json={"device_pub": req["device_pub"], "accept": True})
+    assert r1.status_code == 200
+    assert n.pending_pair["verdict"] is True
+    r2 = c.post("/api/pair/accept",
+               json={"device_pub": req["device_pub"], "accept": False})
+    assert r2.status_code == 400
+    assert n.pending_pair["verdict"] is True
+    assert req["device_pub"] in n.store.load_views(n.identity_pub)
+
+
 def test_pair_accept_423_while_locked(tmp_path):
     # Mirrors test_applock_api.py / test_friend_add_api.py's locked-guard
     # tests: /api/pair/* is not in _APPLOCK_ALLOWLIST, so locked_gate

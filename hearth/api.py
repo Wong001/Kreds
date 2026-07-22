@@ -712,6 +712,13 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
             pending = node.pending_pair
             if pending is None:
                 raise ValueError("no pending pairing request")
+            # Mirror pair_begin's "never flip a decided verdict" guard: a
+            # deny-then-accept (or accept-then-deny) from a second tab, in
+            # the near-nil window before the wire coroutine consumes the
+            # verdict, would otherwise silently overwrite it here --
+            # e.g. turning a real deny into a real enrollment.
+            if "verdict" in pending:
+                raise ValueError("pairing request already decided")
             if body["device_pub"] != pending["device_pub"]:
                 raise ValueError("device_pub mismatch")
             if body["accept"]:
