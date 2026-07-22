@@ -186,7 +186,14 @@ object DecryptPass {
             val bodyNonce = m.payload["body_nonce"] as? String ?: continue
             val bodyCt = m.payload["body_ct"] as? String ?: continue
             val body = KotlinDmcrypt.decryptBody(key, bodyNonce, bodyCt, aad) ?: continue
-            out[target] = KotlinResponses.aggregate(entriesList(body["entries"]), target, profileNames, deviceBound)
+            // Task 6 (read de-anon): thread this device's own encPriv +
+            // ownIdentityPub into aggregate's mutual_box trial-open branch
+            // (KotlinResponses.resolveViaMutualBox) -- both are already this
+            // function's own parameters (encPrivHex is the same key used
+            // above to unwrap this very record's content key), so no new
+            // plumbing beyond this call site is needed.
+            out[target] = KotlinResponses.aggregate(
+                entriesList(body["entries"]), target, profileNames, deviceBound, encPrivHex, ownIdentityPub)
         }
         return out
     }
