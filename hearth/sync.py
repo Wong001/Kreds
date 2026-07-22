@@ -433,7 +433,36 @@ class SyncService:
         return True
 
     async def _handle_pair_request(self, frame, writer):
+        """Checks are ordered cheapest/free-est first, exactly like
+        _handle_friend_add's locked -> no-pending-invite -> rate-limit ->
+        authenticator ordering above -- so a stranger can never spend a
+        more expensive/limited resource (rate-limit budget, then the
+        human's one live code) chasing a request that was always going to
+        be refused."""
+        if self.node.pairing._hash is None:
+            # Cheaper rate-limit (mirrors _handle_friend_add's Fix 1,
+            # sync.py:356-369): with no code minted at all, there is
+            # nothing for verify_and_consume to protect -- refuse
+            # immediately WITHOUT spending rate-limit budget. Otherwise an
+            # onion-address-knowing attacker could sustain a flood with no
+            # code ever live and permanently exhaust the shared 20/60s
+            # budget, denying every real pairing attempt for as long as
+            # the flood continues (not just a transient blip).
+            await write_frame(writer, {"t": "pair-expired"})
+            return
         if not self._pair_request_allowed():
+            await write_frame(writer, {"t": "pair-expired"})
+            return
+        if self.node.pending_pair is not None:
+            # Single active ceremony, checked BEFORE verify_and_consume:
+            # a second frame presenting a fresh, otherwise-valid code
+            # while an earlier request is still parked awaiting the
+            # human's Accept/Deny must not clobber it (that would strand
+            # the first request's held connection with no writer left to
+            # ever resolve it) -- AND must not burn that second code
+            # either, since verify_and_consume never even runs. The human
+            # who just minted it can still redeem it once the first
+            # ceremony resolves.
             await write_frame(writer, {"t": "pair-expired"})
             return
 
@@ -467,15 +496,7 @@ class SyncService:
             # own "consuming is atomic" docstring.
             await write_frame(writer, {"t": "pair-expired"})
             return
-
-        if self.node.pending_pair is not None:
-            # Single active ceremony: a second frame presenting a fresh,
-            # otherwise-valid code while an earlier request is still
-            # parked awaiting the human's Accept/Deny must not clobber it
-            # -- that would strand the first request's held connection
-            # with no writer left to ever resolve it.
-            await write_frame(writer, {"t": "pair-expired"})
-            return
+        device_name = device_name.strip()
 
         request_json = json.dumps({
             "t": "hearth-pair-request", "protocol": PROTOCOL,

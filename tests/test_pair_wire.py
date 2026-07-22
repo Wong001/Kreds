@@ -207,6 +207,12 @@ def test_second_concurrent_pair_frame_expired_single_ceremony(tmp_path):
             reply1 = await first_task
             assert reply1 == {"t": "pair-denied"}
             assert a.pending_pair is None
+
+            # code2 was rejected on the "already pending" check BEFORE
+            # verify_and_consume ever ran on it -- it must still be live
+            # and redeemable now that the first ceremony has resolved,
+            # not silently burned by the rejected attempt.
+            assert a.pairing.verify_and_consume(code2, time.time()) is True
         finally:
             await svc_a.stop()
     asyncio.run(scenario())
@@ -242,18 +248,70 @@ def test_timeout_pair_expired(tmp_path):
 def test_pair_request_rate_limited(tmp_path):
     """Mirrors test_friend_add_delivery.py's
     test_inbound_friend_add_rate_limited -- its OWN budget (not friend-
-    add's), same 20/60s cap."""
+    add's), same 20/60s cap. A live code must be minted for this: with no
+    code active at all, the cheap pre-check below refuses without ever
+    touching the rate limiter (see the next test) -- this one exercises
+    the has-a-live-code case the rate limiter still has to guard, wrong-
+    guessing against it 25 times."""
     async def scenario():
         a = HearthNode.create(tmp_path / "a", "A", "a-dev")
         svc_a, port = await _serve(a)
         try:
+            a.pairing.mint(time.time())     # a live code worth guessing at
             for _ in range(25):
                 reply = await _send_pair_frame(
-                    port, {"t": "hearth-pair-request", "code": "nope"})
+                    port, {"t": "hearth-pair-request", "code": "wrongguess"})
                 assert reply == {"t": "pair-expired"}
             assert not svc_a._pair_request_allowed()
             # the friend-add budget is untouched by the pair flood
             assert svc_a._friend_add_allowed()
+        finally:
+            await svc_a.stop()
+    asyncio.run(scenario())
+
+
+def test_pair_request_with_no_live_code_refused_without_spending_rate_limit(tmp_path):
+    """Fix (mirrors _handle_friend_add's Fix 1, test_friend_add_
+    delivery.py's test_friend_add_with_no_pending_invite_refused_without_
+    spending_rate_limit): with NO code minted at all, a flood must be
+    refused immediately without spending any rate-limit budget -- an
+    onion-address-knowing attacker who never saw a real code must not be
+    able to exhaust the shared 20/60s budget and lock out a legitimate
+    concurrent pairing attempt."""
+    async def scenario():
+        a = HearthNode.create(tmp_path / "a", "A", "a-dev")
+        svc_a, port = await _serve(a)
+        try:
+            assert a.pairing._hash is None      # no code was ever minted
+            for _ in range(25):
+                reply = await _send_pair_frame(
+                    port, {"t": "hearth-pair-request", "code": "nope"})
+                assert reply == {"t": "pair-expired"}
+            assert svc_a._pair_request_times == []
+            assert svc_a._pair_request_allowed()
+        finally:
+            await svc_a.stop()
+    asyncio.run(scenario())
+
+
+def test_malformed_frame_with_valid_code_pair_expired(tmp_path):
+    """A genuinely live, correct code but a malformed device_pub/
+    device_name (buggy or hostile client) -- refused, and the code is
+    consumed in the process (an accepted, documented trade-off: burning a
+    code on a malformed request grants the attacker nothing)."""
+    async def scenario():
+        a = HearthNode.create(tmp_path / "a", "A", "a-dev")
+        svc_a, port = await _serve(a)
+        try:
+            code = a.pairing.mint(time.time())
+            frame = {"t": "hearth-pair-request", "protocol": "hearth/v0.2",
+                     "device_pub": "not-hex", "device_name": "phone-1",
+                     "code": code}
+            reply = await _send_pair_frame(port, frame)
+            assert reply == {"t": "pair-expired"}
+            assert a.pending_pair is None
+            # the code is burned even though the request was malformed
+            assert a.pairing.verify_and_consume(code, time.time()) is False
         finally:
             await svc_a.stop()
     asyncio.run(scenario())
