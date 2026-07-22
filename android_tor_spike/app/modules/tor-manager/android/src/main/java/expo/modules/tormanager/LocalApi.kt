@@ -42,6 +42,7 @@ class LocalApi(private val ctx: Context) {
     // them; every other route below remains GET-only, unchanged.
     fun handle(method: String, path: String, contentType: String? = null, body: ByteArray? = null): HttpResponse? {
         if (method == "POST" && path == "/api/post") return composePost(contentType, body)
+        if (method == "POST" && path == "/api/dm") return composeDm(contentType, body)
         if (method == "POST" && path == "/api/react") return composeReact(body)
         if (method == "POST" && path == "/api/comment") return composeComment(body)
         if (method == "POST" && path == "/api/retract") return composeRetract(body)
@@ -109,6 +110,49 @@ class LocalApi(private val ctx: Context) {
             Compose.post(sharedStore, fx, encPriv, encPub, text, jpegs, scope, createdAt, expiresSeconds)
             json("{\"ok\":true}")
         } catch (e: Exception) { HttpResponse(500, mapOf("Content-Type" to "text/plain"), ("compose failed: ${e.message}").toByteArray()) }
+    }
+
+    // Task 2 (outbound-dm): POST /api/dm -- mirrors api.py:666-681. Multipart:
+    // to (required), text (default ""), expires_seconds, story_ref (JSON,
+    // blank -> null via parseStoryRef), photos file parts. Every file part is
+    // gated through PhotoPrep.toUploadJpeg BEFORE compose() runs -- a bad
+    // image 400s with NO partial send, the same discipline composePost above
+    // already follows. ComposeDm.compose stores each encrypted blob INLINE
+    // (store.putBlob), mirroring Compose.post's own mechanics (see
+    // ComposeDm.kt's doc) -- this route does NOT call store.putBlob itself.
+    // On success, warms dmKeysCache (the same in-memory cache loadDms()/
+    // dmBlob() populate/consume) with the msgId this device just composed,
+    // so a just-sent DM's own photo(s) are immediately viewable via
+    // /api/dm-blob without waiting on the next /api/conversations or
+    // /api/dm/{id} decrypt pass to repopulate the cache. Error split mirrors
+    // respondWithCompose: IllegalArgumentException (from parseExpiresSeconds/
+    // parseStoryRef below, OR from ComposeDm.compose's own require()s --
+    // self-DM, non-friend, bad story_ref shape, no recipient enckeys yet) ->
+    // 400 with the exception's own message; anything else (store/crypto
+    // failure) -> 500 "compose failed: ...", same shape as composePost's.
+    private fun composeDm(contentType: String?, body: ByteArray?): HttpResponse {
+        val ct = contentType ?: return badRequest("no content-type")
+        val bytes = body ?: return badRequest("no body")
+        val form = try { Multipart.parse(ct, bytes) } catch (e: Exception) { return badRequest("bad multipart") }
+        val to = form.fields["to"].orEmpty()
+        if (to.isEmpty()) return badRequest("to required")
+        val text = form.fields["text"].orEmpty()
+        val jpegs = ArrayList<ByteArray>()
+        for (f in form.files) { val j = PhotoPrep.toUploadJpeg(f.bytes) ?: return badRequest("bad image"); jpegs.add(j) }
+        val fx = fixtureOrNull() ?: return badRequest("no fixture")
+        val (encPriv, encPub) = EncKeys.getOrCreate(sharedStore)
+        val createdAt = System.currentTimeMillis() / 1000.0
+        return try {
+            val expiresSeconds = parseExpiresSeconds(form.fields["expires_seconds"].orEmpty())
+            val storyRef = parseStoryRef(form.fields["story_ref"].orEmpty())
+            val r = ComposeDm.compose(sharedStore, fx, encPriv, encPub, to, text, jpegs, expiresSeconds, storyRef, createdAt)
+            dmKeysCache = dmKeysCache + (r.msgId to r.contentKey)
+            json(JSONObject().put("msg_id", r.msgId).toString())
+        } catch (e: IllegalArgumentException) {
+            badRequest(e.message ?: "bad request")
+        } catch (e: Exception) {
+            HttpResponse(500, mapOf("Content-Type" to "text/plain"), ("compose failed: ${e.message}").toByteArray())
+        }
     }
 
     private fun badRequest(msg: String) = HttpResponse(400, mapOf("Content-Type" to "text/plain"), msg.toByteArray())
@@ -619,6 +663,54 @@ class LocalApi(private val ctx: Context) {
             is Double -> KotlinWire.dumps(KotlinWire.PyFloat(v))
             is java.math.BigDecimal -> KotlinWire.dumps(KotlinWire.PyFloat(v.toDouble()))
             else -> throw IllegalArgumentException("bad created_at")
+        }
+
+        // Task 2 (outbound-dm): mirrors api.py's /api/dm route body --
+        // `float(expires_seconds) if expires_seconds.strip() else None`
+        // (api.py:679). Blank/whitespace-only -> null (Python's
+        // falsy-after-strip check). A non-blank, non-numeric value ->
+        // IllegalArgumentException("bad expires_seconds") -- a DELIBERATE
+        // 400-vs-desktop-500 divergence: desktop's bare `float(...)` would
+        // let a ValueError escape uncaught into FastAPI's generic 500 for
+        // this same input, but this route chooses the friendlier 400
+        // instead. Unreachable from app.js today (the composer only ever
+        // emits a well-formed numeric string or an empty one), so the
+        // divergence costs nothing. String.toDoubleOrNull()'s whitespace
+        // handling was pinned EMPIRICALLY (not assumed) before writing the
+        // test for it: a throwaway probe asserting " 60 ".toDoubleOrNull()
+        // == "PROBE_SENTINEL" failed with `expected:<[PROBE_SENTINEL]> but
+        // was:<[60.0]>`, confirming it trims leading/trailing whitespace
+        // itself (same as java.lang.Double.parseDouble and Python's
+        // float()) -- so " 60 " parses to 60.0, it is not treated as
+        // garbage the way e.g. "6 0" (an internal space) still is.
+        fun parseExpiresSeconds(raw: String): Double? {
+            if (raw.isBlank()) return null
+            return raw.toDoubleOrNull() ?: throw IllegalArgumentException("bad expires_seconds")
+        }
+
+        // Task 2 (outbound-dm): mirrors api.py's `_parse_json_field(raw,
+        // "story_ref")` (api.py:68-77) exactly: blank -> null, invalid JSON
+        // -> a 400 naming the field (here, an IllegalArgumentException the
+        // route's catch turns into badRequest). A syntactically valid JSON
+        // value that isn't an object (e.g. a bare number or an array) also
+        // lands here, because org.json's JSONObject(String) constructor
+        // itself throws on a non-object top level -- consistent with this
+        // route ultimately needing a Map, not just "valid JSON any shape".
+        // Conversion reuses the module's ESTABLISHED org.json->Map bridge
+        // (MsgJson.jsonToMap/unwrapJson -- the same BigDecimal-aware idiom
+        // KotlinSync's own toMap/unwrap and MsgJson's read side use), not a
+        // fresh hand-rolled converter that could silently miss the
+        // BigDecimal case and hand back org.json's own BigDecimal instead
+        // of a plain Kotlin Double for a fractional field. ComposeDm.compose
+        // does its own shape validation (validStoryRef) once this returns --
+        // this function only parses JSON into a Map, nothing more.
+        fun parseStoryRef(raw: String): Map<String, Any?>? {
+            if (raw.isBlank()) return null
+            return try {
+                MsgJson.jsonToMap(JSONObject(raw))
+            } catch (e: Exception) {
+                throw IllegalArgumentException("bad story_ref")
+            }
         }
 
         // hearth stories_view (node.py:836-841): a story group is visible
