@@ -376,4 +376,24 @@ class SyncStoreTest {
         assertEquals(mapOf(dvPub to "bb".repeat(32)), ks)                 // latest enc_pub
         assertTrue("unknown identity -> empty", s.enckeys("ff".repeat(32)).isEmpty())
     }
+
+    // -- outbound Task 3: messageById store accessor --
+
+    @Test fun messageByIdReturnsStoredMessageAndNullForMissing() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val payload = mapOf("kind" to "post", "text" to "hello", "blobs" to emptyList<String>(), "placement" to "journal")
+        val m = msg(1, payload)
+        assertTrue(s.ingestMessage(m))
+
+        // messageById returns the stored message with accessible fields
+        val retrieved = s.messageById(m.msgId())!!
+        assertEquals(m.msgId(), retrieved.msgId())
+        assertEquals("post", retrieved.kind)
+        assertEquals("journal", (retrieved.payload["placement"] as? String))
+        assertEquals("hello", (retrieved.payload["text"] as? String))
+
+        // messageById returns null for non-existent message
+        assertNull(s.messageById("ff".repeat(32)))
+    }
 }
