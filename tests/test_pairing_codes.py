@@ -18,6 +18,26 @@ def test_mint_then_verify_true_once_then_false():
     assert p.verify_and_consume(code, now) is False   # consumed -- single-use
 
 
+def test_still_valid_inside_ttl():
+    # Pins TTL_SECONDS == 600 from the inside -- without this, a TTL of
+    # 60 or 500 would still pass test_expired_code_rejected below (both
+    # are also "expired" by now+601).
+    p = PairingCodes()
+    now = 1000.0
+    code = p.mint(now)
+    assert p.verify_and_consume(code, now + 599) is True
+
+
+def test_valid_exactly_at_expiry_boundary():
+    # now == expires_at is still valid -- pins the `now > self.expires_at`
+    # rejection side (strictly greater, not >=) as the intended boundary,
+    # not an accident of the comparison operator chosen.
+    p = PairingCodes()
+    now = 1000.0
+    code = p.mint(now)
+    assert p.verify_and_consume(code, now + 600) is True
+
+
 def test_expired_code_rejected():
     p = PairingCodes()
     now = 1000.0

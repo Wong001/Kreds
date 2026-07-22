@@ -63,7 +63,12 @@ class PairingCodes:
         saw success -- returns False rather than re-authorizing. A
         wrong or expired attempt leaves the active code untouched (an
         honest typo, or a request that merely arrived late, shouldn't
-        burn the human's only live code)."""
+        burn the human's only live code). No lock guards the check-then-
+        clear below: this node runs everything -- the HTTP API and the
+        Tor wire handler alike -- as coroutines on ONE asyncio event
+        loop (hearth/runner.py's run_node), and there is no `await`
+        between reading self._hash and clearing it, so nothing can
+        interleave a second call inside that window."""
         if not isinstance(code, str):
             # A hostile/malformed wire frame's "code" field might not
             # even be a string (Task 2 decodes untrusted JSON off the
