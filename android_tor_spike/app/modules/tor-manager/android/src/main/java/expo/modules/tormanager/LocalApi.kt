@@ -322,7 +322,16 @@ class LocalApi(private val ctx: Context) {
         dmKeysCache = dmKeys(res.feed, res.keys)                 // warm DM blob-key cache
         val decryptedById = res.feed.filter { it.kind == "dm" }.associateBy { it.msgId }
         val rawDms = store.allMessages().filter { it.kind == "dm" }
-        val msgs = extractDmMsgs(rawDms, decryptedById, own)
+        // fix (final review, pre-merge): desktop expires a DM by DELETING
+        // its row (sync.py:273 runs store.sweep_expired() every tick); the
+        // phone never sweeps, so an expired DM must be filtered here at
+        // read time -- notExpiredDms() below -- to stay behavior-equivalent
+        // with a desktop-after-sweep read. This is the ONE spot both
+        // conversations() and dmThread() read through (loadDms()), so the
+        // guard covers the thread view, the conversations list, the
+        // last-message preview, and the per-conversation count together.
+        val now = System.currentTimeMillis() / 1000.0
+        val msgs = notExpiredDms(extractDmMsgs(rawDms, decryptedById, own), now)
         return DmLoad(msgs, store.profileNames(), own)
     }
 
@@ -523,6 +532,24 @@ class LocalApi(private val ctx: Context) {
                     storyRef = m.payload["story_ref"] as? Map<*, *>,
                     partner = partner)
             }.sortedBy { it.createdAt }
+
+        // fix (final review, pre-merge, brick-outbound-dm): desktop expires
+        // a DM by DELETING its row -- hearth's sync.py:273 runs
+        // store.sweep_expired() (store.py:432) on every sync tick, so an
+        // expired DM never reaches a desktop read after that. The phone has
+        // no equivalent sweep, so without this, an expired DM would linger
+        // forever in extractDmMsgs' output. Applied ONCE in loadDms(),
+        // ahead of both threadFor (thread view) and conversationsFrom
+        // (conversations list) -- so it also drops an expired DM from being
+        // the newest-message preview and excludes it from the per-partner
+        // count, matching a desktop-after-sweep read exactly. In-memory
+        // filter only -- no store mutation, no delete; the underlying row
+        // is untouched (a durable phone-side sweep is a follow-up, not this
+        // fix). Reuses notExpired(), the same `<=`-is-expired boundary
+        // feed()/profile()/stories() already apply to posts and stories
+        // (node.py:1594-1598).
+        fun notExpiredDms(msgs: List<DmMsg>, now: Double): List<DmMsg> =
+            msgs.filter { notExpired(it.expiresAt, now) }
 
         // vp2: the ascending thread for one partner. extractDmMsgs already
         // collapsed both directions onto a single `partner` per message and

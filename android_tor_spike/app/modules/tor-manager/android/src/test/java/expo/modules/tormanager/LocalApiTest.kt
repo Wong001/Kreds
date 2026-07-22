@@ -418,6 +418,79 @@ class LocalApiTest {
         assertArrayEquals(byteArrayOf(2), out["dm1"])
     }
 
+    // ---- fix (final review, pre-merge, brick-outbound-dm): expired-DM
+    // read-time filter. Desktop expires a DM by DELETING its row
+    // (hearth sync.py:273 runs store.sweep_expired() every tick); the
+    // phone has no sweep, so notExpiredDms() must filter at read time to
+    // stay behavior-equivalent with a desktop-after-sweep read. ----
+
+    @Test fun notExpiredDmsDropsPastKeepsFutureKeepsNullExpiry() {
+        val msgs = listOf(
+            LocalApi.Companion.DmMsg(
+                msgId = "expired", fromMe = true, createdAt = 10.0, expiresAt = 50.0,
+                text = "gone", blobs = emptyList(), undecryptable = false,
+                storyRef = null, partner = "cara"),
+            LocalApi.Companion.DmMsg(
+                msgId = "live", fromMe = true, createdAt = 20.0, expiresAt = 150.0,
+                text = "still here", blobs = emptyList(), undecryptable = false,
+                storyRef = null, partner = "cara"),
+            LocalApi.Companion.DmMsg(
+                msgId = "forever", fromMe = false, createdAt = 30.0, expiresAt = null,
+                text = "no expiry", blobs = emptyList(), undecryptable = false,
+                storyRef = null, partner = "cara"))
+        val now = 100.0     // strictly past "expired"'s 50.0, strictly before "live"'s 150.0
+        val out = LocalApi.notExpiredDms(msgs, now)
+        assertEquals(listOf("live", "forever"), out.map { it.msgId })
+    }
+
+    @Test fun notExpiredDmsTreatsExactlyNowAsExpired() {
+        // hearth's own boundary is `<=` (node.py:1594-1598) -- expires_at ==
+        // now must be dropped, not kept.
+        val msgs = listOf(LocalApi.Companion.DmMsg(
+            msgId = "boundary", fromMe = true, createdAt = 1.0, expiresAt = 100.0,
+            text = "t", blobs = emptyList(), undecryptable = false, storyRef = null, partner = "cara"))
+        assertTrue(LocalApi.notExpiredDms(msgs, now = 100.0).isEmpty())
+    }
+
+    @Test fun expiredDmAbsentFromThreadAndConversationsWhileLiveOneRemains() {
+        // End-to-end (short of the Context-backed loadDms()): extractDmMsgs
+        // -> notExpiredDms -> {threadFor, conversationsFrom} is production's
+        // exact pipeline (loadDms() calls these in this order). Proves an
+        // expired DM disappears from BOTH the thread view and the
+        // conversations list/preview/count -- the review's explicit ask --
+        // while a live DM (future expires_at) from the same partner
+        // survives in both.
+        val raw = listOf(
+            rawDm("expired", sender = "own", to = "cara", createdAt = 10.0, expiresAt = 50.0),
+            rawDm("live", sender = "cara", to = "own", createdAt = 20.0, expiresAt = 150.0))
+        val dec = mapOf("expired" to decDm("expired", "gone"), "live" to decDm("live", "still here"))
+        val now = 100.0
+        val msgs = LocalApi.notExpiredDms(LocalApi.extractDmMsgs(raw, dec, ownIdentityPub = "own"), now)
+
+        val thread = LocalApi.threadFor(msgs, partner = "cara")
+        assertEquals(listOf("live"), thread.map { it.msgId })
+
+        val convRows = LocalApi.conversationsFrom(msgs, mapOf("cara" to "Cara"), ownIdentityPub = "own")
+        assertEquals(1, convRows.size)
+        val c = convRows[0]
+        assertEquals("cara", c.identityPub)
+        assertEquals(1, c.count)                 // the expired dm must not inflate the count
+        assertEquals("still here", c.lastText)   // the expired dm must not be the stale preview
+        assertEquals(20.0, c.lastAt!!, 0.0)
+    }
+
+    @Test fun expiredDmOnlyMessageDropsConversationEntirely() {
+        // A partner whose ENTIRE history has expired must vanish from the
+        // conversations list too -- matching a desktop read after
+        // store.sweep_expired deleted the row, where no row means no
+        // conversation entry at all.
+        val raw = listOf(rawDm("expired", sender = "own", to = "cara", createdAt = 10.0, expiresAt = 50.0))
+        val dec = mapOf("expired" to decDm("expired", "gone"))
+        val msgs = LocalApi.notExpiredDms(LocalApi.extractDmMsgs(raw, dec, ownIdentityPub = "own"), now = 100.0)
+        assertTrue(LocalApi.threadFor(msgs, partner = "cara").isEmpty())
+        assertTrue(LocalApi.conversationsFrom(msgs, emptyMap(), ownIdentityPub = "own").isEmpty())
+    }
+
     // -- vp3 slice 3 Task 2: pure wall-assembly builders --
 
     private fun wallPost(
