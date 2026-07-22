@@ -9,7 +9,9 @@ const web = (f: string) => readFileSync(resolve(__dirname, "../../../hearth/web"
 // + self-profile chrome doors). Kept in sync with the body.readonly block in
 // hearth/web/style.css by hand - this list IS the contract.
 const HIDDEN_SELECTORS = [
-  ".composer",
+  // NOTE: `.composer` (journal composer) is intentionally NOT here -- the first
+  // outbound slice REVEALS it (see the "outbound-1" test below). Everything
+  // else stays hidden until its own outbound slice.
   ".comment-composer",
   ".rx-open",
   ".rx-picker",
@@ -27,7 +29,7 @@ const HIDDEN_SELECTORS = [
 
 // The subset where a dropped `display: none` (not just a dropped selector)
 // is worth guarding against explicitly - the highest-traffic write doors.
-const LOAD_BEARING_SELECTORS = [".composer", ".comment-composer", ".rx-open", ".comment-x", "#dm-compose"];
+const LOAD_BEARING_SELECTORS = [".comment-composer", ".rx-open", ".comment-x", "#dm-compose"];
 
 function escapeSelector(sel: string): string {
   // Space-separated compound selectors (e.g. ".story-tile .story-ring.add")
@@ -92,5 +94,15 @@ describe("vp1 read-only seam", () => {
   it("app.js gives the friend-profile move button a ring-move class (vp3)", () => {
     const js = web("app.js");
     expect(js).toMatch(/el\(\s*["']button["']\s*,\s*["']ring-move["']/);
+  });
+
+  it("outbound-1: journal composer is REVEALED but every other write stays hidden", () => {
+    const css = web("style.css");
+    // the journal composer is no longer hidden under body.readonly
+    expect(css).not.toMatch(/body\.readonly\s+\.composer\b/);
+    // but every other write affordance is still hidden
+    for (const sel of ["#profile-wall-compose", ".comment-composer", ".rx-open", "#dm-compose"]) {
+      expect(css).toContain("body.readonly " + sel);
+    }
   });
 });
