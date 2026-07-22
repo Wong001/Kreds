@@ -3,6 +3,7 @@ package expo.modules.tormanager
 import org.bouncycastle.crypto.agreement.X25519Agreement
 import org.bouncycastle.crypto.digests.SHA256Digest
 import org.bouncycastle.crypto.generators.HKDFBytesGenerator
+import org.bouncycastle.crypto.macs.HMac
 import org.bouncycastle.crypto.modes.ChaCha20Poly1305
 import org.bouncycastle.crypto.params.AEADParameters
 import org.bouncycastle.crypto.params.HKDFParameters
@@ -33,12 +34,34 @@ object KotlinDmcrypt {
             "from" to author, "target" to target,
             "created_at" to KotlinWire.PyFloat(createdAt)))
 
+    fun responseAad(responder: String, target: String, createdAt: Double): ByteArray =
+        KotlinWire.canonical(mapOf(
+            "type" to "response-aad", "protocol" to KotlinWire.PROTOCOL,
+            "from" to responder, "target" to target,
+            "created_at" to KotlinWire.PyFloat(createdAt)))
+
     private fun deriveKek(shared: ByteArray): ByteArray {
         val out = ByteArray(32)
         val hkdf = HKDFBytesGenerator(SHA256Digest())
         hkdf.init(HKDFParameters(shared, null, "hearth/dm-wrap/v1".toByteArray()))
         hkdf.generateBytes(out, 0, 32)
         return out
+    }
+
+    fun deriveAliasSeed(devicePrivHex: String, target: String): String {
+        val raw = KotlinWire.fromHex(devicePrivHex)
+        val subkeyOut = ByteArray(32)
+        val hkdf = HKDFBytesGenerator(SHA256Digest())
+        hkdf.init(HKDFParameters(raw, null, "hearth/alias-seed/v1".toByteArray()))
+        hkdf.generateBytes(subkeyOut, 0, 32)
+
+        val mac = HMac(SHA256Digest())
+        mac.init(KeyParameter(subkeyOut))
+        mac.update(target.toByteArray(Charsets.UTF_8), 0, target.length)
+        val out = ByteArray(mac.getMacSize())
+        mac.doFinal(out, 0)
+
+        return KotlinWire.toHex(out).substring(0, 32)
     }
 
     /** ChaCha20-Poly1305 decrypt (12-byte nonce), returns null on auth failure.
