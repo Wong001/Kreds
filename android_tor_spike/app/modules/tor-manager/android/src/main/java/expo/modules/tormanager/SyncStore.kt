@@ -74,6 +74,51 @@ interface SyncStore {
     fun knownIdentities(): List<String>
     fun addIdentity(id: String)
     fun ingestMessage(m: SignedMessage): Boolean
+    /** Marks a message as needing to be PUSHED on the next sync (the
+     *  outbound task: `Compose.post` calls this immediately after
+     *  `ingestMessage(signed)` so a composed post doesn't just sit in local
+     *  storage -- see `SyncRunner.runTransport`, which drains this queue
+     *  into `KotlinSync.run`'s `outbound` list and clears it only once that
+     *  sync completes with `SyncResult.Ok`). Idempotent -- re-queueing an
+     *  already-pending msgId must not duplicate it (a caller retrying a
+     *  failed sync, or composing twice before a sync runs, must still only
+     *  push the message once per queued entry).
+     *
+     *  `wireDict` (outbound review wave, FIX 1) is the exact
+     *  `SignedMessage.toDict()` of the message being queued -- the queue
+     *  stores THIS, not a msgId-only row re-derived later from `messages`.
+     *  That's deliberate: `messages`' own storage (`msg_json`, written via
+     *  `serialize()`/org.json) is lossy for round-tripping an INTEGRAL
+     *  `Double` (e.g. `created_at=150.0` reads back as Kotlin `Int` 150,
+     *  which `KotlinWire.dumps` then renders `"150"`, not `"150.0"` -- a
+     *  canonical-byte mismatch the receiving node's device-signature check
+     *  rejects). Storing the wire dict itself at queue time -- via
+     *  `KotlinWire.dumps`, the SAME canonical serializer `writeFrameBytes`
+     *  uses on the wire -- makes the re-send byte-exact BY CONSTRUCTION, for
+     *  any magnitude, not just the large-magnitude production values that
+     *  happen to dodge the bug. `msgId` is expected to match `wireDict`'s
+     *  own signed content (every real caller passes `signed.msgId()` and
+     *  `signed.toDict()` together), but a store impl need not cross-validate
+     *  that. */
+    fun addPendingOutbound(msgId: String, wireDict: Map<String, Any?>)
+    /** The wire dicts (`{cert, seq, payload, signature}` -- the same shape
+     *  as `SignedMessage.toDict()`) of every queued-but-not-yet-pushed
+     *  message, exactly as passed to `addPendingOutbound` (see its doc for
+     *  why the queue stores the wire dict itself rather than re-deriving it
+     *  from `messages`' lossy `msg_json`). Pushing a queued message re-
+     *  serializes this exact dict over the wire via
+     *  `KotlinWire.writeFrameBytes`, and the receiving node's device-
+     *  signature check depends on those bytes being canonically identical
+     *  to what was signed at compose time (in particular, `created_at`'s
+     *  float representation must survive bit-for-bit). Stable insertion
+     *  order (oldest-queued first). */
+    fun pendingOutbound(): List<Map<String, Any?>>
+    /** Removes `msgIds` from the pending-outbound queue -- call only after
+     *  a sync that pushed them has completed with `SyncResult.Ok` (a failed
+     *  or skipped sync must leave them queued so the next sync retries the
+     *  push). The underlying row in `messages` is untouched; this only
+     *  clears queue membership. Empty list is a no-op. */
+    fun clearPendingOutbound(msgIds: List<String>)
     fun missingBlobs(): List<String>
     fun putBlob(hash: String, data: ByteArray): Boolean
     /** Read counterpart to putBlob (Task 4, B.2d): the stored blob's raw
@@ -172,6 +217,11 @@ interface SyncStore {
      *  gated the same is_known+signature checks every stored message
      *  already passes at ingest). */
     fun profileNames(): Map<String, String>
+    /** device_pub -> enc_pub over this identity's KIND_ENCKEY messages,
+     *  latest-wins per device by (created_at, seq). Mirrors hearth
+     *  store.enckeys, EXCEPT it cannot exclude revoked devices (the Kotlin
+     *  store models no revocations) -- a documented outbound limitation. */
+    fun enckeys(identityPub: String): Map<String, String>
     /** The set of device_pubs this store has ever held a (verified-at-ingest)
      *  message from, for `identity` (B.2d-4 Task 2). Mirrors hearth's
      *  `store.load_views(identity_pub)` used by node._device_bound: hearth
@@ -232,6 +282,11 @@ class InMemorySyncStore : SyncStore {
     private val blobs = linkedMapOf<String, ByteArray>()            // hash -> data
     private var encKey: Pair<String, String>? = null                // (encPrivHex, encPubHex)
     private var seqCounter = 0                                      // next nextSeq() call returns seqCounter+1
+    // msgId -> wireDict, insertion order (LinkedHashMap preserves the FIRST
+    // insertion's position on a re-put with the same key, so a re-queue of
+    // an already-pending msgId stays idempotent-in-place, matching the old
+    // LinkedHashSet<String> behavior).
+    private val pendingOutboundMsgs = linkedMapOf<String, Map<String, Any?>>()
 
     private fun sha(b: ByteArray) =
         KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(b))
@@ -263,6 +318,23 @@ class InMemorySyncStore : SyncStore {
             return false
         messages[id] = m
         return true
+    }
+
+    // Stores the wireDict Map DIRECTLY (native types, e.g. created_at as the
+    // caller's PyFloat/Double, seq as Int -- never JSON-round-tripped), so
+    // KotlinWire.dumps sees the exact same values it would at fresh-compose
+    // time, with zero float/canonical-fidelity risk. This already matches
+    // what SqliteSyncStore's canonical wire_json storage achieves via
+    // KotlinWire.dumps/MsgJson.toMap (see its doc) -- here it's simpler
+    // still, since no serialization round-trip is needed at all.
+    override fun addPendingOutbound(msgId: String, wireDict: Map<String, Any?>) {
+        pendingOutboundMsgs[msgId] = wireDict
+    }
+
+    override fun pendingOutbound(): List<Map<String, Any?>> = pendingOutboundMsgs.values.toList()
+
+    override fun clearPendingOutbound(msgIds: List<String>) {
+        for (id in msgIds) pendingOutboundMsgs.remove(id)
     }
 
     /** Blob hashes referenced by stored POST/DM/STORY/PROFILE payloads, minus
@@ -352,6 +424,21 @@ class InMemorySyncStore : SyncStore {
                 best[m.cert.identity_pub] = Candidate(createdAt, m.seq, name)
         }
         return best.mapValues { it.value.name }
+    }
+
+    override fun enckeys(identityPub: String): Map<String, String> {
+        data class Cand(val createdAt: Double, val seq: Int, val encPub: String)
+        val best = linkedMapOf<String, Cand>()
+        for (m in messages.values) {
+            if (m.kind != "enckey" || m.cert.identity_pub != identityPub) continue
+            val enc = m.payload["enc_pub"] as? String ?: continue
+            val ca = (m.payload["created_at"] as? Number)?.toDouble() ?: continue
+            val dev = m.cert.device_pub
+            val cur = best[dev]
+            if (cur == null || ca > cur.createdAt || (ca == cur.createdAt && m.seq > cur.seq))
+                best[dev] = Cand(ca, m.seq, enc)
+        }
+        return best.mapValues { it.value.encPub }
     }
 
     override fun deviceViews(identity: String): Set<String> =

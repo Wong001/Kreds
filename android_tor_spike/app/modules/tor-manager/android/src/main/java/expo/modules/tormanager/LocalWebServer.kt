@@ -27,7 +27,8 @@ data class HttpResponse(val status: Int, val headers: Map<String, String>, val b
  *  NEITHER a valid query token NOR the cookie gets 403 before routing. */
 class LocalWebServer(
     private val assets: (path: String) -> Pair<String, ByteArray>?,
-    private val api: (method: String, path: String, query: String?, cookieToken: String?, queryToken: String?) -> HttpResponse?,
+    private val api: (method: String, path: String, query: String?, cookieToken: String?, queryToken: String?,
+                       contentType: String?, body: ByteArray?) -> HttpResponse?,
 ) {
     val token: String = SecureRandom().let { r -> ByteArray(32).also { r.nextBytes(it) } }
         .joinToString("") { "%02x".format(it) }
@@ -65,6 +66,8 @@ class LocalWebServer(
         val requestLine = reader.readLine() ?: return
         var cookieHeader: String? = null
         var range: String? = null
+        var contentLength = 0
+        var contentType: String? = null
         var headerLines = 0
         while (true) {
             if (++headerLines > 50) break
@@ -72,7 +75,27 @@ class LocalWebServer(
             if (line.isEmpty()) break
             if (line.startsWith("Cookie:", true)) cookieHeader = line.substringAfter(":").trim()
             if (line.startsWith("Range:", true)) range = line.substringAfter(":").trim()
+            if (line.startsWith("Content-Length:", true)) contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
+            if (line.startsWith("Content-Type:", true)) contentType = line.substringAfter(":").trim()
         }
+        // The body (if any) MUST be read from this SAME BufferedReader, not
+        // sock.getInputStream() directly -- the reader may already hold
+        // buffered bytes past the blank line (its own internal buffer reads
+        // ahead of what readLine() consumed), so reading the raw stream here
+        // could miss them entirely. The reader was constructed over
+        // ISO-8859-1, a 1:1 byte<->char map for 0-255, so reading exactly
+        // `contentLength` CHARS and re-encoding via ISO-8859-1 recovers the
+        // original bytes losslessly (including binary file-part bytes).
+        val body: ByteArray? = if (contentLength > 0) {
+            val cbuf = CharArray(contentLength)
+            var got = 0
+            while (got < contentLength) {
+                val r = reader.read(cbuf, got, contentLength - got)
+                if (r < 0) break
+                got += r
+            }
+            String(cbuf, 0, got).toByteArray(Charsets.ISO_8859_1)
+        } else null
         val out = sock.getOutputStream()
         val parts = requestLine.split(" ")
         val method = parts.getOrNull(0) ?: return respond(out, 400, "bad request")
@@ -92,7 +115,8 @@ class LocalWebServer(
         val setCookie = queryToken == token   // stamp the cookie on the initial navigation
 
         if (path.startsWith("/api/")) {
-            val resp = api(method, path, query, cookieToken, queryToken) ?: return respond(out, 404, "not found")
+            val resp = api(method, path, query, cookieToken, queryToken, contentType, body)
+                ?: return respond(out, 404, "not found")
             writeResponse(out, resp, range, setCookie)
             return
         }

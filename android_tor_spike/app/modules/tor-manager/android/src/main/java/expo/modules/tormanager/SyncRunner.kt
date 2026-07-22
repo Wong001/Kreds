@@ -72,9 +72,15 @@ object SyncRunner {
     /** Visible-for-testing seam onto the outcome mapping `runSync` applies to
      *  `KotlinSync.run`'s result -- proves Ok marks-published-on-shouldPublish
      *  and maps counts, SelfRevoked/Failed map to the right skip/error shape,
-     *  and a non-Ok never sets the published marker. */
-    internal fun mapSyncResultForTest(r: SyncResult, prep: EncKeyPrep, store: SyncStore) =
-        mapSyncResult(r, prep, store)
+     *  and a non-Ok never sets the published marker. `pendingIds` defaults to
+     *  empty so every pre-existing 3-arg call site (SyncRunnerTest,
+     *  SyncLoopbackTest) keeps compiling unchanged -- those scenarios don't
+     *  exercise the pending-outbound queue, so an empty list is a no-op on
+     *  Ok's `store.clearPendingOutbound` call, same as if this parameter
+     *  didn't exist for them. */
+    internal fun mapSyncResultForTest(
+        r: SyncResult, prep: EncKeyPrep, store: SyncStore, pendingIds: List<String> = emptyList()
+    ) = mapSyncResult(r, prep, store, pendingIds)
 
     /** Runs the full transport under the process-wide mutex. NEVER decrypts.
      *  Returns `ran=false` immediately if a sync is already in progress. */
@@ -199,13 +205,33 @@ object SyncRunner {
                 return SyncOutcome(true, false, 0, 0, 0, false, "enckey: ${e.message}")
             }
 
+            // outbound Task 3: drain the pending-outbound queue (composed-
+            // but-not-yet-pushed messages -- Compose.post queues via
+            // store.addPendingOutbound; see SyncStore.pendingOutbound's doc)
+            // into this sync's outbound, alongside any enc-key push above.
+            // pendingOutbound() is SQLite I/O and can throw (e.g. DB locked)
+            // just like prepareEncKeyOutbound above -- same close-on-failure
+            // shape. pendingIds is recomputed from the returned dicts (not
+            // read back from the store) via the same fromDict().msgId() a
+            // receiving node would use, so clearPendingOutbound below only
+            // ever targets ids that round-tripped through the wire-dict
+            // bridge, matching what was actually pushed.
+            val (pending, pendingIds) = try {
+                val p = store.pendingOutbound()
+                p to p.map { SignedMessageKt.fromDict(it).msgId() }
+            } catch (e: Exception) {
+                stream.close()
+                store.close()
+                return SyncOutcome(true, false, 0, 0, 0, false, "pending-outbound: ${e.message}")
+            }
+
             // Close the round's store once its result is mapped -- each drain
             // round opens a fresh one, and an unclosed SQLiteOpenHelper leaks a
             // SQLiteConnection (the leak class the LocalApi shared-store fix
             // addresses). mapSyncResult reads store.stats() first, so map before close.
             val outcome = mapSyncResult(
-                KotlinSync.run(stream, store, fx.device_pub, prep.outbound, onProgress),
-                prep, store)
+                KotlinSync.run(stream, store, fx.device_pub, prep.outbound + pending, onProgress),
+                prep, store, pendingIds)
             store.close()
             return outcome
         } catch (e: Exception) {
@@ -229,10 +255,18 @@ object SyncRunner {
      *  pushed enc_pub published ONLY once the carrying sync has FULLY succeeded
      *  (EncKeyPublishGuard's rule) -- a non-Ok result never reaches
      *  setPublishedEncPub, so the marker stays stale/absent and the next sync
-     *  retries the push. */
-    private fun mapSyncResult(r: SyncResult, prep: EncKeyPrep, store: SyncStore): SyncOutcome = when (r) {
+     *  retries the push. Same rule for `pendingIds` (outbound Task 3): only an
+     *  Ok result clears the pending-outbound queue -- a SelfRevoked/Failed
+     *  sync leaves every queued message in place so the NEXT sync retries the
+     *  push, exactly like the enc-key marker. `pendingIds` defaults to empty
+     *  (see mapSyncResultForTest's doc) so clearPendingOutbound is a no-op
+     *  for callers that never populated the queue. */
+    private fun mapSyncResult(
+        r: SyncResult, prep: EncKeyPrep, store: SyncStore, pendingIds: List<String> = emptyList()
+    ): SyncOutcome = when (r) {
         is SyncResult.Ok -> {
             if (prep.shouldPublish) store.setPublishedEncPub(prep.encPub)
+            if (pendingIds.isNotEmpty()) store.clearPendingOutbound(pendingIds)
             SyncOutcome(true, true, r.messages, r.blobs, r.identities, false, null)
         }
         is SyncResult.SelfRevoked -> SyncOutcome(true, false, 0, 0, 0, true, "self-revoked")

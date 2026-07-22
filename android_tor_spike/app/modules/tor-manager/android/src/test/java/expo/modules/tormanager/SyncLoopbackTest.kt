@@ -88,115 +88,155 @@ import java.nio.file.Files
  *      all -- that they still pass is the proof the default no-op leaves
  *      existing callers unaffected.
  */
-class SyncLoopbackTest {
 
-    // Minimal blocking Stream over a TCP socket (JVM-only, test-side) --
-    // mirrors TorStream's shape (Stream.kt) so KotlinHandshake/KotlinSync run
-    // unmodified over it.
-    private class SocketStream(host: String, port: Int) : Stream {
-        private val sock = Socket(host, port).apply { soTimeout = 30000 }
-        private val inp = sock.getInputStream()
-        private val out = sock.getOutputStream()
-        override fun readExactSync(n: Int): ByteArray {
-            val b = ByteArray(n); var off = 0
-            while (off < n) {
-                val r = inp.read(b, off, n - off)
-                if (r < 0) throw RuntimeException("EOF after $off/$n bytes")
-                off += r
-            }
-            return b
+// -- Shared desk-loopback harness (Task 9) -----------------------------------
+//
+// SocketStream/NodeProcess/findRepoRoot/startNode originally lived as private
+// members of SyncLoopbackTest. Hoisted to top-level `internal` declarations
+// (same file, same package) so SyncComposeLoopbackTest.kt (Task 9, the
+// outbound compose loopback gate) can reuse the exact same process-spawn +
+// socket-framing machinery byte-for-byte instead of duplicating it -- "mirror
+// it, don't reinvent". Purely a scope move: every method body below is
+// unchanged, and every pre-existing call site in SyncLoopbackTest's own
+// @Test methods keeps working unmodified (an unqualified `startNode(...)`
+// now resolves to the top-level function instead of a private member, with
+// identical behavior).
+
+// Minimal blocking Stream over a TCP socket (JVM-only, test-side) --
+// mirrors TorStream's shape (Stream.kt) so KotlinHandshake/KotlinSync run
+// unmodified over it.
+internal class SocketStream(host: String, port: Int) : Stream {
+    private val sock = Socket(host, port).apply { soTimeout = 30000 }
+    private val inp = sock.getInputStream()
+    private val out = sock.getOutputStream()
+    override fun readExactSync(n: Int): ByteArray {
+        val b = ByteArray(n); var off = 0
+        while (off < n) {
+            val r = inp.read(b, off, n - off)
+            if (r < 0) throw RuntimeException("EOF after $off/$n bytes")
+            off += r
         }
-        override fun write(bytes: ByteArray) { out.write(bytes); out.flush() }
-        override fun close() { sock.close() }
+        return b
+    }
+    override fun write(bytes: ByteArray) { out.write(bytes); out.flush() }
+    override fun close() { sock.close() }
+}
+
+internal class NodeProcess(val port: Int, val fixtureJson: String, val expect: JSONObject,
+                           private val proc: Process, private val stdout: BufferedReader) {
+    fun kill() {
+        proc.destroy()
+        if (!proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) proc.destroyForcibly()
     }
 
-    private class NodeProcess(val port: Int, val fixtureJson: String, val expect: JSONObject,
-                               private val proc: Process, private val stdout: BufferedReader) {
-        fun kill() {
-            proc.destroy()
-            if (!proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) proc.destroyForcibly()
+    /** Task 6 (B.2): blocks until the node process prints its next
+     *  "maintained" signal line -- emitted once per connection, right
+     *  after node.maintain_own_device_grants() has FULLY run for that
+     *  connection (sync_loopback_node.py's wrapped _on_conn). This is
+     *  the deterministic handoff for the two-sync flow: without it,
+     *  opening a second connection immediately after the first one's
+     *  KotlinSync.run() returns would be racing this process's
+     *  server-side maintenance sweep instead of waiting on it. */
+    fun awaitMaintained() {
+        val line = stdout.readLine()
+            ?: throw RuntimeException(
+                "node process closed stdout before printing a " +
+                "maintained-signal line")
+        val obj = JSONObject(line)
+        if (obj.optString("event") != "maintained") {
+            throw RuntimeException(
+                "expected a maintained-signal line, got: $line")
         }
+    }
 
-        /** Task 6 (B.2): blocks until the node process prints its next
-         *  "maintained" signal line -- emitted once per connection, right
-         *  after node.maintain_own_device_grants() has FULLY run for that
-         *  connection (sync_loopback_node.py's wrapped _on_conn). This is
-         *  the deterministic handoff for the two-sync flow: without it,
-         *  opening a second connection immediately after the first one's
-         *  KotlinSync.run() returns would be racing this process's
-         *  server-side maintenance sweep instead of waiting on it. */
-        fun awaitMaintained() {
+    /** Task 9 (outbound compose loopback gate): blocks until the node
+     *  process prints a line whose "event" field equals `name`, parsing
+     *  and returning it. Generalizes awaitMaintained (left untouched
+     *  above, including its strict "the very next line must be exactly
+     *  this event" behavior, so no existing call site's semantics
+     *  change) to any named signal line -- sync_loopback_node.py's
+     *  "outbound_compose" scenario prints a single {"event":"composed",
+     *  ...} line once the node has ingested + decrypted the phone's
+     *  pushed post. Unlike awaitMaintained, this SKIPS past any other
+     *  event lines instead of failing on the first mismatch: a node
+     *  process may print more than one kind of signal line across a
+     *  test's several connections, and only the caller knows which one
+     *  it is waiting for. */
+    fun awaitEvent(name: String): JSONObject {
+        while (true) {
             val line = stdout.readLine()
                 ?: throw RuntimeException(
                     "node process closed stdout before printing a " +
-                    "maintained-signal line")
+                    "\"$name\" event line")
             val obj = JSONObject(line)
-            if (obj.optString("event") != "maintained") {
-                throw RuntimeException(
-                    "expected a maintained-signal line, got: $line")
-            }
+            if (obj.optString("event") == name) return obj
         }
     }
+}
 
-    /** Walk up from the JVM test's working directory looking for the repo
-     *  root, identified by the two things this test actually needs:
-     *  android_tor_spike/tools/sync_loopback_node.py and
-     *  .venv/Scripts/python.exe. Gradle's default Test task working
-     *  directory is the declaring module's projectDir
-     *  (.../modules/tor-manager/android), several levels below the repo
-     *  root -- but hardcoding a fixed number of parentFile hops is brittle
-     *  against any future gradle/module reshuffle, so this searches instead
-     *  of counting. */
-    private fun findRepoRoot(): File {
-        val userDir = System.getProperty("user.dir")
-            ?: throw RuntimeException("user.dir system property is not set")
-        var dir: File? = File(userDir).absoluteFile
-        var hops = 0
-        while (hops < 12) {
-            val cur = dir ?: break
-            val script = File(cur, "android_tor_spike/tools/sync_loopback_node.py")
-            val venvPy = File(cur, ".venv/Scripts/python.exe")
-            if (script.isFile && venvPy.isFile) return cur
-            dir = cur.parentFile
-            hops++
-        }
+/** Walk up from the JVM test's working directory looking for the repo
+ *  root, identified by the two things this test actually needs:
+ *  android_tor_spike/tools/sync_loopback_node.py and
+ *  .venv/Scripts/python.exe. Gradle's default Test task working
+ *  directory is the declaring module's projectDir
+ *  (.../modules/tor-manager/android), several levels below the repo
+ *  root -- but hardcoding a fixed number of parentFile hops is brittle
+ *  against any future gradle/module reshuffle, so this searches instead
+ *  of counting. */
+internal fun findRepoRoot(): File {
+    val userDir = System.getProperty("user.dir")
+        ?: throw RuntimeException("user.dir system property is not set")
+    var dir: File? = File(userDir).absoluteFile
+    var hops = 0
+    while (hops < 12) {
+        val cur = dir ?: break
+        val script = File(cur, "android_tor_spike/tools/sync_loopback_node.py")
+        val venvPy = File(cur, ".venv/Scripts/python.exe")
+        if (script.isFile && venvPy.isFile) return cur
+        dir = cur.parentFile
+        hops++
+    }
+    throw RuntimeException(
+        "could not locate the repo root by walking up from user.dir=" +
+        "${System.getProperty("user.dir")} (looked for " +
+        "android_tor_spike/tools/sync_loopback_node.py + " +
+        ".venv/Scripts/python.exe at each level)")
+}
+
+/** `scenario`: null (every pre-Task-4 call site) reproduces the
+ *  ORIGINAL single-node invocation byte-for-byte (sync_loopback_node.py
+ *  defaults to "solo" with no second arg). "two_node" (Task 4, B.2c)
+ *  passes the opt-in scenario flag that spawns the second, real friend
+ *  node -- see that script's module docstring. "outbound_compose"
+ *  (Task 9) passes the outbound loopback gate's scenario -- see
+ *  SyncComposeLoopbackTest.kt. */
+internal fun startNode(scenario: String? = null): NodeProcess {
+    val repo = findRepoRoot()
+    val venvPy = File(repo, ".venv/Scripts/python.exe")
+    val script = File(repo, "android_tor_spike/tools/sync_loopback_node.py")
+    val tmp = Files.createTempDirectory("syncgate").toFile()
+    val args = mutableListOf(venvPy.absolutePath, script.absolutePath, tmp.absolutePath)
+    if (scenario != null) args.add(scenario)
+    val proc = ProcessBuilder(args)
+        .redirectErrorStream(false)
+        .start()
+    val stdout = BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8))
+    val line = stdout.readLine()
+    if (line == null) {
+        val err = proc.errorStream.bufferedReader().readText()
+        proc.destroy()
         throw RuntimeException(
-            "could not locate the repo root by walking up from user.dir=" +
-            "${System.getProperty("user.dir")} (looked for " +
-            "android_tor_spike/tools/sync_loopback_node.py + " +
-            ".venv/Scripts/python.exe at each level)")
+            "no handshake line from sync_loopback_node.py " +
+            "(venvPy=${venvPy.absolutePath} exists=${venvPy.isFile}, " +
+            "script=${script.absolutePath} exists=${script.isFile}); stderr:\n$err")
     }
+    val info = JSONObject(line)
+    val fx = info.getJSONObject("fixture")
+    val port = info.getInt("port")
+    return NodeProcess(port, fx.toString(), info.getJSONObject("expect"), proc, stdout)
+}
 
-    /** `scenario`: null (every pre-Task-4 call site) reproduces the
-     *  ORIGINAL single-node invocation byte-for-byte (sync_loopback_node.py
-     *  defaults to "solo" with no second arg). "two_node" (Task 4, B.2c)
-     *  passes the opt-in scenario flag that spawns the second, real friend
-     *  node -- see that script's module docstring. */
-    private fun startNode(scenario: String? = null): NodeProcess {
-        val repo = findRepoRoot()
-        val venvPy = File(repo, ".venv/Scripts/python.exe")
-        val script = File(repo, "android_tor_spike/tools/sync_loopback_node.py")
-        val tmp = Files.createTempDirectory("syncgate").toFile()
-        val args = mutableListOf(venvPy.absolutePath, script.absolutePath, tmp.absolutePath)
-        if (scenario != null) args.add(scenario)
-        val proc = ProcessBuilder(args)
-            .redirectErrorStream(false)
-            .start()
-        val stdout = BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8))
-        val line = stdout.readLine()
-        if (line == null) {
-            val err = proc.errorStream.bufferedReader().readText()
-            proc.destroy()
-            throw RuntimeException(
-                "no handshake line from sync_loopback_node.py " +
-                "(venvPy=${venvPy.absolutePath} exists=${venvPy.isFile}, " +
-                "script=${script.absolutePath} exists=${script.isFile}); stderr:\n$err")
-        }
-        val info = JSONObject(line)
-        val fx = info.getJSONObject("fixture")
-        val port = info.getInt("port")
-        return NodeProcess(port, fx.toString(), info.getJSONObject("expect"), proc, stdout)
-    }
+class SyncLoopbackTest {
 
     @Test fun authProbeConnectionIsAccepted() {
         val node = startNode()

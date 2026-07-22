@@ -35,4 +35,14 @@ class SignedMessageTest {
             }
         }
     }
+
+    @Test fun signedMessageToDictRoundTripsThroughFromDict() {
+        val cert = KotlinWire.CertDict("aa".repeat(32), "bb".repeat(32), "phone", 1752900000.0, "cc".repeat(64))
+        val m = SignedMessage(cert, 5, mapOf("kind" to "enckey", "enc_pub" to "dd".repeat(32), "created_at" to 1752900001.0), "ee".repeat(64))
+        val back = SignedMessageKt.fromDict(m.toDict())
+        assertEquals(m.cert.identity_pub, back.cert.identity_pub)
+        assertEquals(m.cert.device_pub, back.cert.device_pub)
+        assertEquals(m.seq, back.seq); assertEquals(m.signature, back.signature)
+        assertEquals(m.payload["enc_pub"], back.payload["enc_pub"])
+    }
 }

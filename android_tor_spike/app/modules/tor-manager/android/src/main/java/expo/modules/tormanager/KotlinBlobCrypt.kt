@@ -23,4 +23,14 @@ object KotlinBlobCrypt {
             if (len == out.size) out else out.copyOf(len)
         } catch (e: Exception) { null }
     }
+
+    fun encryptBlob(contentKey: ByteArray, data: ByteArray): ByteArray {
+        val nonce = ByteArray(12).also { java.security.SecureRandom().nextBytes(it) }
+        val c = ChaCha20Poly1305()
+        c.init(true, AEADParameters(KeyParameter(contentKey), 128, nonce, BLOB_AAD))
+        val out = ByteArray(c.getOutputSize(data.size))
+        val n = c.processBytes(data, 0, data.size, out, 0)
+        c.doFinal(out, n)
+        return nonce + out
+    }
 }
