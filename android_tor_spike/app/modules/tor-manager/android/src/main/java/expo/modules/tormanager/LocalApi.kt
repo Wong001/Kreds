@@ -101,8 +101,9 @@ class LocalApi(private val ctx: Context) {
         val fx = fixtureOrNull() ?: return badRequest("no fixture")
         val (encPriv, encPub) = EncKeys.getOrCreate(sharedStore)
         val createdAt = System.currentTimeMillis() / 1000.0
+        val expiresSeconds = form.fields["expires_seconds"]?.toDoubleOrNull()
         return try {
-            Compose.post(sharedStore, fx, encPriv, encPub, text, jpegs, scope, createdAt)
+            Compose.post(sharedStore, fx, encPriv, encPub, text, jpegs, scope, createdAt, expiresSeconds)
             json("{\"ok\":true}")
         } catch (e: Exception) { HttpResponse(500, mapOf("Content-Type" to "text/plain"), ("compose failed: ${e.message}").toByteArray()) }
     }

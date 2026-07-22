@@ -111,4 +111,48 @@ class ComposeTest {
         val decrypted = KotlinBlobCrypt.decryptBlob(contentKey, cipher)
         assertArrayEquals(photoBytes, decrypted)
     }
+
+    @Test fun composePostHonorsExpiresSeconds() {
+        val s = InMemorySyncStore()
+        val fx = testFixture()
+        s.addIdentity(fx.cert.identity_pub)
+        val (encPriv, encPub) = EncKeys.getOrCreate(s)
+        // publish own enckey so enckeys(own) resolves this device
+        s.ingestMessage(SignedMessageSigned(fx, s.nextSeq(), mapOf(
+            "kind" to "enckey", "enc_pub" to encPub, "created_at" to 100.0)))
+
+        val createdAt = 1752900000.0
+        val expiresSeconds = 3600.0
+        val res = Compose.post(s, fx, encPriv, encPub, "ephemeral", emptyList(), "kreds", createdAt, expiresSeconds)
+
+        // the composed message is now in the store; find it and check expires_at
+        val stored = s.allMessages().first { it.msgId == res.msgId }
+        val payload = stored.payload
+
+        // expires_at should be createdAt + expiresSeconds, as a PyFloat
+        val expiresAtValue = payload["expires_at"]
+        assertEquals(true, expiresAtValue is KotlinWire.PyFloat)
+        @Suppress("UNCHECKED_CAST")
+        assertEquals(createdAt + expiresSeconds, (expiresAtValue as KotlinWire.PyFloat).value, 0.0)
+    }
+
+    @Test fun composePostWithoutExpiresSecondsLeavesExpiresAtNull() {
+        val s = InMemorySyncStore()
+        val fx = testFixture()
+        s.addIdentity(fx.cert.identity_pub)
+        val (encPriv, encPub) = EncKeys.getOrCreate(s)
+        // publish own enckey so enckeys(own) resolves this device
+        s.ingestMessage(SignedMessageSigned(fx, s.nextSeq(), mapOf(
+            "kind" to "enckey", "enc_pub" to encPub, "created_at" to 100.0)))
+
+        val createdAt = 1752900000.0
+        val res = Compose.post(s, fx, encPriv, encPub, "permanent", emptyList(), "kreds", createdAt)
+
+        // the composed message is now in the store; find it and check expires_at
+        val stored = s.allMessages().first { it.msgId == res.msgId }
+        val payload = stored.payload
+
+        // expires_at should be null when expiresSeconds is not provided
+        assertNull(payload["expires_at"])
+    }
 }

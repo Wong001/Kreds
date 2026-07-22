@@ -27,10 +27,12 @@ object Compose {
 
     /** Compose + LOCALLY ingest a kreds-scope journal post. `photos` are
      *  ready-to-encrypt plaintext (JPEG) bytes. Wraps to own + ALL friends'
-     *  enc-keyed devices (kreds). */
+     *  enc-keyed devices (kreds). `expiresSeconds` is optional: if non-null,
+     *  expires_at = createdAt + expiresSeconds; if null, expires_at = null. */
     fun post(
         store: SyncStore, fx: KotlinHandshake.Fixture, encPriv: String, encPub: String,
         text: String, photos: List<ByteArray>, scope: String, createdAt: Double,
+        expiresSeconds: Double? = null,
     ): Result {
         require(scope == "kreds") { "only kreds scope this slice" }
         val own = fx.cert.identity_pub
@@ -58,7 +60,8 @@ object Compose {
         val payload: Map<String, Any?> = mapOf(
             "kind" to "post", "scope" to scope, "body_nonce" to nonceHex,
             "body_ct" to ctHex, "wraps" to wraps, "blobs" to hashes,
-            "created_at" to KotlinWire.PyFloat(createdAt), "expires_at" to null,
+            "created_at" to KotlinWire.PyFloat(createdAt),
+            "expires_at" to (if (expiresSeconds != null) KotlinWire.PyFloat(createdAt + expiresSeconds) else null),
             "placement" to "journal", "media" to "photo", "poster" to null,
             "codec" to null, "thumbs" to null)
 
