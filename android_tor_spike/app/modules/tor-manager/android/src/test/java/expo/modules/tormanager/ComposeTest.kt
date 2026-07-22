@@ -1,9 +1,11 @@
 package expo.modules.tormanager
 
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import java.security.MessageDigest
 
 /** JVM test for Compose (Task 5, outbound slice 1): proves the FULL compose
  *  chain -- content key, encryptBody, wrapKey, make_post-shaped payload,
@@ -60,5 +62,53 @@ class ComposeTest {
         // always false since JSONArray doesn't implement java.util.List, so
         // compare shape instead of using assertEquals against a Kotlin list.
         assertEquals(0, (body["blobs"] as org.json.JSONArray).length())
+    }
+
+    @Test fun composePostWithPhotoStoresCiphertextBlobDecryptableByContentKey() {
+        val s = InMemorySyncStore()
+        val fx = testFixture()
+        s.addIdentity(fx.cert.identity_pub)
+        val (encPriv, encPub) = EncKeys.getOrCreate(s)
+        // publish own enckey so enckeys(own) resolves this device
+        s.ingestMessage(SignedMessageSigned(fx, s.nextSeq(), mapOf(
+            "kind" to "enckey", "enc_pub" to encPub, "created_at" to 100.0)))
+
+        // arbitrary bytes standing in for a JPEG
+        val photoBytes = ByteArray(3000) { (it % 256).toByte() }
+        val res = Compose.post(s, fx, encPriv, encPub, "with photo", listOf(photoBytes), "kreds", 1752900000.5)
+
+        // the composed message is now in the store; find it + decrypt its body
+        val stored = s.allMessages().first { it.msgId == res.msgId }
+        val payload = stored.payload
+        val aad = KotlinDmcrypt.postAad(fx.cert.identity_pub, "kreds", 1752900000.5)
+        @Suppress("UNCHECKED_CAST") val wraps = payload["wraps"] as Map<String, Any?>
+        val myWrap = wraps[fx.device_pub] as Map<String, Any?>
+        val contentKey = KotlinDmcrypt.unwrapKey(myWrap, encPriv, aad)!!
+
+        // verify blob path: envelope has hash list
+        assertEquals(1, res.blobs.size)
+        val (hash, cipher) = res.blobs[0]
+
+        // envelope payload["blobs"] contains the hash
+        @Suppress("UNCHECKED_CAST") val envelopeBlobs = payload["blobs"] as List<String>
+        assertEquals(listOf(hash), envelopeBlobs)
+
+        // decrypted body["blobs"] contains the same hash
+        val body = KotlinDmcrypt.decryptBody(contentKey, payload["body_nonce"] as String, payload["body_ct"] as String, aad)!!
+        val bodyBlobsArray = body["blobs"] as org.json.JSONArray
+        assertEquals(1, bodyBlobsArray.length())
+        assertEquals(hash, bodyBlobsArray.getString(0))
+
+        // hash equals SHA-256 hex of the ciphertext (hash over CIPHERTEXT, not plaintext)
+        val expectedHash = KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(cipher))
+        assertEquals(expectedHash, hash)
+
+        // store.getBlob(hash) returns the ciphertext
+        val storedCipher = s.getBlob(hash)
+        assertEquals(cipher.toList(), storedCipher?.toList())
+
+        // KotlinBlobCrypt.decryptBlob(contentKey, cipher) recovers the original photoBytes
+        val decrypted = KotlinBlobCrypt.decryptBlob(contentKey, cipher)
+        assertArrayEquals(photoBytes, decrypted)
     }
 }
