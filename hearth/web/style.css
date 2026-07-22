@@ -1226,7 +1226,12 @@ body.readonly #profile-arrange,
 body.readonly #profile-addfriend,
 body.readonly #profile-wall-compose,
 body.readonly #profile-actions .ring-move,
-body.readonly #profile-actions .btn-danger {
+body.readonly #profile-actions .btn-danger,
+/* Task 5 review fix: pairing is desktop-side only - the phone's LocalApi
+   has no /api/pair routes, so this must be an explicit seam entry, not
+   rely on #profile-cog (Settings' sole entry point) happening to be
+   hidden already. */
+body.readonly #add-device {
   display: none !important;
 }
 /* keep the story-add tile's label from leaving an empty column */

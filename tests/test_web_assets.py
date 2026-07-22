@@ -973,6 +973,28 @@ def test_friend_add_notes_use_textcontent_not_innerhtml():
         and "buildManualCeremony" in block   # sanity: didn't slice past the intended functions
 
 
+def test_add_device_notes_use_textcontent_not_innerhtml():
+    # Task 5 review fix: addDeviceUI (the desktop Add-device panel, phone/
+    # desktop pairing over Tor) sits right after ceremonyUI, outside the
+    # wireCopyButton..ceremonyUI slice the test above scans - a sibling
+    # scan for the exact same XSS-safe rule. A pending request's
+    # device_name is attacker-influenced (anyone who has the QR/link can
+    # dial in with any self-reported name), so it must land via
+    # el()/textContent, never innerHTML, same house rule as the friend-add
+    # flow. Starts just past addDeviceUI's own sanctioned static icon
+    # markup (`toggle.innerHTML = ICONS.plus + "<span>Add device</span>"`,
+    # the same pre-existing pattern ceremonyUI's own docstring above
+    # carves out for "Add friend") so that one line doesn't false-fail
+    # this scan.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    block_start = js.index("const stopTimers = () => {")
+    block_end = js.index("function openFriendAdd")
+    block = js[block_start:block_end]
+    assert "innerHTML" not in block
+    assert "p.device_name" in block and "/api/pair/accept" in block \
+        and "/api/pair/begin" in block   # sanity: didn't slice past the intended function
+
+
 def test_friend_add_keyboard_accessible():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     enter = _js_fn_body(js, "buildEnterTab")
