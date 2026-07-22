@@ -45,12 +45,13 @@ import asyncio
 import io
 import json
 import sys
+import time
 from pathlib import Path
 
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
-from hearth import dmcrypt
+from hearth import dmcrypt, invitecodec
 from hearth.identity import _sig_ok
 from hearth.messages import _valid_story_ref
 from hearth.node import HearthNode
@@ -844,6 +845,171 @@ async def main(data_dir, scenario="solo"):
         await sync.stop()
 
 
+async def _drive_pair_accept(node, deny: bool) -> None:
+    """Task 6 (android first-load pairing loopback gate, spec 2026-07-22-
+    android-first-load-pairing-design): the auto-accept/deny driver for
+    the "pairing"/"pairing_deny" scenarios (see _run_pairing's own
+    docstring for the full contract). Runs as a background task for the
+    life of the node process, so it can drive more than one ceremony if a
+    test opens more than one pairing attempt against the same spawned
+    node (SyncPairLoopbackTest.kt's wrong-code test does exactly this: a
+    wrong-code attempt that never parks anything, followed by a REAL
+    ceremony against the same running node) -- though most attempts each
+    spawn their own node, this loop makes no such assumption, looping
+    forever rather than firing once.
+
+    Polling (asyncio.sleep(0.01)), not an Event -- mirrors tests/
+    test_pair_wire.py's own _wait_for_pending helper exactly (the same
+    "no pending -> pending" transition it polls for); there is no
+    existing signal for "pending_pair just appeared" to await instead
+    (pending_pair_event is the OTHER direction -- verdict-set, which
+    _handle_pair_request awaits and this function is the one that sets).
+
+    Drives the EXACT node-level operations hearth/api.py's real POST
+    /api/pair/accept route executes (api.py:709-734) -- not a shortcut
+    around accept_pairing: on accept, node.accept_pairing(pending[
+    "request_json"]) (untouched production code) mints the real package
+    and enrolls the device; either way, pending["verdict"] is set and
+    node.pending_pair_event.set() wakes the held wire connection
+    (sync.py's _handle_pair_request), exactly as the human's Accept/Deny
+    click would in the real desktop UI.
+
+    On accept, the enrollment is read back OFF THE STORE (node.store.
+    load_views(node.identity_pub)), not merely trusted from `pending` --
+    proving accept_pairing's store mutation actually happened -- before
+    emitting {"event":"paired","device_pub":...} (task brief: "from
+    node.store.load_views"). A device_pub that accept_pairing's own
+    return value claims to have enrolled but that does not show up in
+    views would be a real fidelity bug -- this raises loudly rather than
+    fabricating a "paired" line, the same fail-closed posture every other
+    scenario in this file uses (see e.g. _emit_composed_if_ready's own
+    doc comment)."""
+    while True:
+        while node.pending_pair is None:
+            await asyncio.sleep(0.01)
+        pending = node.pending_pair
+        if deny:
+            pending["verdict"] = False
+        else:
+            pending["package"] = node.accept_pairing(pending["request_json"])
+            pending["verdict"] = True
+            views = node.store.load_views(node.identity_pub)
+            device_pub = pending["device_pub"]
+            if device_pub not in views:
+                raise RuntimeError(
+                    "accept_pairing did not enroll the paired device's "
+                    f"view (device_pub={device_pub!r})")
+            print(json.dumps({"event": "paired", "device_pub": device_pub}),
+                 flush=True)
+        node.pending_pair_event.set()
+        while node.pending_pair is not None:
+            await asyncio.sleep(0.01)
+
+
+async def _run_pairing(data_dir, deny: bool = False) -> None:
+    """Task 6 (android first-load pairing loopback gate, spec 2026-07-22-
+    android-first-load-pairing-design): the CEREMONY gate -- proves the
+    phone's Kotlin ceremony client (KotlinPairing.runCeremony, Tasks 3-4)
+    against a REAL hearth node whose pre-auth `hearth-pair-request` wire
+    handler (Task 2, sync.py's _handle_pair_request) is the SAME,
+    unmodified, production listener every other scenario in this file
+    serves (SyncService(node) below is byte-identical construction to
+    main()'s own). This scenario is structurally different from every
+    one above it in one load-bearing way: no mint_fixture at all -- the
+    entire point of Task 6 is that the phone gets its identity FROM the
+    ceremony, not from a pre-baked fixture handed to it out of band the
+    way every other scenario's phone identity works.
+
+    Seeds one own-identity journal post (so a post-pairing sync has real
+    content to pull) and one FRIEND identity with a published enc key
+    (HearthNode.create + ensure_enckey + _gossip_until_converged, the
+    same helper every two-node scenario in this file already uses).
+    accept_pairing's own `friends` list (node.py:2032-2033, `[i for i in
+    self.store.known_identities() if i != self.identity_pub]`) then hands
+    the friend's identity_pub to the phone AS PART OF THE PAIRING PACKAGE
+    ITSELF, before any sync ever runs -- the Kotlin test's post-ceremony
+    sync is what pulls the seeded POST specifically.
+
+    A background driver task (_drive_pair_accept, see its own docstring)
+    watches node.pending_pair and reacts the instant a real phone's
+    hearth-pair-request frame parks a ceremony there. `deny=False` (the
+    "pairing" scenario, default): always accepts. `deny=True` ("
+    pairing_deny"): always denies, proving the negative path -- nothing
+    enrolled, and (per SyncPairLoopbackTest.kt) a subsequent sync attempt
+    with unenrolled device keys is refused by the node's own AUTH gate.
+
+    The wrong-code ("Expired") case needs NO scenario-side driver support
+    at all -- hearth's own verify_and_consume (pairingcodes.py) fails
+    closed before node.pending_pair is ever touched, so the driver task
+    simply never has anything to react to. What IS needed is a second,
+    deliberately-wrong-code link sharing the SAME dialable address (the
+    Kotlin side has no pair-link ENCODER, only decodeLink -- encoding is
+    exclusively a desktop/hearth-side operation in this system, mirroring
+    how only hearth's own /api/pair/begin ever calls invitecodec.
+    encode_pair for real) -- `wrong_code_link` below, packed with a code
+    that can never match the one actually minted.
+
+    Prints one `{"event":"pair_ready", "link":..., "wrong_code_link":...,
+    "identity_priv":..., "identity_pub":..., "friend_identity_pub":...}`
+    line once the listener is live and the code is minted. `link` is
+    exactly what hearth's own /api/pair/begin would return
+    (invitecodec.encode_pair against the REAL listening 127.0.0.1:<port>
+    address -- not a fake onion, so SyncPairLoopbackTest.kt's dial lambda
+    can actually reach this process, per the task brief's own note).
+    `identity_priv`/`identity_pub` are the node's OWN real identity keys
+    -- the ultimate full-pairing assertion (task brief): pairing.json's
+    persisted identity_priv must equal this exact value, proving the
+    ceremony really did hand the phone the node's own identity key, not
+    some other value. Printing the real identity_priv here (regardless of
+    the eventual accept/deny outcome) is a test-harness-only shortcut --
+    a real desktop never discloses it before a human's Accept click; see
+    node.accept_pairing, which only ever returns it as part of an
+    accepted package."""
+    node = HearthNode.create(Path(data_dir) / "n", "Desk", "desk")
+    node.compose_post("paired phone should see this post")
+
+    friend = HearthNode.create(Path(data_dir) / "f", "Freja", "freja-desk")
+    node.store.add_identity(friend.identity_pub)
+    friend.store.add_identity(node.identity_pub)
+    friend.ensure_enckey()
+    _gossip_until_converged(node, friend)   # delivers friend's enckey/profile
+                                             # so accept_pairing's own
+                                             # known_identities() lists the
+                                             # friend in the pairing package
+
+    sync = SyncService(node)
+    port = await sync.start("127.0.0.1", 0)
+    # Real /api/pair/begin reads this same meta key for its own `addr`
+    # (api.py:672) -- mirrored here so accept_pairing's `my_addr` field
+    # (node.py:2035) is realistic too, even though KotlinPairing.
+    # runCeremony pins the persisted onion_addr to the DIALED link
+    # address, never to my_addr (see runCeremony's own doc).
+    node.store.set_meta("gossip_addr", f"127.0.0.1:{port}")
+
+    driver_task = asyncio.create_task(_drive_pair_accept(node, deny))
+    try:
+        code = node.pairing.mint(time.time())
+        link = invitecodec.encode_pair(f"127.0.0.1:{port}", code)
+        # A code that can never match the one just minted -- same address,
+        # deliberately wrong code, produced via the REAL hearth codec
+        # rather than hand-corrupting b58 bytes (which the Kotlin side has
+        # no way to re-encode after decoding -- see docstring above).
+        wrong_code_link = invitecodec.encode_pair(
+            f"127.0.0.1:{port}", "WRONGCODEZZZZZ")
+        print(json.dumps({
+            "event": "pair_ready",
+            "link": link,
+            "wrong_code_link": wrong_code_link,
+            "identity_priv": node.device.to_json()["identity_priv"],
+            "identity_pub": node.identity_pub,
+            "friend_identity_pub": friend.identity_pub,
+        }), flush=True)
+        await asyncio.Event().wait()   # serve until killed
+    finally:
+        driver_task.cancel()
+        await sync.stop()
+
+
 if __name__ == "__main__":
     _scenario = sys.argv[2] if len(sys.argv) > 2 else "solo"
     if _scenario == "outbound_compose":
@@ -871,5 +1037,17 @@ if __name__ == "__main__":
         # _run_responses) stays provably byte-identical to before this
         # task.
         asyncio.run(_run_dm(sys.argv[1]))
+    elif _scenario in ("pairing", "pairing_deny"):
+        # Task 6 (android first-load pairing loopback gate): a
+        # structurally different entry point from every scenario above --
+        # no mint_fixture at all (the whole point is the phone gets its
+        # identity FROM the ceremony, not a pre-baked fixture), a minted
+        # pairing code instead, and a background accept/deny driver
+        # instead of a wrapped _on_conn. Kept as its own entry point for
+        # the same reason outbound_compose/responses/dm are: every
+        # pre-Task-6 call site (main(), _run_outbound_compose,
+        # _run_responses, _run_dm) stays provably byte-identical to
+        # before this task.
+        asyncio.run(_run_pairing(sys.argv[1], deny=(_scenario == "pairing_deny")))
     else:
         asyncio.run(main(sys.argv[1], _scenario))
