@@ -13,10 +13,11 @@ object Compose {
      *  for a later sync to drain the queue -- re-deriving it instead would
      *  consume a second, different `store.nextSeq()` value and diverge from
      *  the message already sitting in the local store. `post` ALSO queues
-     *  `signed.msgId()` via `store.addPendingOutbound` (outbound Task 3) so
-     *  an ordinary caller that does nothing further still gets it pushed on
-     *  the next `SyncRunner` sync -- `messageDict` is no longer the only way
-     *  a composed post reaches the wire, just the immediate-push shortcut.
+     *  `signed.msgId()`/`signed.toDict()` via `store.addPendingOutbound`
+     *  (outbound Task 3) so an ordinary caller that does nothing further
+     *  still gets it pushed on the next `SyncRunner` sync -- `messageDict`
+     *  is no longer the only way a composed post reaches the wire, just the
+     *  immediate-push shortcut.
      *  Existing callers (LocalApi's HTTP route, ComposeTest) only ever read
      *  `msgId`/`blobs` and are unaffected by this field. */
     data class Result(val msgId: String, val blobs: List<Pair<String, ByteArray>>, val messageDict: Map<String, Any?>)
@@ -72,7 +73,13 @@ object Compose {
         // class-level context: `messageDict` alone only let a CALLER push it
         // manually, e.g. the Task 9 loopback gate; ordinary callers like
         // LocalApi's HTTP route never did).
-        store.addPendingOutbound(signed.msgId())
+        //
+        // outbound review wave (FIX 1): pass `signed.toDict()` -- the native
+        // wire dict, with created_at as a Double/PyFloat and seq as an Int --
+        // not just the msgId. The queue now stores this dict directly (see
+        // SyncStore.addPendingOutbound's doc), so re-send never has to round-
+        // trip through the lossy org.json `messages.msg_json` storage.
+        store.addPendingOutbound(signed.msgId(), signed.toDict())
         return Result(signed.msgId(), blobPairs, signed.toDict())
     }
 }

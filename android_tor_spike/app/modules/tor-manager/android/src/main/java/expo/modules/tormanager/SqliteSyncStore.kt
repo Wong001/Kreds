@@ -21,13 +21,18 @@ class SqliteSyncStore(context: Context) :
 
     companion object {
         private const val DB_NAME = "sync_store.db"
-        // outbound Task 2: bumped 1 -> 2 to add the pending_outbound table
-        // (see CREATE_PENDING_OUTBOUND_TABLE_SQL + onUpgrade below). This is
-        // the first REAL version bump this store has ever shipped -- DB_VERSION
-        // sat at 1 through the whole B.2 `keys`-table field bug (see onOpen's
-        // comment), so onUpgrade below, despite existing since B.2, has never
-        // actually RUN on a real device before this change.
-        private const val DB_VERSION = 2
+        // outbound review wave (FIX 3): DELIBERATELY NOT bumped for the
+        // pending_outbound table. onUpgrade (below) is DESTRUCTIVE -- it
+        // DROPs identities/messages/blobs unconditionally -- so bumping
+        // DB_VERSION here would wipe every existing device's synced store
+        // the moment it updates, just to add one new table. Same fix as the
+        // B.2 `keys`-table field bug (see onOpen's comment): ensure the
+        // table via onOpen's IF NOT EXISTS, which runs on every open
+        // regardless of version and is a no-op once the table exists. This
+        // stays non-destructive on both fresh installs (onCreate) and
+        // existing DBs (onOpen), and DB_VERSION sitting at 1 means onUpgrade
+        // still has never actually run on a real device.
+        private const val DB_VERSION = 1
         // Task 3 (B.2): this device's own X25519 enc keypair, keyed enc_priv/enc_pub.
         // Plaintext at rest -- accepted posture, matches desktop (see EncKeys.kt).
         // Shared by onCreate (fresh DBs) and onOpen (existing B.1-era DBs --
@@ -35,14 +40,23 @@ class SqliteSyncStore(context: Context) :
         // can't drift out of sync.
         private const val CREATE_KEYS_TABLE_SQL =
             "CREATE TABLE IF NOT EXISTS keys (k TEXT PRIMARY KEY, v TEXT)"
-        // outbound Task 2: the pending-outbound push queue -- msg_id ONLY,
-        // the message body already lives in `messages` (pendingOutbound()
-        // joins to it). IF NOT EXISTS so onCreate (fresh DBs) and onUpgrade
-        // (existing DBs, via the onCreate(db) call at the end of onUpgrade)
-        // share one definition without either site needing to know which
-        // case it's in -- same pattern as CREATE_KEYS_TABLE_SQL above.
+        // outbound review wave (FIX 1): the pending-outbound push queue now
+        // stores its OWN canonical wire_json per row, not just a msg_id that
+        // joins back to `messages`. `messages.msg_json` is written via
+        // MsgJson.serialize()/org.json, which is lossy for round-tripping an
+        // INTEGRAL Double (e.g. created_at=150.0 reads back as Kotlin Int
+        // 150 -- KotlinWire.dumps then renders "150", not "150.0", a
+        // canonical-byte mismatch the receiving node's device-signature
+        // check rejects). `wire_json` here is instead `KotlinWire.dumps(
+        // wireDict)` at ENQUEUE time -- the SAME canonical serializer
+        // `writeFrameBytes` uses on the wire -- so re-send is byte-exact by
+        // construction, for any magnitude, independent of `messages`'
+        // storage format. IF NOT EXISTS so onCreate (fresh DBs) and onOpen
+        // (existing DBs -- see onOpen below) share one definition without
+        // either site needing to know which case it's in -- same pattern as
+        // CREATE_KEYS_TABLE_SQL above.
         private const val CREATE_PENDING_OUTBOUND_TABLE_SQL =
-            "CREATE TABLE IF NOT EXISTS pending_outbound (msg_id TEXT PRIMARY KEY)"
+            "CREATE TABLE IF NOT EXISTS pending_outbound (msg_id TEXT PRIMARY KEY, wire_json TEXT NOT NULL)"
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -77,9 +91,17 @@ class SqliteSyncStore(context: Context) :
     // and every keys-table query fails with "no such table: keys". onOpen
     // runs on every open regardless of version, so ensure the table here too;
     // IF NOT EXISTS makes this a no-op on DBs that already have it.
+    //
+    // outbound review wave (FIX 3): pending_outbound follows the SAME
+    // pattern, for the SAME reason -- ensured here instead of via a
+    // DB_VERSION bump (see the companion object's DB_VERSION comment for why
+    // a bump is unacceptable: onUpgrade is destructive). This makes an
+    // existing device's DB gain the table non-destructively on its next open,
+    // no migration required.
     override fun onOpen(db: SQLiteDatabase) {
         super.onOpen(db)
         db.execSQL(CREATE_KEYS_TABLE_SQL)
+        db.execSQL(CREATE_PENDING_OUTBOUND_TABLE_SQL)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -98,13 +120,17 @@ class SqliteSyncStore(context: Context) :
         // Never wipe this table on migration.
         //
         // `pending_outbound` (outbound Task 2) is likewise NOT dropped here.
-        // Its rows are meaningless without the `messages` rows they
-        // reference, which the DROP above just wiped -- but leaving the now-
-        // orphaned msg_id rows in place is harmless (pendingOutbound()'s JOIN
-        // to `messages` simply yields nothing for them) and simpler than
-        // reasoning about whether a queued-but-unsynced compose should
-        // survive a schema migration. onCreate's IF NOT EXISTS below is a
-        // no-op here since the table already exists.
+        // Since the review wave's FIX 1, its rows are SELF-CONTAINED
+        // (`wire_json` holds the full canonical wire dict, not just a msg_id
+        // that joins back to `messages` -- see addPendingOutbound's doc), so
+        // a row here actually SURVIVES the DROP above with its content
+        // intact, unlike the old msg_id-only design (where an orphaned row
+        // would have gone silently unresolvable). This is presently moot in
+        // practice -- DB_VERSION sits at 1 (see the companion object's
+        // comment), so onUpgrade is not known to have ever run on a real
+        // device -- but if it ever does, a queued-but-unsynced compose still
+        // gets pushed on the next sync rather than silently lost. onCreate's
+        // IF NOT EXISTS below is a no-op here since the table already exists.
         onCreate(db)
     }
 
@@ -192,40 +218,51 @@ class SqliteSyncStore(context: Context) :
             put("device_pub", m.cert.device_pub)
             put("seq", m.seq)
             put("kind", m.kind)
-            put("msg_json", serialize(m))
+            put("msg_json", MsgJson.serialize(m))
         }
         db.insertWithOnConflict("messages", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
         return true
     }
 
-    override fun addPendingOutbound(msgId: String) {
-        val cv = ContentValues().apply { put("msg_id", msgId) }
+    /** See the SyncStore interface doc (FIX 1): `wire_json` is
+     *  `KotlinWire.dumps(wireDict)` -- the CANONICAL wire serializer, the
+     *  SAME one `writeFrameBytes` uses to actually send a message -- NOT
+     *  `MsgJson.serialize()`/org.json (what `messages.msg_json` uses below).
+     *  That distinction is the whole point: canonical JSON keeps an
+     *  integral Double's decimal (e.g. "150.0"), so org.json parses it back
+     *  as BigDecimal (not Int) when this row is later read via
+     *  `pendingOutbound()`, `MsgJson`'s unwrap normalizes BigDecimal->Double,
+     *  and `KotlinWire.dumps` re-renders "150.0" -- byte-exact for ANY
+     *  magnitude, not just the large-magnitude values that happen to dodge
+     *  msg_json's Int-truncation bug. CONFLICT_IGNORE keeps this idempotent:
+     *  a re-queue of an already-pending msgId is a no-op (same signed
+     *  message -> same wireDict -> no need to overwrite). */
+    override fun addPendingOutbound(msgId: String, wireDict: Map<String, Any?>) {
+        val cv = ContentValues().apply {
+            put("msg_id", msgId)
+            put("wire_json", KotlinWire.dumps(wireDict))
+        }
         writableDatabase.insertWithOnConflict(
             "pending_outbound", null, cv, SQLiteDatabase.CONFLICT_IGNORE)  // idempotent
     }
 
     /** See the SyncStore interface doc: the wire dicts of every queued
-     *  message, joined from `messages` and parsed via the SAME jsonToMap
-     *  bridge `allMessages()`/etc. use below -- but applied to the WHOLE
-     *  parsed msg_json object (not just its `payload` sub-object, unlike
-     *  those other accessors), because msg_json's top-level shape IS
-     *  already `{cert, seq, payload, signature}` (see `serialize()`) --
-     *  exactly the wire dict shape `pendingOutbound()` must return, with no
+     *  message, read directly off `pending_outbound.wire_json` (see
+     *  `addPendingOutbound`'s doc for why this is the canonical form, not a
+     *  join back to `messages.msg_json`) and parsed via `MsgJson.toMap` --
+     *  the same org.json Map bridge `allMessages()`/etc. use below, just
+     *  applied to the WHOLE parsed object (not a `payload` sub-object),
+     *  since `wire_json`'s top-level shape already IS `{cert, seq, payload,
+     *  signature}` -- exactly what `pendingOutbound()` must return, no
      *  further reshaping needed. Ordered by `rowid` (insertion order),
-     *  matching InMemorySyncStore's LinkedHashSet insertion-order
-     *  guarantee. An id in `pending_outbound` with no matching `messages`
-     *  row (should not happen -- see the interface doc) is simply excluded
-     *  by the JOIN, not an error. */
+     *  matching InMemorySyncStore's LinkedHashMap insertion-order
+     *  guarantee. */
     override fun pendingOutbound(): List<Map<String, Any?>> {
         val out = mutableListOf<Map<String, Any?>>()
         readableDatabase.rawQuery(
-            """
-            SELECT m.msg_json FROM messages m
-            JOIN pending_outbound p ON m.msg_id = p.msg_id
-            ORDER BY m.rowid
-            """.trimIndent(), null
+            "SELECT wire_json FROM pending_outbound ORDER BY rowid", null
         ).use { c ->
-            while (c.moveToNext()) out.add(jsonToMap(JSONObject(c.getString(0))))
+            while (c.moveToNext()) out.add(MsgJson.toMap(c.getString(0)))
         }
         return out
     }
@@ -235,96 +272,6 @@ class SqliteSyncStore(context: Context) :
         val placeholders = msgIds.joinToString(",") { "?" }
         writableDatabase.execSQL(
             "DELETE FROM pending_outbound WHERE msg_id IN ($placeholders)", msgIds.toTypedArray())
-    }
-
-    /** Re-derives the node's dict shape (cert/seq/payload/signature) from
-     *  the parsed SignedMessage and serializes it via org.json -- ingestMessage
-     *  only ever receives a parsed SignedMessage (KotlinSync parses frames
-     *  straight into one), never the node's raw JSON string, so this is the
-     *  faithful re-serialization available.
-     *
-     *  Deliberately NOT KotlinWire.dumps: dumps routes any Double (incl.
-     *  cert.enrolled_at) through pyFloatRepr, which THROWS outside a narrow
-     *  supported range (|n|>=1e16, <1e-4, or non-finite). enrolled_at is part
-     *  of the enrollment cert, not covered by THIS message's device
-     *  signature -- verifyDeviceSignature() never touches it -- so a
-     *  validly-signed message carrying a hostile/odd enrolled_at would throw
-     *  here, uncaught, and abort KotlinSync.run's whole session (its
-     *  top-level catch turns it into SyncResult.Failed), dropping every
-     *  other good message in the same sync. InMemorySyncStore never
-     *  serializes enrolled_at at all, so it has no equivalent failure mode.
-     *  org.json has no such range restriction, and msg_json is only ever
-     *  read back via org.json (missingBlobs), so this round-trips fine. */
-    @Suppress("UNCHECKED_CAST")
-    private fun serialize(m: SignedMessage): String {
-        val cert = JSONObject().apply {
-            put("identity_pub", m.cert.identity_pub); put("device_pub", m.cert.device_pub)
-            put("device_name", m.cert.device_name); put("enrolled_at", m.cert.enrolled_at)
-            put("signature", m.cert.signature)
-        }
-        return JSONObject().apply {
-            put("cert", cert); put("seq", m.seq)
-            // jsonSafe FIRST, not JSONObject(m.payload) directly -- see its
-            // doc for the two silent corruptions org.json's Map/List
-            // constructors would otherwise apply to a locally-composed
-            // payload (Compose.post's `KotlinWire.PyFloat`-wrapped
-            // created_at and its several explicit-null fields).
-            put("payload", JSONObject(jsonSafe(m.payload) as Map<String, Any?>))
-            put("signature", m.signature)
-        }.toString()
-    }
-
-    /** Recursively prepares a payload value tree for org.json's Map/List-
-     *  based JSONObject/JSONArray constructors, which -- confirmed
-     *  empirically against this exact org.json version (20240303) -- corrupt
-     *  a locally-composed payload two DIFFERENT silent ways:
-     *
-     *  1. `JSONObject(Map)`'s constructor SKIPS any entry whose value is
-     *  Kotlin/Java `null` instead of writing a JSON `null` (`if (value !=
-     *  null) { map.put(...) }`) -- so a payload field like Compose.post's
-     *  `"expires_at" to null` simply VANISHES from the stored msg_json
-     *  instead of round-tripping as a present-but-null key. Every existing
-     *  reader of msg_json (missingBlobs/profileNames/wrapGrantsFor/etc.)
-     *  never noticed because `JSONObject.opt(field)` treats "key absent"
-     *  and "key present, value null" identically. Fix: swap Kotlin `null`
-     *  for the `org.json.JSONObject.NULL` sentinel, which the SAME
-     *  constructor's `wrap()` call preserves correctly once past the
-     *  null-value skip (`NULL.equals(object)` is one of `wrap()`'s
-     *  recognized passthrough cases).
-     *
-     *  2. An unrecognized POJO -- e.g. `KotlinWire.PyFloat`, which
-     *  Compose.post wraps `created_at` in so `KotlinWire.dumps` renders it
-     *  via Python-float-repr rules at SIGN time -- falls through org.json's
-     *  `wrap()` to its bean-introspection fallback (`new JSONObject(bean)`),
-     *  which reflects `PyFloat`'s public `getValue()` getter and produces
-     *  the nested object `{"value": 1752900000.5}` instead of the bare
-     *  number `1752900000.5`. Fix: unwrap to `.value` (a plain Double)
-     *  before it ever reaches `JSONObject`.
-     *
-     *  Both corruptions are silent (no exception at write time) and, for a
-     *  payload round-tripped back out through `pendingOutbound()` for
-     *  RE-SIGNING VERIFICATION (the outbound task), change the canonical
-     *  bytes hashed at sign time -- breaking `msgId()` equality with the
-     *  originally-signed message and, more importantly, the RECEIVING
-     *  NODE's device-signature check on the pushed message (a corrupted
-     *  `created_at` shape also breaks `postAad`/`dmAad` reconstruction,
-     *  since those key off `payload["created_at"]` being a Number).
-     *  `pendingOutbound()` is the first msg_json consumer that needs
-     *  byte-exact round-tripping -- every other accessor only ever reads
-     *  individual fields for display/filtering, never re-derives signed
-     *  bytes -- which is why this gap went unnoticed until now. Applied
-     *  unconditionally in `serialize()` (not just for Compose-authored
-     *  messages): messages parsed off the wire never carry a `PyFloat`
-     *  (KotlinSync's own bridge already normalizes to plain Double before
-     *  `ingestMessage` ever sees them), so this is a no-op for them, and
-     *  running it uniformly is simpler than threading an origin flag
-     *  through `ingestMessage`. */
-    private fun jsonSafe(v: Any?): Any? = when (v) {
-        null -> JSONObject.NULL
-        is KotlinWire.PyFloat -> v.value
-        is Map<*, *> -> v.entries.associate { (k, vv) -> (k as String) to jsonSafe(vv) }
-        is List<*> -> v.map { jsonSafe(it) }
-        else -> v
     }
 
     /** Blob hashes referenced by stored POST/DM/STORY/PROFILE payloads, minus
@@ -486,22 +433,6 @@ class SqliteSyncStore(context: Context) :
         writableDatabase.insertWithOnConflict("keys", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
-    // org.json -> plain Kotlin bridge (JSONObject -> Map, JSONArray -> List),
-    // same idiom as KotlinSync's private toMap/unwrap (each file keeps its
-    // own copy -- see KotlinSync.kt's comment on why: values are consumed
-    // downstream via Map/List casts -- e.g. KotlinDmcrypt.unwrapKey's
-    // `wrap["eph_pub"] as String` -- which throws on a raw org.json type).
-    private fun jsonToMap(o: JSONObject): Map<String, Any?> =
-        o.keys().asSequence().associateWith { unwrapJson(o.get(it)) }
-
-    private fun unwrapJson(v: Any?): Any? = when (v) {
-        is JSONObject -> jsonToMap(v)
-        is JSONArray -> (0 until v.length()).map { unwrapJson(v.get(it)) }
-        JSONObject.NULL -> null
-        is java.math.BigDecimal -> v.toDouble()
-        else -> v
-    }
-
     /** Every stored message (Task 5, B.2 DecryptPass) -- payload
      *  recursively converted from the stored JSON into plain Kotlin
      *  Map/List so callers can use ordinary casts, exactly like
@@ -520,7 +451,7 @@ class SqliteSyncStore(context: Context) :
                 // a non-null String, so this keeps the two columns'
                 // null-handling visibly consistent rather than trusting the
                 // schema constraint implicitly.
-                out.add(StoredMsg(c.getString(0), c.getString(2) ?: "", c.getString(1) ?: "", jsonToMap(payload)))
+                out.add(StoredMsg(c.getString(0), c.getString(2) ?: "", c.getString(1) ?: "", MsgJson.jsonToMap(payload)))
             }
         }
         return out
@@ -558,7 +489,7 @@ class SqliteSyncStore(context: Context) :
                 val payload = JSONObject(c.getString(1)).optJSONObject("payload") ?: continue
                 if (payload.optString("target") != msgId) continue
                 val wraps = payload.optJSONObject("wraps") ?: continue
-                rows.add(Row(payload.optDouble("created_at", 0.0), seq, jsonToMap(wraps)))
+                rows.add(Row(payload.optDouble("created_at", 0.0), seq, MsgJson.jsonToMap(wraps)))
             }
         }
         return rows.sortedWith(compareBy({ it.createdAt }, { it.seq })).map { it.wraps }
@@ -681,7 +612,7 @@ class SqliteSyncStore(context: Context) :
                 val createdAt = payload.optDouble("created_at", 0.0)
                 val cur = best
                 if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
-                    best = Cand(createdAt, seq, jsonToMap(payload))
+                    best = Cand(createdAt, seq, MsgJson.jsonToMap(payload))
             }
         }
         return best?.payload
@@ -702,7 +633,7 @@ class SqliteSyncStore(context: Context) :
                 val createdAt = payload.optDouble("created_at", 0.0)
                 val cur = best
                 if (cur == null || createdAt > cur.createdAt || (createdAt == cur.createdAt && seq > cur.seq))
-                    best = Cand(createdAt, seq, jsonToMap(payload))
+                    best = Cand(createdAt, seq, MsgJson.jsonToMap(payload))
             }
         }
         val p = best?.payload ?: return ProfileLayout(emptyMap(), emptyMap(), emptyMap(), emptyMap())

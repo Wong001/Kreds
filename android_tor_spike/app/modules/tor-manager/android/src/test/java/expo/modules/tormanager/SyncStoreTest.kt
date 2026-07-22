@@ -313,9 +313,9 @@ class SyncStoreTest {
 
     // -- outbound Task 2: pending-outbound push queue --
 
-    private fun postPayload(text: String, createdAt: Double): Map<String, Any?> = mapOf(
+    private fun postPayload(text: String, createdAt: Double, bodyCt: String): Map<String, Any?> = mapOf(
         "kind" to "post", "scope" to "kreds", "body_nonce" to "ab".repeat(12),
-        "body_ct" to "cd".repeat(20), "wraps" to emptyMap<String, Any?>(),
+        "body_ct" to bodyCt, "wraps" to emptyMap<String, Any?>(),
         "blobs" to emptyList<String>(), "created_at" to createdAt, "expires_at" to null,
         "placement" to "journal", "media" to "photo", "poster" to null,
         "codec" to null, "thumbs" to null)
@@ -323,22 +323,31 @@ class SyncStoreTest {
     @Test fun pendingOutboundQueueAddPushAndClear() {
         val s = InMemorySyncStore()
         s.addIdentity(idPub)
-        val m1 = msg(1, postPayload("first", 100.0))
-        val m2 = msg(2, postPayload("second", 200.0))
+        // DISTINCT body_ct per fixture (review fix, Minor) -- the two
+        // messages must be tell-apart-able by content, not just by count,
+        // so the assertions below actually distinguish m1 from m2 rather
+        // than merely confirming "two messages of some kind are queued".
+        val bodyCt1 = "bb".repeat(20)
+        val bodyCt2 = "dd".repeat(20)
+        val m1 = msg(1, postPayload("first", 100.0, bodyCt1))
+        val m2 = msg(2, postPayload("second", 200.0, bodyCt2))
         assertTrue(s.ingestMessage(m1))
         assertTrue(s.ingestMessage(m2))
         val id1 = m1.msgId(); val id2 = m2.msgId()
 
         assertTrue("nothing queued yet", s.pendingOutbound().isEmpty())
 
-        s.addPendingOutbound(id1)
-        s.addPendingOutbound(id2)
-        s.addPendingOutbound(id1)                      // idempotent -- must not duplicate
+        s.addPendingOutbound(id1, m1.toDict())
+        s.addPendingOutbound(id2, m2.toDict())
+        s.addPendingOutbound(id1, m1.toDict())          // idempotent -- must not duplicate
         val pending = s.pendingOutbound()
         assertEquals(2, pending.size)
         @Suppress("UNCHECKED_CAST")
         val bodyCts = pending.map { (it["payload"] as Map<String, Any?>)["body_ct"] }
-        assertEquals(setOf(m1.payload["body_ct"], m2.payload["body_ct"]), bodyCts.toSet())
+        // Stable insertion order (m1 then m2), each fixture's DISTINCT
+        // body_ct -- proves pendingOutbound() actually distinguishes the
+        // two queued messages by content, not just a matching count.
+        assertEquals(listOf(bodyCt1, bodyCt2), bodyCts)
 
         s.clearPendingOutbound(listOf(id1))
         val remaining = s.pendingOutbound()
@@ -347,7 +356,8 @@ class SyncStoreTest {
         val remainingCert = remaining.first()["cert"] as Map<String, Any?>
         assertEquals(m2.cert.identity_pub, remainingCert["identity_pub"])
         @Suppress("UNCHECKED_CAST")
-        assertEquals(m2.payload["body_ct"], (remaining.first()["payload"] as Map<String, Any?>)["body_ct"])
+        assertEquals("the SPECIFIC surviving message (m2, not m1) by its distinct body_ct",
+            bodyCt2, (remaining.first()["payload"] as Map<String, Any?>)["body_ct"])
     }
 
     @Test fun enckeysLatestWinsPerDeviceOverEnckeyMessages() {

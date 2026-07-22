@@ -74,7 +74,7 @@ interface SyncStore {
     fun knownIdentities(): List<String>
     fun addIdentity(id: String)
     fun ingestMessage(m: SignedMessage): Boolean
-    /** Marks a stored message as needing to be PUSHED on the next sync (the
+    /** Marks a message as needing to be PUSHED on the next sync (the
      *  outbound task: `Compose.post` calls this immediately after
      *  `ingestMessage(signed)` so a composed post doesn't just sit in local
      *  storage -- see `SyncRunner.runTransport`, which drains this queue
@@ -82,26 +82,36 @@ interface SyncStore {
      *  sync completes with `SyncResult.Ok`). Idempotent -- re-queueing an
      *  already-pending msgId must not duplicate it (a caller retrying a
      *  failed sync, or composing twice before a sync runs, must still only
-     *  push the message once per queued entry). `msgId` is expected to
-     *  already be a row in this store's messages (every real caller queues
-     *  right after ingesting the same message), but a store impl need not
-     *  validate that -- `pendingOutbound()` naturally yields nothing for an
-     *  id with no backing message row. */
-    fun addPendingOutbound(msgId: String)
+     *  push the message once per queued entry).
+     *
+     *  `wireDict` (outbound review wave, FIX 1) is the exact
+     *  `SignedMessage.toDict()` of the message being queued -- the queue
+     *  stores THIS, not a msgId-only row re-derived later from `messages`.
+     *  That's deliberate: `messages`' own storage (`msg_json`, written via
+     *  `serialize()`/org.json) is lossy for round-tripping an INTEGRAL
+     *  `Double` (e.g. `created_at=150.0` reads back as Kotlin `Int` 150,
+     *  which `KotlinWire.dumps` then renders `"150"`, not `"150.0"` -- a
+     *  canonical-byte mismatch the receiving node's device-signature check
+     *  rejects). Storing the wire dict itself at queue time -- via
+     *  `KotlinWire.dumps`, the SAME canonical serializer `writeFrameBytes`
+     *  uses on the wire -- makes the re-send byte-exact BY CONSTRUCTION, for
+     *  any magnitude, not just the large-magnitude production values that
+     *  happen to dodge the bug. `msgId` is expected to match `wireDict`'s
+     *  own signed content (every real caller passes `signed.msgId()` and
+     *  `signed.toDict()` together), but a store impl need not cross-validate
+     *  that. */
+    fun addPendingOutbound(msgId: String, wireDict: Map<String, Any?>)
     /** The wire dicts (`{cert, seq, payload, signature}` -- the same shape
      *  as `SignedMessage.toDict()`) of every queued-but-not-yet-pushed
-     *  message, reconstructed from the stored `messages` rows via the SAME
-     *  msg_json -> Map bridge the store already uses to read messages
-     *  elsewhere (`allMessages`/`wrapGrantsFor`'s toMap/unwrap idiom) --
-     *  NOT a second, ad-hoc serialization. That reuse matters: pushing a
-     *  queued message re-serializes this exact dict over the wire via
+     *  message, exactly as passed to `addPendingOutbound` (see its doc for
+     *  why the queue stores the wire dict itself rather than re-deriving it
+     *  from `messages`' lossy `msg_json`). Pushing a queued message re-
+     *  serializes this exact dict over the wire via
      *  `KotlinWire.writeFrameBytes`, and the receiving node's device-
      *  signature check depends on those bytes being canonically identical
      *  to what was signed at compose time (in particular, `created_at`'s
-     *  float representation must survive bit-for-bit) -- inventing a
-     *  different read path risks silently diverging from that. Stable
-     *  insertion order (oldest-queued first). An id with no backing message
-     *  row is simply omitted, not an error. */
+     *  float representation must survive bit-for-bit). Stable insertion
+     *  order (oldest-queued first). */
     fun pendingOutbound(): List<Map<String, Any?>>
     /** Removes `msgIds` from the pending-outbound queue -- call only after
      *  a sync that pushed them has completed with `SyncResult.Ok` (a failed
@@ -272,7 +282,11 @@ class InMemorySyncStore : SyncStore {
     private val blobs = linkedMapOf<String, ByteArray>()            // hash -> data
     private var encKey: Pair<String, String>? = null                // (encPrivHex, encPubHex)
     private var seqCounter = 0                                      // next nextSeq() call returns seqCounter+1
-    private val pendingOutboundIds = linkedSetOf<String>()          // msgIds queued for push, insertion order
+    // msgId -> wireDict, insertion order (LinkedHashMap preserves the FIRST
+    // insertion's position on a re-put with the same key, so a re-queue of
+    // an already-pending msgId stays idempotent-in-place, matching the old
+    // LinkedHashSet<String> behavior).
+    private val pendingOutboundMsgs = linkedMapOf<String, Map<String, Any?>>()
 
     private fun sha(b: ByteArray) =
         KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(b))
@@ -306,18 +320,22 @@ class InMemorySyncStore : SyncStore {
         return true
     }
 
-    override fun addPendingOutbound(msgId: String) { pendingOutboundIds.add(msgId) }
+    // Stores the wireDict Map DIRECTLY (native types, e.g. created_at as the
+    // caller's PyFloat/Double, seq as Int -- never JSON-round-tripped), so
+    // KotlinWire.dumps sees the exact same values it would at fresh-compose
+    // time, with zero float/canonical-fidelity risk. This already matches
+    // what SqliteSyncStore's canonical wire_json storage achieves via
+    // KotlinWire.dumps/MsgJson.toMap (see its doc) -- here it's simpler
+    // still, since no serialization round-trip is needed at all.
+    override fun addPendingOutbound(msgId: String, wireDict: Map<String, Any?>) {
+        pendingOutboundMsgs[msgId] = wireDict
+    }
 
-    // messages[it]?.toDict() -- the native (never JSON-round-tripped)
-    // SignedMessage.toDict(), same object identity all the way down to the
-    // PyFloat-wrapped created_at Compose.post built -- so KotlinWire.dumps
-    // sees the exact same PyFloat instance it would at fresh-compose time,
-    // with zero float/canonical-fidelity risk (unlike the SQLite impl,
-    // which must round-trip through msg_json -- see its own doc).
-    override fun pendingOutbound(): List<Map<String, Any?>> =
-        pendingOutboundIds.mapNotNull { messages[it]?.toDict() }
+    override fun pendingOutbound(): List<Map<String, Any?>> = pendingOutboundMsgs.values.toList()
 
-    override fun clearPendingOutbound(msgIds: List<String>) { pendingOutboundIds.removeAll(msgIds.toSet()) }
+    override fun clearPendingOutbound(msgIds: List<String>) {
+        for (id in msgIds) pendingOutboundMsgs.remove(id)
+    }
 
     /** Blob hashes referenced by stored POST/DM/STORY/PROFILE payloads, minus
      *  what we hold. Mirrors hearth.store.referenced_blobs for the KIND_POST/
