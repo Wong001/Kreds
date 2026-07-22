@@ -63,6 +63,39 @@ def test_pack_addr_roundtrips_onion_plain_and_none():
     addr3, off3 = ic.unpack_addr(packed3, 0)
     assert addr3 is None and off3 == len(packed3)
 
+def test_pair_roundtrip():
+    # The android first-load pairing link (spec 2026-07-22): the
+    # desktop's onion address + a short-lived pairing code, packed
+    # together so the phone's QR scan/typed entry carries both in one
+    # string. Same _wrap/base58 mechanics as the other three types, new
+    # type tag (4).
+    addr = "otkspt5nohnwvmgir7obhcpeouqx4qkxchorw3ybhznjatdmwc7t5lad.onion:53799"
+    code = "aB3dEfGh"
+    link = ic.encode_pair(addr, code)
+    assert len(link) < 100
+    assert ic.decode(link) == ("pair", addr, code)
+
+
+def test_pair_roundtrip_no_addr():
+    # A node with no gossip_addr yet can't mint a pairing link in
+    # practice (api.py's own 400 guard) -- but the codec itself stays
+    # symmetric with pack_addr/unpack_addr's None case, same as every
+    # other message type here.
+    code = "XyZ12345"
+    link = ic.encode_pair(None, code)
+    assert ic.decode(link) == ("pair", None, code)
+
+
+def test_pair_decode_rejects_truncated_code():
+    import pytest
+    addr = "otkspt5nohnwvmgir7obhcpeouqx4qkxchorw3ybhznjatdmwc7t5lad.onion:53799"
+    good = ic.encode_pair(addr, "aB3dEfGh")
+    raw = ic.b58decode(good)
+    truncated = ic.b58encode(raw[:-3])   # chop bytes off the code's tail
+    with pytest.raises(ValueError, match="truncated pair code"):
+        ic.decode(truncated)
+
+
 def test_decode_rejects_bad_version_and_garbage():
     import pytest
     addr = "otkspt5nohnwvmgir7obhcpeouqx4qkxchorw3ybhznjatdmwc7t5lad.onion:53799"
