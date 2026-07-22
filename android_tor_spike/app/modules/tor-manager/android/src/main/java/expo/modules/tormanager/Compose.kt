@@ -4,7 +4,20 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 
 object Compose {
-    data class Result(val msgId: String, val blobs: List<Pair<String, ByteArray>>)
+    /** `messageDict` (Task 9, outbound loopback gate): the exact
+     *  `SignedMessage.toDict()` of the message this call just locally
+     *  ingested -- i.e. wire-frame-ready for `KotlinSync.run`'s `outbound`
+     *  parameter. Compose.post has no built-in "push what I just composed"
+     *  path of its own (a later outbound-sync task); KotlinSync.run's
+     *  MESSAGES phase only ever sends the caller-supplied `outbound` list
+     *  verbatim (composeEncKey is the only pre-existing producer of one) --
+     *  a caller that wants to sync a freshly composed post onward needs
+     *  this exact dict, not a re-derived one (re-deriving would consume a
+     *  second, different `store.nextSeq()` value and diverge from the
+     *  message already sitting in the local store). Existing callers
+     *  (LocalApi's HTTP route, ComposeTest) only ever read `msgId`/`blobs`
+     *  and are unaffected by this additive field. */
+    data class Result(val msgId: String, val blobs: List<Pair<String, ByteArray>>, val messageDict: Map<String, Any?>)
 
     private fun sha256hex(b: ByteArray): String =
         KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(b))
@@ -49,6 +62,6 @@ object Compose {
         val unsigned = SignedMessage(fx.cert, store.nextSeq(), payload, "")
         val signed = unsigned.copy(signature = KotlinWire.signRaw(fx.device_priv, unsigned.body()))
         store.ingestMessage(signed)
-        return Result(signed.msgId(), blobPairs)
+        return Result(signed.msgId(), blobPairs, signed.toDict())
     }
 }

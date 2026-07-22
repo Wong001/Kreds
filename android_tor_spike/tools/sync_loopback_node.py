@@ -50,6 +50,7 @@ from pathlib import Path
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
+from hearth import dmcrypt
 from hearth.node import HearthNode
 from hearth.sync import SyncService
 
@@ -97,6 +98,150 @@ def _compute_expect(node) -> dict:
         # to {node.identity_pub} regardless of who else node knows.
         "identities": len(node.store.known_identities()),
     }
+
+
+def _find_composed_post(node, phone_device_pub: str):
+    """Task 9 (outbound loopback gate): the KIND_POST authored under the
+    phone's own device_pub -- i.e. the message KotlinSync's connection-2
+    MESSAGES-phase push just ingested, not any of the node's/friend's own
+    seeded content (which is authored under THEIR device_pubs). Returns
+    None until it has landed (checked after every connection -- see
+    _run_outbound_compose's wrapped _on_conn)."""
+    for m in node.store.messages_by_author(node.identity_pub):
+        if m.payload.get("kind") == "post" and m.cert.device_pub == phone_device_pub:
+            return m
+    return None
+
+
+def _emit_composed_if_ready(node, friend, phone_device_pub: str) -> bool:
+    """Task 9: once the phone's pushed KIND_POST has landed, decrypt it
+    with the NODE'S OWN device enc key -- via the real hearth.dmcrypt
+    primitives directly (unwrap_key -> decrypt_body -> decrypt_blob), not
+    node._content_key's convenience wrapper -- proving the node really is
+    an own device of this identity, able to read the phone's freshly
+    composed content exactly like a real desktop would. Prints
+    {"event": "composed", "text":..., "blob_len":..., "blob_ok":...,
+    "wrapped_friend":...} once decryption succeeds; returns True so the
+    caller stops checking (idempotent -- the event must fire exactly
+    once). `blob_ok` is True iff decrypt_blob's AEAD auth actually
+    succeeded, which -- given ChaCha20-Poly1305 -- is itself the proof
+    the recovered bytes are byte-for-byte what the phone encrypted (any
+    corruption/mismatch fails the tag rather than returning wrong bytes),
+    so `blob_ok` alone already proves fidelity; `blob_len` rides along so
+    the Kotlin side can additionally cross-check it against the original
+    plaintext length it composed with. Returns False (no-op, safe to
+    retry on the next connection) if the post has not landed yet, or
+    if -- unexpectedly -- the node's own wrap does not decrypt (a real
+    crypto-fidelity bug in the phone's compose path; this is never
+    swallowed into a silent False forever, since the caller re-checks
+    after every connection and a wire desync would surface as the test's
+    own awaitEvent timing out)."""
+    msg = _find_composed_post(node, phone_device_pub)
+    if msg is None:
+        return False
+    p = msg.payload
+    aad = dmcrypt.post_aad(msg.cert.identity_pub, p["scope"], p["created_at"])
+    wraps = p.get("wraps") or {}
+    key = dmcrypt.unwrap_key(wraps, node.device.device_pub,
+                             node.device.enc_priv, aad)
+    if key is None:
+        return False
+    body = dmcrypt.decrypt_body(key, p["body_nonce"], p["body_ct"], aad)
+    if body is None:
+        return False
+    blob_hashes = [h for h in (body.get("blobs") or []) if isinstance(h, str)]
+    blob_len = None
+    blob_ok = False
+    if blob_hashes:
+        cipher = node.store.get_blob(blob_hashes[0])
+        if cipher is not None:
+            plain = dmcrypt.decrypt_blob(key, cipher)
+            if plain is not None:
+                blob_len = len(plain)
+                blob_ok = True
+    print(json.dumps({
+        "event": "composed",
+        "text": body.get("text"),
+        "blob_len": blob_len,
+        "blob_ok": blob_ok,
+        "wrapped_friend": friend.device.device_pub in wraps,
+    }), flush=True)
+    return True
+
+
+async def _run_outbound_compose(data_dir) -> None:
+    """Task 9 (B.3 outbound slice): the KEY INTEGRATION PROOF for the
+    phone's outbound compose crypto. Seeds a node that is (a) an OWN
+    DEVICE of the phone's identity -- mint_fixture below enrolls the
+    phone's device under the node's own identity, exactly like every
+    other scenario, so the node can decrypt the phone's own-wrapped
+    content like a real desktop -- and (b) already knows one FRIEND
+    identity with a published enc key, so Compose.post's automatic
+    friend-wrap (it wraps to every known identity's enc-keyed devices,
+    own + friends) has someone real to wrap to.
+
+    Unlike solo/two_node above, this scenario seeds NO desk journal posts
+    (nothing to decrypt but the phone's own compose) and does not run
+    node.maintain_own_device_grants()/maintain_wrap_grants() -- the
+    node's and friend's enc keys are published UP FRONT (ensure_enckey,
+    before the phone ever connects) and Compose.post inline-wraps to
+    them directly; no wrap_grant backfill is exercised or needed here
+    (that machinery is already proven by phoneDecryptsRealBackfilledContent/
+    phoneReadsFriendContentEndToEnd in SyncLoopbackTest.kt -- this
+    scenario's whole point is the OUTBOUND direction those don't cover).
+
+    The printed fixture carries an extra `friend_identity_pub` field
+    (beyond the usual device_priv/device_pub/cert/onion_addr) so the
+    Kotlin test can pre-seed its own store's known-identities with the
+    friend BEFORE connection 1's HAVE swap -- hearth/sync.py's
+    `entitled` (messages_not_in) is restricted to identities the PEER
+    already reports knowing in THAT SAME round's own HAVE frame, so a
+    store that only reports knowing itself would not yet be entitled to
+    the friend's enckey message on the very first connection. Pre-seeding
+    (mirroring how the phone's own identity is always pre-seeded) is what
+    makes connection 1 a genuine single-round pull of both the node's own
+    enckey and the friend's enckey -- see SyncComposeLoopbackTest.kt's
+    class doc for the full protocol trace."""
+    node = HearthNode.create(Path(data_dir) / "n", "Desk", "desk")
+    node.ensure_enckey()          # node's own device enckey -- so the
+                                   # phone's store.enckeys(own) resolves
+                                   # this device as a wrap recipient
+
+    friend = HearthNode.create(Path(data_dir) / "f", "Freja", "freja-desk")
+    node.store.add_identity(friend.identity_pub)
+    friend.store.add_identity(node.identity_pub)
+    friend.ensure_enckey()
+    _gossip_until_converged(node, friend)   # delivers node's <-> friend's
+                                             # enckey/profile messages so
+                                             # node.store holds friend's
+                                             # enckey message to relay to
+                                             # the phone in connection 1
+
+    sync = SyncService(node)
+
+    composed_done = False
+    orig_on_conn = sync._on_conn
+
+    async def _on_conn_then_check(reader, writer):
+        nonlocal composed_done
+        await orig_on_conn(reader, writer)
+        if not composed_done:
+            composed_done = _emit_composed_if_ready(
+                node, friend, fx["device_pub"])
+
+    sync._on_conn = _on_conn_then_check
+
+    port = await sync.start("127.0.0.1", 0)
+    try:
+        fx = mint_fixture(node)
+        fx["onion_addr"] = f"127.0.0.1:{port}"
+        fx["friend_identity_pub"] = friend.identity_pub
+        expect = _compute_expect(node)
+        print(json.dumps({"port": port, "fixture": fx, "expect": expect}),
+              flush=True)
+        await asyncio.Event().wait()   # serve until killed
+    finally:
+        await sync.stop()
 
 
 def _deliver(src, dst) -> bool:
@@ -277,4 +422,13 @@ async def main(data_dir, scenario="solo"):
 
 if __name__ == "__main__":
     _scenario = sys.argv[2] if len(sys.argv) > 2 else "solo"
-    asyncio.run(main(sys.argv[1], _scenario))
+    if _scenario == "outbound_compose":
+        # Task 9: a structurally different seed (own enckey + a friend's
+        # enckey up front, no desk journal posts) from solo/two_node above
+        # -- kept as its own entry point rather than folded into main() as
+        # a third branch, so solo/two_node's behavior stays provably
+        # byte-identical to every pre-Task-9 call site (main() itself is
+        # untouched).
+        asyncio.run(_run_outbound_compose(sys.argv[1]))
+    else:
+        asyncio.run(main(sys.argv[1], _scenario))
