@@ -18,7 +18,7 @@ Plan: ledger section `PLAN: 2026-07-22 android-outbound-dm-send` in
 
 4 code tasks (Task 1 crypto/model, Task 2 route, Task 3 seam, Task 4
 loopback fidelity gate), all APPROVED at review first pass with zero
-Critical/Important findings — no fix wave needed on this slice. Global
+Critical/Important findings — no fix wave needed on those 4 tasks. Global
 constraints held throughout: `feat/fix/docs/test(dm)` lowercase, no
 AI/Co-Authored-By trailers; byte-exact vs `node.py:2308-2345 compose_dm`
 (`dmAad` reused from the read side, `_dm_device_pubs` theirs+mine merge,
@@ -28,7 +28,55 @@ caught before merge); `story_ref` rides plaintext on the envelope by
 hearth design, shape-guarded via a port of `_valid_story_ref`; reused
 outbound-1's `wrapKey`/`encryptBody`/`encryptBlob`/`Multipart`/`PhotoPrep`/
 pending-outbound-queue/`enckeys`; `KotlinSeal` (the mutual-box machinery)
-deliberately NOT involved in DMs.
+deliberately NOT involved in DMs. The **whole-branch final review** (after
+Task 5's on-device-prep report, below) found one Important finding, fixed
+in the pre-merge fix wave documented immediately below.
+
+## Final-review fix wave (post-HEAD `83b4f65`)
+
+Whole-branch final review found one Important finding, fixed on this
+branch before merge:
+
+- **Expired DMs never disappeared on the phone.** Desktop expires a DM by
+  DELETING its row: `store.sweep_expired()` (`store.py:432`) runs every
+  sync tick (`sync.py:273`). The phone's read path already applies the
+  equivalent `notExpired` guard to posts (`feed()`/`profile()`,
+  `LocalApi.kt:260`/`289`/`293`) and to stories (`activeStories`), but
+  never to DMs — `extractDmMsgs` (`LocalApi.kt:503-525`) carried
+  `expires_at` into every row and `dmThreadJson` emitted it, but nothing
+  ever filtered on it, so an expired DM would linger forever in both the
+  thread view and the conversations list (including as a stale
+  last-message preview, and inflating the unread count). Fixed by a new
+  `LocalApi.notExpiredDms()`, applied once in `loadDms()` — the single
+  decrypt-pass read both `conversations()` and `dmThread()` consume — so
+  the guard covers the thread, the conversations list, the last-message
+  preview, and the per-conversation count together. In-memory filter
+  only: no store mutation, no delete — the stored row itself is
+  untouched. A durable phone-side sweep (actually deleting expired rows,
+  the way desktop's sweep does) is a follow-up, not this fix — see
+  Follow-up tickets below.
+- **On-device DoD item (e) was unwriteable as originally specified.** It
+  asked August to "drive an expiring DM from the phone," which no UI on
+  either platform can do: every `/api/dm` caller in the shared
+  `web/app.js` hardcodes `expires_seconds=""` (the DM composer,
+  `app.js:4684`, and the story-reply chip, `app.js:3207`) —
+  `expires_seconds` is an API-only capability, not reachable from either
+  platform's UI, so this checklist step could never have passed as
+  written. Corrected in place below (see item (e)) to point at the real
+  coverage instead: Task 4's loopback gate (real `store.sweep_expired`
+  sweeping a real phone-composed expiring DM on a real node) for the wire
+  proof, and the four new `notExpiredDms`-covering `LocalApiTest.kt`
+  cases for the phone read-side, with an optional (non-blocking)
+  curl-driven desktop check offered in place of the impossible phone-UI
+  step.
+
+JVM suite grew from 242 to 246 (4 new tests in `LocalApiTest.kt`: past-
+vs-future-vs-null expiry, the exact-`now`-is-expired boundary matching
+hearth's `<=`, an expired DM absent from both the thread and the
+conversation preview/count while a live one from the same partner
+survives, and a partner whose entire history expired dropping out of the
+conversations list entirely). `:app:assembleRelease` rebuilt and
+reinstalled on the G20 this fix wave (see "Install confirmation" below).
 
 ## What it does
 
@@ -190,12 +238,61 @@ Desktop `serve --tor`, unlocked, with a friend synced. From the phone:
 - [ ] (c) photo DM arrives, renders both ends, EXIF stripped
 - [ ] (d) story reply from the phone story viewer lands as a DM with story
       context on desktop
-- [ ] (e) expiring DM disappears after TTL on both ends
+- [x] (e) **expiring DM — DESK-PROVEN, not phone-UI-driveable.** Corrected
+      (final review, pre-merge): item (e) as originally written asked
+      August to "drive an expiring DM from the phone," which is
+      impossible on EITHER platform. `expires_seconds` is an API-only
+      capability — every `/api/dm` caller in the shared `web/app.js`
+      (used by both desktop and the phone's WebView shell) hardcodes
+      `expires_seconds=""`: the DM composer
+      (`document.getElementById("dm-compose").onsubmit`, `app.js:4684`)
+      and the story-reply chip (`app.js:3207`) both do
+      `fd.append("expires_seconds", "")`. There is no UI control on
+      either platform that sets it to anything else, so this checklist
+      step could never have passed as written. Two things now stand in
+      for the impossible on-device UI check:
+      1. **Wire-level expiry proof (desk-proven):** Task 4's loopback gate
+         (`SyncDmLoopbackTest.phoneComposedDmsDecryptOnRealNodeAsRecipientAndExpire`)
+         composes a real phone-side expiring DM
+         (`expires_seconds = 60.0`), asserts `expires_at == created_at +
+         expires_seconds` exactly, then runs hearth's REAL
+         `store.sweep_expired` (`store.py:432`) on a real node past that
+         expiry and asserts the DM was actually reclaimed (`dm_expired
+         {"swept": true}`) — proving the compose/expiry-honoring path
+         and the node-side sweep, byte-exact against hearth.
+      2. **Phone read-side coverage (desk-proven, this fix):** the phone
+         never ran a sweep of its own — `extractDmMsgs` carried
+         `expires_at` into every DM row but nothing filtered on it, so
+         an expired DM would have lingered forever in both the thread
+         view and the conversations list/preview/count. Fixed by
+         `LocalApi.notExpiredDms()`, applied once in `loadDms()` (the
+         single read shared by `conversations()` and `dmThread()`), and
+         covered by four new `LocalApiTest.kt` cases: past-vs-future-vs-
+         null expiry, the exact-`now`-is-expired boundary (matching
+         hearth's `<=`), an expired DM absent from both the thread and
+         the conversation preview/count while a live one from the same
+         partner survives, and a partner whose entire history expired
+         dropping out of the conversations list entirely.
+      - **Optional realistic on-device check (August, if desired):**
+        since the phone can only ever COMPOSE a non-expiring DM through
+        its own UI, the only way to exercise expiry end-to-end
+        live is from the API directly — e.g. `curl` an expiring DM at
+        the **desktop's** `/api/dm` with `expires_seconds` set, confirm
+        it renders normally at first, then confirm it is gone from the
+        desktop's own thread after TTL (desktop's own
+        `store.sweep_expired` tick). This exercises the same node-side
+        sweep Task 4 already proved and is optional, not blocking — the
+        wire proof + the new read-filter test are the real coverage for
+        this item.
+      - A durable phone-side sweep (deleting expired DM rows locally,
+        the way desktop's periodic sweep does, instead of only
+        filtering them at read time) is a follow-up, not part of this
+        fix — see Follow-up tickets below.
 - [ ] (f) sent bubble renders on the phone immediately (dmKeysCache warm)
 - [ ] (g) regression: profile wall compose / Arrange / story-add stay
       hidden
 
-## Install confirmation (this session)
+## Install confirmation (original session, pre-fix-wave)
 
 Device: G20, serial `ZY32DLZQ2N`, package `eu.kreds.torspike`, RELEASE
 apk only (built against HEAD `83b4f65`).
@@ -221,12 +318,38 @@ APK), after which the backgrounded install call's output showed
 No behavioral checks were run beyond confirming the install succeeded —
 the DoD above is August's to drive.
 
+## Install confirmation (this session, final-review fix wave)
+
+Device: G20, serial `ZY32DLZQ2N`, package `eu.kreds.torspike`, RELEASE apk
+only (rebuilt against this fix wave's HEAD, after `LocalApi.notExpiredDms`
++ the four new `LocalApiTest.kt` cases landed and the full JVM suite
+passed 246/246).
+
+```
+adb shell am force-stop eu.kreds.torspike        -> (no output, success)
+adb install -r -d app-release.apk                -> "Performing Streamed Install" / "Success"
+```
+
+Same Play Protect gotcha as every prior sideload cycle on this device
+(now a fourth documented occurrence across the outbound family):
+`dumpsys window | grep mCurrentFocus` showed
+`PlayProtectDialogsActivity` in focus mid-install; `adb exec-out
+screencap -p` confirmed the "Vil du sende appen til sikkerhedstjek?"
+prompt for `KredsTorSpike`, dismissed via a tap on "Send ikke" (Don't
+send), after which focus returned to the launcher and the backgrounded
+install call's output showed `Success`. No behavioral checks were run
+beyond confirming the install succeeded — the on-device DoD checklist
+above remains August's to drive; nothing in this fix wave changes what
+it needs to cover beyond the corrected item (e).
+
 ## Run gotchas
 
 - **A Play Protect scan-consent dialog can silently block `adb install`
-  with no error and no timeout** (hit again in this session, third
+  with no error and no timeout** (hit in the original session, a third
   documented occurrence across the outbound family — outbound-2/responses'
-  report documented the second). If a reinstall hangs with no output
+  report documented the second — and hit AGAIN in this fix wave's
+  reinstall, a fourth occurrence; see "Install confirmation (this
+  session, final-review fix wave)" above). If a reinstall hangs with no output
   after "Performing Streamed Install" (or even before it), check
   `adb shell dumpsys window | grep mCurrentFocus` for
   `PlayProtectDialogsActivity` before assuming a transfer stall — the app
@@ -273,6 +396,19 @@ Reproduced verbatim from the design spec's "Honest limits" section
 
 ## Follow-up tickets (non-blocking, carried from the ledger)
 
+- **Phone-side durable expiry sweep (new, final review, pre-merge).**
+  `LocalApi.notExpiredDms()` (this fix) hides an expired DM at READ time
+  only — it filters `loadDms()`'s output before `conversations()`/
+  `dmThread()` see it, but never touches the stored row. Desktop instead
+  runs a real `store.sweep_expired()` sweep (`sync.py:273`, `store.py:432`)
+  that deletes expired rows outright. The phone has no equivalent sweep:
+  an expired DM's ciphertext, blobs, and row stay in `SqliteSyncStore`
+  forever, unlike desktop where the row is actually gone. This is
+  behaviorally invisible today (every read path is filtered), but it is a
+  storage-growth and hygiene gap, not full desktop parity. Candidate: a
+  periodic (or app-start) `SqliteSyncStore.sweepExpiredDms()`-style pass
+  mirroring desktop's sweep, or reusing the same trigger point if/when the
+  phone gains a background sync tick equivalent for DMs.
 - **`ComposeDm.kt` — `encPriv` unused-parameter doc note missing.**
   `ComposeResponse`'s precedent documents why an unused `encPriv`
   parameter is kept in the signature (shape consistency across the
