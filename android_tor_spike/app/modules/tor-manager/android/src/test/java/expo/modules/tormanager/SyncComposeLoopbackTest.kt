@@ -43,15 +43,23 @@ import org.junit.Test
  *  "own" wrap recipient) and the friend's enckey (so the friend-wrap has
  *  someone real to wrap to).
  *
- *  Compose.post has no built-in "push what I just composed" path of its
- *  own (a later outbound-sync task) -- KotlinSync.run's MESSAGES phase
- *  only ever sends the caller-supplied `outbound` list verbatim
- *  (composeEncKey was, before this task, the only producer of one).
- *  Compose.Result gained a `messageDict` field (Task 9) -- the exact
- *  `.toDict()` of the message Compose.post already locally ingested --
- *  so connection 2 can push That Exact Message onward; nothing else
- *  about Compose.post's contract changed (existing callers only ever
- *  read `msgId`/`blobs`).
+ *  KotlinSync.run's MESSAGES phase only ever sends the caller-supplied
+ *  `outbound` list verbatim -- it never auto-pushes stored own-authored
+ *  content. Originally (Task 9) this test pushed connection 2's `outbound`
+ *  as `listOf(res.messageDict)`, the exact `.toDict()` of the message
+ *  Compose.post had just locally ingested, proving a freshly-composed
+ *  message is node-accepted. The outbound task (pending-outbound queue,
+ *  Task 8 here) changes what THIS test drives: Compose.post now ALSO calls
+ *  `store.addPendingOutbound(signed.msgId())`, and connection 2 pushes
+ *  `store.pendingOutbound()` instead -- the queue's own reconstruction of
+ *  the wire dict from the stored `messages` row (via the store's
+ *  toDict()/jsonToMap bridge), not the directly-returned dict. That
+ *  reconstruction is the thing that needs proving now: if it silently
+ *  diverged (e.g. a float-precision or canonical-shape mismatch), the
+ *  node's device-signature check below would reject it and this test would
+ *  fail RED. `messageDict` itself is unchanged and still available on
+ *  `Compose.Result` for any caller that wants an immediate push without
+ *  waiting on the queue.
  *
  *  Single-connection message+blob delivery (sharp edge, confirmed against
  *  hearth/sync.py's real _session): connection 2's MESSAGES phase ingests
@@ -112,14 +120,29 @@ class SyncComposeLoopbackTest {
             val res = Compose.post(store, fx, encPriv, encPub, "hi from phone",
                 listOf(photoBytes), "kreds", createdAt)
 
-            // -- Connection 2: fresh auth, push the composed post
-            // (messageDict, see class doc) via MESSAGES; the BLOBS phase
-            // of this SAME session then honors the node's resulting
-            // blob_want (Task 8's outbound push) in one round trip.
+            // outbound Task 8: push via the QUEUE (Compose.post already
+            // called store.addPendingOutbound(signed.msgId()) internally),
+            // NOT res.messageDict directly -- this is what proves the queue
+            // itself (msg_id -> stored `messages` row -> reconstructed wire
+            // dict via the store's toDict()/jsonToMap bridge) produces a
+            // node-accepted, decryptable message, not just that a freshly-
+            // composed dict handed straight through works.
+            val pending = store.pendingOutbound()
+            assertEquals("exactly the one composed post should be queued", 1, pending.size)
+
+            // -- Connection 2: fresh auth, push the queued post via MESSAGES;
+            // the BLOBS phase of this SAME session then honors the node's
+            // resulting blob_want (Task 8's outbound push) in one round trip.
             val stream2 = SocketStream("127.0.0.1", node.port)
             KotlinHandshake.authOnlyOverStream(stream2, fx)
-            val res2 = KotlinSync.run(stream2, store, fx.device_pub, outbound = listOf(res.messageDict))
-            assertTrue("sync 2 (push composed post + blob): $res2", res2 is SyncResult.Ok)
+            val res2 = KotlinSync.run(stream2, store, fx.device_pub, outbound = pending)
+            assertTrue("sync 2 (push queued composed post + blob): $res2", res2 is SyncResult.Ok)
+
+            // clearPendingOutbound is exercised end-to-end by SyncRunner in
+            // production (on SyncResult.Ok); mirror that here so this test's
+            // store state matches what a real successful sync would leave.
+            store.clearPendingOutbound(listOf(res.msgId))
+            assertTrue("queue drained after a successful push", store.pendingOutbound().isEmpty())
 
             // The node's wrapped _on_conn (sync_loopback_node.py) decrypts
             // the just-ingested post with ITS OWN device enc key -- via the
