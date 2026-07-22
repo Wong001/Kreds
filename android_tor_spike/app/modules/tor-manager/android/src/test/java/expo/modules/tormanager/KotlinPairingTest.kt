@@ -477,6 +477,29 @@ class KotlinPairingTest {
         override fun close() { closed = true }
     }
 
+    /** A reply frame with a VALID 4-byte length header but a body that
+     *  isn't JSON at all -- the "truly malformed bytes" garbage case (MINOR,
+     *  post-review), distinct from FixedReplyStream's well-formed-JSON/
+     *  wrong-`t` garbage: this one drives KotlinPairing.readFrame's
+     *  `JSONObject(...)` parse itself into throwing. */
+    private class RawFramedBytesStream(body: String) : Stream {
+        private val replyBytes: ByteArray = body.toByteArray(Charsets.US_ASCII).let { b ->
+            val out = ByteArray(4 + b.size)
+            out[0] = (b.size ushr 24).toByte(); out[1] = (b.size ushr 16).toByte()
+            out[2] = (b.size ushr 8).toByte(); out[3] = b.size.toByte()
+            b.copyInto(out, 4)
+            out
+        }
+        private var pos = 0
+        var closed = false
+        override fun write(bytes: ByteArray) {}
+        override fun readExactSync(n: Int): ByteArray {
+            check(pos + n <= replyBytes.size) { "RawFramedBytesStream exhausted" }
+            val out = replyBytes.copyOfRange(pos, pos + n); pos += n; return out
+        }
+        override fun close() { closed = true }
+    }
+
     /** Never produces enough reply bytes -- sleeps well past any reasonable
      *  test timeoutMs on every read. Cheap simulated hang: the test uses a
      *  tiny timeoutMs (tens of ms), so runCeremony's Future.get times out
@@ -581,6 +604,63 @@ class KotlinPairingTest {
         assertTrue("expected Unreachable, got $result", result is KotlinPairing.CeremonyResult.Unreachable)
         assertTrue(stream.closed)
         assertNull(PairingStore.load(dir))
+    }
+
+    /** MINOR (post-review): a reply frame whose body isn't JSON at all
+     *  (as opposed to runCeremonyUnrecognizedReplyIsUnreachable's
+     *  well-formed-JSON-but-wrong-`t` case) -- exercises the OTHER path to
+     *  Unreachable, KotlinPairing.readFrame's `JSONObject(...)` parse
+     *  throwing, caught by runCeremony's generic `catch (e: Exception)`
+     *  rather than falling through the `when`'s `else` branch. */
+    @Test fun runCeremonyNonJsonReplyBytesIsUnreachable() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-nonjson").toFile()
+        val stream = RawFramedBytesStream("this is not json at all")
+        val result = KotlinPairing.runCeremony({ _, _ -> stream }, VALID_LINK, "My Phone", 5000, store, dir)
+        assertTrue("expected Unreachable, got $result", result is KotlinPairing.CeremonyResult.Unreachable)
+        assertTrue(stream.closed)
+        assertNull(PairingStore.load(dir))
+    }
+
+    /** IMPORTANT 1 (post-review): the "dialing" -> "waiting" pairProgress
+     *  sequence, driven directly on runCeremony's onProgress callback (the
+     *  bridge just forwards each stage string to sendEvent -- no bridge-
+     *  level behavior to test beyond that direct forward). "dialing" runs
+     *  on this test thread; "waiting" runs on runCeremony's internal
+     *  executor thread (after the request frame is written, before the
+     *  blocking read) -- Collections.synchronizedList so both writers are
+     *  safe, and the assertion happens after runCeremony has already
+     *  returned (so no data race on the read side either). */
+    @Test fun runCeremonyEmitsDialingThenWaitingProgress() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-progress").toFile()
+        val stages = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val stream = FixedReplyStream(mapOf("t" to "pair-denied"))
+
+        val result = KotlinPairing.runCeremony(
+            dial = { _, _ -> stream }, link = VALID_LINK, deviceName = "My Phone",
+            timeoutMs = 5000, store = store, dir = dir,
+            onProgress = { stage -> stages.add(stage) },
+        )
+
+        assertEquals(KotlinPairing.CeremonyResult.Denied, result)
+        assertEquals(listOf("dialing", "waiting"), stages)
+    }
+
+    /** A malformed link must not even emit "dialing" -- BadLink returns
+     *  before onProgress is invoked at all (same "dial never called"
+     *  short-circuit runCeremonyMalformedLinkIsBadLinkAndNeverDials pins). */
+    @Test fun runCeremonyMalformedLinkEmitsNoProgress() {
+        val store = InMemorySyncStore()
+        val dir = Files.createTempDirectory("ceremony-progress-badlink").toFile()
+        val stages = mutableListOf<String>()
+        val result = KotlinPairing.runCeremony(
+            dial = { _, _ -> throw AssertionError("must not dial") }, link = "not a valid pairing link!",
+            deviceName = "My Phone", timeoutMs = 5000, store = store, dir = dir,
+            onProgress = { stage -> stages.add(stage) },
+        )
+        assertEquals(KotlinPairing.CeremonyResult.BadLink, result)
+        assertTrue("no progress for a link that never dials", stages.isEmpty())
     }
 
     @Test fun runCeremonyRejectedPackageIsUnreachableStoreUntouched() {

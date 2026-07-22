@@ -3,6 +3,7 @@ package expo.modules.tormanager
 import android.content.Context
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
@@ -19,13 +20,35 @@ import kotlinx.coroutines.SupervisorJob
  *  blobKeys/decryptBlob). */
 private const val STORY_MARKER = "story"
 
+/** Log tag for this module -- no pre-existing android.util.Log usage
+ *  exists anywhere in this app to mirror (grepped the whole
+ *  android_tor_spike tree, none found); "TorManager" matches this module's
+ *  own Name("TorManager") in `definition()` below. */
+private const val TAG = "TorManager"
+
 /** Task 4 (first-load pairing): bounds pairWithNode's single request/reply
- *  round trip (KotlinPairing.runCeremony's timeoutMs). Independent of
- *  TorEngine.dial's own onion-circuit-build blocking (Socks.kt's 120s
- *  soTimeout, already spent by the time runCeremony's timeout clock even
- *  starts) -- this only bounds the pairing frame exchange itself, which a
- *  live home node should answer quickly once connected. */
-private const val PAIR_TIMEOUT_MS = 30_000L
+ *  round trip (KotlinPairing.runCeremony's timeoutMs).
+ *
+ *  POST-REVIEW FIX: this was originally 30_000L ("a live node should answer
+ *  quickly") -- wrong. The wait this bounds is NOT "how long a node takes
+ *  to answer a frame"; it's "how long the SERVER holds the connection open
+ *  while a HUMAN walks to the desktop and clicks Accept/Deny" --
+ *  node.accept_pairing / api.py's /api/pair/accept gates on
+ *  node.pending_pair, and the server only gives up once the pairing code
+ *  itself expires. So this must be anchored to the code's server-side TTL,
+ *  not to network/handshake latency: hearth/pairingcodes.py's
+ *  `TTL_SECONDS = 600` (10 minutes -- "design doc: short TTL (10 min)").
+ *  610_000L = that 600s window + 10s margin for clock skew / the last leg
+ *  of frame delivery. A client bound shorter than the server's own window
+ *  abandons a still-live ceremony mid-wait: the code is already consumed
+ *  server-side by the time the human sees the Accept screen, so a client
+ *  retry can't reuse it (a fresh code + a fresh QR scan is the only
+ *  recovery), a late Accept enrolls a device the phone gave up hearing
+ *  about, and a retry racing a stale Accept risks double-enrolling.
+ *  IF hearth/pairingcodes.py's TTL_SECONDS ever changes, THIS CONSTANT
+ *  MUST FOLLOW IT -- nothing on the wire carries the TTL for this to derive
+ *  automatically; there is no cross-check that would catch drift. */
+private const val PAIR_TIMEOUT_MS = 610_000L
 
 class TorManagerModule : Module() {
     // recv/send/dial block on socket I/O; keep them OFF the single default
@@ -264,7 +287,7 @@ class TorManagerModule : Module() {
             "fixtureDir" to (appContext.reactContext?.getExternalFilesDir(null)?.absolutePath ?: "")
         )
 
-        Events("torProgress", "nodeBeat", "nodeState", "nodeSync", "onSyncProgress")
+        Events("torProgress", "nodeBeat", "nodeState", "nodeSync", "onSyncProgress", "pairProgress")
 
         OnCreate {
             val ctx = appContext.reactContext ?: return@OnCreate
@@ -360,12 +383,27 @@ class TorManagerModule : Module() {
         // never throws/rejects for an ordinary ceremony outcome (ceremony
         // failures are VALUES, status="unreachable"/"bad_link"/etc, not
         // promise rejections) so the JS side has one flat switch instead of
-        // a try/catch-plus-switch.
+        // a try/catch-plus-switch. The 5 statuses are Task 7's UI contract
+        // and stay fixed; an "unreachable" result additionally carries a
+        // "reason" string (post-review addition) so a REJECTED package
+        // (forged/tampered cert, device_pub mismatch, ...) doesn't read to
+        // the human as an indistinguishable Wi-Fi hiccup -- the same
+        // installPackage IllegalArgumentException message that used to be
+        // swallowed into a bare "unreachable" now surfaces in both logcat
+        // (Log.w, for on-device debugging) and the resolved map (for a
+        // future UI that wants to show it). "dialing"/"waiting"
+        // pairProgress events (post-review addition) mirror syncNow's own
+        // onSyncProgress -- Task 7's UI is the consumer; a ceremony that
+        // can legitimately wait most of PAIR_TIMEOUT_MS (600s) for the
+        // human's desktop Accept click needs a "still waiting" signal.
         AsyncFunction("pairWithNode") { link: String, deviceName: String ->
-            val ctx = appContext.reactContext
-                ?: return@AsyncFunction mapOf("status" to "unreachable")
-            if (!TorEngine.isUp)
-                return@AsyncFunction mapOf("status" to "unreachable")
+            fun unreachable(reason: String): Map<String, Any?> {
+                Log.w(TAG, "pairWithNode: unreachable - $reason")
+                return mapOf("status" to "unreachable", "reason" to reason)
+            }
+
+            val ctx = appContext.reactContext ?: return@AsyncFunction unreachable("no context")
+            if (!TorEngine.isUp) return@AsyncFunction unreachable("tor not up - start the node first")
 
             val store = SqliteSyncStore(ctx)
             val result = try {
@@ -376,19 +414,19 @@ class TorManagerModule : Module() {
                     timeoutMs = PAIR_TIMEOUT_MS,
                     store = store,
                     dir = ctx.filesDir,
+                    onProgress = { stage -> sendEvent("pairProgress", mapOf("stage" to stage)) },
                 )
             } finally {
                 store.close()   // SQLiteOpenHelper leaks its connection if not closed
             }
 
-            val status = when (result) {
-                is KotlinPairing.CeremonyResult.Linked -> "linked"
-                is KotlinPairing.CeremonyResult.Denied -> "denied"
-                is KotlinPairing.CeremonyResult.Expired -> "expired"
-                is KotlinPairing.CeremonyResult.Unreachable -> "unreachable"
-                is KotlinPairing.CeremonyResult.BadLink -> "bad_link"
+            when (result) {
+                is KotlinPairing.CeremonyResult.Linked -> mapOf("status" to "linked")
+                is KotlinPairing.CeremonyResult.Denied -> mapOf("status" to "denied")
+                is KotlinPairing.CeremonyResult.Expired -> mapOf("status" to "expired")
+                is KotlinPairing.CeremonyResult.BadLink -> mapOf("status" to "bad_link")
+                is KotlinPairing.CeremonyResult.Unreachable -> unreachable(result.reason)
             }
-            mapOf("status" to status)
         }.runOnQueue(ioScope)
 
         // -- Brick A: background node control --

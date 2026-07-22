@@ -335,6 +335,21 @@ object KotlinPairing {
         object BadLink : CeremonyResult()
     }
 
+    /** `onProgress` (post-review addition): purely additive observability,
+     *  same posture as KotlinSync.run's own `onProgress` callback -- default
+     *  null, exceptions from the caller's lambda are NOT swallowed here
+     *  (unlike KotlinSync's terminal-outcome protection, there is no
+     *  "already succeeded, don't let a side-channel flip the result" risk:
+     *  both call sites happen strictly BEFORE the outcome is known). Fires
+     *  "dialing" right before `dial` runs (never fires at all for a
+     *  malformed link -- BadLink returns first) and "waiting" right after
+     *  the request frame is written, before the (possibly multi-minute)
+     *  blocking read for the human's Accept/Deny click on the desktop --
+     *  see PAIR_TIMEOUT_MS's doc (TorManagerModule.kt) for why that wait
+     *  can legitimately run for most of 10 minutes. Runs on whatever thread
+     *  calls runCeremony ("dialing") and on the executor's background
+     *  thread ("waiting") -- the bridge's lambda (sendEvent) is safe to
+     *  call from either. */
     fun runCeremony(
         dial: (host: String, port: Int) -> Stream,
         link: String,
@@ -342,10 +357,12 @@ object KotlinPairing {
         timeoutMs: Long,
         store: SyncStore,
         dir: File,
+        onProgress: ((String) -> Unit)? = null,
     ): CeremonyResult {
         val (addr, code) = decodeLink(link) ?: return CeremonyResult.BadLink
         val (host, port) = KotlinHandshake.splitAddr(addr)
 
+        onProgress?.invoke("dialing")
         val stream = try {
             dial(host, port)
         } catch (e: Exception) {
@@ -362,6 +379,7 @@ object KotlinPairing {
             val reply: JSONObject = try {
                 executor.submit<JSONObject> {
                     writeFrame(stream, requestFrame)
+                    onProgress?.invoke("waiting")
                     readFrame(stream)
                 }.get(timeoutMs, TimeUnit.MILLISECONDS)
             } catch (e: TimeoutException) {
