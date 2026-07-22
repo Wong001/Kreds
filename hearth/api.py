@@ -672,6 +672,25 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         addr = node.store.get_meta("gossip_addr")
         if not addr:
             raise HTTPException(400, "node is not serving yet")
+        # Stale-ceremony release (whole-branch review): an orphaned wire
+        # ceremony (the phone dropped mid-wait -- crashed, lost Tor, user
+        # backed out -- with no accept/deny ever posted) would otherwise
+        # block every retry until the code's own TTL, since only ONE
+        # ceremony can be parked at a time (sync.py's _handle_pair_request).
+        # begin already invalidates the prior CODE (PairingCodes.mint's
+        # "one active code" contract) -- extend that same semantics to the
+        # prior CEREMONY: resolve it as denied (exactly pair/accept's own
+        # deny path: set verdict, fire the event) so its held connection
+        # wakes up immediately instead of hanging, and the desktop user can
+        # unblock themselves by simply reopening/restarting Add-device.
+        # Guarded on "no verdict yet" so a ceremony the human ALREADY
+        # decided (verdict set, event fired, wire handler not yet
+        # scheduled to consume it) is never flipped from accept to deny --
+        # see node.py's pending_pair docstring: "still waiting" is exactly
+        # "pending_pair exists but has no verdict key yet".
+        if node.pending_pair is not None and "verdict" not in node.pending_pair:
+            node.pending_pair["verdict"] = False
+            node.pending_pair_event.set()
         code = node.pairing.mint(time.time())
         return {"link": invitecodec.encode_pair(addr, code),
                 "expires_at": node.pairing.expires_at}

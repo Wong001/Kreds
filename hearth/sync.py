@@ -441,7 +441,7 @@ class SyncService:
         be refused."""
         if self.node.pairing._hash is None:
             # Cheaper rate-limit (mirrors _handle_friend_add's Fix 1,
-            # sync.py:356-369): with no code minted at all, there is
+            # sync.py:377-390): with no code minted at all, there is
             # nothing for verify_and_consume to protect -- refuse
             # immediately WITHOUT spending rate-limit budget. Otherwise an
             # onion-address-knowing attacker could sustain a flood with no
@@ -466,6 +466,22 @@ class SyncService:
             await write_frame(writer, {"t": "pair-expired"})
             return
 
+        # Frame-shape validated BEFORE verify_and_consume (whole-branch
+        # review): a malformed frame from a buggy-but-legitimate client
+        # must not burn the human's live code. This costs nothing security-
+        # wise -- a malformed frame gets the exact same uniform pair-
+        # expired reply regardless of whether the code it carried was
+        # valid, and an attacker who genuinely HOLDS a valid code can just
+        # resend a well-formed frame and succeed anyway, so there was never
+        # any protection in consuming first.
+        device_pub = frame.get("device_pub")
+        device_name = frame.get("device_name")
+        if not (_is_hexn(device_pub, 64)
+                and isinstance(device_name, str) and device_name.strip()):
+            await write_frame(writer, {"t": "pair-expired"})
+            return
+        device_name = device_name.strip()
+
         # Capture expires_at BEFORE consuming: verify_and_consume clears it
         # to None on success, and the held-connection wait below must use
         # the code's OWN remaining window (it was already live for up to
@@ -482,21 +498,6 @@ class SyncService:
             # every other refusal on this pre-auth surface.
             await write_frame(writer, {"t": "pair-expired"})
             return
-
-        device_pub = frame.get("device_pub")
-        device_name = frame.get("device_name")
-        if not (_is_hexn(device_pub, 64)
-                and isinstance(device_name, str) and device_name.strip()):
-            # The code was real (a human showed this connection their live
-            # QR/code), but the frame shape itself is bad -- a buggy or
-            # hostile client. The code is already burned at this point
-            # (verify_and_consume above already consumed it); that is an
-            # acceptable cost of a malformed request, not a security hole,
-            # since burning it doesn't grant anything -- see PairingCodes'
-            # own "consuming is atomic" docstring.
-            await write_frame(writer, {"t": "pair-expired"})
-            return
-        device_name = device_name.strip()
 
         request_json = json.dumps({
             "t": "hearth-pair-request", "protocol": PROTOCOL,

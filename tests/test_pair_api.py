@@ -78,6 +78,48 @@ def test_pair_begin_replaces_prior_code(tmp_path):
     assert n.pairing.verify_and_consume(code2, time.time()) is True
 
 
+def test_pair_begin_releases_stale_pending_as_denied(tmp_path):
+    """Whole-branch review: an orphaned ceremony (no verdict yet -- the
+    phone dropped mid-wait) must not block a re-begin, and the human
+    reopening Add-device should unblock it. The wire handler (sync.py)
+    is what actually clears pending_pair once it wakes up and replies;
+    this test pins the API's own half of that handoff -- verdict set to
+    False and the event fired, exactly mirroring pair/accept's deny
+    path -- given a stub pending in the exact shape sync.py parks."""
+    n = _fresh(tmp_path)
+    n.store.set_meta("gossip_addr", "127.0.0.1:7101")
+    _stub_pending(n, tmp_path)
+    assert "verdict" not in n.pending_pair       # orphaned: still waiting
+    assert not n.pending_pair_event.is_set()
+    c = TestClient(build_app(n))
+    r = c.post("/api/pair/begin")
+    assert r.status_code == 200
+    assert n.pending_pair["verdict"] is False
+    assert n.pending_pair_event.is_set()
+    # the fresh code from THIS begin call is unaffected -- live and
+    # redeemable, exactly like the ordinary replace-prior-code case above
+    _, _, code = invitecodec.decode(r.json()["link"])
+    assert n.pairing.verify_and_consume(code, time.time()) is True
+
+
+def test_pair_begin_does_not_flip_an_already_decided_pending(tmp_path):
+    """A ceremony the human ALREADY decided (verdict set, event fired,
+    but the wire handler hasn't yet been scheduled to consume/clear it --
+    a narrow same-event-loop window) must never be flipped from accept to
+    deny by a concurrent re-begin. 'Still waiting' is exactly 'no verdict
+    key yet' per node.py's pending_pair docstring."""
+    n = _fresh(tmp_path)
+    n.store.set_meta("gossip_addr", "127.0.0.1:7101")
+    _stub_pending(n, tmp_path)
+    n.pending_pair["verdict"] = True
+    n.pending_pair["package"] = "irrelevant-for-this-test"
+    n.pending_pair_event.set()
+    c = TestClient(build_app(n))
+    r = c.post("/api/pair/begin")
+    assert r.status_code == 200
+    assert n.pending_pair["verdict"] is True
+
+
 # -- GET /api/pair/pending ----------------------------------------------------
 
 def test_pair_pending_null_when_none(tmp_path):

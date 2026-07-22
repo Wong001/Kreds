@@ -22,6 +22,7 @@ import time
 import httpx
 import pytest
 
+from hearth import invitecodec
 from hearth.api import build_app
 from hearth.node import HearthNode
 from hearth.pairingcodes import TTL_SECONDS
@@ -63,6 +64,14 @@ async def _api_accept(app, device_pub, accept):
         r = await c.post("/api/pair/accept",
                          json={"device_pub": device_pub, "accept": accept})
         assert r.status_code == 200
+
+
+async def _api_begin(app):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.post("/api/pair/begin")
+        assert r.status_code == 200
+        return r.json()
 
 
 # -- happy path ---------------------------------------------------------
@@ -296,9 +305,11 @@ def test_pair_request_with_no_live_code_refused_without_spending_rate_limit(tmp_
 
 def test_malformed_frame_with_valid_code_pair_expired(tmp_path):
     """A genuinely live, correct code but a malformed device_pub/
-    device_name (buggy or hostile client) -- refused, and the code is
-    consumed in the process (an accepted, documented trade-off: burning a
-    code on a malformed request grants the attacker nothing)."""
+    device_name (buggy or hostile client) -- refused, and (whole-branch
+    review: shape validated BEFORE verify_and_consume) the code is NOT
+    burned -- a malformed frame gets the same uniform pair-expired reply
+    either way, so consuming first bought no security and only cost a
+    legitimate human a working code on a client bug."""
     async def scenario():
         a = HearthNode.create(tmp_path / "a", "A", "a-dev")
         svc_a, port = await _serve(a)
@@ -310,8 +321,75 @@ def test_malformed_frame_with_valid_code_pair_expired(tmp_path):
             reply = await _send_pair_frame(port, frame)
             assert reply == {"t": "pair-expired"}
             assert a.pending_pair is None
-            # the code is burned even though the request was malformed
-            assert a.pairing.verify_and_consume(code, time.time()) is False
+            # the code survives a malformed request -- still redeemable
+            assert a.pairing.verify_and_consume(code, time.time()) is True
+        finally:
+            await svc_a.stop()
+    asyncio.run(scenario())
+
+
+# -- stale-pending release on re-begin ---------------------------------------
+
+def test_rebegin_releases_stale_pending_as_denied(tmp_path):
+    """An orphaned ceremony (the phone dropped mid-wait -- no accept/deny
+    ever arrives) must not block every retry until the code's TTL.
+    Calling /api/pair/begin again -- exactly what a human does by
+    reopening/restarting the desktop's Add-device screen -- resolves the
+    stale ceremony as denied (waking its held wire connection
+    immediately) BEFORE minting the fresh code, extending begin's
+    existing "one active code" contract to "one active ceremony"."""
+    async def scenario():
+        a = HearthNode.create(tmp_path / "a", "A", "a-dev")
+        svc_a, port = await _serve(a)
+        app = build_app(a)
+        try:
+            code1 = a.pairing.mint(time.time())
+            req1 = json.loads(HearthNode.pair_request(tmp_path / "p1", "phone-1"))
+            frame1 = {**req1, "code": code1}
+            first_task = asyncio.create_task(
+                _send_pair_frame(port, frame1, timeout=10.0))
+            await _wait_for_pending(a)
+
+            body = await _api_begin(app)      # desktop user reopens Add-device
+
+            # The orphaned first ceremony wakes up immediately, denied --
+            # not left hanging until code1's TTL.
+            reply1 = await asyncio.wait_for(first_task, timeout=5.0)
+            assert reply1 == {"t": "pair-denied"}
+            assert a.pending_pair is None
+
+            # A fresh ceremony with the NEW code succeeds completely
+            # normally -- re-begin didn't wedge the pairing subsystem.
+            _, addr, code2 = invitecodec.decode(body["link"])
+            req2 = json.loads(HearthNode.pair_request(tmp_path / "p2", "phone-2"))
+            frame2 = {**req2, "code": code2}
+
+            async def accept_when_pending():
+                await _wait_for_pending(a)
+                await _api_accept(app, req2["device_pub"], True)
+
+            reply2, _ = await asyncio.gather(
+                _send_pair_frame(port, frame2), accept_when_pending())
+            assert reply2["t"] == "hearth-pair-package"
+            assert a.pending_pair is None
+        finally:
+            await svc_a.stop()
+    asyncio.run(scenario())
+
+
+def test_rebegin_with_no_pending_mints_normally(tmp_path):
+    """The common case (no orphaned ceremony) is unaffected by the
+    release logic -- begin just mints, exactly as before."""
+    async def scenario():
+        a = HearthNode.create(tmp_path / "a", "A", "a-dev")
+        svc_a, port = await _serve(a)
+        app = build_app(a)
+        try:
+            assert a.pending_pair is None
+            body = await _api_begin(app)
+            typ, addr, code = invitecodec.decode(body["link"])
+            assert typ == "pair"
+            assert a.pairing.verify_and_consume(code, time.time()) is True
         finally:
             await svc_a.stop()
     asyncio.run(scenario())
