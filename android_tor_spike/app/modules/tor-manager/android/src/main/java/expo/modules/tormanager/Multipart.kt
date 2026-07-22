@@ -44,7 +44,7 @@ object Multipart {
             if (start > end) continue
             val part = parsePart(body, start, end) ?: continue
             if (part.filename != null) files.add(part)
-            else fields[part.name] = String(part.bytes, Charsets.ISO_8859_1)
+            else fields[part.name] = String(part.bytes, Charsets.UTF_8)
         }
         return Form(fields, files)
     }
