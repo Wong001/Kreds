@@ -42,6 +42,9 @@ class LocalApi(private val ctx: Context) {
     // them; every other route below remains GET-only, unchanged.
     fun handle(method: String, path: String, contentType: String? = null, body: ByteArray? = null): HttpResponse? {
         if (method == "POST" && path == "/api/post") return composePost(contentType, body)
+        if (method == "POST" && path == "/api/react") return composeReact(body)
+        if (method == "POST" && path == "/api/comment") return composeComment(body)
+        if (method == "POST" && path == "/api/retract") return composeRetract(body)
         if (method != "GET") return null
         return when {
             path == "/api/bootstrap" -> json(bootstrapJson())
@@ -109,6 +112,110 @@ class LocalApi(private val ctx: Context) {
     }
 
     private fun badRequest(msg: String) = HttpResponse(400, mapOf("Content-Type" to "text/plain"), msg.toByteArray())
+
+    // Task 5 (outbound-responses): POST /api/react + /api/comment +
+    // /api/retract -- response-side siblings of composePost above, over
+    // ComposeResponse.compose (Task 4). Error mapping mirrors hearth's own
+    // _400 helper (hearth/api.py:151-155, which converts ValueError/
+    // KeyError/TypeError from node.compose_response into HTTP 400): every
+    // validation failure inside ComposeResponse.compose is an
+    // IllegalArgumentException (require(...) or an explicit throw -- see
+    // ComposeResponse.kt) -- caught below as 400. A missing/malformed JSON
+    // field is this route's own equivalent of Python's KeyError -- also
+    // 400, checked before compose() is even invoked. Anything else (store/
+    // crypto failure) is a genuine server error -- 500, matching
+    // composePost's "compose failed: <message>" shape.
+    //
+    // hearth/api.py:520-536 -- the three routes this mirrors:
+    //   POST /api/react   {msg_id, token}      -> rkind="reaction", body=token
+    //     (token may be "clear", the un-react sentinel; rkind is ALWAYS
+    //     "reaction" here -- it never varies by the token's value)
+    //   POST /api/comment {msg_id, text}       -> rkind="comment",  body=text
+    //   POST /api/retract {msg_id, created_at} -> rkind="retract",  body=
+    //     str(created_at) -- see pyStr() below for why the exact string
+    //     form is load-bearing, not cosmetic.
+    //
+    // NOT implemented: /api/response-remove (hearth/api.py:538-546).
+    // Confirmed by reading api.py that this is NOT a compose_response call
+    // at all -- it's node.remove_response(msg_id, responder, created_at),
+    // which writes a LOCAL moderation tombstone (store.
+    // mark_response_removed) then rebuilds+republishes the KIND_RESPONSES
+    // record (node.process_responses -> _rebuild_responses_record, node.py:
+    // 2631-2750). Neither store.mark_response_removed nor the record
+    // rebuild/fold/publish logic has any Kotlin port -- Task 4's own report
+    // explicitly scoped ComposeResponse.compose as compose-only and left
+    // process_responses() unported (design decision 7). It is also
+    // unreachable from THIS client today regardless of that gap: this
+    // file's own responsesJson() (below) hardcodes "can_moderate": false,
+    // so app.js's `r.can_moderate && c.responder` gate (web/app.js:653)
+    // never renders the "remove someone else's comment" button that would
+    // POST here -- see task-5-report.md for the full writeup.
+    private fun composeReact(body: ByteArray?): HttpResponse {
+        val json = readJsonBody(body) ?: return badRequest("bad json body")
+        val msgId = json.optString("msg_id", "")
+        val token = json.optString("token", "")
+        if (msgId.isEmpty()) return badRequest("msg_id required")
+        return respondWithCompose("reaction", msgId, token)
+    }
+
+    private fun composeComment(body: ByteArray?): HttpResponse {
+        val json = readJsonBody(body) ?: return badRequest("bad json body")
+        val msgId = json.optString("msg_id", "")
+        val text = json.optString("text", "")
+        if (msgId.isEmpty()) return badRequest("msg_id required")
+        return respondWithCompose("comment", msgId, text)
+    }
+
+    private fun composeRetract(body: ByteArray?): HttpResponse {
+        val json = readJsonBody(body) ?: return badRequest("bad json body")
+        val msgId = json.optString("msg_id", "")
+        if (msgId.isEmpty() || !json.has("created_at")) return badRequest("msg_id and created_at required")
+        val retractBody = try { pyStr(json.get("created_at")) } catch (e: Exception) { return badRequest("bad created_at") }
+        return respondWithCompose("retract", msgId, retractBody)
+    }
+
+    private fun readJsonBody(body: ByteArray?): JSONObject? {
+        val bytes = body ?: return null
+        return try { JSONObject(String(bytes, Charsets.UTF_8)) } catch (e: Exception) { null }
+    }
+
+    // hearth/api.py's /api/retract does `str(body["created_at"])` on
+    // whatever Python's json.loads decoded the JSON number as: an int for a
+    // decimal-point-free literal (JS's JSON.stringify of a whole-number
+    // float omits the ".0", so e.g. "5" round-trips to Python int 5 and
+    // str() gives "5"), a float otherwise (str() via CPython's repr-
+    // equivalent formatting -- matched here through KotlinWire.PyFloat's
+    // pyFloatRepr, the exact port ComposeResponse itself already uses for
+    // created_at). org.json parses JSON numbers the same way -- Long/
+    // Integer for a bare-integer literal, Double once a '.' or exponent is
+    // present -- so mirroring the parsed value's runtime TYPE (not
+    // unconditionally converting through Double) reproduces Python's str()
+    // output for both shapes. This match matters: hearth's
+    // _rebuild_responses_record (node.py:2648-2653, 2681) folds a retract
+    // by exact-matching (responder, str(created_at)) against
+    // str(entry["created_at"]) -- a wrong string form makes the retract
+    // silently inert (accepted 200 OK, but never actually withdraws
+    // anything).
+    private fun pyStr(v: Any): String = when (v) {
+        is Int -> v.toString()
+        is Long -> v.toString()
+        is Double -> KotlinWire.dumps(KotlinWire.PyFloat(v))
+        else -> v.toString()
+    }
+
+    private fun respondWithCompose(rkind: String, msgId: String, body: String): HttpResponse {
+        val fx = fixtureOrNull() ?: return badRequest("no fixture")
+        val (encPriv, encPub) = EncKeys.getOrCreate(sharedStore)
+        val createdAt = System.currentTimeMillis() / 1000.0
+        return try {
+            ComposeResponse.compose(sharedStore, fx, encPriv, encPub, msgId, rkind, body, createdAt)
+            json("{\"ok\":true}")
+        } catch (e: IllegalArgumentException) {
+            badRequest(e.message ?: "bad request")
+        } catch (e: Exception) {
+            HttpResponse(500, mapOf("Content-Type" to "text/plain"), ("compose failed: ${e.message}").toByteArray())
+        }
+    }
 
     private fun feed(): String {
         val fx = fixtureOrNull() ?: return "[]"
