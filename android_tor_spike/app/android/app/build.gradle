@@ -2,16 +2,6 @@ apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
 
-// vp1: single source of truth for the WebView shell's UI. Copy hearth/web into
-// the APK assets at build time so the bundle is never duplicated into the RN
-// tree. `../../../hearth/web` is relative to android_tor_spike/app/android.
-def hearthWebDir = new File(rootProject.projectDir, "../../../hearth/web")
-tasks.register('copyHearthWeb', Copy) {
-    from hearthWebDir
-    into "${projectDir}/src/main/assets/www"
-}
-preBuild.dependsOn 'copyHearthWeb'
-
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
 
 /**
@@ -92,7 +82,7 @@ def enableMinifyInReleaseBuilds = (findProperty('android.enableMinifyInReleaseBu
 def jscFlavor = 'io.github.react-native-community:jsc-android:2026004.+'
 
 android {
-    ndkVersion "27.1.12297006"
+    ndkVersion rootProject.ext.ndkVersion
 
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
@@ -203,3 +193,11 @@ dependencies {
         implementation jscFlavor
     }
 }
+
+// vp1:copyHearthWeb — single source of truth for the WebView shell UI (see withHearthWebAssets.js)
+def hearthWebDir = new File(rootProject.projectDir, "../../../hearth/web")
+tasks.register('copyHearthWeb', Copy) {
+    from hearthWebDir
+    into "${projectDir}/src/main/assets/www"
+}
+preBuild.dependsOn 'copyHearthWeb'

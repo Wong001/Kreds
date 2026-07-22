@@ -233,6 +233,46 @@ export function getStoryVideoUrl(hash: string): Promise<string | null> {
   return native.getStoryVideoUrl(hash);
 }
 
+// -- Task 7 (first-load pairing): hasIdentity/pairWithNode ceremony bridge --
+// hasIdentity is a plain (sync) Function, same shape as isBatteryExempt --
+// a cheap local file check (PairingStore.hasIdentity, internal-then-legacy
+// dual read), never network I/O. index.ts's gate calls this once to decide
+// FirstLoad vs WebShell.
+export function hasIdentity(): boolean { return native.hasIdentity(); }
+
+// The 5 fixed ceremony outcomes (TorManagerModule.pairWithNode's doc): the
+// UI contract FirstLoad.tsx switches on. "unreachable" additionally carries
+// `reason` (dial/timeout/io/bad-package detail, for the small-print under
+// the retryable error message -- never parsed, display only).
+export type PairStatus = "linked" | "denied" | "expired" | "unreachable" | "bad_link";
+export interface PairResult { status: PairStatus; reason?: string }
+
+// Runs the full pairing ceremony (dial -> pair-request -> one bounded
+// reply -> install+persist) off the main thread. Never rejects for an
+// ordinary ceremony outcome -- see TorManagerModule.pairWithNode's doc --
+// so callers switch on `status` rather than try/catch. Requires Tor already
+// bootstrapped (the native side fast-fails "unreachable" otherwise, with NO
+// pairProgress events -- see TorManagerModule's `TorEngine.isUp` guard);
+// callers must `await bootstrap()` first, same as WebShell's own mount
+// sequence (bootstrap() is idempotent, so this never double-pays the cost
+// if Tor is already up from an earlier bootstrap() call).
+export function pairWithNode(link: string, deviceName: string): Promise<PairResult> {
+  return native.pairWithNode(link, deviceName);
+}
+
+// Progress events for a pairWithNode() ceremony currently in flight:
+// "dialing" (right before the SOCKS dial to the desktop's onion address)
+// then "waiting" (request frame written, now blocking on the human's
+// Accept/Deny click on the desktop -- can legitimately run for most of 10
+// minutes, see PAIR_TIMEOUT_MS's doc in TorManagerModule.kt). No event
+// marks the local install step that follows a "waiting" reply -- it's
+// synchronous and already complete by the time pairWithNode's promise
+// resolves.
+export function onPairProgress(cb: (p: { stage: string }) => void): () => void {
+  const sub = native.addListener("pairProgress", (e: { stage: string }) => cb(e));
+  return () => sub.remove();
+}
+
 export function onSync(cb: (r: {
   ok: boolean; messages: number; blobs: number; identities: number; reason?: string;
   // Task 7 (B.2): true iff this sync completed successfully and the decrypted
