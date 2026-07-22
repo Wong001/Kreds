@@ -676,4 +676,13 @@ class SqliteSyncStore(context: Context) :
         }
         return best.mapValues { it.value.members }
     }
+
+    override fun messageById(msgId: String): SignedMessage? {
+        val msgJson = readableDatabase.rawQuery(
+            "SELECT msg_json FROM messages WHERE msg_id = ? LIMIT 1", arrayOf(msgId)
+        ).use { c ->
+            if (c.moveToFirst()) c.getString(0) else return null
+        }
+        return SignedMessageKt.fromDict(MsgJson.toMap(msgJson))
+    }
 }

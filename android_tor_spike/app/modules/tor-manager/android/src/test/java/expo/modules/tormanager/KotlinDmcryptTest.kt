@@ -5,6 +5,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -121,5 +122,23 @@ class KotlinDmcryptTest {
         assertArrayEquals(key, recovered)
         // malformed enc_pub is skipped, not thrown
         assertTrue(KotlinDmcrypt.wrapKey(key, mapOf("bad" to "zz"), aad).isEmpty())
+    }
+
+    @Test fun responseAadShapeAndAliasSeedDeterministic() {
+        val aad = KotlinDmcrypt.responseAad("id".repeat(32), "t".repeat(32), 1752900000.5)
+        val s = String(aad)
+        assertTrue(s.contains("\"type\":\"response-aad\"") && s.contains("\"from\":\"" + "id".repeat(32) + "\""))
+        assertTrue(s.contains("\"target\":\"" + "t".repeat(32) + "\"") && s.contains("\"created_at\":1752900000.5"))
+        // deriveAliasSeed: deterministic per (device, target), 32 hex chars, differs by target
+        val dpriv = "22".repeat(32)
+        val a1 = KotlinDmcrypt.deriveAliasSeed(dpriv, "post1")
+        val a2 = KotlinDmcrypt.deriveAliasSeed(dpriv, "post1")
+        val b = KotlinDmcrypt.deriveAliasSeed(dpriv, "post2")
+        assertEquals(32, a1.length)
+        assertEquals(a1, a2)
+        assertNotEquals(a1, b)
+        // Cross-check with Python: derive_alias_seed("22"*32, "post1") = "ca19e85f36529f393784b52a001e6133"
+        assertEquals("ca19e85f36529f393784b52a001e6133", a1)
+        assertEquals("63befa3c46778d1b346f5a3d805f5880", b)
     }
 }

@@ -1207,14 +1207,11 @@ body.lb-open { overflow: hidden; }   /* lock background scroll behind the lightb
    Desktop never sets body.readonly, so this is inert there. vp3 closed the
    gap: friend-profile controls (Unfriend, ring-move) now hidden under
    body.readonly. outbound-1: the journal `.composer` is now REVEALED (it
-   posts to POST /api/post, natively composed+signed+pushed) -- everything
-   else here stays hidden until its own outbound slice. */
-body.readonly .comment-composer,
-body.readonly .rx-open,
-body.readonly .rx-picker,
+   posts to POST /api/post, natively composed+signed+pushed). outbound
+   task-7: reaction picker + comment composer REVEALED (reactions+comments
+   seam). Everything else stays hidden until its own outbound slice. */
 body.readonly .pact.del,
 body.readonly .settings-del,
-body.readonly .comment-x,
 body.readonly .story-tile .story-ring.add,
 body.readonly #profile-cog,
 body.readonly #profile-arrange,

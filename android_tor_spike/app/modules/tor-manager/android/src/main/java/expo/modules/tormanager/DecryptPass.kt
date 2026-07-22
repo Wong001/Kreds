@@ -162,6 +162,12 @@ object DecryptPass {
         val all = store.allMessages()
         val postAuthorByMsgId = all.filter { it.kind == "post" }.associate { it.msgId to it.identityPub }
 
+        // Finding 1 (final review): hearth's step-1 identity resolution
+        // (node.py's `raw_by_created_at`), restricted per this port's scope
+        // to responses THIS identity itself composed -- see
+        // ownRawByCreatedAt's own doc.
+        val ownRaw = ownRawByCreatedAt(all, phoneDevicePub, encPrivHex, ownIdentityPub)
+
         // Best (latest by created_at) KIND_RESPONSES StoredMsg per target,
         // restricted to records signed by that target's own post author --
         // see this function's doc above for why that restriction is
@@ -186,7 +192,95 @@ object DecryptPass {
             val bodyNonce = m.payload["body_nonce"] as? String ?: continue
             val bodyCt = m.payload["body_ct"] as? String ?: continue
             val body = KotlinDmcrypt.decryptBody(key, bodyNonce, bodyCt, aad) ?: continue
-            out[target] = KotlinResponses.aggregate(entriesList(body["entries"]), target, profileNames, deviceBound)
+            // Task 6 (read de-anon): thread this device's own encPriv +
+            // ownIdentityPub into aggregate's mutual_box trial-open branch
+            // (KotlinResponses.resolveViaMutualBox) -- both are already this
+            // function's own parameters (encPrivHex is the same key used
+            // above to unwrap this very record's content key), so no new
+            // plumbing beyond this call site is needed. Finding 1 adds
+            // ownRaw[target] (this target's own-raw createdAt->identity
+            // map, or empty if this identity never responded to it) as
+            // aggregate's step-1 rawByCreatedAt.
+            out[target] = KotlinResponses.aggregate(
+                entriesList(body["entries"]), target, profileNames, deviceBound, encPrivHex, ownIdentityPub,
+                ownRaw[target] ?: emptyMap())
+        }
+        return out
+    }
+
+    /** Finding 1 (final review): hearth node.py's step-1 identity
+     *  resolution (`raw_by_created_at`, node.py:1510-1521) -- restricted,
+     *  per this task's documented scope, to responses THIS identity
+     *  itself composed (see KotlinResponses' class doc: the mutual_box
+     *  branch can never resolve the viewer's own identity, since
+     *  compose_response's box excludes the responder's own devices from
+     *  its audience -- this is therefore the ONLY path that can ever
+     *  attribute a folded entry to `ownIdentityPub`, driving the retract
+     *  UI / `my_reaction`).
+     *
+     *  Builds target -> (createdAt -> identity) from every stored
+     *  kind="response" (KIND_RESPONSE, singular -- the raw per-response
+     *  envelope ComposeResponse.compose writes, NOT the folded
+     *  kind="responses" aggregate) message THIS identity authored
+     *  (StoredMsg.identityPub == ownIdentityPub), decrypted via this
+     *  device's own self-readable wrap (ComposeResponse.kt's "self-readable
+     *  (retract UI)" wrap -- `wraps[phoneDevicePub]`) using the SAME
+     *  response_aad every other KIND_RESPONSE consumer uses
+     *  (KotlinDmcrypt.responseAad(ownIdentityPub, target, createdAt) --
+     *  matches hearth's own `_content_key`'s KIND_RESPONSE branch,
+     *  node.py:2818-2820, which derives the AAD from `msg.cert.
+     *  identity_pub`, i.e. the responder itself, exactly `ownIdentityPub`
+     *  here since this scan is already filtered to own-authored rows).
+     *
+     *  Only rkind "comment"/"reaction" populate the map -- mirrors
+     *  node.py's own `ev["rkind"] in ("comment", "reaction")` filter: a
+     *  "retract" raw response has no corresponding row in a folded
+     *  record's `entries` list (retracting REMOVES an entry during the
+     *  fold, it does not become one), so a retract's created_at could
+     *  never usefully match anything here. The map KEY is the DECRYPTED
+     *  BODY's `created_at` (matching node.py's `ev["created_at"]`, which
+     *  also comes from the decrypted body, not the outer envelope) --
+     *  these are the same value by construction (ComposeResponse.compose
+     *  writes the identical `effectiveCreatedAt` to both places), but
+     *  reading from the body is what actually mirrors hearth's own
+     *  source of truth.
+     *
+     *  Fail-closed per response, same idiom as decryptOne/responsesPass:
+     *  no self-wrap, failed unwrap, failed decrypt, or a malformed body --
+     *  all degrade to "this response contributes nothing", never a crash,
+     *  never a fabricated match. Trusting the resolved identity directly
+     *  (no signature re-check) is deliberate and matches hearth: this
+     *  device's own store only ever holds a "response" row after
+     *  ingestMessage's own Verifier already proved cert.identity_pub/
+     *  device_pub really signed it (SyncStore.ingestMessage /
+     *  SignedMessage.verifyDeviceSignature) -- re-verifying here would be
+     *  redundant, exactly hearth's own reasoning for why raw_by_
+     *  created_at's step-1 needs no sig_ok/_device_bound gate the way
+     *  steps 2/3 do. `device_pub` (hearth's raw_by_created_at also
+     *  captures it per entry) is deliberately NOT threaded through: hearth
+     *  itself never reads that half of the tuple again after step 1's
+     *  assignment (only `identity` feeds `mine`/comment["name"] downstream
+     *  in node.py), so carrying it here would be dead weight, not a
+     *  simplification that loses anything hearth actually uses. */
+    @Suppress("UNCHECKED_CAST")
+    private fun ownRawByCreatedAt(
+        all: List<StoredMsg>, phoneDevicePub: String, encPrivHex: String, ownIdentityPub: String,
+    ): Map<String, Map<Double, String>> {
+        val out = linkedMapOf<String, MutableMap<Double, String>>()
+        for (m in all) {
+            if (m.kind != "response" || m.identityPub != ownIdentityPub) continue
+            val target = m.payload["target"] as? String ?: continue
+            val outerCreatedAt = (m.payload["created_at"] as? Number)?.toDouble() ?: continue
+            val aad = KotlinDmcrypt.responseAad(ownIdentityPub, target, outerCreatedAt)
+            val wrap = (m.payload["wraps"] as? Map<*, *>)?.get(phoneDevicePub) as? Map<String, Any?> ?: continue
+            val key = KotlinDmcrypt.unwrapKey(wrap, encPrivHex, aad) ?: continue
+            val bodyNonce = m.payload["body_nonce"] as? String ?: continue
+            val bodyCt = m.payload["body_ct"] as? String ?: continue
+            val body = KotlinDmcrypt.decryptBody(key, bodyNonce, bodyCt, aad) ?: continue
+            val rkind = body["rkind"] as? String ?: continue
+            if (rkind != "comment" && rkind != "reaction") continue
+            val bodyCreatedAt = (body["created_at"] as? Number)?.toDouble() ?: continue
+            out.getOrPut(target) { linkedMapOf() }[bodyCreatedAt] = ownIdentityPub
         }
         return out
     }

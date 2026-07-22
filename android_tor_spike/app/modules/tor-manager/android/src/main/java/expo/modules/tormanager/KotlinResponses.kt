@@ -6,12 +6,23 @@ import org.json.JSONObject
 /** B.2d-4 Task 2 -- the SECURITY CORE of the reactions+comments slice.
  *
  *  Ports hearth's `_post_responses_view` verification (node.py) for a
- *  decrypted KIND_RESPONSES record's `entries`, MINUS the deferred
- *  `mutual_box`/seal_slots PRIVATE-resolution branch and the author's
- *  own raw-response lookup (both out of scope for this view-only slice).
- *  What remains is exactly the part that decides, per entry, whether a
- *  PUBLIC comment/reaction may be attributed to its claimed identity or
- *  must render as an anonymous ALIAS.
+ *  decrypted KIND_RESPONSES record's `entries`. Task 6 (read de-anon)
+ *  added the `mutual_box`/seal_slots PRIVATE-resolution branch (node.py:
+ *  1541-1561, see [resolveViaMutualBox]) on top of Task 2's original
+ *  PUBLIC-only attribution. Final-review Finding 1 then added STEP 1 --
+ *  node.py's `raw_by_created_at` (node.py:1510-1521/1532-1533), the
+ *  AUTHORITATIVE identity match tried BEFORE public/mutual_box, on the
+ *  SUBSET hearth itself documents as always available to a non-author
+ *  viewer: THIS device's own composed comment/reaction responses,
+ *  matched to a folded entry by `created_at` (see [resolve]'s doc and
+ *  DecryptPass.responsesPass' `ownRawByCreatedAt`). hearth's full step 1
+ *  additionally resolves EVERY responder's entry when the reading node
+ *  IS the post's own author (routing sends every raw KIND_RESPONSE
+ *  there) -- that author-side breadth is NOT ported here (the Android
+ *  sync/routing path this would need is a separate, larger question) and
+ *  stays out of scope, deferred. What remains is the part that decides,
+ *  per entry, whether a comment/reaction may be attributed to its
+ *  claimed identity or must render as an anonymous ALIAS.
  *
  *  THE SECURITY CORE (never weaken): a PUBLIC entry is attributed to its
  *  claimed `identity` ONLY when BOTH hold:
@@ -28,12 +39,29 @@ import org.json.JSONObject
  *  sig verifies but proves nothing about WHOSE key it is. Device-binding is
  *  what catches that, so it is MANDATORY, not an optimization.
  *
+ *  Task 6 extends the SAME two-part gate to a NON-PUBLIC (private) entry
+ *  that carries a `mutual_box`: [resolveViaMutualBox] trial-opens the box
+ *  with this device's `encPriv` (KotlinSeal.tryOpenSlots -- succeeds only
+ *  for a mutual friend the sender's box was actually sealed to), parses
+ *  the opened `{identity, device_pub, sig}`, then re-verifies with THE
+ *  SAME sig+device-bound gate above -- but critically against the ENTRY's
+ *  own outer `responder_sig` field, not the box's own "sig" key (hearth
+ *  node.py:1554-1559 only ever reads `box.get("identity")`/
+ *  `box.get("device_pub")`; box["sig"] is written by compose_response for
+ *  shape symmetry but never read back here). Reusing the outer
+ *  responder_sig, re-payloaded with the BOX's claimed identity, is what
+ *  makes this fail-closed against forgery: that signature was produced by
+ *  signing over a payload whose `responder` field was the responder's
+ *  REAL identity, so re-deriving the payload with a DIFFERENT (forged)
+ *  claimed identity makes the signature check fail. An unopened box, an
+ *  opened-but-malformed payload, a failed sig, or a failed device-bound
+ *  check all degrade to the alias -- exactly like the public path.
+ *
  *  Byte-for-byte parity points with hearth:
  *   - `_valid_response_entry` (node.py:93-131) -> [validEntry], including
  *     its `_valid_mutual_box` shape check (node.py:62-90) -> [validMutualBox]
  *     -- the box's SHAPE is validated (so phone/desktop drop the same
- *     entries, and the box is well-formed before the deferred private/
- *     seal_slots branch ever opens it), but it is NEVER opened in this slice.
+ *     entries) whether or not it ends up opened.
  *   - `_response_sig_payload` (node.py) -> [responseSigPayload]: the 5
  *     fields `{target, rkind, body, created_at, responder}` canonicalized,
  *     with `created_at` wrapped in `KotlinWire.PyFloat` so it renders as a
@@ -41,6 +69,23 @@ import org.json.JSONObject
  *     to hearth's `canonical(...)`.
  *   - `web/app.js` `aliasName`/`aliasColor` -> [aliasName]/[aliasColor],
  *     same wordlists, same `parseInt(seed.slice(...),16) % n` derivation.
+ *
+ *  Android-specific (not a hearth divergence, an existing established
+ *  simplification -- see DecryptPass's own single-encPriv threading):
+ *  hearth's node.py loops `for priv in self.device.enc_privs()` (current
+ *  key + retired keys, a key-rotation grace period). This port takes a
+ *  single `encPriv` (the device's current key only, threaded from
+ *  DecryptPass.responsesPass) -- no retired-key grace period on Android
+ *  yet, matching every other encPriv consumer in this codebase
+ *  (KotlinDmcrypt.unwrapKey call sites), not a new gap Task 6 introduces.
+ *  Own-identity display: unlike hearth (which has no "you" special case
+ *  for a comment's identity -- `_post_responses_view` never resolves a
+ *  responder's OWN private entries via this trial-open branch at all,
+ *  since compose_response's mutual box audience deliberately EXCLUDES the
+ *  responder's own devices, node.py:2417-2420/1462-1467), this port adds
+ *  an own-identity override to `display` ONLY (never to `name`, which
+ *  stays hearth's own bare-identity[:8] API-parity fallback) -- see
+ *  [resolve]'s doc.
  */
 object KotlinResponses {
     /** A resolved comment for one feed row's engagement view. `display` is
@@ -66,11 +111,27 @@ object KotlinResponses {
         // resolved comment's avatar color off `c.responder` via
         // identityColor(), so an alias comment must never carry it.
         val alias: Boolean = false, val aliasSeed: String = "", val name: String? = null,
-        val responder: String? = null)
+        val responder: String? = null,
+        // Finding 1 (final review): whether THIS comment resolved to the
+        // viewer's OWN identity -- via [resolve]'s step-1 raw match ONLY
+        // (see this class's top-level doc: the mutual_box branch can never
+        // resolve the viewer's own identity, since compose_response's box
+        // excludes the responder's own devices from its audience, so step
+        // 1 is the ONLY path that can ever set this true). Drives
+        // web/app.js's retract "x" (app.js:640, `if (c.mine)`) -- LocalApi.
+        // responsesJson used to hardcode this false for every comment.
+        val mine: Boolean = false)
 
-    /** A post's aggregated engagement: reaction tally (token -> count) and
-     *  the resolved comment list (entry order preserved). */
-    data class Responses(val reactions: Map<String, Int>, val comments: List<Comment>)
+    /** A post's aggregated engagement: reaction tally (token -> count), the
+     *  resolved comment list (entry order preserved), and (Finding 1) this
+     *  viewer's own current reaction token, or null if none/cleared --
+     *  hearth node.py:1573-1574's `if mine: my_reaction = e["body"]`,
+     *  ported the same way Comment.mine is: resolvable ONLY via [resolve]'s
+     *  step-1 raw match. LocalApi.responsesJson used to hardcode this
+     *  null for every post. */
+    data class Responses(
+        val reactions: Map<String, Int>, val comments: List<Comment>,
+        val myReaction: String? = null)
 
     // hearth/messages.py: REACTION_TOKENS + MAX_COMMENT.
     private val REACTION_TOKENS = setOf("heart", "laugh", "wow", "sad", "up", "fire")
@@ -203,24 +264,150 @@ object KotlinResponses {
         return true
     }
 
-    /** Resolve ONE entry to a display label. Returns `(name, null)` when the
-     *  entry is a PUBLIC one whose responder signature verifies AND whose
-     *  device is bound to the claimed identity; otherwise `(alias, hue)`.
-     *  Fail-closed: any missing/short-circuiting field, a failed verify, or a
-     *  false `deviceBound` all fall through to the alias -- never a crash,
-     *  never a mis-attribution. Callers pass entries that have already
-     *  cleared [validEntry] (so `alias_seed` is valid hex32 for the alias
-     *  helpers); [aggregate] enforces that. */
-    fun resolveDisplay(
+    /** Bridges one entry's `mutual_box` value into the `List<Map<String,
+     *  String>>` shape `KotlinSeal.tryOpenSlots` expects. Mirrors
+     *  [slotStr]'s dual-shape handling: a raw org.json JSONArray of
+     *  JSONObject slots (a decrypted body's `mutual_box`, in production) or
+     *  a plain Kotlin `List<Map<String,String>>` (a caller-built entry, as
+     *  in tests, or [KotlinSeal.sealSlots]'s own return shape). A slot
+     *  missing any of eph_pub/nonce/ct is dropped rather than passed
+     *  through partially -- [validEntry]/[validMutualBox] already reject a
+     *  malformed slot for any entry that reaches [aggregate], but
+     *  [resolveDisplay] can be called directly (as several tests do)
+     *  without that gate, so this stays defensive on its own. */
+    private fun mutualBoxSlots(v: Any?): List<Map<String, String>> {
+        val slots: List<Any?> = when (v) {
+            is List<*> -> v
+            is JSONArray -> (0 until v.length()).map { v.opt(it) }
+            else -> return emptyList()
+        }
+        return slots.mapNotNull { s ->
+            val ephPub = slotStr(s, "eph_pub") ?: return@mapNotNull null
+            val nonce = slotStr(s, "nonce") ?: return@mapNotNull null
+            val ct = slotStr(s, "ct") ?: return@mapNotNull null
+            mapOf("eph_pub" to ephPub, "nonce" to nonce, "ct" to ct)
+        }
+    }
+
+    /** Task 6 -- hearth node.py:1541-1561, the trial-open ("private"/
+     *  mutual_box) identity-resolution branch: trial-open the entry's
+     *  `mutual_box` with this device's `encPriv`
+     *  ([KotlinSeal.tryOpenSlots]); on success, parse the opened canonical
+     *  JSON `{identity, device_pub, sig}` (written by ComposeResponse.kt /
+     *  hearth's compose_response, node.py:2434-2436); then re-verify with
+     *  the SAME sig+device-bound gate [resolve]'s public branch uses --
+     *  against the box's claimed `identity`/`device_pub`, but the ENTRY's
+     *  own outer `responder_sig` field, never the box's own "sig" key (see
+     *  this class's top-level doc for why that asymmetry is the actual
+     *  security gate, not a simplification). Returns the verified
+     *  identity, or null on ANY failure -- no mutual_box, empty/malformed
+     *  slots, the box doesn't open with `encPriv`, the opened bytes aren't
+     *  valid JSON / not an object, `identity`/`device_pub` aren't hex64,
+     *  the sig doesn't verify, or the device isn't bound to the claimed
+     *  identity. Every branch is a plain `return null`, matching hearth's
+     *  own fail-closed shape (node.py wraps `json.loads` in
+     *  try/except ValueError/UnicodeDecodeError; the JSONObject parse
+     *  below is wrapped the same way for the same reason -- an opened
+     *  payload from a hostile/buggy sender is untrusted bytes until
+     *  proven otherwise). */
+    private fun resolveViaMutualBox(
+        e: Map<String, Any?>, target: String,
+        deviceBound: (identity: String, devicePub: String) -> Boolean,
+        encPriv: String,
+    ): String? {
+        if (encPriv.isEmpty()) return null
+        val slots = mutualBoxSlots(e["mutual_box"])
+        if (slots.isEmpty()) return null
+        val opened = KotlinSeal.tryOpenSlots(slots, encPriv) ?: return null
+        val box = try {
+            JSONObject(String(opened, Charsets.UTF_8))
+        } catch (ex: Exception) { return null }
+        val candId = box.opt("identity") as? String ?: return null
+        val candDev = box.opt("device_pub") as? String ?: return null
+        if (!isHexN(candId, 64) || !isHexN(candDev, 64)) return null
+        val rkind = str(e, "rkind") ?: return null
+        val body = str(e, "body") ?: return null
+        val createdAt = num(e, "created_at") ?: return null
+        val sig = str(e, "responder_sig") ?: return null
+        val payload = responseSigPayload(target, rkind, body, createdAt, candId)
+        // BOTH conditions mandatory, same as the public path -- sig proves
+        // the device signed it, device-binding proves the device is really
+        // the claimed identity's.
+        return if (KotlinWire.verifyRaw(candDev, sig, payload) && deviceBound(candId, candDev)) candId else null
+    }
+
+    /** Full identity resolution for one entry: `identity` is the verified
+     *  responder (null when unresolved -- the alias case), `display`/
+     *  `color` are [resolveDisplay]'s return shape. Internal core shared by
+     *  [resolveDisplay] (display/color only) and [aggregate] (which also
+     *  needs the resolved `identity` for Comment.responder/name -- see
+     *  that call site's own comment for why str(e,"identity") alone is
+     *  wrong for a mutual_box-resolved PRIVATE entry, which carries no
+     *  cleartext `identity` field at all).
+     *
+     *  Own-identity display (Task 6, extended Finding 1): when the
+     *  mutual_box branch OR the step-1 raw match (below) resolves to
+     *  `ownIdentityPub`, `display` becomes the literal "you" -- this is
+     *  new Android-only UX texture, not a hearth behavior to mirror (see
+     *  this class's top-level doc: hearth's own trial-open branch can
+     *  never actually resolve the viewer's OWN identity, since
+     *  compose_response's mutual box deliberately excludes the responder's
+     *  own devices from its audience -- step 1's raw match is therefore
+     *  the ONLY path that can ever legitimately produce "you"). Deliberately
+     *  does NOT touch the public branch (unchanged, no own-identity special
+     *  case there, preserving byte-identical behavior with pre-Task-6
+     *  `display` values) and deliberately does NOT touch `name` (computed
+     *  separately in [aggregate] from the resolved `identity`, hearth's own
+     *  bare-prefix fallback, no "you" case in node.py either). */
+    private data class Resolved(val identity: String?, val display: String, val color: Int?)
+
+    // Shared by step 1 (raw match) and the mutual_box branch -- the ONLY two
+    // paths that can ever resolve `ownIdentityPub` (see Resolved's doc).
+    // The public branch deliberately does not call this (unchanged from
+    // pre-Task-6 behavior).
+    private fun displayFor(identity: String, profileNames: Map<String, String>, ownIdentityPub: String): String =
+        if (identity == ownIdentityPub) "you"
+        else (profileNames[identity] ?: ("friend-" + identity.take(8)))
+
+    private fun resolve(
         e: Map<String, Any?>, target: String,
         profileNames: Map<String, String>,
         deviceBound: (identity: String, devicePub: String) -> Boolean,
-    ): Pair<String, Int?> {
+        encPriv: String, ownIdentityPub: String,
+        // Finding 1 (final review): hearth node.py:1510-1521/1532-1533's
+        // `raw_by_created_at` step 1 -- createdAt -> the identity THIS
+        // device's own store already cert-proved authored a raw
+        // comment/reaction KIND_RESPONSE with that exact created_at (see
+        // DecryptPass.responsesPass' `ownRawByCreatedAt`, which is the ONLY
+        // populator today -- see this class's top-level doc for the
+        // author-side breadth that stays deferred). Defaults to empty (a
+        // no-op) so every existing call site keeps its pre-Finding-1
+        // behavior byte-identical.
+        rawByCreatedAt: Map<Double, String> = emptyMap(),
+    ): Resolved {
         val aliasSeed = str(e, "alias_seed") ?: ""
-        fun alias(): Pair<String, Int?> = aliasName(aliasSeed) to aliasColor(aliasSeed)
+        fun alias() = Resolved(null, aliasName(aliasSeed), aliasColor(aliasSeed))
+
+        // Step 1 -- tried FIRST and unconditionally (hearth: before even
+        // looking at e["public"]), matching hearth's own priority order.
+        // No sig/device-bound re-check here: the raw KIND_RESPONSE this
+        // identity is read from already passed ingestMessage's own
+        // Verifier (cert.identity_pub/device_pub genuinely signed it) --
+        // re-verifying THIS entry's signature would be redundant, exactly
+        // hearth's own reasoning for why raw_by_created_at needs no
+        // _sig_ok/_device_bound gate the way steps 2/3 do.
+        val createdAt0 = num(e, "created_at")
+        if (createdAt0 != null) {
+            rawByCreatedAt[createdAt0]?.let { identity ->
+                return Resolved(identity, displayFor(identity, profileNames, ownIdentityPub), null)
+            }
+        }
 
         val public = e["public"] as? Boolean ?: return alias()
-        if (!public) return alias()
+        if (!public) {
+            val identity = resolveViaMutualBox(e, target, deviceBound, encPriv) ?: return alias()
+            return Resolved(identity, displayFor(identity, profileNames, ownIdentityPub), null)
+        }
         val identity = str(e, "identity") ?: return alias()
         val devicePub = str(e, "device_pub") ?: return alias()
         val rkind = str(e, "rkind") ?: return alias()
@@ -233,43 +420,103 @@ object KotlinResponses {
         // device-binding proves the device is really the identity's.
         val attributed = KotlinWire.verifyRaw(devicePub, sig, payload) && deviceBound(identity, devicePub)
         if (!attributed) return alias()
-        return (profileNames[identity] ?: ("friend-" + identity.take(8))) to null
+        return Resolved(identity, profileNames[identity] ?: ("friend-" + identity.take(8)), null)
+    }
+
+    /** Resolve ONE entry to a display label. Returns `(name, null)` when
+     *  the entry attributes to a real identity -- a PUBLIC entry whose
+     *  responder signature verifies AND whose device is bound to the
+     *  claimed identity, OR (Task 6) a non-public entry whose mutual_box
+     *  opens with `encPriv` and whose opened identity clears the same
+     *  sig+device-bound gate, OR (Finding 1) an entry whose created_at
+     *  matches this device's own raw-response record; otherwise
+     *  `(alias, hue)`. Fail-closed: any missing/short-circuiting field, a
+     *  failed verify, or a false `deviceBound` all fall through to the
+     *  alias -- never a crash, never a mis-attribution. `encPriv`/
+     *  `ownIdentityPub` default to "" (the mutual_box branch then never
+     *  attempts to open anything, and the own-identity display override
+     *  never matches) -- existing PUBLIC-entry call sites that omit them
+     *  keep their pre-Task-6 behavior byte-identical; `rawByCreatedAt`
+     *  defaults to empty for the same reason (pre-Finding-1 parity).
+     *  Callers pass entries that have already cleared [validEntry] (so
+     *  `alias_seed` is valid hex32 for the alias helpers); [aggregate]
+     *  enforces that. */
+    fun resolveDisplay(
+        e: Map<String, Any?>, target: String,
+        profileNames: Map<String, String>,
+        deviceBound: (identity: String, devicePub: String) -> Boolean,
+        encPriv: String = "", ownIdentityPub: String = "",
+        rawByCreatedAt: Map<Double, String> = emptyMap(),
+    ): Pair<String, Int?> {
+        val r = resolve(e, target, profileNames, deviceBound, encPriv, ownIdentityPub, rawByCreatedAt)
+        return r.display to r.color
     }
 
     /** Aggregate a decrypted record's raw `entries` into a post's view:
      *  drop anything failing [validEntry], tally reactions by token, and
-     *  resolve each comment's display via [resolveDisplay]. Entry order is
-     *  preserved for comments; reaction insertion order is preserved in the
-     *  tally map. */
+     *  resolve each entry's identity via [resolve] (comments: display/
+     *  responder/name/mine; reactions: only `mine`, feeding `myReaction`).
+     *  Entry order is preserved for comments; reaction insertion order is
+     *  preserved in the tally map. `encPriv`/`ownIdentityPub`/
+     *  `rawByCreatedAt` thread straight into [resolve] -- see
+     *  [resolveDisplay]'s doc for their defaults' effect.
+     *
+     *  `myReaction` (Finding 1, hearth node.py:1564-1574): set to a
+     *  reaction entry's `body` whenever that entry resolves `mine` --
+     *  resolvable ONLY via step 1 (rawByCreatedAt), since a reaction is
+     *  always private (compose_response never composes the public shape
+     *  for this port -- ComposeResponse.kt's own doc) and the mutual_box
+     *  branch can never resolve the viewer's own identity (see this
+     *  class's top-level doc). At most one entry can ever match: a folded
+     *  record carries at most one reaction entry per responder
+     *  (node.py's `_rebuild_responses_record`, latest-wins-per-responder,
+     *  "clear" REMOVES the entry rather than becoming one) -- so no
+     *  "last one wins" ordering concern here, unlike a naive read might
+     *  assume. */
     fun aggregate(
         entries: List<Map<String, Any?>>, target: String,
         profileNames: Map<String, String>,
         deviceBound: (String, String) -> Boolean,
+        encPriv: String = "", ownIdentityPub: String = "",
+        rawByCreatedAt: Map<Double, String> = emptyMap(),
     ): Responses {
         val reactions = linkedMapOf<String, Int>()
         val comments = mutableListOf<Comment>()
+        var myReaction: String? = null
         for (e in entries) {
             if (!validEntry(e)) continue
             val rkind = str(e, "rkind") ?: continue
             val body = str(e, "body") ?: continue
             val createdAt = num(e, "created_at") ?: continue
+            // hearth resolves identity for EVERY entry, reaction or
+            // comment, before branching (node.py:1532-1563) -- mirrored
+            // here rather than only inside the comment branch, since
+            // `mine` (and thus `myReaction`) needs it for reactions too.
+            val resolved = resolve(e, target, profileNames, deviceBound, encPriv, ownIdentityPub, rawByCreatedAt)
+            val mine = resolved.identity != null && resolved.identity == ownIdentityPub
             if (rkind == "reaction") {
                 reactions[body] = (reactions[body] ?: 0) + 1
+                if (mine) myReaction = body
             } else {
-                val (display, color) = resolveDisplay(e, target, profileNames, deviceBound)
-                val isAlias = color != null           // a null aliasColor == verified real name
+                val isAlias = resolved.color != null   // a null aliasColor == verified real name
                 // vp1 fields, hearth-parity (node.py:1562-1588): `responder` is the
-                // resolved identity_pub, present only when NOT alias -- resolveDisplay
-                // already required a present, valid `identity` to attribute (else it
-                // would have returned the alias), so str(e, "identity") is non-null
-                // whenever isAlias is false. `name` is hearth's OWN fallback (bare
-                // identity[:8]), independent of `display`'s "friend-"-prefixed value.
-                val responder = if (isAlias) null else str(e, "identity")
+                // RESOLVED identity_pub, present only when NOT alias. Task 6 fix:
+                // this used to read str(e, "identity") straight off the entry,
+                // which is correct for a PUBLIC entry (its cleartext "identity"
+                // field IS the attributed identity by construction) but wrong for
+                // a mutual_box-resolved PRIVATE entry -- a private entry carries
+                // no cleartext "identity" field at all (validEntry only requires
+                // it `if public`), so that read would silently come back null even
+                // though `resolved` (and isAlias) correctly reflect a successful
+                // de-anon. `resolved.identity` is right for BOTH paths. `name` is
+                // hearth's OWN fallback (bare identity[:8]), independent of
+                // `display`'s "friend-"/"you" native-app values.
+                val responder = if (isAlias) null else resolved.identity
                 val name = if (isAlias) null else (responder?.let { profileNames[it] ?: it.take(8) })
                 val seed = str(e, "alias_seed") ?: ""
-                comments.add(Comment(body, display, color, createdAt, isAlias, seed, name, responder))
+                comments.add(Comment(body, resolved.display, resolved.color, createdAt, isAlias, seed, name, responder, mine))
             }
         }
-        return Responses(reactions, comments)
+        return Responses(reactions, comments, myReaction)
     }
 }

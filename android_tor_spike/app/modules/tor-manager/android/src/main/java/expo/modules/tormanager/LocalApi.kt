@@ -42,6 +42,9 @@ class LocalApi(private val ctx: Context) {
     // them; every other route below remains GET-only, unchanged.
     fun handle(method: String, path: String, contentType: String? = null, body: ByteArray? = null): HttpResponse? {
         if (method == "POST" && path == "/api/post") return composePost(contentType, body)
+        if (method == "POST" && path == "/api/react") return composeReact(body)
+        if (method == "POST" && path == "/api/comment") return composeComment(body)
+        if (method == "POST" && path == "/api/retract") return composeRetract(body)
         if (method != "GET") return null
         return when {
             path == "/api/bootstrap" -> json(bootstrapJson())
@@ -109,6 +112,90 @@ class LocalApi(private val ctx: Context) {
     }
 
     private fun badRequest(msg: String) = HttpResponse(400, mapOf("Content-Type" to "text/plain"), msg.toByteArray())
+
+    // Task 5 (outbound-responses): POST /api/react + /api/comment +
+    // /api/retract -- response-side siblings of composePost above, over
+    // ComposeResponse.compose (Task 4). Error mapping mirrors hearth's own
+    // _400 helper (hearth/api.py:151-155, which converts ValueError/
+    // KeyError/TypeError from node.compose_response into HTTP 400): every
+    // validation failure inside ComposeResponse.compose is an
+    // IllegalArgumentException (require(...) or an explicit throw -- see
+    // ComposeResponse.kt) -- caught below as 400. A missing/malformed JSON
+    // field is this route's own equivalent of Python's KeyError -- also
+    // 400, checked before compose() is even invoked. Anything else (store/
+    // crypto failure) is a genuine server error -- 500, matching
+    // composePost's "compose failed: <message>" shape.
+    //
+    // hearth/api.py:520-536 -- the three routes this mirrors:
+    //   POST /api/react   {msg_id, token}      -> rkind="reaction", body=token
+    //     (token may be "clear", the un-react sentinel; rkind is ALWAYS
+    //     "reaction" here -- it never varies by the token's value)
+    //   POST /api/comment {msg_id, text}       -> rkind="comment",  body=text
+    //   POST /api/retract {msg_id, created_at} -> rkind="retract",  body=
+    //     str(created_at) -- see pyStr() below for why the exact string
+    //     form is load-bearing, not cosmetic.
+    //
+    // NOT implemented: /api/response-remove (hearth/api.py:538-546).
+    // Confirmed by reading api.py that this is NOT a compose_response call
+    // at all -- it's node.remove_response(msg_id, responder, created_at),
+    // which writes a LOCAL moderation tombstone (store.
+    // mark_response_removed) then rebuilds+republishes the KIND_RESPONSES
+    // record (node.process_responses -> _rebuild_responses_record, node.py:
+    // 2631-2750). Neither store.mark_response_removed nor the record
+    // rebuild/fold/publish logic has any Kotlin port -- Task 4's own report
+    // explicitly scoped ComposeResponse.compose as compose-only and left
+    // process_responses() unported (design decision 7). It is also
+    // unreachable from THIS client today regardless of that gap: this
+    // file's own responsesJson() (below) hardcodes "can_moderate": false,
+    // so app.js's `r.can_moderate && c.responder` gate (web/app.js:653)
+    // never renders the "remove someone else's comment" button that would
+    // POST here -- see task-5-report.md for the full writeup.
+    private fun composeReact(body: ByteArray?): HttpResponse {
+        val json = readJsonBody(body) ?: return badRequest("bad json body")
+        val msgId = json.optString("msg_id", "")
+        val token = json.optString("token", "")
+        if (msgId.isEmpty()) return badRequest("msg_id required")
+        return respondWithCompose("reaction", msgId, token)
+    }
+
+    private fun composeComment(body: ByteArray?): HttpResponse {
+        val json = readJsonBody(body) ?: return badRequest("bad json body")
+        val msgId = json.optString("msg_id", "")
+        val text = json.optString("text", "")
+        if (msgId.isEmpty()) return badRequest("msg_id required")
+        return respondWithCompose("comment", msgId, text)
+    }
+
+    private fun composeRetract(body: ByteArray?): HttpResponse {
+        val json = readJsonBody(body) ?: return badRequest("bad json body")
+        val msgId = json.optString("msg_id", "")
+        if (msgId.isEmpty() || !json.has("created_at")) return badRequest("msg_id and created_at required")
+        // pyStr throws IllegalArgumentException on a non-numeric created_at
+        // (fix wave: was a silent v.toString() catch-all before -- caught
+        // here the same way respondWithCompose catches ComposeResponse's own
+        // IllegalArgumentExceptions, so both map to 400 through one idiom.
+        val retractBody = try { pyStr(json.get("created_at")) } catch (e: Exception) { return badRequest("bad created_at") }
+        return respondWithCompose("retract", msgId, retractBody)
+    }
+
+    private fun readJsonBody(body: ByteArray?): JSONObject? {
+        val bytes = body ?: return null
+        return try { JSONObject(String(bytes, Charsets.UTF_8)) } catch (e: Exception) { null }
+    }
+
+    private fun respondWithCompose(rkind: String, msgId: String, body: String): HttpResponse {
+        val fx = fixtureOrNull() ?: return badRequest("no fixture")
+        val (encPriv, encPub) = EncKeys.getOrCreate(sharedStore)
+        val createdAt = System.currentTimeMillis() / 1000.0
+        return try {
+            ComposeResponse.compose(sharedStore, fx, encPriv, encPub, msgId, rkind, body, createdAt)
+            json("{\"ok\":true}")
+        } catch (e: IllegalArgumentException) {
+            badRequest(e.message ?: "bad request")
+        } catch (e: Exception) {
+            HttpResponse(500, mapOf("Content-Type" to "text/plain"), ("compose failed: ${e.message}").toByteArray())
+        }
+    }
 
     private fun feed(): String {
         val fx = fixtureOrNull() ?: return "[]"
@@ -485,6 +572,55 @@ class LocalApi(private val ctx: Context) {
         fun dmKeys(feed: List<DecryptPass.Decrypted>, keys: Map<String, ByteArray>): Map<String, ByteArray> =
             feed.filter { it.kind == "dm" }.mapNotNull { d -> keys[d.msgId]?.let { d.msgId to it } }.toMap()
 
+        // Task 5 (outbound-responses), fix wave: hearth/api.py's /api/retract
+        // does `str(body["created_at"])` on whatever Python's json.loads
+        // decoded the JSON number as. This function reproduces that str()
+        // output on the values org.json:json:20240303 (the pinned version)
+        // ACTUALLY hands back from JSONObject.get() -- verified by
+        // decompiling JSONObject.stringToNumber (org.json's own number
+        // parser), not assumed:
+        //   - a DECIMAL-notation literal (contains '.', 'e', or 'E') is
+        //     parsed via `new BigDecimal(string)` and returned AS a
+        //     BigDecimal (the "-0" literal is special-cased to the Double
+        //     -0.0, org.json's one exception -- harmless here since -0.0
+        //     never occurs in a real created_at). This is the SAME BB-5
+        //     desk-gate finding KotlinSync.unwrap() (KotlinSync.kt:108-118)
+        //     and MsgJson.unwrapJson() (MsgJson.kt:133) already document and
+        //     handle for exactly this reason -- a fractional created_at from
+        //     a real node/client is BigDecimal, never Double, and code that
+        //     only branches on `is Double` silently falls through to
+        //     whatever the `else` case does.
+        //   - an INTEGER-notation literal is parsed via `new
+        //     BigInteger(string)`, then narrowed to Integer if its bit
+        //     length fits (<=31 bits), Long if it fits in 63 bits, else left
+        //     as BigInteger. A realistic created_at like 1752900000 (~31
+        //     bits) actually comes back as Integer, not Long -- confirmed by
+        //     decompiling the same method.
+        // pyFloatRepr (via KotlinWire.PyFloat) already reproduces Python's
+        // str(float) formatting byte-for-byte within its supported range --
+        // routing BOTH Double and BigDecimal through v.toDouble() then that
+        // same port (rather than trusting BigDecimal.toString(), whose
+        // scientific-notation threshold differs from Python's) is the fix:
+        // BigDecimal.toDouble() is a correctly-rounded decimal -> IEEE754
+        // conversion (the same contract Double.parseDouble uses), so it
+        // recovers the identical double bit pattern Python's own float
+        // parse would have produced from the same JSON literal, and
+        // pyFloatRepr then formats THAT the way Python's str() would.
+        // Anything outside these four numeric shapes (bool, string, null,
+        // JSONObject/JSONArray) is not a value a real created_at could ever
+        // take -- reject it as a 400 (via the IllegalArgumentException the
+        // caller already catches) rather than silently stringifying garbage
+        // into a retract body hearth's fold logic would just as silently
+        // never match against anything.
+        fun pyStr(v: Any): String = when (v) {
+            is Int -> v.toString()
+            is Long -> v.toString()
+            is java.math.BigInteger -> v.toString()
+            is Double -> KotlinWire.dumps(KotlinWire.PyFloat(v))
+            is java.math.BigDecimal -> KotlinWire.dumps(KotlinWire.PyFloat(v.toDouble()))
+            else -> throw IllegalArgumentException("bad created_at")
+        }
+
         // hearth stories_view (node.py:836-841): a story group is visible
         // only for self or a known (friended) identity -- an unfriended
         // author's already-synced, unexpired story row must not surface
@@ -791,7 +927,14 @@ class LocalApi(private val ctx: Context) {
                     .put("avatar", JSONObject.NULL)           // comment-author avatars deferred
                     .put("alias", c.alias)
                     .put("alias_seed", c.aliasSeed)
-                    .put("mine", false)                        // read-only
+                    // Finding 1 (final review): was hardcoded false -- now
+                    // KotlinResponses.Comment.mine, resolved via aggregate's
+                    // step-1 own-raw-response match (DecryptPass.
+                    // responsesPass' ownRawByCreatedAt). Lights up
+                    // web/app.js:640's retract "x" for THIS device's own
+                    // comment (app.js:649's POST /api/retract body uses
+                    // `c.created_at`, unaffected -- already correct above).
+                    .put("mine", c.mine)
                     .put("body", c.body)
                     .put("created_at", c.createdAt)
                 // `responder` is emitted CONDITIONALLY -- present only for a
@@ -808,9 +951,14 @@ class LocalApi(private val ctx: Context) {
             }
             return JSONObject()
                 .put("reactions", reactions)
-                .put("my_reaction", JSONObject.NULL)          // read-only
+                // Finding 1 (final review): was hardcoded null -- now
+                // KotlinResponses.Responses.myReaction, resolved the same
+                // step-1 way as Comment.mine above. Lights up web/app.js's
+                // `.on` reaction-picker state (app.js:540/543/574) and the
+                // retract-via-"clear" POST path (app.js:587).
+                .put("my_reaction", r.myReaction ?: JSONObject.NULL)
                 .put("comments", comments)
-                .put("can_moderate", false)                    // read-only
+                .put("can_moderate", false)                    // still unimplemented (see composeReact's own note)
         }
     }
 }

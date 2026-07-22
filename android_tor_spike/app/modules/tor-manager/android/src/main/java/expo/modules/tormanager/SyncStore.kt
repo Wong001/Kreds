@@ -271,6 +271,9 @@ interface SyncStore {
      *  uses, keyed by album_id here). Empty map when none. PLAINTEXT
      *  (make_album signs a plain dict). */
     fun albums(identityPub: String): Map<String, List<String>>
+    /** The stored message with msgId, or null if not found. Used by
+     *  ComposeResponse to resolve a target post's author/kind/placement. */
+    fun messageById(msgId: String): SignedMessage?
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -507,4 +510,6 @@ class InMemorySyncStore : SyncStore {
         }
         return best.mapValues { it.value.members }
     }
+
+    override fun messageById(msgId: String): SignedMessage? = messages[msgId]
 }

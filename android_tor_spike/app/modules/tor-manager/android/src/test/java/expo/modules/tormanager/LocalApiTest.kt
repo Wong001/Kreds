@@ -90,6 +90,36 @@ class LocalApiTest {
         assertFalse(c.getBoolean("alias"))
     }
 
+    // -- Finding 1 (final review): responsesJson wires KotlinResponses.
+    // Comment.mine / Responses.myReaction through instead of hardcoding
+    // false/null -- these prove the MARSHALLING layer specifically (the
+    // resolution logic itself is KotlinResponsesTest's/DecryptPassTest's
+    // job); a KotlinResponses.Comment/Responses value with mine=true /
+    // myReaction set is hand-built here, independent of how it got resolved.
+
+    @Test fun feedRowSurfacesMyReactionWhenResponsesCarriesIt() {
+        val resp = KotlinResponses.Responses(
+            reactions = linkedMapOf("fire" to 1), comments = emptyList(), myReaction = "fire")
+        val o = LocalApi.feedRow(sampleDecrypted(mine = true), ownIdentityPub = "own", responses = resp)
+        val r = o.getJSONObject("responses")
+        assertEquals("fire", r.getString("my_reaction"))
+    }
+
+    @Test fun feedRowSurfacesMineTrueForAnOwnComment() {
+        val resp = KotlinResponses.Responses(
+            reactions = emptyMap(),
+            comments = listOf(
+                KotlinResponses.Comment(
+                    body = "my own comment", display = "you", aliasColor = null, createdAt = 5.0,
+                    alias = false, aliasSeed = "aabbccdd", name = "own01234", responder = "own",
+                    mine = true)))
+        val o = LocalApi.feedRow(sampleDecrypted(mine = true), ownIdentityPub = "own", responses = resp)
+        val r = o.getJSONObject("responses")
+        val c = r.getJSONArray("comments").getJSONObject(0)
+        assertTrue("an own-resolved comment must surface mine=true, not the old hardcoded false", c.getBoolean("mine"))
+        assertEquals(5.0, c.getDouble("created_at"), 0.0)   // what app.js's retract POST sends back
+    }
+
     @Test fun notExpiredMatchesHearthBoundary() {
         // hearth _decrypt_post_row (node.py:1594-1598): drop a post iff
         // expires_at is present AND <= now. So keep iff no expiry, or expiry
@@ -547,5 +577,77 @@ class LocalApiTest {
         assertTrue(o.isNull("avatar")); assertTrue(o.isNull("banner"))
         assertEquals(50, o.getInt("banner_pos"))
         assertEquals("", o.getString("bio"))
+    }
+
+    // -- Task 5 fix wave: pyStr's org.json numeric-type coverage --
+    //
+    // Reviewer-caught Important: org.json:json:20240303 parses a
+    // DECIMAL-notation JSON number as java.math.BigDecimal (not Double) and
+    // an INTEGER-notation one as Integer/Long/BigInteger depending on bit
+    // length -- confirmed by decompiling JSONObject.stringToNumber, not
+    // assumed. pyStr must format every one of those runtime types the way
+    // Python's str() would format whatever json.loads would have produced
+    // from the identical JSON text, since this string becomes a retract's
+    // compose body and hearth's fold logic (node.py:2648-2653/2681) matches
+    // it by exact string equality.
+
+    @Test fun pyStrIntegralTypesMatchPythonStr() {
+        // "1752900000" -- a realistic created_at integer part. bitLength
+        // ~31, so org.json itself would hand back an Integer for this exact
+        // literal (decompiled JSONObject.stringToNumber: <=31 bits ->
+        // Integer, <=63 -> Long, else raw BigInteger) -- covering Int here
+        // is not a hypothetical, it is what a whole-number timestamp
+        // ACTUALLY parses as.
+        assertEquals("1752900000", LocalApi.pyStr(1752900000))
+        assertEquals("1752900000", LocalApi.pyStr(1752900000L))
+        assertEquals("1752900000", LocalApi.pyStr(java.math.BigInteger("1752900000")))
+    }
+
+    @Test fun pyStrFractionalTypesMatchPythonStr() {
+        // The BigDecimal branch is the one the review caught as previously
+        // unreachable (fell into the old catch-all `else -> v.toString()`
+        // instead of routing through pyFloatRepr). BigDecimal("...5")'s own
+        // toString() happens to already equal Python's str() for THIS
+        // literal (no exponent involved) -- that coincidence is exactly why
+        // the bug shipped looking correct; the real point of this port is
+        // matching Python's repr-equivalent formatting in general (exponent
+        // thresholds differ between BigDecimal.toString() and
+        // Python str(float)), which is what routing through
+        // KotlinWire.pyFloatRepr (via PyFloat) actually guarantees.
+        assertEquals("1752900000.5", LocalApi.pyStr(java.math.BigDecimal("1752900000.5")))
+        assertEquals("1752900000.5", LocalApi.pyStr(1752900000.5))         // Double branch, same output
+        assertEquals("1752900000.0", LocalApi.pyStr(java.math.BigDecimal("1752900000.0")))  // whole-valued BigDecimal
+    }
+
+    @Test fun pyStrRejectsNonNumericTypes() {
+        // Minor (review): the old `else -> v.toString()` would have turned
+        // Kotlin's `true` into the string "true" -- Python's str(True) is
+        // "True". Neither string is a real created_at, and hearth's fold
+        // can never match either -- reject outright (400 via the caller's
+        // catch) rather than silently emitting a body that looks plausible
+        // but can never retract anything.
+        try { LocalApi.pyStr(true); fail("expected IllegalArgumentException") }
+        catch (e: IllegalArgumentException) { /* expected */ }
+        try { LocalApi.pyStr("1752900000.5"); fail("expected IllegalArgumentException") }
+        catch (e: IllegalArgumentException) { /* expected */ }
+    }
+
+    @Test fun pyStrMatchesRealOrgJsonParsePipeline() {
+        // Closes the review's "nothing downstream tests retract formatting"
+        // gap end-to-end: parse actual JSON text through org.json (the same
+        // path composeRetract() uses -- JSONObject(String(body, UTF_8)),
+        // then .get("created_at")) rather than hand-constructing the
+        // BigDecimal/Integer values, proving org.json really does hand back
+        // the types the comment above claims for both an integer and a
+        // fractional literal.
+        val intJson = JSONObject("""{"created_at": 1752900000}""")
+        assertTrue("a whole-number literal parses as Integer, not Double/BigDecimal",
+            intJson.get("created_at") is Int)
+        assertEquals("1752900000", LocalApi.pyStr(intJson.get("created_at")))
+
+        val fracJson = JSONObject("""{"created_at": 1752900000.5}""")
+        assertTrue("a decimal-notation literal parses as BigDecimal, not Double",
+            fracJson.get("created_at") is java.math.BigDecimal)
+        assertEquals("1752900000.5", LocalApi.pyStr(fracJson.get("created_at")))
     }
 }
