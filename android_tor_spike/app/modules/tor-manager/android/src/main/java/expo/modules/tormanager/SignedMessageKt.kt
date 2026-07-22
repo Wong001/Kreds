@@ -27,6 +27,13 @@ data class SignedMessage(
 
     fun verifyDeviceSignature(): Boolean =
         KotlinWire.verifyRaw(cert.device_pub, signature, body())
+
+    fun toDict(): Map<String, Any?> = mapOf(
+        "cert" to mapOf(
+            "identity_pub" to cert.identity_pub, "device_pub" to cert.device_pub,
+            "device_name" to cert.device_name, "enrolled_at" to cert.enrolled_at,
+            "signature" to cert.signature),
+        "seq" to seq, "payload" to payload, "signature" to signature)
 }
 
 object SignedMessageKt {

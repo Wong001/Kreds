@@ -138,24 +138,8 @@ object KotlinSync {
         )
         val unsigned = SignedMessage(fixture.cert, seq, payload, "")
         val signed = unsigned.copy(signature = KotlinWire.signRaw(fixture.device_priv, unsigned.body()))
-        return mapOf(
-            "cert" to certToMap(signed.cert), "seq" to signed.seq,
-            "payload" to signed.payload, "signature" to signed.signature,
-        )
+        return signed.toDict()
     }
-
-    // Mirrors KotlinHandshake's private certToMap (identity_pub/device_pub/
-    // device_name/enrolled_at/signature) but with enrolled_at as a plain
-    // Double rather than a KotlinWire.PyFloat wrapper -- KotlinWire.dumps'
-    // `is Double` case (the BB-5 fix, see KotlinSync.unwrap's comment above)
-    // formats a bare Double identically to a PyFloat-wrapped one, so the two
-    // produce byte-identical wire output; plain Double is simpler here and
-    // lets composeEncKey's own result be compared with ordinary Kotlin Map
-    // equality in tests (a PyFloat instance has no value-based equals()).
-    private fun certToMap(c: KotlinWire.CertDict): Map<String, Any?> = mapOf(
-        "identity_pub" to c.identity_pub, "device_pub" to c.device_pub,
-        "device_name" to c.device_name, "enrolled_at" to c.enrolled_at,
-        "signature" to c.signature)
 
     /** `onProgress` (Task 6, B.2d): purely additive observability -- fired at
      *  the phase boundaries already present below (connecting/handshake/
