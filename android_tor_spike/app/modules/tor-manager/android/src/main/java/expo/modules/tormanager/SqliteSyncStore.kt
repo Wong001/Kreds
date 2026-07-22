@@ -134,6 +134,16 @@ class SqliteSyncStore(context: Context) :
         onCreate(db)
     }
 
+    // Defensive: SQLiteOpenHelper's DEFAULT onDowngrade throws, crashing every
+    // store open on a version skew (e.g. a DB_VERSION briefly bumped then
+    // reverted during development). The satellite store resyncs from the home
+    // node and ensures all tables in onOpen (CREATE TABLE IF NOT EXISTS), so a
+    // downgrade needs no destructive action -- tolerate it silently rather than
+    // crash. (A real forward migration still uses onUpgrade.)
+    override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        // no-op: onOpen re-ensures the schema
+    }
+
     private fun sha(b: ByteArray) =
         KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(b))
 
