@@ -26,6 +26,37 @@ payload `canonical({identity,device_pub,sig})`, mutual-box audience = MY
 friends); reused outbound-1's `wrapKey`/`encryptBody`/pending-queue/`enckeys`
 and B.2d-4's `KotlinResponses`/`responsesPass`.
 
+## Final-review fix wave (post-HEAD `aaaf4e7`/`b007b40`)
+
+Whole-branch final review found one blocker and two nits, all fixed on this
+branch before the on-device run:
+
+- **Own-response read-side (`mine`/`my_reaction`) — the blocker.**
+  `LocalApi.responsesJson` hardcoded `mine:false` and `my_reaction:null` for
+  EVERY entry, on every post, always — so the retract "×" (`app.js:640,
+  if (c.mine)`) never rendered for any comment, ever, and the reaction
+  picker never showed your own reaction as active (`app.js`'s `.on` class),
+  and your own comment displayed as an anonymous alias to YOU, on your own
+  phone. Fixed by porting hearth's step-1 identity resolution
+  (`node.py`'s `raw_by_created_at`, `_post_responses_view`) into
+  `KotlinResponses.resolve`/`aggregate` and a new `DecryptPass.
+  ownRawByCreatedAt` store scan — see "Own-response read-side" under Honest
+  boundary below for exactly what this does and does not cover.
+- **`KotlinDmcrypt.deriveAliasSeed` HMAC byte-count nit.** `mac.update` used
+  `target.length` (a UTF-16 char count) instead of the encoded byte array's
+  `.size`. Already flagged as a follow-up ticket at the original review;
+  fixed now. Dormant in practice (every real target is a 64-hex `msg_id`,
+  where char count == byte count) — no observable behavior change, pinned
+  hex vectors stay green.
+- **This doc's own wording.** The "Seam" bullet below said `.comment-x` was
+  "revealed" in a way that could be misread as functional; corrected inline.
+
+JVM suite grew from 212 to 227 (15 new tests: 8 in `KotlinResponsesTest`
+covering the pure step-1 resolution logic, 5 end-to-end in `DecryptPassTest`
+using real crypto against a hand-built raw response + folded record, 2 in
+`LocalApiTest` proving the JSON marshal). `npx vitest run` stayed 28/28
+(no `app.js` changes — the fix is entirely server-side/Kotlin).
+
 ## What it does
 
 - **Native compose crypto (`KotlinSeal` + `ComposeResponse`):** `sealSlots`/
@@ -54,7 +85,16 @@ and B.2d-4's `KotlinResponses`/`responsesPass`.
 - **Seam:** `.rx-open` (reaction toggle), `.rx-picker` (reaction picker), and
   `.comment-composer`/`.comment-x` (comment box + delete) are now revealed
   from `body.readonly`. Everything else — DM composer, profile Arrange,
-  profile-wall composer, moderation controls — stays hidden.
+  profile-wall composer, moderation controls — stays hidden. **Correction
+  (final-review fix wave, below):** "revealed" here described CSS visibility
+  only. `.comment-x` (retract) and the reaction picker's `.on` state were
+  reachable in the DOM at the time this line was written, but were dead in
+  practice — `LocalApi.responsesJson` hardcoded `mine:false` and
+  `my_reaction:null` for every entry, so `.comment-x` never actually
+  rendered for any comment (`app.js`'s `if (c.mine)` never fired) and the
+  reaction picker never showed your own glyph as active. The own-response
+  read-side fix below wires the real values through, making both
+  genuinely functional, not merely present in the markup.
 
 ## Desk gates (all GREEN — Claude, pre-August, this session)
 
@@ -169,33 +209,66 @@ Desktop `serve --tor`, unlocked, with a friend + a mutual friend synced. On
 the phone: react + comment on a friend's post AND your own; verify:
 
 - [ ] (a) the reaction picker + comment box are visible
-- [ ] (b) your reaction/comment appears
+- [ ] (b) your reaction/comment appears **on the desktop feed** right away
+      (composed + pushed on next sync); on the **phone's own** feed it may
+      take a fold cycle to show `mine`/your reaction as active — see "Own-
+      response read-side" under Honest boundary above before treating a
+      delay as a bug. Give it ~1 sync interval + the desktop's fold sweep,
+      then pull-to-refresh (or re-open the post) before concluding it failed.
 - [ ] (c) on the desktop feed it shows with correct attribution (your name to
       mutual friends)
 - [ ] (d) a friend's response on your phone shows their **REAL NAME** (not an
       alias) after this build (the read de-anon)
 - [ ] (e) a stranger's response shows an alias
-- [ ] (f) un-react/retract works
+- [ ] (f) un-react/retract works on the phone: the retract "×" appears on
+      YOUR OWN comment/reaction (this fix wave — it did not render at all
+      before, see "Final-review fix wave" above) once the fold in (b) has
+      caught up, and un-reacting behaves like (b) — expect the SAME
+      fold-cycle lag before the active state clears, not an instant flip.
 - [ ] (g) regression: DM composer + profile Arrange stay hidden
 
 ### Verdict (August to fill)
 
 > _(pass / partial / fail + notes)_
 
-## Install confirmation (this session)
+## Install confirmation (this session, final-review fix wave)
 
 Device: G20, serial `ZY32DLZQ2N`, package `eu.kreds.torspike`, RELEASE apk
-only.
+only (rebuilt against this fix wave's HEAD).
 
 ```
 adb shell am force-stop eu.kreds.torspike        -> (no output, success)
 adb install -r -d app-release.apk                -> "Performing Streamed Install" / "Success"
 ```
 
+The install call hung silently for several minutes before returning —
+`adb shell dumpsys window | grep mCurrentFocus` showed a Google Play
+Protect "send this unrecognized app for a security scan?" dialog had
+taken focus (the app had, in fact, already installed by that point — its
+icon was visible on the home screen behind the dialog). Dismissed via
+`adb shell input tap` on "Send ikke" (Don't send — the privacy-preserving
+choice for an unreleased, pre-IP-filing sideloaded APK), after which the
+install call returned `Success` immediately. See "Run gotchas" below for
+the added field lesson.
+
 No behavioral checks were run beyond confirming the install succeeded — the
 DoD above is August's to drive.
 
 ## Run gotchas
+
+- **A Play Protect scan-consent dialog can silently block `adb install`
+  with no error and no timeout** (hit in this session's reinstall,
+  final-review fix wave). If a reinstall hangs with no output after
+  "Performing Streamed Install" (or even before it), check `adb shell
+  dumpsys window | grep mCurrentFocus` for
+  `PlayProtectDialogsActivity` before assuming a transfer stall — the app
+  may have already installed and just be waiting on the post-install
+  scan-consent prompt. `adb shell input tap` on the dialog's "don't send"
+  option unblocks it (screenshot via `adb shell screencap -p /sdcard/x.png`
+  + `adb pull` to find the exact coordinates first — they can shift with
+  device language/resolution). The original 9-task report already flagged
+  hitting this class of dialog once before (Task 8's install); this is the
+  second occurrence, now with root-cause + workaround documented.
 
 - **`org.json` parses decimal literals as `BigDecimal`, not `Double`.**
   Task 5 found the route-side `pyStr` had a dead `is Double` branch — retract
@@ -218,6 +291,61 @@ DoD above is August's to drive.
 
 ## Honest boundary
 
+- **Own-response read-side (`mine`/`my_reaction`) — what shows and when.**
+  Read this before the on-device run so a delay does not read as a failure.
+  The phone has no port of `node.process_responses` (the author-side fold
+  that rebuilds `KIND_RESPONSES` from the raw `KIND_RESPONSE` rows) — same
+  boundary this doc already documented for the read de-anon side, now
+  spelled out for `mine`/`my_reaction` too, because it is exactly hearth's
+  own behavior, not a phone-specific gap:
+  - **Immediately after composing** (react/comment on ANY post, yours or a
+    friend's): the phone's own local store already holds the raw response
+    it just wrote (self-readable wrap), but that alone changes NOTHING
+    visible — `mine`/`my_reaction` are resolved only from entries inside an
+    already-**folded** `KIND_RESPONSES` record (mirroring hearth's
+    `_post_responses_view`, which returns nothing at all — not even your
+    own entries — when `store.responses_record(...)` is `None`). If the
+    post has no folded record yet at all, `responses` stays `null` for
+    that row exactly as before this fix; if it has a STALE folded record
+    (one that predates your new response), your new response is simply
+    absent from `reactions`/`comments`/`my_reaction` until a newer record
+    arrives.
+  - **Once the post author's node (desktop, running `process_responses`
+    on its ~3s sweep) folds and republishes, and that record syncs down
+    to the phone:** the phone's new `DecryptPass.ownRawByCreatedAt` step
+    matches the folded entry to the phone's own locally-held raw response
+    by `created_at` and resolves it to `mine:true` — a real name (not
+    "you"; see below), the retract "×", and `my_reaction` — with NO
+    further action needed on the phone. For a reaction ON YOUR OWN post,
+    this requires YOUR OWN account's desktop device to be the one folding
+    (an own-post's `KIND_RESPONSES` is signed by the post's own author);
+    for a reaction on a FRIEND's post, it's the friend's own node that
+    folds.
+  - **Un-reacting ("clear") behaves the same way, not instantly:** hearth's
+    fold treats "clear" as removing the previous reaction ENTRY, never as
+    an entry itself (`node.py:2698-2699`) — so `my_reaction` stays stuck at
+    the pre-clear value until the NEXT fold publishes a record that omits
+    the entry. There is no local/optimistic clear; expect the picker's
+    active state to lag one fold cycle behind a un-react tap, same as a
+    react.
+  - **Display uses hearth's own bare name, not a "you" literal.** The
+    JSON-facing `comments[].name` field is hearth's exact
+    `names.get(identity, identity[:8])` fallback (your stored profile name,
+    or your own identity's first-8-hex) — matching what a mutual friend
+    would see too, deliberately NOT the native-app-only "you" label
+    `KotlinResponses.Comment.display` computes for a possible future native
+    UI. `mine:true` is what actually drives the retract affordance in
+    `app.js`, not the display string.
+  - **What this does NOT extend to:** hearth's OWN step 1
+    (`raw_by_created_at`) additionally resolves EVERY responder's identity
+    when the reading node IS the post's own author (routing sends every
+    raw response there) — e.g. a post author's desktop can name a stranger
+    by cert alone, no mutual-box trial-open needed. This fix ported only
+    the always-available subset (the viewer's OWN composed responses); the
+    phone does not attempt the full author-side breadth. A friend's
+    response on your phone still resolves only via the existing mutual-box
+    de-anon path (real name to mutual friends, alias to strangers) — that
+    part is unchanged by this fix wave.
 - **Reactions + comments + retract, journal only.** Same scope boundary as
   outbound-1's journal-only compose — profile-wall responses are a later
   slice (composer stays hidden; `#profile-wall-compose` is unaffected by this
