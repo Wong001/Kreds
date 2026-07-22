@@ -37,10 +37,11 @@ class LocalApi(private val ctx: Context) {
     // only; never persisted (decrypt-on-read).
     @Volatile private var dmKeysCache: Map<String, ByteArray> = emptyMap()
 
-    // contentType/body: accepted here (Task 6, loopback body-reading plumbing)
-    // but IGNORED -- every route below is still GET-only. Task 7 wires the
-    // compose POST route and starts reading them.
+    // contentType/body: accepted here (Task 6, loopback body-reading plumbing).
+    // Task 7 wires the first non-GET route (compose POST) and starts reading
+    // them; every other route below remains GET-only, unchanged.
     fun handle(method: String, path: String, contentType: String? = null, body: ByteArray? = null): HttpResponse? {
+        if (method == "POST" && path == "/api/post") return composePost(contentType, body)
         if (method != "GET") return null
         return when {
             path == "/api/bootstrap" -> json(bootstrapJson())
@@ -78,6 +79,35 @@ class LocalApi(private val ctx: Context) {
             else -> null
         }
     }
+
+    // Task 7: the first non-GET route. Parses the composer's multipart body,
+    // preps any photos (EXIF-strip/downscale/JPEG via PhotoPrep -- privacy
+    // requirement), and hands plaintext straight to Compose.post over
+    // sharedStore (the SAME long-lived instance every GET route uses -- NOT a
+    // fresh SqliteSyncStore, which is the connection-leak class of bug fixed
+    // in sharedStore's own comment above). createdAt is generated ONCE here
+    // and passed through: Compose uses it for both the payload and the AAD,
+    // so a route-side/compose-side mismatch would break the wrap/AAD binding.
+    private fun composePost(contentType: String?, body: ByteArray?): HttpResponse {
+        val ct = contentType ?: return badRequest("no content-type")
+        val bytes = body ?: return badRequest("no body")
+        val form = try { Multipart.parse(ct, bytes) } catch (e: Exception) { return badRequest("bad multipart") }
+        val text = form.fields["text"].orEmpty()
+        val scope = form.fields["scope"] ?: "kreds"
+        if (scope != "kreds") return badRequest("only kreds this slice")
+        if (text.isBlank() && form.files.isEmpty()) return badRequest("empty post")
+        val jpegs = ArrayList<ByteArray>()
+        for (f in form.files) { val j = PhotoPrep.toUploadJpeg(f.bytes) ?: return badRequest("bad image"); jpegs.add(j) }
+        val fx = fixtureOrNull() ?: return badRequest("no fixture")
+        val (encPriv, encPub) = EncKeys.getOrCreate(sharedStore)
+        val createdAt = System.currentTimeMillis() / 1000.0
+        return try {
+            Compose.post(sharedStore, fx, encPriv, encPub, text, jpegs, scope, createdAt)
+            json("{\"ok\":true}")
+        } catch (e: Exception) { HttpResponse(500, mapOf("Content-Type" to "text/plain"), ("compose failed: ${e.message}").toByteArray()) }
+    }
+
+    private fun badRequest(msg: String) = HttpResponse(400, mapOf("Content-Type" to "text/plain"), msg.toByteArray())
 
     private fun feed(): String {
         val fx = fixtureOrNull() ?: return "[]"
