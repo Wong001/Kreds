@@ -3,6 +3,7 @@ package expo.modules.tormanager
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class KotlinBlobCryptTest {
@@ -33,5 +34,15 @@ class KotlinBlobCryptTest {
 
     @Test fun shortInputReturnsNull() {
         assertNull(KotlinBlobCrypt.decryptBlob(ByteArray(32), ByteArray(5)))
+    }
+
+    @Test fun encryptBlobRoundTripsThroughDecryptBlob() {
+        val key = ByteArray(32) { (it + 3).toByte() }
+        val data = ByteArray(5000) { (it % 256).toByte() }
+        val cipher = KotlinBlobCrypt.encryptBlob(key, data)
+        assertTrue("nonce+ct+tag longer than plain", cipher.size == data.size + 12 + 16)
+        assertArrayEquals(data, KotlinBlobCrypt.decryptBlob(key, cipher))
+        // wrong key -> null
+        assertNull(KotlinBlobCrypt.decryptBlob(ByteArray(32), cipher))
     }
 }
