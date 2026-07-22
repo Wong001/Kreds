@@ -51,6 +51,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
 from hearth import dmcrypt
+from hearth.identity import _sig_ok
 from hearth.node import HearthNode
 from hearth.sync import SyncService
 
@@ -236,6 +237,225 @@ async def _run_outbound_compose(data_dir) -> None:
         fx = mint_fixture(node)
         fx["onion_addr"] = f"127.0.0.1:{port}"
         fx["friend_identity_pub"] = friend.identity_pub
+        expect = _compute_expect(node)
+        print(json.dumps({"port": port, "fixture": fx, "expect": expect}),
+              flush=True)
+        await asyncio.Event().wait()   # serve until killed
+    finally:
+        await sync.stop()
+
+
+def _find_new_phone_responses(node, phone_device_pub: str, seen_ids: set):
+    """Task 8 (outbound-responses loopback gate): every KIND_RESPONSE
+    authored by the phone's device (node identity == phone identity,
+    own-identity model -- same shape as Task 9's _find_composed_post)
+    that has not already had a "responded" event emitted for it, oldest
+    created_at first -- so a reaction always gets processed (and its
+    created_at captured for the retract check below) strictly before any
+    later retract naming it, regardless of how many land in one
+    connection's MESSAGES phase."""
+    out = [m for m in node.store.messages_by_author(node.identity_pub)
+           if m.payload.get("kind") == "response"
+           and m.cert.device_pub == phone_device_pub
+           and m.msg_id not in seen_ids]
+    out.sort(key=lambda m: m.payload.get("created_at", 0))
+    return out
+
+
+def _decrypt_response_event(node, friend, msg):
+    """Task 8: decrypts ONE phone-composed KIND_RESPONSE exactly the way
+    _emit_composed_if_ready decrypts a KIND_POST -- via the real
+    hearth.dmcrypt primitives directly (response_aad -> unwrap_key ->
+    decrypt_body), using the NODE's OWN device enc key. The node is a
+    genuine second device of the same identity here (mint_fixture
+    enrolled the phone's device under the node's own identity), reachable
+    as a wrap recipient only because the scenario's node.ensure_enckey()
+    was pulled by the phone's connection-1 HAVE/MESSAGES round BEFORE
+    compose -- the same precondition _run_outbound_compose's own class
+    doc calls out. A successful unwrap here is therefore proof the node
+    really is an author device of this response, able to read it exactly
+    like a real second device/desktop would -- not a mock.
+
+    Then independently reverifies responder_sig against
+    HearthNode._response_sig_payload/_sig_ok (node.py:1389-1397,
+    identity.py:79-84) -- the exact canonical form every real viewer
+    (_post_responses_view) re-derives to check a folded entry -- rather
+    than trusting the encrypted body's own claim that it is valid.
+
+    Finally simulates a FRIEND opening the mutual_box:
+    dmcrypt.try_open_slots(mutual_box, friend.device.enc_priv) -- a real,
+    independently-generated X25519 key belonging to the friend node this
+    scenario seeded, never a key the phone used to seal the box -- and
+    confirms the box opens to exactly {identity, device_pub, sig} naming
+    the responding phone device and matching responder_sig. This is the
+    real engagement-privacy mechanism (seal_slots/try_open_slots)
+    round-tripping the phone's composed disclosure byte-for-byte.
+
+    Returns None on any decrypt/verify failure (unwrap_key/decrypt_body
+    already fail closed and return None; nothing here swallows an
+    unexpected exception -- a genuinely malformed wire shape is a real
+    fidelity bug and should crash this process loudly rather than emit a
+    fabricated success line, exactly mirroring _emit_composed_if_ready's
+    style)."""
+    p = msg.payload
+    aad = dmcrypt.response_aad(msg.cert.identity_pub, p["target"], p["created_at"])
+    wraps = p.get("wraps") or {}
+    key = dmcrypt.unwrap_key(wraps, node.device.device_pub,
+                             node.device.enc_priv, aad)
+    if key is None:
+        return None
+    body = dmcrypt.decrypt_body(key, p["body_nonce"], p["body_ct"], aad)
+    if body is None:
+        return None
+    rkind = body.get("rkind")
+    rbody = body.get("body")
+    created_at = body.get("created_at")
+    responder = body.get("responder")
+    responder_sig = body.get("responder_sig")
+    sig_payload = HearthNode._response_sig_payload(
+        p["target"], rkind, rbody, created_at, responder)
+    # responder_sig is a DEVICE-key signature (self.device.sign_raw in
+    # compose_response), not an identity-key one -- verify against
+    # msg.cert.device_pub (the signed envelope's own device_pub, which
+    # for a KIND_RESPONSE this node ingested IS the responder's signing
+    # device), exactly as node.py's _post_responses_view docstring
+    # spells out ("Verify responder_sig against device_pub, then
+    # _device_bound") and as ComposeResponseTest.kt's own independent
+    # check does (KotlinWire.verifyRaw(fx.device_pub, responderSig,
+    # sigPayload)) -- NOT the responder identity_pub, which is a
+    # different keypair entirely.
+    sig_ok = _sig_ok(msg.cert.device_pub, responder_sig, sig_payload)
+
+    opened = dmcrypt.try_open_slots(body.get("mutual_box"),
+                                    friend.device.enc_priv)
+    friend_opened = False
+    if opened is not None:
+        disclosed = json.loads(opened)
+        friend_opened = (
+            disclosed.get("identity") == msg.cert.identity_pub
+            and disclosed.get("device_pub") == msg.cert.device_pub
+            and disclosed.get("sig") == responder_sig)
+    return {"rkind": rkind, "body": rbody, "created_at": created_at,
+            "sig_ok": sig_ok, "friend_opened": friend_opened}
+
+
+def _check_retract_applied(node, target: str, reaction_created_at: float) -> bool:
+    """Controller addition (carried from Task 5 review): runs hearth's
+    REAL author sweep (node.process_responses -> _rebuild_responses_record,
+    node.py:2579-2750) -- not a reimplementation of its fold logic -- then
+    decrypts the resulting KIND_RESPONSES record with the node's own
+    device key (dmcrypt directly, same rigor as _decrypt_response_event)
+    to see what the fold actually produced. True iff the reaction entry
+    (matched by created_at, the exact key node.py:2648-2654's `retracted`
+    set uses) is no longer present -- i.e. the retract's pyStr-formatted
+    body genuinely string-matched str(the reaction's created_at) inside
+    the REAL fold, not merely that the retract message itself decrypted
+    and verified okay (that is _decrypt_response_event's job, exercised
+    separately for every response including this one)."""
+    node.process_responses()
+    rec = node.store.responses_record(target, node.identity_pub)
+    if rec is None:
+        return False
+    p = rec.payload
+    aad = dmcrypt.responses_aad(node.identity_pub, p["target"], p["created_at"])
+    key = dmcrypt.unwrap_key(p.get("wraps") or {}, node.device.device_pub,
+                             node.device.enc_priv, aad)
+    if key is None:
+        return False
+    body = dmcrypt.decrypt_body(key, p["body_nonce"], p["body_ct"], aad)
+    if body is None:
+        return False
+    entries = body.get("entries") or []
+    return not any(e.get("rkind") == "reaction"
+                  and e.get("created_at") == reaction_created_at
+                  for e in entries)
+
+
+async def _run_responses(data_dir) -> None:
+    """Task 8 (outbound-responses slice): the loopback FIDELITY GATE for
+    the whole slice -- a real hearth node decrypts a phone-composed
+    reaction + comment with its OWN device key (proving it really is a
+    second device of the same identity), independently reverifies
+    responder_sig, and a real FRIEND identity's enc key genuinely opens
+    the mutual_box (proving the engagement-privacy mechanism round-trips
+    byte-for-byte), THEN a phone-composed retract is proven against
+    hearth's REAL author fold (node.process_responses ->
+    _rebuild_responses_record) -- not just accepted onto the wire, but
+    shown to have actually withdrawn the reaction it named. That last
+    part is a controller addition (carried from Task 5's review): retract
+    otherwise has zero behavioral coverage, and its body carries the
+    str(created_at) contract (node.py:2648-2653) that only a real fold
+    run can prove.
+
+    Seed mirrors _run_outbound_compose's own-identity + friend pattern
+    exactly (see that function's docstring for the full protocol-trace
+    rationale for why connection 1 must be a priming pull): the node is
+    an OWN DEVICE of the phone's identity (mint_fixture enrolls the
+    phone's device under the node's own identity) with its own enckey
+    published up front (ensure_enckey, so ComposeResponse.compose's
+    authorDevs/self-wrap branches resolve THIS device -- not just the
+    phone's own -- as a wrap recipient once pulled), plus a real FRIEND
+    identity with its own published enckey (so the mutual box has a
+    genuine non-dummy slot to open). Unlike outbound_compose, this
+    scenario ALSO seeds an own JOURNAL POST up front -- compose_response
+    responds to an EXISTING post, so target_msg_id rides on the fixture
+    line exactly like friend_identity_pub does, letting the Kotlin test
+    skip rediscovering it via the synced store."""
+    node = HearthNode.create(Path(data_dir) / "n", "Desk", "desk")
+    node.ensure_enckey()          # node's own device enckey -- so the
+                                   # phone's store.enckeys(own) resolves
+                                   # this device as a wrap recipient
+
+    friend = HearthNode.create(Path(data_dir) / "f", "Freja", "freja-desk")
+    node.store.add_identity(friend.identity_pub)
+    friend.store.add_identity(node.identity_pub)
+    friend.ensure_enckey()
+    _gossip_until_converged(node, friend)   # delivers node's <-> friend's
+                                             # enckey/profile messages
+
+    target_id = node.compose_post("respond to this", scope="kreds",
+                                  placement="journal")
+
+    sync = SyncService(node)
+
+    emitted_ids: set = set()
+    retract_reaction_created_at = None
+    retract_checked = False
+    orig_on_conn = sync._on_conn
+
+    async def _on_conn_then_check(reader, writer):
+        nonlocal retract_reaction_created_at, retract_checked
+        await orig_on_conn(reader, writer)
+        for msg in _find_new_phone_responses(node, fx["device_pub"], emitted_ids):
+            ev = _decrypt_response_event(node, friend, msg)
+            emitted_ids.add(msg.msg_id)
+            if ev is None:
+                # A real fidelity bug -- never fabricate a "responded"
+                # line for it. The Kotlin side's awaitEvent("responded")
+                # will time out instead of seeing a false success.
+                continue
+            print(json.dumps({
+                "event": "responded", "rkind": ev["rkind"],
+                "body": ev["body"], "sig_ok": ev["sig_ok"],
+                "friend_opened": ev["friend_opened"],
+            }), flush=True)
+            if ev["rkind"] == "reaction":
+                retract_reaction_created_at = ev["created_at"]
+            if ev["rkind"] == "retract" and not retract_checked:
+                retract_checked = True
+                applied = _check_retract_applied(
+                    node, target_id, retract_reaction_created_at)
+                print(json.dumps({"event": "retracted", "applied": applied}),
+                     flush=True)
+
+    sync._on_conn = _on_conn_then_check
+
+    port = await sync.start("127.0.0.1", 0)
+    try:
+        fx = mint_fixture(node)
+        fx["onion_addr"] = f"127.0.0.1:{port}"
+        fx["friend_identity_pub"] = friend.identity_pub
+        fx["target_msg_id"] = target_id
         expect = _compute_expect(node)
         print(json.dumps({"port": port, "fixture": fx, "expect": expect}),
               flush=True)
@@ -430,5 +650,13 @@ if __name__ == "__main__":
         # byte-identical to every pre-Task-9 call site (main() itself is
         # untouched).
         asyncio.run(_run_outbound_compose(sys.argv[1]))
+    elif _scenario == "responses":
+        # Task 8: a structurally different seed (own enckey + a friend's
+        # enckey + an own journal POST up front, no other desk journal
+        # content) from solo/two_node/outbound_compose above -- kept as
+        # its own entry point for the same reason outbound_compose is:
+        # every pre-Task-8 call site (main(), _run_outbound_compose)
+        # stays provably byte-identical to before this task.
+        asyncio.run(_run_responses(sys.argv[1]))
     else:
         asyncio.run(main(sys.argv[1], _scenario))
