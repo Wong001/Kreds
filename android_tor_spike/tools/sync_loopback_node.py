@@ -52,6 +52,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
 from hearth import dmcrypt
 from hearth.identity import _sig_ok
+from hearth.messages import _valid_story_ref
 from hearth.node import HearthNode
 from hearth.sync import SyncService
 
@@ -475,6 +476,198 @@ async def _run_responses(data_dir) -> None:
         await sync.stop()
 
 
+def _find_new_phone_dms(node, friend_identity_pub: str, phone_device_pub: str,
+                        seen_ids: set):
+    """Task 4 (outbound-dm loopback gate): every KIND_DM authored by the
+    phone's device (node identity == phone identity, own-identity model --
+    same shape as _find_new_phone_responses/_find_composed_post) addressed
+    to the seeded FRIEND identity that has not already had a "dm" event
+    emitted for it, oldest created_at first. compose_dm rejects a self-DM
+    (node.py:2320-2321: `to_identity == self.identity_pub` raises), so
+    every DM this scenario's phone composes necessarily targets the friend
+    -- the `payload["to"] == friend_identity_pub` filter is therefore not
+    narrowing away some other traffic, it is just being explicit about
+    what is already structurally guaranteed, the same way
+    _run_phase3/_seed_friend_and_befriend's comments are explicit about
+    guarantees that follow from hearth's own validation. Sorting by
+    created_at (not insertion/discovery order) is what makes the four
+    DMs the Kotlin test composes with strictly increasing createdAt values
+    always surface in the same order they were written, regardless of how
+    many land in one connection's MESSAGES phase."""
+    out = [m for m in node.store.messages_by_author(node.identity_pub)
+           if m.payload.get("kind") == "dm"
+           and m.cert.device_pub == phone_device_pub
+           and m.payload.get("to") == friend_identity_pub
+           and m.msg_id not in seen_ids]
+    out.sort(key=lambda m: m.payload.get("created_at", 0))
+    return out
+
+
+def _decrypt_dm_event(node, friend, msg):
+    """Task 4 (outbound-dm loopback gate): decrypts ONE phone-composed
+    KIND_DM as the REAL RECIPIENT -- the friend node's own device enc key,
+    via dmcrypt.unwrap_key/decrypt_body directly (never node._content_key's
+    convenience wrapper), exactly mirroring _decrypt_response_event's own
+    rigor for KIND_RESPONSE and _emit_composed_if_ready's for KIND_POST.
+    compose_dm always rejects a self-DM, so every DM in this scenario is
+    addressed to the friend identity -- a successful unwrap against
+    friend.device.enc_priv is therefore proof the friend really is the
+    named recipient, able to read the phone's freshly composed DM exactly
+    like a real second person's device would. (The SAME wraps dict also
+    carries an own-device copy -- compose_dm's `_dm_device_pubs` always
+    merges 'mine' alongside 'theirs', node.py:2308-2315 -- but proving
+    THAT wrap path is already _emit_composed_if_ready's job for KIND_POST;
+    this function deliberately decrypts via the recipient's key only, the
+    thing nothing else in this harness covers yet.)
+
+    AAD is RECOMPUTED from the envelope's own cert/payload fields --
+    dm_aad(msg.cert.identity_pub, payload["to"], payload["created_at"]) --
+    never phone-supplied out-of-band, exactly matching hearth's own
+    _content_key for KIND_DM (node.py:2816-2817).
+
+    body["blobs"] is cross-checked against payload["blobs"] BEFORE either
+    is trusted -- mirrors _decrypt_response_event's responder-identity
+    cross-check (itself mirroring hearth's real _response_event guard,
+    node.py:2525-2533): the encrypted body's own claim about what it
+    references is attacker-controlled plaintext once decrypted, so a body
+    that lies about its own blob refs must fail this closed rather than
+    have blob_ok computed against a value the body merely asserts.
+
+    story_ref rides the envelope IN THE CLEAR (messages.py:139-150, never
+    inside the encrypted body) -- re-validated here via hearth's REAL
+    _valid_story_ref (messages.py:241-255), not a hand-rolled shape check,
+    exactly as compose_dm itself validates it before ever publishing
+    (node.py:2329-2330). Absent (None) is vacuously fine -- only a
+    present-but-malformed story_ref should ever fail this.
+
+    Returns None on any decrypt/verify failure (unwrap_key/decrypt_body
+    already fail closed and return None; a body/envelope blob mismatch is
+    treated identically) -- nothing here swallows an unexpected exception,
+    so a genuinely malformed wire shape crashes this process loudly rather
+    than emitting a fabricated "dm" line; the caller never emits an event
+    for a None result, so the Kotlin side's awaitEvent("dm") times out
+    instead of seeing a false success."""
+    p = msg.payload
+    aad = dmcrypt.dm_aad(msg.cert.identity_pub, p["to"], p["created_at"])
+    wraps = p.get("wraps") or {}
+    key = dmcrypt.unwrap_key(wraps, friend.device.device_pub,
+                             friend.device.enc_priv, aad)
+    if key is None:
+        return None
+    body = dmcrypt.decrypt_body(key, p["body_nonce"], p["body_ct"], aad)
+    if body is None:
+        return None
+    payload_blobs = p.get("blobs") or []
+    body_blobs = body.get("blobs") or []
+    if body_blobs != payload_blobs:
+        return None
+    text = body.get("text")
+    text_ok = isinstance(text, str)
+    blob_ok = True
+    for h in payload_blobs:
+        cipher = node.store.get_blob(h)
+        if cipher is None:
+            blob_ok = False
+            break
+        if dmcrypt.decrypt_blob(key, cipher) is None:
+            blob_ok = False
+            break
+    sref = p.get("story_ref")
+    story_ref_ok = _valid_story_ref(sref) if sref is not None else True
+    return {
+        "msg_id": msg.msg_id,
+        "text": text,
+        "text_ok": text_ok,
+        "blob_ok": blob_ok,
+        "story_ref_ok": story_ref_ok,
+        "expires_at": p.get("expires_at"),
+    }
+
+
+async def _run_dm(data_dir) -> None:
+    """Task 4 (outbound-dm-send slice): the loopback FIDELITY GATE for the
+    whole slice -- a real hearth node ingests phone-composed DMs (text,
+    photo, story-reply, expiring) over the real wire protocol, and a real
+    FRIEND identity's device key -- never the phone's own -- genuinely
+    decrypts each one as the addressed recipient, cross-checks the
+    envelope's plaintext blob refs against the encrypted body's own claim,
+    re-validates story_ref via hearth's real shape guard, and -- for the
+    expiring DM -- runs hearth's REAL store.sweep_expired (store.py:432-
+    447) past its expiry instant and confirms the swept list actually
+    names it. Structurally the same own-identity + friend seed as
+    _run_outbound_compose/_run_responses (see either's own docstring for
+    the full protocol-trace rationale on why connection 1 must be a
+    priming pull): the node is an OWN DEVICE of the phone's identity
+    (mint_fixture enrolls the phone's device under the node's own
+    identity) with its own enckey published up front, plus a real FRIEND
+    identity with its own published enckey -- here the friend is not just
+    a mutual-box opener (as in _run_responses) but the DM's actual named
+    recipient, since compose_dm rejects addressing yourself.
+
+    The node's wrapped _on_conn (see main()'s own for the untouched
+    "solo"/"two_node" path) decrypts every newly-landed phone-authored DM
+    after each connection fully completes, emitting one {"event":"dm",...}
+    line per DM in created_at order (_find_new_phone_dms). Immediately
+    after a DM whose envelope carries a non-null expires_at, the sweep
+    runs and a {"event":"dm_expired","swept":...} line follows -- `now`
+    is expires_at + 1 (equivalent to the brief's created_at +
+    expires_seconds + 1, since expires_at IS created_at + expires_seconds
+    on the wire; the script never sees expires_seconds as a separate
+    field, only the envelope's own expires_at)."""
+    node = HearthNode.create(Path(data_dir) / "n", "Desk", "desk")
+    node.ensure_enckey()          # node's own device enckey -- so the
+                                   # phone's store.enckeys(own) resolves
+                                   # this device as a wrap recipient
+
+    friend = HearthNode.create(Path(data_dir) / "f", "Freja", "freja-desk")
+    node.store.add_identity(friend.identity_pub)
+    friend.store.add_identity(node.identity_pub)
+    friend.ensure_enckey()
+    _gossip_until_converged(node, friend)   # delivers node's <-> friend's
+                                             # enckey/profile messages
+
+    sync = SyncService(node)
+
+    emitted_ids: set = set()
+    expiry_checked_ids: set = set()
+    orig_on_conn = sync._on_conn
+
+    async def _on_conn_then_check(reader, writer):
+        await orig_on_conn(reader, writer)
+        for msg in _find_new_phone_dms(
+                node, friend.identity_pub, fx["device_pub"], emitted_ids):
+            ev = _decrypt_dm_event(node, friend, msg)
+            emitted_ids.add(msg.msg_id)
+            if ev is None:
+                # A real fidelity bug -- never fabricate a "dm" line for
+                # it. The Kotlin side's awaitEvent("dm") will time out
+                # instead of seeing a false success.
+                continue
+            print(json.dumps({"event": "dm", **ev}), flush=True)
+            expires_at = ev["expires_at"]
+            if expires_at is not None and msg.msg_id not in expiry_checked_ids:
+                expiry_checked_ids.add(msg.msg_id)
+                swept = node.store.sweep_expired(now=expires_at + 1)
+                print(json.dumps({
+                    "event": "dm_expired",
+                    "swept": msg.msg_id in swept,
+                }), flush=True)
+
+    sync._on_conn = _on_conn_then_check
+
+    port = await sync.start("127.0.0.1", 0)
+    try:
+        fx = mint_fixture(node)
+        fx["onion_addr"] = f"127.0.0.1:{port}"
+        fx["friend_identity_pub"] = friend.identity_pub
+        expect = _compute_expect(node)
+        print(json.dumps({"port": port, "fixture": fx, "expect": expect}),
+              flush=True)
+        await asyncio.Event().wait()   # serve until killed
+    finally:
+        await sync.stop()
+
+
 def _deliver(src, dst) -> bool:
     """One-directional content transfer: every message `src` has authored
     that `dst` does not yet hold, via the real store.messages_not_in +
@@ -669,5 +862,14 @@ if __name__ == "__main__":
         # every pre-Task-8 call site (main(), _run_outbound_compose)
         # stays provably byte-identical to before this task.
         asyncio.run(_run_responses(sys.argv[1]))
+    elif _scenario == "dm":
+        # Task 4 (outbound-dm-send slice): a structurally different seed
+        # (own enckey + a friend's enckey up front, no desk journal
+        # content) from solo/two_node above -- kept as its own entry
+        # point for the same reason outbound_compose/responses are: every
+        # pre-Task-4 call site (main(), _run_outbound_compose,
+        # _run_responses) stays provably byte-identical to before this
+        # task.
+        asyncio.run(_run_dm(sys.argv[1]))
     else:
         asyncio.run(main(sys.argv[1], _scenario))

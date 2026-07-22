@@ -12,21 +12,21 @@ const HIDDEN_SELECTORS = [
   // NOTE: `.composer` (journal composer) is intentionally NOT here -- the first
   // outbound slice REVEALS it (see the "outbound-1" test below). outbound slice
   // TASK 7 REVEALS `.rx-open`, `.rx-picker`, `.comment-composer`, `.comment-x`
-  // (reactions + comments). Everything else stays hidden until its own outbound slice.
+  // (reactions + comments). TASK 3 REVEALS `#dm-compose` (DM composer).
+  // Everything else stays hidden until its own outbound slice.
   ".pact.del",
   ".settings-del",
   ".story-tile .story-ring.add",
   "#profile-cog",
   "#profile-arrange",
   "#profile-addfriend",
-  "#dm-compose",            // vp2: the DM composer bar (Photo + textarea + Send)
   "#profile-actions .ring-move",   // vp3: friend-profile ring-move (POST write)
   "#profile-actions .btn-danger",  // vp3: friend-profile Unfriend (POST write), scoped
 ];
 
 // The subset where a dropped `display: none` (not just a dropped selector)
 // is worth guarding against explicitly - the highest-traffic write doors.
-const LOAD_BEARING_SELECTORS = ["#dm-compose", "#profile-arrange"];
+const LOAD_BEARING_SELECTORS = ["#profile-arrange"];
 
 function escapeSelector(sel: string): string {
   // Space-separated compound selectors (e.g. ".story-tile .story-ring.add")
@@ -98,21 +98,33 @@ describe("vp1 read-only seam", () => {
     // the journal composer is no longer hidden under body.readonly
     expect(css).not.toMatch(/body\.readonly\s+\.composer\b/);
     // but these other write affordances are still hidden (note: .comment-composer
-    // and .rx-open are revealed in task-7; .pact.del, .settings-del etc. stay hidden)
-    for (const sel of ["#profile-wall-compose", "#dm-compose"]) {
+    // and .rx-open are revealed in task-7; #dm-compose is revealed in task-3;
+    // .pact.del, .settings-del etc. stay hidden)
+    for (const sel of ["#profile-wall-compose"]) {
       expect(css).toContain("body.readonly " + sel);
     }
   });
 
-  it("outbound-task-7: reaction picker + comment composer are REVEALED but profile/dm composers stay hidden", () => {
+  it("outbound-task-7: reaction picker + comment composer are REVEALED but profile composers stay hidden", () => {
     const css = web("style.css");
     // the reaction picker, comment composer, rx-open, and comment-x are no longer hidden
     for (const sel of [".rx-open", ".rx-picker", ".comment-composer", ".comment-x"]) {
       expect(css, `expected "${sel}" to NO LONGER be hidden under body.readonly`)
         .not.toMatch(selectorPresentRegex(sel));
     }
-    // but profile-wall-compose, dm-compose, and profile-arrange stay hidden
-    for (const sel of ["#profile-wall-compose", "#dm-compose", "#profile-arrange"]) {
+    // but profile-wall-compose and profile-arrange stay hidden
+    for (const sel of ["#profile-wall-compose", "#profile-arrange"]) {
+      expect(css).toContain("body.readonly " + sel);
+    }
+  });
+
+  it("outbound-task-3: dm composer is REVEALED but profile/arrange composers stay hidden", () => {
+    const css = web("style.css");
+    // dm-compose is no longer hidden under body.readonly
+    expect(css, `expected "#dm-compose" to NO LONGER be hidden under body.readonly`)
+      .not.toMatch(selectorPresentRegex("#dm-compose"));
+    // but profile-wall-compose and profile-arrange stay hidden
+    for (const sel of ["#profile-wall-compose", "#profile-arrange"]) {
       expect(css).toContain("body.readonly " + sel);
     }
   });

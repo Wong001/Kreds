@@ -1209,7 +1209,8 @@ body.lb-open { overflow: hidden; }   /* lock background scroll behind the lightb
    body.readonly. outbound-1: the journal `.composer` is now REVEALED (it
    posts to POST /api/post, natively composed+signed+pushed). outbound
    task-7: reaction picker + comment composer REVEALED (reactions+comments
-   seam). Everything else stays hidden until its own outbound slice. */
+   seam). outbound task-3: dm composer REVEALED (DM seam). Everything else
+   stays hidden until its own outbound slice. */
 body.readonly .pact.del,
 body.readonly .settings-del,
 body.readonly .story-tile .story-ring.add,
@@ -1217,7 +1218,6 @@ body.readonly #profile-cog,
 body.readonly #profile-arrange,
 body.readonly #profile-addfriend,
 body.readonly #profile-wall-compose,
-body.readonly #dm-compose,
 body.readonly #profile-actions .ring-move,
 body.readonly #profile-actions .btn-danger {
   display: none !important;

@@ -418,6 +418,79 @@ class LocalApiTest {
         assertArrayEquals(byteArrayOf(2), out["dm1"])
     }
 
+    // ---- fix (final review, pre-merge, brick-outbound-dm): expired-DM
+    // read-time filter. Desktop expires a DM by DELETING its row
+    // (hearth sync.py:273 runs store.sweep_expired() every tick); the
+    // phone has no sweep, so notExpiredDms() must filter at read time to
+    // stay behavior-equivalent with a desktop-after-sweep read. ----
+
+    @Test fun notExpiredDmsDropsPastKeepsFutureKeepsNullExpiry() {
+        val msgs = listOf(
+            LocalApi.Companion.DmMsg(
+                msgId = "expired", fromMe = true, createdAt = 10.0, expiresAt = 50.0,
+                text = "gone", blobs = emptyList(), undecryptable = false,
+                storyRef = null, partner = "cara"),
+            LocalApi.Companion.DmMsg(
+                msgId = "live", fromMe = true, createdAt = 20.0, expiresAt = 150.0,
+                text = "still here", blobs = emptyList(), undecryptable = false,
+                storyRef = null, partner = "cara"),
+            LocalApi.Companion.DmMsg(
+                msgId = "forever", fromMe = false, createdAt = 30.0, expiresAt = null,
+                text = "no expiry", blobs = emptyList(), undecryptable = false,
+                storyRef = null, partner = "cara"))
+        val now = 100.0     // strictly past "expired"'s 50.0, strictly before "live"'s 150.0
+        val out = LocalApi.notExpiredDms(msgs, now)
+        assertEquals(listOf("live", "forever"), out.map { it.msgId })
+    }
+
+    @Test fun notExpiredDmsTreatsExactlyNowAsExpired() {
+        // hearth's own boundary is `<=` (node.py:1594-1598) -- expires_at ==
+        // now must be dropped, not kept.
+        val msgs = listOf(LocalApi.Companion.DmMsg(
+            msgId = "boundary", fromMe = true, createdAt = 1.0, expiresAt = 100.0,
+            text = "t", blobs = emptyList(), undecryptable = false, storyRef = null, partner = "cara"))
+        assertTrue(LocalApi.notExpiredDms(msgs, now = 100.0).isEmpty())
+    }
+
+    @Test fun expiredDmAbsentFromThreadAndConversationsWhileLiveOneRemains() {
+        // End-to-end (short of the Context-backed loadDms()): extractDmMsgs
+        // -> notExpiredDms -> {threadFor, conversationsFrom} is production's
+        // exact pipeline (loadDms() calls these in this order). Proves an
+        // expired DM disappears from BOTH the thread view and the
+        // conversations list/preview/count -- the review's explicit ask --
+        // while a live DM (future expires_at) from the same partner
+        // survives in both.
+        val raw = listOf(
+            rawDm("expired", sender = "own", to = "cara", createdAt = 10.0, expiresAt = 50.0),
+            rawDm("live", sender = "cara", to = "own", createdAt = 20.0, expiresAt = 150.0))
+        val dec = mapOf("expired" to decDm("expired", "gone"), "live" to decDm("live", "still here"))
+        val now = 100.0
+        val msgs = LocalApi.notExpiredDms(LocalApi.extractDmMsgs(raw, dec, ownIdentityPub = "own"), now)
+
+        val thread = LocalApi.threadFor(msgs, partner = "cara")
+        assertEquals(listOf("live"), thread.map { it.msgId })
+
+        val convRows = LocalApi.conversationsFrom(msgs, mapOf("cara" to "Cara"), ownIdentityPub = "own")
+        assertEquals(1, convRows.size)
+        val c = convRows[0]
+        assertEquals("cara", c.identityPub)
+        assertEquals(1, c.count)                 // the expired dm must not inflate the count
+        assertEquals("still here", c.lastText)   // the expired dm must not be the stale preview
+        assertEquals(20.0, c.lastAt!!, 0.0)
+    }
+
+    @Test fun expiredDmOnlyMessageDropsConversationEntirely() {
+        // A partner whose ENTIRE history has expired must vanish from the
+        // conversations list too -- matching a desktop read after
+        // store.sweep_expired deleted the row, where no row means no
+        // conversation entry at all.
+        val raw = listOf(rawDm("expired", sender = "own", to = "cara", createdAt = 10.0, expiresAt = 50.0))
+        val dec = mapOf("expired" to decDm("expired", "gone"))
+        val msgs = LocalApi.notExpiredDms(LocalApi.extractDmMsgs(raw, dec, ownIdentityPub = "own"), now = 100.0)
+        assertTrue(LocalApi.threadFor(msgs, partner = "cara").isEmpty())
+        assertTrue(LocalApi.conversationsFrom(msgs, emptyMap(), ownIdentityPub = "own").isEmpty())
+    }
+
     // -- vp3 slice 3 Task 2: pure wall-assembly builders --
 
     private fun wallPost(
@@ -649,5 +722,71 @@ class LocalApiTest {
         assertTrue("a decimal-notation literal parses as BigDecimal, not Double",
             fracJson.get("created_at") is java.math.BigDecimal)
         assertEquals("1752900000.5", LocalApi.pyStr(fracJson.get("created_at")))
+    }
+
+    // -- Task 2: POST /api/dm parse helpers --
+    //
+    // parseExpiresSeconds mirrors api.py's `float(expires_seconds) if
+    // expires_seconds.strip() else None`. Kotlin's String.toDoubleOrNull()
+    // whitespace handling was pinned empirically (not assumed) before writing
+    // this: a throwaway probe test asserting " 60 ".toDoubleOrNull() ==
+    // "PROBE_SENTINEL" failed with `expected:<[PROBE_SENTINEL]> but
+    // was:<[60.0]>` (see build/test-results XML from that run) -- confirming
+    // toDoubleOrNull(), like java.lang.Double.parseDouble, trims leading/
+    // trailing whitespace itself, matching Python float()'s own whitespace
+    // handling for this case. The probe was removed once this was pinned.
+
+    @Test fun parseExpiresSecondsBlankAndWhitespaceAreNull() {
+        assertNull(LocalApi.parseExpiresSeconds(""))
+        assertNull(LocalApi.parseExpiresSeconds("   "))
+        assertNull(LocalApi.parseExpiresSeconds("\t\n"))
+    }
+
+    @Test fun parseExpiresSecondsTrimsSurroundingWhitespaceLikeToDoubleOrNull() {
+        // Pinned actual behavior (see comment above): toDoubleOrNull() trims
+        // whitespace the same way java.lang.Double.parseDouble/Python float()
+        // do, so " 60 " parses to 60.0, not null and not a throw.
+        assertEquals(60.0, LocalApi.parseExpiresSeconds(" 60 ")!!, 0.0)
+        assertEquals(60.0, LocalApi.parseExpiresSeconds("60")!!, 0.0)
+    }
+
+    @Test fun parseExpiresSecondsGarbageThrows() {
+        try {
+            LocalApi.parseExpiresSeconds("not-a-number")
+            fail("expected IllegalArgumentException")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("bad expires_seconds", e.message)
+        }
+    }
+
+    // parseStoryRef mirrors api.py's `_parse_json_field(story_ref,
+    // "story_ref")` (api.py:68-77): blank -> null, bad JSON -> a 400 naming
+    // the field. Conversion reuses the module's established org.json->Map
+    // idiom (MsgJson.jsonToMap/unwrapJson -- the same BigDecimal-aware bridge
+    // KotlinSync and MsgJson's own read side use), not a hand-rolled one.
+
+    @Test fun parseStoryRefBlankAndWhitespaceAreNull() {
+        assertNull(LocalApi.parseStoryRef(""))
+        assertNull(LocalApi.parseStoryRef("   "))
+    }
+
+    @Test fun parseStoryRefBadJsonThrows() {
+        try {
+            LocalApi.parseStoryRef("{not json")
+            fail("expected IllegalArgumentException")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("bad story_ref", e.message)
+        }
+    }
+
+    @Test fun parseStoryRefValidObjectRoundTripsIncludingFractionalNumber() {
+        val hash64 = "ab".repeat(32)
+        val raw = """{"story_id":"s1","media_hash":"$hash64","score":1752900000.5}"""
+        val m = LocalApi.parseStoryRef(raw)
+        assertEquals("s1", m!!["story_id"])
+        assertEquals(hash64, m["media_hash"])
+        // BigDecimal-aware unwrap: a decimal-notation JSON literal must come
+        // back as a plain Kotlin Double, not org.json's own BigDecimal.
+        assertEquals(1752900000.5, m["score"] as Double, 0.0)
     }
 }
