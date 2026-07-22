@@ -1,5 +1,6 @@
 package expo.modules.tormanager
 
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -10,6 +11,7 @@ import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.file.Files
+import java.security.SecureRandom
 
 class KotlinPairingTest {
 
@@ -112,17 +114,37 @@ class KotlinPairingTest {
     // KotlinPairing.installPackage
     // =======================================================================
 
-    private fun certJson(identityPub: String, devicePub: String, name: String = "Desktop"): JSONObject =
-        JSONObject().apply {
-            put("identity_pub", identityPub); put("device_pub", devicePub)
-            put("device_name", name); put("enrolled_at", 1752900000.0)
-            put("signature", "ab".repeat(64))
-        }
+    /** A fresh real Ed25519 keypair (privHex, pubHex) -- installPackage now
+     *  verifies actual crypto (cert signature + identity_priv derivation),
+     *  so hand-rolled "11".repeat(32)-style fixtures no longer pass; every
+     *  test below mints real keys the same way ComposeTest/DecryptPassTest/
+     *  SyncStoreTest already do. */
+    private fun genKeypair(): Pair<String, String> {
+        val p = Ed25519PrivateKeyParameters(SecureRandom())
+        return KotlinWire.toHex(p.encoded) to KotlinWire.toHex(p.generatePublicKey().encoded)
+    }
+
+    /** A REALLY signed CertDict: `identityPriv` signs `certBody` (the exact
+     *  body KotlinWire.verifyCert checks), same two-step "unsigned then
+     *  .copy(signature=...)" idiom certBody's own callers use (it excludes
+     *  the signature field itself, so the placeholder value doesn't matter). */
+    private fun signedCert(
+        identityPriv: String, identityPub: String, devicePub: String,
+        name: String = "Desktop", enrolledAt: Double = 1752900000.0,
+    ): KotlinWire.CertDict {
+        val unsigned = KotlinWire.CertDict(identityPub, devicePub, name, enrolledAt, "")
+        return unsigned.copy(signature = KotlinWire.signRaw(identityPriv, KotlinWire.certBody(unsigned)))
+    }
+
+    private fun certJson(c: KotlinWire.CertDict): JSONObject = JSONObject().apply {
+        put("identity_pub", c.identity_pub); put("device_pub", c.device_pub)
+        put("device_name", c.device_name); put("enrolled_at", c.enrolled_at)
+        put("signature", c.signature)
+    }
 
     private fun packageJson(
-        identityPub: String = "11".repeat(32),
-        devicePub: String = "22".repeat(32),
-        identityPriv: String = "33".repeat(32),
+        cert: KotlinWire.CertDict,
+        identityPriv: String,
         friends: List<String> = listOf("44".repeat(32), "55".repeat(32)),
         myAddr: String? = "abcexampleaddr.onion:9997",
         t: String = "hearth-pair-package",
@@ -130,7 +152,7 @@ class KotlinPairingTest {
         val o = JSONObject()
         o.put("t", t)
         o.put("protocol", KotlinWire.PROTOCOL)
-        o.put("cert", certJson(identityPub, devicePub))
+        o.put("cert", certJson(cert))
         o.put("identity_priv", identityPriv)
         o.put("friends", JSONArray(friends))
         // Real hearth peers shape (node.py store.list_peers()): [{address,
@@ -146,23 +168,22 @@ class KotlinPairingTest {
 
     @Test fun installPackageHappyPath() {
         val store = InMemorySyncStore()
-        val identityPub = "11".repeat(32)
-        val devicePubInCert = "22".repeat(32)
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()   // the keypair WE generated (pair_request side)
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
         val friendA = "44".repeat(32)
         val friendB = "55".repeat(32)
-        val pkg = packageJson(identityPub = identityPub, devicePub = devicePubInCert,
-            identityPriv = "33".repeat(32), friends = listOf(friendA, friendB),
-            myAddr = "homenode.onion:9997")
+        val pkg = packageJson(cert, identityPriv, friends = listOf(friendA, friendB), myAddr = "homenode.onion:9997")
 
         val identity = KotlinPairing.installPackage(
-            store, pkg, devicePriv = "dpriv-local", devicePub = "dpub-local", deviceName = "My Phone")
+            store, pkg, devicePriv = localDevicePriv, devicePub = localDevicePub, deviceName = "My Phone")
 
         // -- returned Identity record -----------------------------------
-        assertEquals("dpriv-local", identity.device_priv)
-        assertEquals("dpub-local", identity.device_pub)
+        assertEquals(localDevicePriv, identity.device_priv)
+        assertEquals(localDevicePub, identity.device_pub)
         assertEquals(identityPub, identity.cert.identity_pub)
-        assertEquals(devicePubInCert, identity.cert.device_pub)
-        assertEquals("33".repeat(32), identity.identity_priv)
+        assertEquals(localDevicePub, identity.cert.device_pub)
+        assertEquals(identityPriv, identity.identity_priv)
         assertEquals("homenode.onion:9997", identity.onion_addr)
 
         // -- store.addIdentity(self) -- mirrors add_identity(..., is_self=True) --
@@ -176,9 +197,12 @@ class KotlinPairingTest {
 
     @Test fun installPackageWrongTThrows() {
         val store = InMemorySyncStore()
-        val pkg = packageJson(t = "hearth-pair-request")
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
+        val pkg = packageJson(cert, identityPriv, t = "hearth-pair-request")
         val ex = assertThrows(IllegalArgumentException::class.java) {
-            KotlinPairing.installPackage(store, pkg, "dpriv", "dpub", "name")
+            KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "name")
         }
         assertTrue(ex.message?.contains("pairing package") == true)
         // Nothing mutated on rejection.
@@ -187,11 +211,87 @@ class KotlinPairingTest {
 
     @Test fun installPackageNoFriendsNoMyAddr() {
         val store = InMemorySyncStore()
-        val identityPub = "11".repeat(32)
-        val pkg = packageJson(identityPub = identityPub, friends = emptyList(), myAddr = null)
-        val identity = KotlinPairing.installPackage(store, pkg, "dpriv", "dpub", "name")
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
+        val pkg = packageJson(cert, identityPriv, friends = emptyList(), myAddr = null)
+        val identity = KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "name")
         assertEquals("", identity.onion_addr)
         assertEquals(setOf(identityPub), store.knownIdentities().toSet())
+    }
+
+    /** Post-review Important fix: installPackage must VERIFY BEFORE
+     *  MUTATING, mirroring hearth's device.install (identity.py:295-303,
+     *  called by pair_install BEFORE its store writes, node.py:2044-2050). */
+    @Test fun installPackageTamperedCertSignatureThrows() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val goodCert = signedCert(identityPriv, identityPub, localDevicePub)
+        // Flip a signed field after signing -- signature no longer matches certBody.
+        val tampered = goodCert.copy(device_name = "Tampered Name")
+        val pkg = packageJson(tampered, identityPriv)
+
+        val ex = assertThrows(IllegalArgumentException::class.java) {
+            KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "name")
+        }
+        assertEquals("cert signature invalid", ex.message)
+        assertTrue("store must be untouched on a rejected install", store.knownIdentities().isEmpty())
+    }
+
+    @Test fun installPackageDevicePubMismatchThrows() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val (_, someOtherDevicePub) = genKeypair()
+        // Validly signed, but for a DIFFERENT device than the one devicePub names.
+        val cert = signedCert(identityPriv, identityPub, someOtherDevicePub)
+        val pkg = packageJson(cert, identityPriv)
+
+        val ex = assertThrows(IllegalArgumentException::class.java) {
+            KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "name")
+        }
+        assertTrue(ex.message?.contains("device_pub") == true)
+        assertTrue(store.knownIdentities().isEmpty())
+    }
+
+    @Test fun installPackageIdentityPrivMismatchThrows() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val (wrongIdentityPriv, _) = genKeypair()   // a DIFFERENT identity's priv
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        // Cert is validly signed by the REAL identity...
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
+        // ...but the package hands us a DIFFERENT identity_priv (doesn't derive cert.identity_pub).
+        val pkg = packageJson(cert, wrongIdentityPriv)
+
+        val ex = assertThrows(IllegalArgumentException::class.java) {
+            KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "name")
+        }
+        assertTrue(ex.message?.contains("identity_priv") == true)
+        assertTrue(store.knownIdentities().isEmpty())
+    }
+
+    @Test fun installPackageMissingFieldOrGarbageJsonThrows() {
+        val store = InMemorySyncStore()
+        val (_, localDevicePub) = genKeypair()
+        val localDevicePriv = genKeypair().first
+
+        assertThrows(IllegalArgumentException::class.java) {
+            KotlinPairing.installPackage(store, "{ not valid json", localDevicePriv, localDevicePub, "name")
+        }
+        assertTrue(store.knownIdentities().isEmpty())
+
+        // Well-formed JSON, correct t, but "cert" is missing entirely.
+        val missingCert = JSONObject().apply {
+            put("t", "hearth-pair-package"); put("protocol", KotlinWire.PROTOCOL)
+            put("identity_priv", "aa".repeat(32))
+        }.toString()
+        val ex = assertThrows(IllegalArgumentException::class.java) {
+            KotlinPairing.installPackage(store, missingCert, localDevicePriv, localDevicePub, "name")
+        }
+        assertEquals("bad package", ex.message)
+        assertTrue(store.knownIdentities().isEmpty())
     }
 
     // =======================================================================

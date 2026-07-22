@@ -1,6 +1,8 @@
 package expo.modules.tormanager
 
 import org.bouncycastle.crypto.digests.SHA3Digest
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.json.JSONException
 import org.json.JSONObject
 import java.math.BigInteger
 
@@ -181,16 +183,28 @@ object KotlinPairing {
      *  authoritative device_name is `cert.device_name` (the desktop echoes
      *  back exactly what buildRequestFrame sent, node.py:2022-2023).
      *
-     *  NOTE (deferred, flagged not silently skipped): hearth's own
-     *  `pair_install` -> `DeviceKeys.install` (identity.py:295-303) verifies
-     *  `cert.verify()`, `cert.device_pub == self.device_pub`, and that
-     *  `identity_priv` actually derives `cert.identity_pub`, before
-     *  accepting a package. This Kotlin mirror does not repeat those checks
-     *  (out of Task 3's brief scope) -- a malformed/forged package would
-     *  currently install without complaint here, and only fail later, the
-     *  first time this identity's cert is presented at a real HELLO
-     *  (KotlinHandshake.verifyCert). Fail-eventually, not fail-fast; carried
-     *  as a follow-up. */
+     *  VERIFY BEFORE MUTATING (post-review fix): mirrors hearth's own
+     *  `pair_install` -> `DeviceKeys.install` (identity.py:295-303), which
+     *  runs its checks BEFORE `pair_install`'s store writes
+     *  (node.py:2044-2050). Three checks, in this order, all before any
+     *  `store.addIdentity` call:
+     *   1. `KotlinWire.verifyCert(cert)` -- the cert's own signature
+     *      (already used for exactly this CertDict shape at
+     *      KotlinHandshake.kt:97/169).
+     *   2. `cert.device_pub == devicePub` -- the package must be enrolling
+     *      THIS device's own keypair (the one `devicePriv`/`devicePub`
+     *      belong to), not some other device's cert.
+     *   3. `identityPriv` actually derives `cert.identity_pub` (Ed25519
+     *      public-key derivation via BouncyCastle, the same idiom
+     *      EncKeys.kt:35-41 uses for the X25519 analog) -- a cert can be
+     *      validly signed by a DIFFERENT identity than the one whose
+     *      "identity_priv" the package hands us; this catches that.
+     *  Each failure throws IllegalArgumentException with a distinct
+     *  message. Any malformed/missing-field JSON (bad `t`-adjacent
+     *  structure aside, which keeps its own "not a pairing package"
+     *  message) surfaces as IllegalArgumentException("bad package") rather
+     *  than a raw org.json.JSONException, so callers (Task 4's
+     *  runCeremony) only ever need to catch one exception family. */
     fun installPackage(
         store: SyncStore,
         pkgJson: String,
@@ -198,25 +212,53 @@ object KotlinPairing {
         devicePub: String,
         deviceName: String,
     ): PairingStore.Identity {
-        val pkg = JSONObject(pkgJson)
+        val pkg = try { JSONObject(pkgJson) } catch (e: JSONException) {
+            throw IllegalArgumentException("bad package")
+        }
         if (pkg.optString("t") != "hearth-pair-package")
             throw IllegalArgumentException("not a pairing package")
 
-        val certJson = pkg.getJSONObject("cert")
-        val cert = KotlinWire.CertDict(
-            certJson.getString("identity_pub"), certJson.getString("device_pub"),
-            certJson.getString("device_name"), certJson.getDouble("enrolled_at"),
-            certJson.getString("signature"))
-        val identityPriv = pkg.getString("identity_priv")
+        val cert: KotlinWire.CertDict
+        val identityPriv: String
+        val friends: List<String>
+        val onionAddr: String
+        try {
+            val certJson = pkg.getJSONObject("cert")
+            cert = KotlinWire.CertDict(
+                certJson.getString("identity_pub"), certJson.getString("device_pub"),
+                certJson.getString("device_name"), certJson.getDouble("enrolled_at"),
+                certJson.getString("signature"))
+            identityPriv = pkg.getString("identity_priv")
+            val friendsArr = pkg.optJSONArray("friends")
+            friends = if (friendsArr != null) (0 until friendsArr.length()).map { friendsArr.getString(it) }
+                      else emptyList()
+            onionAddr = pkg.optString("my_addr", "")
+        } catch (e: JSONException) {
+            throw IllegalArgumentException("bad package")
+        }
+
+        // -- verify BEFORE mutating (see doc above) --------------------------
+        if (!KotlinWire.verifyCert(cert))
+            throw IllegalArgumentException("cert signature invalid")
+        if (cert.device_pub != devicePub)
+            throw IllegalArgumentException("cert device_pub does not match this device's device_pub")
+        if (!identityPrivMatchesPub(identityPriv, cert.identity_pub))
+            throw IllegalArgumentException("identity_priv does not derive cert.identity_pub")
 
         store.addIdentity(cert.identity_pub)
-
-        val friends = pkg.optJSONArray("friends")
-        if (friends != null) for (i in 0 until friends.length()) store.addIdentity(friends.getString(i))
-
+        for (f in friends) store.addIdentity(f)
         // peers: intentionally dropped (see doc above)
-        val onionAddr = pkg.optString("my_addr", "")
 
         return PairingStore.Identity(devicePriv, devicePub, cert, identityPriv, onionAddr)
     }
+
+    /** Same idiom as EncKeys.pubMatchesPriv/derivePub (X25519 analog): any
+     *  derivation failure (malformed hex, wrong length, etc.) is treated as
+     *  "does not match", not propagated as a crash -- installPackage turns
+     *  a `false` here into its own IllegalArgumentException. */
+    private fun identityPrivMatchesPub(privHex: String, pubHex: String): Boolean = try {
+        val derived = KotlinWire.toHex(
+            Ed25519PrivateKeyParameters(KotlinWire.fromHex(privHex), 0).generatePublicKey().encoded)
+        derived == pubHex
+    } catch (e: Exception) { false }
 }
