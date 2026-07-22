@@ -161,6 +161,9 @@ acceptance currently requires the CLI).
 ## Out of scope (arc 2+ / tickets)
 
 Create-new-profile on phone (button stubs to coming-soon); phone-enrolls-
-desktop ("vice versa"); at-rest sealing of identity_priv on the phone;
+desktop ("vice versa"); at-rest sealing of identity_priv on the phone —
+August's direction (2026-07-22) for that later arc: consider an opt-in
+panic-wipe ("nuke profile after N failed unlock attempts") or similar
+alongside an App-lock analog — its own design conversation;
 phone-side unlink/log-out; iOS; visual-parity polish of the first-load
 screen; multi-QR/NFC channels.
