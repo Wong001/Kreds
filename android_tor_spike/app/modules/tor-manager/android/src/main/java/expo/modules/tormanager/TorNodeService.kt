@@ -25,6 +25,11 @@ class TorNodeService : Service() {
         const val ACTION_BEAT_NOW = "eu.kreds.torspike.BEAT_NOW"
         const val BROADCAST_BEAT = "eu.kreds.torspike.BEAT"
         const val BROADCAST_STATE = "eu.kreds.torspike.STATE"
+        // Task 6 (phone-onion-reachability): self-revoke -> full wipe to
+        // First-Load. TorManagerModule's own BroadcastReceiver (mirroring
+        // its existing BROADCAST_BEAT/BROADCAST_STATE handling) listens for
+        // this and bridges it to the RN-facing "revoked" event.
+        const val BROADCAST_REVOKED = "eu.kreds.torspike.REVOKED"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, TorNodeService::class.java)
@@ -33,6 +38,53 @@ class TorNodeService : Service() {
         }
         fun stop(ctx: Context) = ctx.startService(Intent(ctx, TorNodeService::class.java).setAction(ACTION_STOP))
         fun beatNow(ctx: Context) = ctx.startService(Intent(ctx, TorNodeService::class.java).setAction(ACTION_BEAT_NOW))
+
+        /** Self-revoke -> full wipe to First-Load (Task 6; node.py:3144's
+         *  `enter_revoked_state` is the desktop analog: destroy ALL key
+         *  material, drop the whole synced store). The phone-side
+         *  counterpart destroys pairing.json (device_priv + identity_priv,
+         *  PairingStore.wipe) and the legacy external fixture, and drops
+         *  the whole sync_store.db (identities/messages/blobs/keys --
+         *  INCLUDING the enc keypair, which lives in that DB's `keys`
+         *  table -- /pending_outbound/meta/revoked_devices; see
+         *  SqliteSyncStore.wipe's doc for why no separate blob-cache clear
+         *  is needed beyond that).
+         *
+         *  A STATIC/companion function taking a bare Context, not an
+         *  instance method: it has TWO independent call sites with no
+         *  shared TorNodeService instance -- SyncRunner.runSync (the
+         *  outbound path; reached from BOTH this service's own syncCycle
+         *  AND the foreground TorManagerModule.syncNow, since both funnel
+         *  through the same SyncRunner choke point) and GossipServer's
+         *  onSelfRevoked callback (the inbound serve path, wired in
+         *  startGossipServer() below). Only the latter is even reached FROM
+         *  a running TorNodeService instance -- the former can fire with no
+         *  TorNodeService instance alive at all (a foreground-only sync,
+         *  background service never started).
+         *
+         *  Order: wipe identity + store FIRST -- a caller polling
+         *  hasIdentity() must never observe a window where the old identity
+         *  is still readable after SelfRevoked has already been detected --
+         *  THEN best-effort stop() the foreground service (a harmless
+         *  intent even if no instance is currently running; if one IS
+         *  running, its own shutdown() closes gossipStore/gossipServer and
+         *  cancels the sync scheduler) -- THEN broadcast, so
+         *  TorManagerModule's receiver can sendEvent("revoked", ...) to the
+         *  RN layer (FirstLoad.tsx re-checks hasIdentity(), now false, and
+         *  un-links back to the menu).
+         *
+         *  Idempotent: PairingStore.wipe/SqliteSyncStore.wipe both
+         *  delete-if-present (never throws on an absent target), and
+         *  stop()/the broadcast are harmless repeats -- a second
+         *  SelfRevoked observed after the first wipe (e.g. the inbound
+         *  serve path noticing moments after an outbound sync already
+         *  wiped) does nothing further. */
+        fun enterRevokedState(ctx: Context) {
+            PairingStore.wipe(ctx)
+            SqliteSyncStore.wipe(ctx)
+            stop(ctx)
+            ctx.sendBroadcast(Intent(BROADCAST_REVOKED).setPackage(ctx.packageName))
+        }
     }
 
     @Volatile private var scheduler: ScheduledExecutorService? = null
@@ -125,6 +177,11 @@ class TorNodeService : Service() {
         gossipStore = store
         gossipServer = GossipServer(
             store, { PairingStore.readFixtureOrNull(this) }, SyncRunner.syncLock, port = 0,
+            // Task 6: an inbound sync revealing our own revocation drives
+            // the same wipe the outbound path (SyncRunner.runSync) does --
+            // see GossipServer's onSelfRevoked doc and enterRevokedState's
+            // own doc for the full ordering/idempotency contract.
+            onSelfRevoked = { enterRevokedState(this) },
         ).also { it.start() }
     }
 

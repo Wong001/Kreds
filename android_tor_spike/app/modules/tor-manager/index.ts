@@ -273,6 +273,21 @@ export function onPairProgress(cb: (p: { stage: string }) => void): () => void {
   return () => sub.remove();
 }
 
+// Task 6 (phone-onion-reachability): fires once this device's own identity
+// has just been wiped -- TorNodeService.enterRevokedState (self-revoked, or
+// a sibling device observing our revocation) deletes pairing.json + the
+// synced store and broadcasts, which the native module bridges to this
+// event (registered in TorManagerModule's Events(...) list -- an
+// unregistered event name silently drops, see that list's own comment).
+// The payload carries nothing (there is nothing left to report); the
+// listener's whole job is to re-check hasIdentity() (now false) and drop
+// back to the First-Load menu -- mirrors how onPairProgress/onState are
+// consumed, see FirstLoad.tsx.
+export function onRevoked(cb: () => void): () => void {
+  const sub = native.addListener("revoked", () => cb());
+  return () => sub.remove();
+}
+
 export function onSync(cb: (r: {
   ok: boolean; messages: number; blobs: number; identities: number; reason?: string;
   // Task 7 (B.2): true iff this sync completed successfully and the decrypted

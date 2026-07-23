@@ -72,6 +72,34 @@ class SqliteSyncStore(context: Context) :
         // non-destructive IF NOT EXISTS pattern as the tables above.
         private const val CREATE_REVOKED_DEVICES_TABLE_SQL =
             "CREATE TABLE IF NOT EXISTS revoked_devices (device_pub TEXT PRIMARY KEY, last_valid_seq INTEGER NOT NULL)"
+
+        /** Task 6 (phone-onion-reachability): revocation wipe -- drops the
+         *  WHOLE on-disk sync_store.db (identities/messages/blobs/keys --
+         *  INCLUDING the enc keypair, EncKeys.getOrCreate's persisted
+         *  enc_priv/enc_pub, which lives in this DB's `keys` table --
+         *  /pending_outbound/meta/revoked_devices), not a per-table clear.
+         *  `Context.deleteDatabase`, not a bare `File.delete` on the .db
+         *  path alone: it also removes the SQLite journal siblings
+         *  (-wal/-shm/-journal, depending on journal mode) that can sit
+         *  next to the main file, so no fragment of the wiped store is left
+         *  behind. Idempotent: deleteDatabase on an already-absent DB
+         *  simply returns false, never throws -- a second wipe (e.g. a
+         *  second SelfRevoked observed after the first already deleted it)
+         *  is a safe no-op. Any already-open SqliteSyncStore/
+         *  SQLiteOpenHelper connection (e.g. TorNodeService's own
+         *  long-lived gossipStore) is unaffected mid-call -- Android
+         *  (Linux) allows unlinking a file an existing handle still has
+         *  open; that handle's data is freed once it eventually closes, and
+         *  every NEW SqliteSyncStore(ctx) opened after this call gets a
+         *  fresh, empty database (onCreate reruns, since the file is
+         *  gone). No separate on-disk blob cache exists to clear beyond
+         *  this DB -- blob bytes live in its `blobs` table only
+         *  (getBlobImage/MediaServer resolve straight from the DB into
+         *  memory; nothing is ever written back out to a filesystem
+         *  cache). */
+        fun wipe(ctx: Context) {
+            ctx.deleteDatabase(DB_NAME)
+        }
     }
 
     override fun onCreate(db: SQLiteDatabase) {

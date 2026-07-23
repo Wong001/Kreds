@@ -5,7 +5,7 @@ import {
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import {
-  bootstrap, hasIdentity, onPairProgress, pairWithNode, PairStatus,
+  bootstrap, hasIdentity, onPairProgress, onRevoked, pairWithNode, PairStatus,
 } from "./modules/tor-manager";
 import WebShell from "./WebShell";
 
@@ -74,6 +74,23 @@ export default function FirstLoad() {
       if (stage === "dialing" || stage === "waiting") {
         setScreen((s) => (s.kind === "pairing" ? { kind: "pairing", phase: stage } : s));
       }
+    });
+    return off;
+  }, []);
+
+  // Task 6 (phone-onion-reachability): this device's identity was just
+  // wiped (TorNodeService.enterRevokedState -- self-revoked, or a sibling
+  // device observing our revocation) -- drop back to the menu screen.
+  // setLinked(false) is what actually un-mounts WebShell (the `if (linked)
+  // return <WebShell />` guard below); setScreen resets any stale
+  // leftover screen state (e.g. a lingering "success" from the original
+  // pairing flow, still sitting in this component's state from long
+  // before the revoke) so the user sees the ordinary Link/Start-new-profile
+  // menu, not confusing leftover copy.
+  useEffect(() => {
+    const off = onRevoked(() => {
+      setLinked(false);
+      setScreen({ kind: "menu" });
     });
     return off;
   }, []);

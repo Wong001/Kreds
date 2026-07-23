@@ -112,6 +112,22 @@ object SyncRunner {
             // is empty after round 1, so this is a single round -- the extra
             // rounds happen only when there is a real backlog to drain.
             var last = runTransport(ctx, fx, onProgress)
+            // Task 6 (phone-onion-reachability): the outbound path's
+            // SelfRevoked trigger -- this is the ONE choke point every
+            // outbound sync runs through (TorNodeService's own background
+            // syncCycle and TorManagerModule's foreground syncNow both call
+            // this same runSync), so wiring it here covers both callers at
+            // once, rather than duplicating the check at each call site.
+            // See TorNodeService.enterRevokedState's doc for the full
+            // ordering/idempotency contract; safe to call while still
+            // holding `syncLock` above (enterRevokedState never blocks on
+            // or re-acquires it -- PairingStore.wipe/SqliteSyncStore.wipe
+            // are plain file I/O, and stop()/the broadcast are both
+            // fire-and-forget). last.selfRevoked implies !last.ok (see
+            // mapSyncResult), so the guard just below still returns
+            // immediately after this -- the drain loop never runs a
+            // further round on a revoked identity.
+            if (last.selfRevoked) TorNodeService.enterRevokedState(ctx)
             if (!last.ran || !last.ok) return last
             var rounds = 1
             while (rounds < MAX_DRAIN_ROUNDS &&

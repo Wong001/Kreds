@@ -104,6 +104,19 @@ class GossipServer(
     private val fixtureProvider: () -> KotlinHandshake.Fixture?,
     private val lock: ReentrantLock,
     private val port: Int = 0,
+    // Task 6 (phone-onion-reachability): fired when an inbound `serve()`
+    // reveals OUR OWN device was revoked (a peer's REVOCATIONS frame naming
+    // fixture.device_pub -- see KotlinSync.serve's own SelfRevoked check,
+    // already unit-proven at KotlinSync's level). Defaults to a no-op so
+    // every pre-existing call site (GossipServerTest's earlier tests) keeps
+    // compiling/behaving unchanged. The ONE production call site
+    // (TorNodeService.startGossipServer) passes `{ enterRevokedState(this) }`
+    // -- the SAME wipe SyncRunner's outbound path triggers, see
+    // TorNodeService.enterRevokedState's doc for the full ordering/
+    // idempotency contract. Invoked from `handle`'s worker thread, AFTER
+    // `lock` has been released (see `handle`'s own comment for why that
+    // ordering matters) -- never called while holding `lock`.
+    private val onSelfRevoked: () -> Unit = {},
 ) {
     companion object {
         // Bounds how long an accepted connection's read/write calls may block
@@ -188,13 +201,17 @@ class GossipServer(
             // (the `finally` below) rather than attempting a handshake that
             // can only fail deep inside respondHandshake's writeFrame.
             val fixture = fixtureProvider() ?: return
+            // Task 6: captured inside the lock, read outside it (just past
+            // the inner try/finally below) -- see the read site's comment
+            // for why onSelfRevoked must run only after `lock.unlock()`.
+            var syncResult: SyncResult? = null
             lock.lock()
             try {
                 val result = KotlinHandshake.respondHandshake(
                     stream, fixture, isKnown = { store.knownIdentities().contains(it) },
                     isRevoked = { store.isRevokedDevice(it) })
                 if (result is KotlinHandshake.HandshakeResult.Ok) {
-                    KotlinSync.serve(stream, store, fixture, result.peerCert)
+                    syncResult = KotlinSync.serve(stream, store, fixture, result.peerCert)
                 }
                 // Refused/Failed: respondHandshake never closes the stream by
                 // contract (its own doc comment -- a caller that continues on
@@ -204,6 +221,19 @@ class GossipServer(
             } finally {
                 lock.unlock()
             }
+            // Task 6 (phone-onion-reachability): an inbound sync that just
+            // revealed OUR OWN device was revoked drives the same wipe the
+            // outbound path (SyncRunner.runSync) triggers. Checked here,
+            // deliberately OUTSIDE `lock` (already released above):
+            // onSelfRevoked's production implementation
+            // (TorNodeService.enterRevokedState) ultimately calls
+            // TorNodeService.stop(ctx), which only POSTS an ACTION_STOP
+            // intent (async, returns immediately, never re-enters this
+            // lock) -- but running it after unlock() avoids the needless
+            // hazard of a wipe/stop callback executing while this worker
+            // still holds the process-wide lock every other connection/
+            // outbound sync is waiting on.
+            if (syncResult is SyncResult.SelfRevoked) onSelfRevoked()
         } catch (e: Exception) {
             // Per-connection catch-all (garbage first frame, peer closed
             // mid-read, malformed JSON, an oversized length prefix, ...): one
