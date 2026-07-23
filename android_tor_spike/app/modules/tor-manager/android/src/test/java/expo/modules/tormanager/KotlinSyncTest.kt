@@ -150,6 +150,120 @@ class KotlinSyncTest {
     }
 
     // =======================================================================
+    // run() -- REVOCATIONS phase ingest (phone-onion-reachability Task 3).
+    // `genKeypair` is reused unqualified from GossipServerTest.kt (top-level
+    // `internal fun` in the same package/test source set -- that file's own
+    // doc comment already states the "mirror it, don't reinvent" rationale
+    // for sharing it rather than duplicating a THIRD copy here).
+    // RespondingStream (declared below, this file) works identically for
+    // `run` as for `serve`: it only cares about the ORDER of `readExactSync`
+    // calls, which is REVOCATIONS -> DEFRIENDS -> HAVE -> MESSAGES ->
+    // BLOB_WANT -> BLOBS either way -- `run`'s writes (recorded into
+    // `written`, never consulted by these tests) are simply interleaved
+    // differently (write-then-read per phase, vs. serve's read-then-write).
+    // =======================================================================
+
+    /** A REALLY identity-signed RevocationCert -- mirrors RevocationCertTest's
+     *  own `signedRevocation` helper exactly (duplicated here per this
+     *  file's own stated precedent for RespondingStream: "a fresh
+     *  file-scoped fake per test file" rather than a shared one). */
+    private fun signedRevocation(
+        identityPriv: String, identityPub: String, devicePub: String,
+        lastValidSeq: Int, revokedAt: Double = 1752900000.0,
+    ): RevocationCert {
+        val unsigned = RevocationCert(identityPub, devicePub, lastValidSeq, revokedAt, "")
+        return unsigned.copy(signature = KotlinWire.signRaw(identityPriv, unsigned.body()))
+    }
+
+    @Test fun runIngestsValidPeerRevocationForKnownFriendDeviceAndRetroDrops() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val devicePriv = "44".repeat(32)
+        val devicePub = devPub(devicePriv)
+        store.addIdentity(identityPub)
+        val m1 = identityMsg(identityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
+        val m2 = identityMsg(identityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devicePriv)
+        val m3 = identityMsg(identityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devicePriv)
+        assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2)); assertTrue(store.ingestMessage(m3))
+
+        val rev = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 2)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32))
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertTrue("device now revoked via wire-ingested cert", store.isRevokedDevice(devicePub))
+        val remaining = store.allMessages().map { it.msgId }.toSet()
+        assertTrue("seq<=lastValid kept (seq 1)", m1.msgId() in remaining)
+        assertTrue("seq<=lastValid kept (seq 2)", m2.msgId() in remaining)
+        assertFalse("seq>lastValid retro-dropped (seq 3) -- cross-check with Task 2's markRevoked", m3.msgId() in remaining)
+    }
+
+    @Test fun runDoesNotIngestRevocationForUnknownIdentity() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()   // deliberately NOT addIdentity'd
+        val devicePub = "55".repeat(32)
+        val rev = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 0)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32))
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("unknown identity -> never ingested", store.isRevokedDevice(devicePub))
+    }
+
+    @Test fun runSurfacesSelfRevokedWhenPeerRevocationNamesOwnDeviceRegardlessOfIngestOutcome() {
+        val store = InMemorySyncStore()
+        // A DIFFERENT identity, not known to us -- proves SelfRevoked fires
+        // off the raw device_pub comparison, independent of whether
+        // ingestRevocation itself would have accepted this cert.
+        val (identityPriv, identityPub) = genKeypair()
+        val ownDevicePub = "aa".repeat(32)
+        val rev = signedRevocation(identityPriv, identityPub, ownDevicePub, lastValidSeq = 0)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            // run() returns before reading any further frame.
+        ))
+        val result = KotlinSync.run(stream, store, ownDevicePub = ownDevicePub)
+        assertEquals(SyncResult.SelfRevoked, result)
+        assertFalse("unknown-identity cert was still not ingested", store.isRevokedDevice(ownDevicePub))
+    }
+
+    @Test fun runDoesNotIngestRevocationWithTamperedSignature() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val devicePub = "66".repeat(32)
+        store.addIdentity(identityPub)
+        val good = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 0)
+        val tampered = good.copy(last_valid_seq = 999)   // signature no longer matches body()
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(tampered.toDict())),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32))
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("tampered signature -> never ingested", store.isRevokedDevice(devicePub))
+    }
+
+    // =======================================================================
     // serve() -- the RESPONDER content phases (gossip server Task 3).
     // Mirrors _session (sync.py:643-825) in REVERSE I/O order vs. `run`
     // above (responder = read-then-write per phase, KotlinHandshake.kt:76).
@@ -392,5 +506,119 @@ class KotlinSyncTest {
         assertTrue("expected Ok, got $result", result is SyncResult.Ok)
         assertTrue("own-device trust adopts the sibling's known identity",
             store.knownIdentities().contains(newFriendPub))
+    }
+
+    // =======================================================================
+    // serve() -- REVOCATIONS phase ingest (phone-onion-reachability Task 3).
+    // Same read-call ORDER as `run`'s own REVOCATIONS tests above (REVOCATIONS
+    // -> DEFRIENDS -> HAVE -> MESSAGES -> BLOB_WANT -> BLOBS) -- only the
+    // write/read INTERLEAVING per phase differs (responder: read-then-write).
+    // =======================================================================
+
+    @Test fun serveIngestsValidPeerRevocationForKnownFriendDeviceAndRetroDrops() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+
+        val (identityPriv, identityPub) = genKeypair()
+        val devicePriv = "77".repeat(32)
+        val devicePub = devPub(devicePriv)
+        store.addIdentity(identityPub)
+        val m1 = identityMsg(identityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
+        val m2 = identityMsg(identityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devicePriv)
+        val m3 = identityMsg(identityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devicePriv)
+        assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2)); assertTrue(store.ingestMessage(m3))
+
+        val rev = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 2)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertTrue("device now revoked via wire-ingested cert", store.isRevokedDevice(devicePub))
+        val remaining = store.allMessages().map { it.msgId }.toSet()
+        assertTrue("seq<=lastValid kept (seq 1)", m1.msgId() in remaining)
+        assertTrue("seq<=lastValid kept (seq 2)", m2.msgId() in remaining)
+        assertFalse("seq>lastValid retro-dropped (seq 3) -- cross-check with Task 2's markRevoked", m3.msgId() in remaining)
+    }
+
+    @Test fun serveDoesNotIngestRevocationForUnknownIdentity() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+
+        val (identityPriv, identityPub) = genKeypair()   // deliberately NOT addIdentity'd
+        val devicePub = "88".repeat(32)
+        val rev = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 0)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("unknown identity -> never ingested", store.isRevokedDevice(devicePub))
+    }
+
+    @Test fun serveSurfacesSelfRevokedWhenPeerRevocationNamesOwnDeviceRegardlessOfIngestOutcome() {
+        val ownIdentityPub = "aa".repeat(32)
+        val fixture = buildFixture(ownIdentityPub)   // fixture.device_pub is devPub("aa"-fixture's default "aa".repeat(32) priv)
+        val store = InMemorySyncStore()
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+
+        // A DIFFERENT identity, not known to us -- proves SelfRevoked fires
+        // off the raw device_pub comparison, independent of whether
+        // ingestRevocation itself would have accepted this cert.
+        val (identityPriv, identityPub) = genKeypair()
+        val rev = signedRevocation(identityPriv, identityPub, fixture.device_pub, lastValidSeq = 0)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            // serve() returns before reading any further frame.
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertEquals(SyncResult.SelfRevoked, result)
+        assertFalse("unknown-identity cert was still not ingested", store.isRevokedDevice(fixture.device_pub))
+    }
+
+    @Test fun serveDoesNotIngestRevocationWithTamperedSignature() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+
+        val (identityPriv, identityPub) = genKeypair()
+        val devicePub = "99".repeat(32)
+        store.addIdentity(identityPub)
+        val good = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 0)
+        val tampered = good.copy(last_valid_seq = 999)   // signature no longer matches body()
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(tampered.toDict())),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("tampered signature -> never ingested", store.isRevokedDevice(devicePub))
     }
 }

@@ -216,14 +216,26 @@ object KotlinSync {
         }
         try {
             progress("connecting", 0)
-            // -- REVOCATIONS -- (initiator writes then reads)
+            // -- REVOCATIONS -- (initiator writes then reads). Own list is
+            // always empty (the phone authors none). Each peer revocation is
+            // parsed + ingested via store.ingestRevocation (Task 3: is_known
+            // + verify() + markRevoked, which performs the retro-drop) --
+            // this marks FRIEND devices revoked. The own-device SelfRevoked
+            // detection is unchanged from before Task 3 (still a raw field
+            // comparison, not gated on ingestRevocation's result): even a
+            // revocation this store can't/won't ingest (e.g. our own
+            // identity, which is never "known" to ourselves via
+            // knownIdentities()) must still surface SelfRevoked so the wipe
+            // path (Task 6) can act on it.
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             val revs = readFrame(stream)
             if (revs.optString("t") == "refused") return SyncResult.Failed("revocations", "refused")
             val revArr = revs.optJSONArray("revs") ?: JSONArray()
             for (i in 0 until revArr.length()) {
                 val r = revArr.getJSONObject(i)
-                if (r.optString("device_pub") == ownDevicePub) return SyncResult.SelfRevoked
+                val rev = RevocationCert.fromDict(toMap(r))
+                store.ingestRevocation(rev)
+                if (rev.device_pub == ownDevicePub) return SyncResult.SelfRevoked
             }
 
             // -- DEFRIENDS --
@@ -345,39 +357,42 @@ object KotlinSync {
      *  respondHandshake explains why: a stray close here would break a
      *  caller -- this one -- that continues on the same connection).
      *
-     *  Deliberately NOT full hearth parity in three places, each documented
-     *  at its phase below: no revocation-ingest model (REVOCATIONS is
-     *  read+discard, not hearth's ingest_revocation), no defriend-apply
-     *  model (DEFRIENDS is read+discard, not hearth's apply-then-ack,
-     *  sync.py:673-721), and peer-address/peer-table merging is dropped
-     *  entirely (HAVE's `peers`/`addr` fields are read but never consulted
-     *  -- arc 3, no peer table exists on the phone yet, the same "read it,
-     *  drop it" shape `KotlinPairing.installPackage` already set for
-     *  `peers`, KotlinPairing.kt:176-183). The first two mirror a gap `run`
-     *  already has today (SyncStore.kt's `enckeys` doc comment: "the
-     *  Kotlin store models no revocations"; `run`'s own DEFRIENDS phase
-     *  already just reads-and-ignores) -- this function's parity target
-     *  for those two phases is `run`'s EXISTING behavior, not hearth's
-     *  fuller responder shape, per the brief. */
+     *  Deliberately NOT full hearth parity in two places, each documented
+     *  at its phase below: no defriend-apply model (DEFRIENDS is
+     *  read+discard, not hearth's apply-then-ack, sync.py:673-721), and
+     *  peer-address/peer-table merging is dropped entirely (HAVE's
+     *  `peers`/`addr` fields are read but never consulted -- arc 3, no peer
+     *  table exists on the phone yet, the same "read it, drop it" shape
+     *  `KotlinPairing.installPackage` already set for `peers`,
+     *  KotlinPairing.kt:176-183). DEFRIENDS mirrors a gap `run` already has
+     *  today (`run`'s own DEFRIENDS phase already just reads-and-ignores)
+     *  -- this function's parity target for that phase is `run`'s EXISTING
+     *  behavior, not hearth's fuller responder shape, per the brief.
+     *  REVOCATIONS (Task 3, phone-onion-reachability) is now a REAL
+     *  ingest, matching `run`'s own REVOCATIONS phase -- see that phase's
+     *  doc below and `RevocationCert.kt`'s `SyncStore.ingestRevocation`. */
     fun serve(stream: Stream, store: SyncStore, fixture: KotlinHandshake.Fixture, peerCert: KotlinWire.CertDict): SyncResult {
         try {
             // -- REVOCATIONS -- (responder: read peer's first, THEN write
-            // ours -- _swap's read-then-write responder branch). The phone
-            // store models no revocations -- no ingest path exists, so
-            // peer revocations are read and DISCARDED (never
-            // store.ingest_revocation'd, because no such method exists);
+            // ours -- _swap's read-then-write responder branch). Each peer
+            // revocation is parsed + ingested via store.ingestRevocation
+            // (Task 3, phone-onion-reachability -- mirrors `run`'s own
+            // REVOCATIONS phase, just reached via the opposite I/O order);
             // own `list_revocations` is unconditionally empty, the phone
-            // has none to offer. The two checks below on the already-read
-            // frame mirror `run`'s own checks on ITS read side exactly
-            // (KotlinSync.kt run(), REVOCATIONS phase), just reached via
-            // the opposite I/O order.
+            // has none to offer. The self-revoked check below is unchanged
+            // from before Task 3 (a raw field comparison, not gated on
+            // ingestRevocation's result) -- mirrors `run`'s own check on
+            // ITS read side exactly (KotlinSync.kt run(), REVOCATIONS
+            // phase).
             val revs = readFrame(stream)
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             if (revs.optString("t") == "refused") return SyncResult.Failed("revocations", "refused")
             val revArr = revs.optJSONArray("revs") ?: JSONArray()
             for (i in 0 until revArr.length()) {
                 val r = revArr.getJSONObject(i)
-                if (r.optString("device_pub") == fixture.device_pub) return SyncResult.SelfRevoked
+                val rev = RevocationCert.fromDict(toMap(r))
+                store.ingestRevocation(rev)
+                if (rev.device_pub == fixture.device_pub) return SyncResult.SelfRevoked
             }
 
             // -- DEFRIENDS -- (responder: read peer's first, ignore --
