@@ -151,9 +151,19 @@ independent re-run reproduced.
 
 ## On-device DoD — G20 (August drives)
 
-**Status: PENDING.** Reproduced verbatim from `task-8-brief.md` Step 3
-(all items unchecked, none run this session beyond confirming install
-`Success`):
+**Status: PASSED — confirmed by August 2026-07-23** ("the pairing worked
+well on the phone"). Run sequence as executed: (a) legacy-fixture boot
+verified before reset; revoke pressed on the old spike-phone device
+(REVOKED=YES confirmed in the desktop store; the phone kept local data
+and lost sync, the documented current-design behavior — self-wipe is the
+revocation arc's slice C); `pm clear`; fresh first-load screen; QR
+ceremony against the branch-served desktop node (Add-device panel);
+paired successfully. Items beyond the core flow were not individually
+reported; no issues raised. UX notes from the run, ticketed: the
+first-load screen wants a visual pass (later — the cross-platform
+visual-parity slice), and the SAME first-run UI should be REUSED on
+desktop so phone and desktop onboarding look and act alike (August
+2026-07-23). Checklist preserved as run documentation:
 
 - [ ] (a) G20 with legacy fixture boots straight to the web UI (no
       first-load screen)
