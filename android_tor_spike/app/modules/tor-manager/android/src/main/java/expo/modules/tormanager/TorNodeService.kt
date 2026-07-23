@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -21,6 +22,19 @@ class TorNodeService : Service() {
         const val CHANNEL_ID = "kreds-node"
         const val NOTIF_ID = 1
         private const val SYNC_INTERVAL_MS = 900_000L    // N = 15 min (Brick C: was the 5-min AUTH heartbeat)
+        // Task 7 (phone-onion-reachability): the public port peers dial on
+        // this phone's onion service. FIXED FOREVER (mirrors hearth's own
+        // tor.py:41 ONION_VIRTUAL_PORT) -- re-picking this once deadlocked
+        // every node (0.3.14's outage), and TorTransport.connect on the
+        // desktop side normalizes every .onion dial to this exact port
+        // regardless of what a stored address says, so a value that ever
+        // drifted from the desktop's own constant would silently strand
+        // dialbacks.
+        private const val ONION_VIRTUAL_PORT = 9997
+        // No pre-existing android.util.Log usage anywhere in this file to
+        // mirror; TorManagerModule.kt set the "module name as tag" precedent
+        // (its own TAG doc comment) -- followed here with this class's name.
+        private const val TAG = "TorNodeService"
         const val ACTION_STOP = "eu.kreds.torspike.STOP"
         const val ACTION_BEAT_NOW = "eu.kreds.torspike.BEAT_NOW"
         const val BROADCAST_BEAT = "eu.kreds.torspike.BEAT"
@@ -141,6 +155,20 @@ class TorNodeService : Service() {
                     broadcastState("up")
                     val s = scheduler
                     runCatching {
+                        // Task 7: publish/republish the onion FIRST, still on
+                        // the single scheduler thread so it can never overlap
+                        // a sync (same overlap concern the comment above this
+                        // block already explains for syncCycle). By the time
+                        // this callback fires, startGossipServer() (called
+                        // synchronously in startNode(), well before
+                        // TorEngine.bootstrap even began) has already
+                        // returned, so gossipServer.boundPort is already
+                        // valid -- Tor being up is the only thing this
+                        // callback itself was waiting on. Submitted BEFORE
+                        // the immediate first sync below so that sync's own
+                        // HAVE has the best chance of already advertising the
+                        // (possibly freshly republished) gossip_addr.
+                        s?.execute { publishOnion() }
                         s?.execute { syncCycle() }   // immediate first sync, on the scheduler thread
                         s?.scheduleAtFixedRate({ syncCycle() },
                             SYNC_INTERVAL_MS, SYNC_INTERVAL_MS, TimeUnit.MILLISECONDS)
@@ -188,6 +216,62 @@ class TorNodeService : Service() {
     private fun stopGossipServer() {
         runCatching { gossipServer?.stop() }; gossipServer = null
         runCatching { gossipStore?.close() }; gossipStore = null
+    }
+
+    /** Publish (or republish) this device's onion service (Task 7,
+     *  phone-onion-reachability), forwarding to GossipServer's own bound
+     *  loopback port so a friend/sibling dialing our .onion reaches it.
+     *  Called from `startNode`'s `onDone`, once Tor has bootstrapped --
+     *  `gossipServer.boundPort` is ALREADY valid by then regardless (
+     *  `startGossipServer()` runs synchronously in `startNode`, well before
+     *  `TorEngine.bootstrap` is even kicked off), so the only thing this
+     *  callback actually waits on is Tor being up enough for the control
+     *  port to answer AUTHENTICATE.
+     *
+     *  Uses `gossipStore` -- the SAME long-lived `SqliteSyncStore` instance
+     *  `startGossipServer()` already opened onto `sync_store.db` (a fixed
+     *  DB_NAME) -- rather than opening a second connection: the meta rows
+     *  written here (`onion_key`/`gossip_addr`) must be immediately visible
+     *  to `KotlinSync.run`/`serve`'s HAVE phase on EITHER sync path
+     *  (`SyncRunner.runTransport`'s own `SqliteSyncStore(ctx)` for the
+     *  outbound path, `serve`'s caller -- this same `gossipStore` -- for the
+     *  inbound path); since both opens target the same on-disk file, reusing
+     *  `gossipStore` here is simply the cheaper of two equally-correct
+     *  options.
+     *
+     *  Key persistence: `savedBlob` is whatever `addOnion` returned last
+     *  boot (null on the very first run ever). Passing it back in makes Tor
+     *  mint the exact SAME onion identity again (`ControlPort.addOnion`'s
+     *  own contract: a `NEW:ED25519-V3` key spec only when no saved blob
+     *  exists) -- a stable `.onion` across restarts, even though
+     *  `boundPort` itself (the loopback forwarding target) is a fresh
+     *  ephemeral port every boot. Re-issued unconditionally on EVERY start,
+     *  not just the first: `Flags=Detach` keeps a PRIOR boot's onion alive
+     *  in the Tor daemon only as long as that daemon process lives, and a
+     *  fresh `tor` process (this boot's `TorEngine.bootstrap`) starts with
+     *  no onions published at all -- so every boot must ADD_ONION again
+     *  regardless of whether the key is new or reused.
+     *
+     *  Best-effort by design (per the Task 7 brief): a control-port hiccup,
+     *  a cookie-auth race, or a store I/O failure here must never crash this
+     *  foreground service -- reachability (friends/the desktop dialing IN)
+     *  simply degrades for this boot, while the phone continues working
+     *  fine as a sync-INITIATING client regardless. Logged, not rethrown;
+     *  the next restart's attempt is entirely independent of this one's
+     *  outcome. */
+    private fun publishOnion() {
+        runCatching {
+            val store = gossipStore ?: return@runCatching
+            val port = gossipServer?.boundPort ?: -1
+            if (port <= 0) return@runCatching
+            val ctl = ControlPort(CONTROL_PORT, TorEngine.cookieFile())
+            val savedBlob = store.getMeta("onion_key")
+            val (serviceId, blob) = ctl.addOnion(ONION_VIRTUAL_PORT, port, savedBlob)
+            if (blob != null) store.setMeta("onion_key", blob)
+            store.setMeta("gossip_addr", "$serviceId.onion:$ONION_VIRTUAL_PORT")
+        }.onFailure { e ->
+            Log.w(TAG, "onion publish failed (best-effort -- reachability degrades this boot): ${e.message}")
+        }
     }
 
     // Brick C Task 2: was the bare AUTH heartbeat (dial + KotlinHandshake.run).

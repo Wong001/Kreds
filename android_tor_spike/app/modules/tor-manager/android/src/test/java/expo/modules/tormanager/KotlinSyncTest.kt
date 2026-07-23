@@ -448,6 +448,109 @@ class KotlinSyncTest {
     }
 
     // =======================================================================
+    // HAVE phase -- gossip_addr advertise (phone-onion-reachability Task 7).
+    // TorNodeService.publishOnion (on-device, not JVM-testable -- needs a
+    // real Context + Tor control port) is what actually SETS meta
+    // "gossip_addr" in production; what's proven here at the JVM level is
+    // the pure wire-level contract both `run` and `serve` now honor: the
+    // HAVE frame's own `addr` field mirrors whatever is currently in
+    // `store.getMeta("gossip_addr")`, falling back to "" (never a bare
+    // `null`) when nothing has been published yet -- arc-1 parity for the
+    // null/absent case (serve always sent "" from arc 1; run sent a bare
+    // `null` from arc 1 -- Task 7 unifies both to this same "" fallback).
+    // Same RespondingStream/full-phase-queue idiom as the REVOCATIONS/
+    // DEFRIENDS tests above; `run` writes HAVE at written[2] (revocations=0,
+    // defriends=1, have=2, messages=3, blob_want=4, blobs=5) and `serve`
+    // writes it at the SAME index (identical write positions, just
+    // interleaved read-then-write per phase instead of write-then-read --
+    // see KotlinSync.serve's own doc comment).
+    // =======================================================================
+
+    @Test fun runAdvertisesStoredGossipAddrInHave() {
+        val store = InMemorySyncStore()
+        store.setMeta("gossip_addr", "abc234def567abc234def567abc234def567abc234def567abc234def5.onion:9997")
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32))
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        val wroteHave = stream.written[2]
+        assertEquals("have", wroteHave.getString("t"))
+        assertEquals("the stored gossip_addr must be advertised so the desktop's " +
+            "_merge_peer_address (sync.py:773-776) can learn this phone's onion and dial back",
+            "abc234def567abc234def567abc234def567abc234def567abc234def5.onion:9997", wroteHave.getString("addr"))
+    }
+
+    @Test fun runSendsEmptyAddrWhenGossipAddrNeverSet() {
+        val store = InMemorySyncStore()   // gossip_addr never set -- onion publish never ran/succeeded this boot
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32))
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertEquals("arc-1 parity for the absent case -- empty string, never null/omitted",
+            "", stream.written[2].getString("addr"))
+    }
+
+    @Test fun serveAdvertisesStoredGossipAddrInHave() {
+        val store = InMemorySyncStore()
+        store.setMeta("gossip_addr", "fed765cba432fed765cba432fed765cba432fed765cba432fed765cba4.onion:9997")
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+        store.addIdentity(peerPub)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        val wroteHave = stream.written[2]
+        assertEquals("have", wroteHave.getString("t"))
+        assertEquals("the stored gossip_addr must be advertised so the desktop's " +
+            "_merge_peer_address (sync.py:773-776) can learn this phone's onion and dial back",
+            "fed765cba432fed765cba432fed765cba432fed765cba432fed765cba4.onion:9997", wroteHave.getString("addr"))
+    }
+
+    @Test fun serveSendsEmptyAddrWhenGossipAddrNeverSet() {
+        val store = InMemorySyncStore()   // gossip_addr never set
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+        store.addIdentity(peerPub)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertEquals("arc-1 parity for the absent case -- empty string, never null/omitted",
+            "", stream.written[2].getString("addr"))
+    }
+
+    // =======================================================================
     // serve() -- the RESPONDER content phases (gossip server Task 3).
     // Mirrors _session (sync.py:643-825) in REVERSE I/O order vs. `run`
     // above (responder = read-then-write per phase, KotlinHandshake.kt:76).
@@ -607,7 +710,8 @@ class KotlinSyncTest {
         val wroteHave = stream.written[2]
         assertEquals("have", wroteHave.getString("t"))
         assertEquals("peers dropped (arc 3, no peer table yet)", 0, wroteHave.getJSONArray("peers").length())
-        assertEquals("no loopback addr concept yet at this arc", "", wroteHave.getString("addr"))
+        assertEquals("gossip_addr never set in this test's store -- falls back to \"\" " +
+            "(Task 7's dedicated tests below cover the populated case)", "", wroteHave.getString("addr"))
     }
 
     /** BLOBS phase: smallest-first within BLOB_GIVE_BUDGET (a wanted blob

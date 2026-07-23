@@ -338,10 +338,18 @@ object KotlinSync {
                 store.applyDefriendNotice(notice, ownIdentity)
             }
 
-            // -- HAVE --
+            // -- HAVE -- `addr` (phone-onion-reachability Task 7): the
+            // stored gossip_addr (set by TorNodeService.publishOnion after
+            // ADD_ONION -- see that method's doc comment), or "" if never
+            // published yet (arc-1 parity: an empty string, never a bare
+            // `null`, so this stays wire-shape-identical to what `serve`
+            // has always sent). Lets the desktop's own
+            // `_merge_peer_address` (sync.py:773-776) learn this phone's
+            // .onion and dial back -- the piece that makes the phone a
+            // reachable node, not just an initiator.
             writeFrame(stream, mapOf("t" to "have",
                 "summary" to store.summary(), "known" to store.knownIdentities(),
-                "peers" to emptyList<Any>(), "addr" to null))
+                "peers" to emptyList<Any>(), "addr" to (store.getMeta("gossip_addr") ?: "")))
             val have = readFrame(stream)
             val known = have.optJSONArray("known") ?: JSONArray()
             for (i in 0 until known.length()) store.addIdentity(known.getString(i))
@@ -578,16 +586,21 @@ object KotlinSync {
             val have = readFrame(stream)
             writeFrame(stream, mapOf("t" to "have",
                 "summary" to store.summary(), "known" to store.knownIdentities(),
-                "peers" to emptyList<Any>(), "addr" to ""))
-            // peers / addr (the peer's own advertised address + its peer
-            // table): read above as part of `have`, but intentionally never
-            // consulted below -- arc 3 (friend peering / address merge), no
-            // peer table exists on the phone yet. Same "read it, drop it"
-            // shape KotlinPairing.installPackage already set for `peers`
-            // (KotlinPairing.kt:176-183). Our own `addr` is written as ""
-            // (not null, unlike `run`'s own HAVE write) -- the phone has no
-            // gossip_addr concept yet at this arc (no SyncStore.getMeta
-            // equivalent), so there is no real loopback address to report.
+                "peers" to emptyList<Any>(), "addr" to (store.getMeta("gossip_addr") ?: "")))
+            // peers (the peer's own gossiped peer table): read above as part
+            // of `have`, but intentionally never consulted below -- arc 3
+            // (friend peering / address merge), no peer table exists on the
+            // phone yet. Same "read it, drop it" shape
+            // KotlinPairing.installPackage already set for `peers`
+            // (KotlinPairing.kt:176-183). Our own `addr` (phone-onion-
+            // reachability Task 7, mirrors `run`'s own HAVE write above) is
+            // now the stored gossip_addr -- set by TorNodeService.
+            // publishOnion after a successful ADD_ONION -- or "" if onion
+            // publish never ran/succeeded yet this boot. This is the SAME
+            // shared on-disk store `serve`'s caller (GossipServer) and
+            // TorNodeService's onion publish both read/write (SqliteSyncStore,
+            // fixed DB_NAME), so a `gossip_addr` set moments ago by this same
+            // boot's publish is already visible here.
             val knownArr = have.optJSONArray("known") ?: JSONArray()
             val peerKnown = (0 until knownArr.length()).map { knownArr.getString(it) }.toSet()
             // Own-device trust (sync.py:768-772): only a verified SIBLING
