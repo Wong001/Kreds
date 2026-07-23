@@ -112,6 +112,17 @@ class TorNodeService : Service() {
     @Volatile private var scheduler: ScheduledExecutorService? = null
     @Volatile private var syncs = 0
     @Volatile private var lastLine = "starting"
+    // Task 6 review fix (Finding 1): previous round's absolute store total
+    // (messages+blobs+identities), the baseline `syncCycle` diffs against
+    // to derive `pulledNew` -- see AdaptiveBackoff.pulledNewContent's own
+    // doc for why an absolute-total>0 check was wrong. -1L sentinel == "no
+    // successful (ran && ok) round yet this process"; the very first real
+    // sweep then counts as pulled-new, resetting the cadence to base, which
+    // is the desired startup behavior. Only ever written from syncCycle,
+    // which always runs on the single scheduler thread -- @Volatile for the
+    // same cross-thread-visibility discipline as `syncs`/`lastLine` above,
+    // not because there's a concurrent writer.
+    @Volatile private var lastSyncTotal: Long = -1L
 
     // Task 6: one AdaptiveBackoff per service instance, driving the
     // self-rescheduling chain in startNode()'s onDone below. reset() is
@@ -304,11 +315,20 @@ class TorNodeService : Service() {
     // foreground module's syncNow. SyncRunner NEVER decrypts (background
     // stores encrypted only; decrypt-on-read happens in the foreground), so
     // no decrypt/content-key/feed-cache work is introduced here.
-    // Task 6: now RETURNS whether this sweep pulled new content (true iff
-    // SyncRunner actually ran, succeeded, AND the total pulled count across
-    // messages/blobs/identities was > 0) -- sweepAndReschedule below feeds
-    // this straight into AdaptiveBackoff.nextInterval to pick the next
-    // interval. Everything else is unchanged from before Task 6.
+    // Task 6: now RETURNS whether this sweep pulled new content --
+    // sweepAndReschedule below feeds this straight into
+    // AdaptiveBackoff.nextInterval to pick the next interval. Everything
+    // else is unchanged from before Task 6.
+    // Task 6 review fix (Finding 1): "pulled new" used to be `ran && ok &&
+    // (total > 0)`, where `total` is SyncRunner's messages+blobs+identities
+    // -- but those are ABSOLUTE store totals (store.stats() is an
+    // unconditional SELECT COUNT(*)), not "new this round". Own identity is
+    // always seeded (identities >= 1 on every successful AUTH) and
+    // messages/blobs never shrink, so `total > 0` was true on essentially
+    // every successful sync -- the adaptive feature never actually backed
+    // off. Now derived as a DELTA against `lastSyncTotal` via
+    // AdaptiveBackoff.pulledNewContent; see that function's doc for the
+    // full rationale.
     private fun syncCycle(): Boolean {
         val start = System.currentTimeMillis()
         var pulledNew = false
@@ -316,7 +336,13 @@ class TorNodeService : Service() {
             if (!TorEngine.isUp) throw IllegalStateException("tor not up")
             val fx = fixture()
             val o = SyncRunner.runSync(this, fx)     // default no-op progress; NEVER decrypts
-            pulledNew = o.ran && o.ok && (o.messages + o.blobs + o.identities > 0)
+            val nowTotal = o.messages.toLong() + o.blobs + o.identities
+            pulledNew = AdaptiveBackoff.pulledNewContent(lastSyncTotal, nowTotal, o.ran, o.ok)
+            // Advance the baseline ONLY on a real ran&&ok round -- a
+            // skipped (mutex-contended) or failed round must not overwrite
+            // it, or it would corrupt the NEXT round's delta (see
+            // pulledNewContent's doc).
+            if (o.ran && o.ok) lastSyncTotal = nowTotal
             // skipped = true (Brick C Task 3 fix): SyncRunner.ran == false is
             // a benign mutex contention (the foreground syncNow held the
             // lock), not a real failure -- flagged with a dedicated boolean
@@ -342,12 +368,19 @@ class TorNodeService : Service() {
      *  `s.scheduleAtFixedRate(syncCycle, SYNC_INTERVAL_MS, SYNC_INTERVAL_MS)`
      *  fixed cadence. Runs one sweep, then reschedules ITSELF after an
      *  interval AdaptiveBackoff computes from whether that sweep pulled new
-     *  content -- never a fixed period. The reschedule step is wrapped in
-     *  runCatching, mirroring syncCycle's own "never throw to the executor"
-     *  discipline (see its doc above): an uncaught throwable in a scheduled
-     *  task silently ends the chain, since nothing else re-arms it, so a
-     *  transient scheduler hiccup here must not permanently kill the sync
-     *  cadence.
+     *  content -- never a fixed period.
+     *
+     *  Task 6 review fix (Finding 2): interval computation and the
+     *  reschedule call are TWO INDEPENDENT runCatching blocks, not one.
+     *  Under the original single-runCatching shape, a throw out of
+     *  `backoff.nextInterval` would skip the `scheduler?.schedule(...)`
+     *  call entirely -- silently ending the whole chain, since nothing else
+     *  re-arms it, killing the sync cadence for the rest of the process's
+     *  life. Now a failed interval computation falls back to
+     *  `BASE_SYNC_MS` and the reschedule still happens unconditionally;
+     *  only a failure in the `schedule()` call itself (e.g. the
+     *  stop-during-bootstrap race nulling `scheduler`) can end the chain,
+     *  exactly as intended before.
      *
      *  This is the ONLY function that reschedules itself. ACTION_BEAT_NOW
      *  (the on-compose / on-app-resume event trigger, via beatNow) does NOT
@@ -357,10 +390,8 @@ class TorNodeService : Service() {
      *  instance, regardless of how many event triggers fire in between. */
     private fun sweepAndReschedule() {
         val pulledNew = syncCycle()
-        runCatching {
-            val next = backoff.nextInterval(pulledNew)
-            scheduler?.schedule({ sweepAndReschedule() }, next, TimeUnit.MILLISECONDS)
-        }
+        val next = runCatching { backoff.nextInterval(pulledNew) }.getOrDefault(BASE_SYNC_MS)
+        runCatching { scheduler?.schedule({ sweepAndReschedule() }, next, TimeUnit.MILLISECONDS) }
     }
 
     private fun recordAndBroadcast(beat: Beat) {

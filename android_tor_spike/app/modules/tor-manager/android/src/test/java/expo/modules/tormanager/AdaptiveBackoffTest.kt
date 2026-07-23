@@ -1,6 +1,8 @@
 package expo.modules.tormanager
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** Task 6 (friend-peering, cadence overhaul): AdaptiveBackoff is the pure
@@ -85,5 +87,52 @@ class AdaptiveBackoffTest {
         val b = AdaptiveBackoff(BASE, MAX)
         b.reset()
         assertEquals(1_200_000L, b.nextInterval(false))
+    }
+
+    // --- pulledNewContent (Task 6 review fix, Finding 1) ---
+    // Pure decision fed into nextInterval above. SyncRunner's counts are
+    // ABSOLUTE store totals (store.stats() is an unconditional
+    // SELECT COUNT(*)), so "pulled new" must be a DELTA against the
+    // previous round's total -- never `newTotal > 0` alone. Every case
+    // below is an exact assertion, and the totalUnchangedButPositive case
+    // in particular is chosen to FAIL under the old `(ran && ok && total >
+    // 0)` logic (5 -> 5 is "positive" but not new) -- that's the bug this
+    // fix closes; see the mutation-verify note in the Task 6 review-fix
+    // report for a live demonstration.
+
+    @Test fun veryFirstRoundEverCountsAsPulledNewRegardlessOfTotal() {
+        // prevTotal < 0 is TorNodeService's startup sentinel (-1L, "no
+        // successful round yet this process") -- always true so the very
+        // first real sweep resets the cadence to base.
+        assertTrue(AdaptiveBackoff.pulledNewContent(prevTotal = -1L, newTotal = 0L, ran = true, ok = true))
+        assertTrue(AdaptiveBackoff.pulledNewContent(prevTotal = -1L, newTotal = 5L, ran = true, ok = true))
+    }
+
+    @Test fun totalUnchangedButPositiveIsNotPulledNew() {
+        // THE bug this fix closes: own-identity seeding means the absolute
+        // total is essentially always > 0. Under the old `sum > 0` logic
+        // this case (5 -> 5, nothing new) wrongly returned true; the
+        // delta-based helper correctly returns false.
+        assertFalse(AdaptiveBackoff.pulledNewContent(prevTotal = 5L, newTotal = 5L, ran = true, ok = true))
+    }
+
+    @Test fun totalIncreasedIsPulledNew() {
+        assertTrue(AdaptiveBackoff.pulledNewContent(prevTotal = 5L, newTotal = 8L, ran = true, ok = true))
+    }
+
+    @Test fun totalIncreasedButNotRanIsNotPulledNew() {
+        // A skipped (mutex-contended) round never counts, even if the
+        // shared store's total happens to have grown meanwhile (e.g. a
+        // foreground syncNow ran concurrently).
+        assertFalse(AdaptiveBackoff.pulledNewContent(prevTotal = 5L, newTotal = 8L, ran = false, ok = true))
+    }
+
+    @Test fun ranAndOkButTotalNotIncreasedIsNotPulledNew() {
+        assertFalse(AdaptiveBackoff.pulledNewContent(prevTotal = 5L, newTotal = 5L, ran = true, ok = true))
+        assertFalse(AdaptiveBackoff.pulledNewContent(prevTotal = 8L, newTotal = 5L, ran = true, ok = true))
+    }
+
+    @Test fun notOkIsNeverPulledNewEvenIfTotalIncreased() {
+        assertFalse(AdaptiveBackoff.pulledNewContent(prevTotal = 5L, newTotal = 8L, ran = true, ok = false))
     }
 }
