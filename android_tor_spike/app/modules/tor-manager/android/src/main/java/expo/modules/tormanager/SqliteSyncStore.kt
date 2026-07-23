@@ -57,6 +57,49 @@ class SqliteSyncStore(context: Context) :
         // CREATE_KEYS_TABLE_SQL above.
         private const val CREATE_PENDING_OUTBOUND_TABLE_SQL =
             "CREATE TABLE IF NOT EXISTS pending_outbound (msg_id TEXT PRIMARY KEY, wire_json TEXT NOT NULL)"
+        // phone-onion-reachability Task 2: arbitrary key/value store, mirrors
+        // hearth store.py's `meta` table (store.py:121-133, set_meta/get_meta).
+        // Same IF NOT EXISTS / onCreate+onOpen pattern as keys/pending_outbound
+        // above -- non-destructive, no DB_VERSION bump (see that comment for
+        // why a bump would be unacceptable here).
+        private const val CREATE_META_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)"
+        // phone-onion-reachability Task 2: the per-device revoked set
+        // (markRevoked/isRevokedDevice) -- one row per revoked device_pub,
+        // holding the last_valid_seq threshold markRevoked's retro-drop
+        // already applied at write time (mirrors the boundary hearth's
+        // ingest_revocation retro-drop uses, store.py:421-427). Same
+        // non-destructive IF NOT EXISTS pattern as the tables above.
+        private const val CREATE_REVOKED_DEVICES_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS revoked_devices (device_pub TEXT PRIMARY KEY, last_valid_seq INTEGER NOT NULL)"
+
+        /** Task 6 (phone-onion-reachability): revocation wipe -- drops the
+         *  WHOLE on-disk sync_store.db (identities/messages/blobs/keys --
+         *  INCLUDING the enc keypair, EncKeys.getOrCreate's persisted
+         *  enc_priv/enc_pub, which lives in this DB's `keys` table --
+         *  /pending_outbound/meta/revoked_devices), not a per-table clear.
+         *  `Context.deleteDatabase`, not a bare `File.delete` on the .db
+         *  path alone: it also removes the SQLite journal siblings
+         *  (-wal/-shm/-journal, depending on journal mode) that can sit
+         *  next to the main file, so no fragment of the wiped store is left
+         *  behind. Idempotent: deleteDatabase on an already-absent DB
+         *  simply returns false, never throws -- a second wipe (e.g. a
+         *  second SelfRevoked observed after the first already deleted it)
+         *  is a safe no-op. Any already-open SqliteSyncStore/
+         *  SQLiteOpenHelper connection (e.g. TorNodeService's own
+         *  long-lived gossipStore) is unaffected mid-call -- Android
+         *  (Linux) allows unlinking a file an existing handle still has
+         *  open; that handle's data is freed once it eventually closes, and
+         *  every NEW SqliteSyncStore(ctx) opened after this call gets a
+         *  fresh, empty database (onCreate reruns, since the file is
+         *  gone). No separate on-disk blob cache exists to clear beyond
+         *  this DB -- blob bytes live in its `blobs` table only
+         *  (getBlobImage/MediaServer resolve straight from the DB into
+         *  memory; nothing is ever written back out to a filesystem
+         *  cache). */
+        fun wipe(ctx: Context) {
+            ctx.deleteDatabase(DB_NAME)
+        }
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -83,6 +126,13 @@ class SqliteSyncStore(context: Context) :
         // Same IF NOT EXISTS reasoning as keys -- also deliberately not in
         // onUpgrade's drop list (see onUpgrade comment).
         db.execSQL(CREATE_PENDING_OUTBOUND_TABLE_SQL)
+        // Same IF NOT EXISTS reasoning as keys/pending_outbound above --
+        // also deliberately not in onUpgrade's drop list (see onUpgrade
+        // comment): meta/revoked_devices hold durable bookkeeping (onion-
+        // reachability meta, revocation enforcement state) that a schema
+        // bump must not silently wipe, same as keys' enc-key material.
+        db.execSQL(CREATE_META_TABLE_SQL)
+        db.execSQL(CREATE_REVOKED_DEVICES_TABLE_SQL)
     }
 
     // Field bug (G20, B.2 live run): DB_VERSION was never bumped past 1, so
@@ -102,6 +152,8 @@ class SqliteSyncStore(context: Context) :
         super.onOpen(db)
         db.execSQL(CREATE_KEYS_TABLE_SQL)
         db.execSQL(CREATE_PENDING_OUTBOUND_TABLE_SQL)
+        db.execSQL(CREATE_META_TABLE_SQL)
+        db.execSQL(CREATE_REVOKED_DEVICES_TABLE_SQL)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -131,6 +183,13 @@ class SqliteSyncStore(context: Context) :
         // device -- but if it ever does, a queued-but-unsynced compose still
         // gets pushed on the next sync rather than silently lost. onCreate's
         // IF NOT EXISTS below is a no-op here since the table already exists.
+        //
+        // `meta`/`revoked_devices` (phone-onion-reachability Task 2) are likewise
+        // NOT dropped here, for the same reason as `keys`: meta holds durable
+        // bookkeeping and revoked_devices holds revocation-enforcement state,
+        // neither of which resyncs from the home node the way identities/
+        // messages/blobs do -- dropping revoked_devices in particular would
+        // silently un-revoke a device until the next revocation re-arrives.
         onCreate(db)
     }
 
@@ -176,6 +235,68 @@ class SqliteSyncStore(context: Context) :
         writableDatabase.insertWithOnConflict(
             "identities", null, cv, SQLiteDatabase.CONFLICT_IGNORE
         )
+    }
+
+    /** See the SyncStore interface doc: mirrors hearth store.py:162
+     *  remove_identity's plain `DELETE FROM identities WHERE
+     *  identity_pub=?`. `SQLiteDatabase.delete` is used (not a raw execSQL)
+     *  purely for terseness -- its return value (rows affected) isn't
+     *  needed here, unlike purgeAuthoredBy below. */
+    override fun removeIdentity(id: String) {
+        writableDatabase.delete("identities", "identity_pub = ?", arrayOf(id))
+    }
+
+    /** See the SyncStore interface doc: mirrors hearth store.py:1036
+     *  purge_authored_by's `DELETE FROM messages WHERE identity_pub=?`,
+     *  including its exact semantics of returning the affected row count
+     *  (hearth returns `cur.rowcount`; `SQLiteDatabase.delete` returns the
+     *  same "rows affected" count directly). hearth additionally cleans its
+     *  `dm_keys`/`undecryptable` side tables for the deleted msg_ids -- this
+     *  schema has neither table, so there is nothing further to clean. */
+    override fun purgeAuthoredBy(id: String): Int {
+        return writableDatabase.delete("messages", "identity_pub = ?", arrayOf(id))
+    }
+
+    /** See the SyncStore interface doc: records `devicePub` in
+     *  `revoked_devices` (INSERT OR REPLACE -- a later call for the same
+     *  device overwrites its lastValidSeq rather than erroring or
+     *  duplicating), then retro-drops that device's messages with `seq >
+     *  lastValidSeq` -- the exact boundary of hearth's ingest_revocation
+     *  retro-drop query (store.py:421-427: `WHERE device_pub=? AND
+     *  seq>?`). Deletes outright rather than tombstoning, same posture and
+     *  reasoning as purgeAuthoredBy above (no tombstones table here). */
+    override fun markRevoked(devicePub: String, lastValidSeq: Int) {
+        val db = writableDatabase
+        val cv = ContentValues().apply {
+            put("device_pub", devicePub)
+            put("last_valid_seq", lastValidSeq)
+        }
+        db.insertWithOnConflict("revoked_devices", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        db.delete("messages", "device_pub = ? AND seq > ?", arrayOf(devicePub, lastValidSeq.toString()))
+    }
+
+    /** See the SyncStore interface doc: a pure membership check against
+     *  `revoked_devices`, mirroring InMemorySyncStore's `devicePub in
+     *  revokedDevices` -- no seq comparison here (that gate already ran,
+     *  once, inside markRevoked's retro-drop above). */
+    override fun isRevokedDevice(devicePub: String): Boolean =
+        readableDatabase.rawQuery(
+            "SELECT 1 FROM revoked_devices WHERE device_pub = ? LIMIT 1", arrayOf(devicePub)
+        ).use { it.moveToFirst() }
+
+    /** See the SyncStore interface doc: mirrors hearth store.py's
+     *  get_meta/set_meta over the `meta` k/v table (store.py:123-133) --
+     *  same INSERT OR REPLACE-on-write, SELECT-or-null-on-read shape as
+     *  hearth's own `INSERT OR REPLACE INTO meta VALUES(?,?)` /
+     *  `SELECT v FROM meta WHERE k=?`. */
+    override fun getMeta(k: String): String? =
+        readableDatabase.rawQuery(
+            "SELECT v FROM meta WHERE k = ? LIMIT 1", arrayOf(k)
+        ).use { if (it.moveToFirst()) it.getString(0) else null }
+
+    override fun setMeta(k: String, v: String) {
+        val cv = ContentValues().apply { put("k", k); put("v", v) }
+        writableDatabase.insertWithOnConflict("meta", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
     override fun ingestMessage(m: SignedMessage): Boolean {

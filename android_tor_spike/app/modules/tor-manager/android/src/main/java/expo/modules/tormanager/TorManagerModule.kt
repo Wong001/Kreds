@@ -287,7 +287,11 @@ class TorManagerModule : Module() {
             "fixtureDir" to (appContext.reactContext?.getExternalFilesDir(null)?.absolutePath ?: "")
         )
 
-        Events("torProgress", "nodeBeat", "nodeState", "nodeSync", "onSyncProgress", "pairProgress")
+        // "revoked" (Task 6): must be registered here -- an unregistered
+        // event name silently drops (the pairProgress lesson, see that
+        // event's own history) -- FirstLoad.tsx's onRevoked listener would
+        // otherwise never fire.
+        Events("torProgress", "nodeBeat", "nodeState", "nodeSync", "onSyncProgress", "pairProgress", "revoked")
 
         OnCreate {
             val ctx = appContext.reactContext ?: return@OnCreate
@@ -301,6 +305,7 @@ class TorManagerModule : Module() {
             KotlinImageDecode.avifDecoder = { bytes -> ImageDecodeClient.decodeAvif(bytes) }
             val filter = android.content.IntentFilter().apply {
                 addAction(TorNodeService.BROADCAST_BEAT); addAction(TorNodeService.BROADCAST_STATE)
+                addAction(TorNodeService.BROADCAST_REVOKED)
             }
             val rx = object : android.content.BroadcastReceiver() {
                 override fun onReceive(c: android.content.Context?, i: android.content.Intent?) {
@@ -310,6 +315,22 @@ class TorManagerModule : Module() {
                             "latencyMs" to i.getLongExtra("latencyMs", 0), "reason" to i.getStringExtra("reason")))
                         TorNodeService.BROADCAST_STATE -> sendEvent("nodeState",
                             mapOf("state" to i.getStringExtra("state")))
+                        // Task 6: this device's identity was just wiped
+                        // (TorNodeService.enterRevokedState -- self-revoked
+                        // or a sibling-observed revocation). Drop every
+                        // in-memory cache derived from the now-destroyed
+                        // store BEFORE sendEvent -- so a getFeed()/
+                        // getSyncStats()/getBlobImage() call racing the RN
+                        // layer's reaction to "revoked" can never still
+                        // serve the wiped identity's content. sendEvent lets
+                        // FirstLoad.tsx re-check hasIdentity() (now false)
+                        // and un-link back to the menu.
+                        TorNodeService.BROADCAST_REVOKED -> {
+                            feedCache = emptyList()
+                            blobKeys = emptyMap()
+                            responsesByPost = emptyMap()
+                            sendEvent("revoked", emptyMap<String, Any?>())
+                        }
                     }
                 }
             }

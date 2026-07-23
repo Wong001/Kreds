@@ -89,6 +89,20 @@ object Base64Portable {
  *  still `run(stream, store, ownDevicePub)`. Always ingests the node's
  *  own-identity messages + blobs.
  *
+ *  `ownIdentity` (phone-onion-reachability Task 4): this device's own
+ *  identity_pub, consulted by the DEFRIENDS phase's
+ *  `store.applyDefriendNotice` (target==own / author!=own gates) AND
+ *  (remote-wipe fix, Task 6 review) the REVOCATIONS phase's SelfRevoked
+ *  gate -- see that phase's doc comment below for the full exploit/fix
+ *  writeup. Defaults to `""` so every pre-existing call site that never
+ *  exercises DEFRIENDS/REVOCATIONS content compiles and behaves identically
+ *  unchanged -- an empty-string identity can never equal a real notice's
+ *  `target_identity` or a real revocation's `identity_pub`, so both gates
+ *  simply never match for those callers (a no-op for DEFRIENDS; FAILS
+ *  CLOSED, never self-revokes, for REVOCATIONS -- the safe direction for a
+ *  caller that omits this). The ONE production call site,
+ *  `SyncRunner.runTransport`, passes the real `fx.cert.identity_pub`.
+ *
  *  Blocking, like KotlinHandshake.run -- callers (BB-7) must invoke this
  *  off the main thread (Dispatchers.IO), same reason TorEngine's own
  *  send/recv must be. */
@@ -210,30 +224,132 @@ object KotlinSync {
      *  `onProgress` failure can never surface as a false sync failure. */
     fun run(stream: Stream, store: SyncStore, ownDevicePub: String,
             outbound: List<Map<String, Any?>> = emptyList(),
-            onProgress: (phase: String, count: Int) -> Unit = { _, _ -> }): SyncResult {
+            onProgress: (phase: String, count: Int) -> Unit = { _, _ -> },
+            ownIdentity: String = ""): SyncResult {
         fun progress(phase: String, count: Int) {
             try { onProgress(phase, count) } catch (_: Throwable) {}
         }
         try {
             progress("connecting", 0)
-            // -- REVOCATIONS -- (initiator writes then reads)
+            // -- REVOCATIONS -- (initiator writes then reads). Own list is
+            // always empty (the phone authors none). Each peer revocation is
+            // parsed + ingested via store.ingestRevocation (Task 3: is_known
+            // + verify() + markRevoked, which performs the retro-drop) --
+            // this marks FRIEND devices revoked, independent of the
+            // SelfRevoked gate just below.
+            //
+            // SECURITY (remote-wipe fix, phone-onion-reachability Task 6
+            // review): the SelfRevoked check below used to be a RAW
+            // `rev.device_pub == ownDevicePub` comparison, run
+            // UNCONDITIONALLY after ingestRevocation and NOT gated on its
+            // result. That was exploitable: ingestRevocation's is_known+
+            // verify() gate only decides whether the cert gets INGESTED
+            // (recorded as revoking some FRIEND device) -- it does nothing
+            // to gate the SelfRevoked return, and RevocationCert.verify()
+            // only proves internal self-consistency (the cert was signed by
+            // WHOEVER'S key matches the cert's OWN, attacker-chosen,
+            // `identity_pub` field), not that the signer is us or anyone we
+            // trust. So ANY authenticated known peer could self-sign a
+            // RevocationCert with a THROWAWAY keypair, naming the VICTIM's
+            // device_pub (learnable from AUTH's exchanged CertDict), and the
+            // raw comparison would fire SelfRevoked regardless -- which,
+            // since Task 6, triggers an irreversible full identity+store
+            // wipe (TorNodeService.enterRevokedState). The fix: SelfRevoked
+            // now additionally requires `rev.identity_pub == ownIdentity`
+            // (the revocation claims to be issued by OUR OWN identity, not
+            // an attacker-chosen one) AND `rev.verify()` (that claim is
+            // actually signed by that identity's real private key) -- i.e.
+            // the revocation must be signed by OUR OWN identity_priv, the
+            // secret only we and our other paired devices hold. An attacker
+            // without that key cannot forge this, no matter which identity
+            // they authenticate as. `ownIdentity` defaults to `""` (see this
+            // fun's own param doc) so no real hex64 `rev.identity_pub` can
+            // ever accidentally match it -- a caller that never passes
+            // `ownIdentity` (an old/incomplete integration) fails CLOSED
+            // (never self-revokes), not open.
+            //
+            // This is STRICTER than hearth's own is_known+device-match gate
+            // (sync.py's session has no equivalent extra identity-match
+            // requirement for its own is_self row) -- deliberately so: it
+            // closes even a KNOWN-FRIEND-forges-it gap hearth's model
+            // doesn't need to worry about the same way (hearth's revocation
+            // model assumes ingest's is_known+verify is sufficient because a
+            // friend has no reason to send a cert naming a device that
+            // isn't theirs; the phone's SelfRevoked->wipe coupling makes
+            // that assumption load-bearing in a way hearth's model never
+            // was, so the phone closes it explicitly instead of inheriting
+            // the assumption).
+            //
+            // CORRECTNESS NOTE (own identity IS known -- do not assume
+            // otherwise): our own identity_pub is seeded into
+            // knownIdentities() both at pairing (KotlinPairing.kt's
+            // installPackage: `store.addIdentity(cert.identity_pub)`) and on
+            // every sync (SyncRunner.kt's runTransport:
+            // `SqliteSyncStore(ctx).also { it.addIdentity(fx.cert.identity_pub) }`),
+            // and serve() reads/writes the SAME on-disk store. So a GENUINE
+            // self-revocation (real own identity_pub, validly identity-signed,
+            // device_pub == our own) PASSES ingestRevocation's is_known gate
+            // and verify(), and DOES call markRevoked(ownDevicePub,
+            // lastValidSeq) -- marking our own device revoked and retro-
+            // dropping our own prior messages with seq > lastValidSeq --
+            // BEFORE the loop reaches the tightened check below and returns
+            // SelfRevoked. This mirrors hearth exactly: hearth's own identity
+            // row has is_self=1, and sync.py's session (sync.py:664-671)
+            // runs ingest_revocation on a self-revocation the same as any
+            // other -- there is no is_self short-circuit that skips
+            // ingestion. The end state is correct/safe either way: Task 6's
+            // wipe clears the whole store on SelfRevoked, so markRevoked's
+            // effects (now-redundant revoked-device bookkeeping and
+            // retro-dropped own messages) are wiped again moments later
+            // regardless of whether they ran.
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             val revs = readFrame(stream)
             if (revs.optString("t") == "refused") return SyncResult.Failed("revocations", "refused")
             val revArr = revs.optJSONArray("revs") ?: JSONArray()
             for (i in 0 until revArr.length()) {
                 val r = revArr.getJSONObject(i)
-                if (r.optString("device_pub") == ownDevicePub) return SyncResult.SelfRevoked
+                val rev = RevocationCert.fromDict(toMap(r))
+                store.ingestRevocation(rev)
+                if (rev.identity_pub == ownIdentity && rev.device_pub == ownDevicePub && rev.verify()) {
+                    return SyncResult.SelfRevoked
+                }
             }
 
-            // -- DEFRIENDS --
+            // -- DEFRIENDS -- (initiator: write then read, same _swap order
+            // as REVOCATIONS above -- hearth's initiator branch, sync.py:
+            // 697-704: write my_defriends first (nothing to apply yet,
+            // since nothing has been read), THEN read the peer's frame and
+            // apply what targets me from it. Own notices are always empty
+            // -- the phone has no unfriend/outbox model yet (out of this
+            // task's scope, phone-onion-reachability Task 4). Each peer
+            // notice is parsed + applied via store.applyDefriendNotice
+            // (Task 4 -- the same 4-gate order node.apply_defriend_notice
+            // uses: target==own, author!=own self-guard, verify(),
+            // isKnown(author) -> purge+remove). No ack write here -- matches
+            // hearth's own initiator branch exactly: it never sends a
+            // second frame reporting what IT applied, only reads
+            // peer_df.get("applied", []) for ITS OWN sent notices (always
+            // empty for us, so there is nothing to consult).
             writeFrame(stream, mapOf("t" to "defriends", "notices" to emptyList<Any>()))
-            readFrame(stream)   // read node's, ignore (own-identity, B.1)
+            val defriends = readFrame(stream)
+            val noticeArr = defriends.optJSONArray("notices") ?: JSONArray()
+            for (i in 0 until noticeArr.length()) {
+                val notice = DefriendNotice.fromDict(toMap(noticeArr.getJSONObject(i)))
+                store.applyDefriendNotice(notice, ownIdentity)
+            }
 
-            // -- HAVE --
+            // -- HAVE -- `addr` (phone-onion-reachability Task 7): the
+            // stored gossip_addr (set by TorNodeService.publishOnion after
+            // ADD_ONION -- see that method's doc comment), or "" if never
+            // published yet (arc-1 parity: an empty string, never a bare
+            // `null`, so this stays wire-shape-identical to what `serve`
+            // has always sent). Lets the desktop's own
+            // `_merge_peer_address` (sync.py:773-776) learn this phone's
+            // .onion and dial back -- the piece that makes the phone a
+            // reachable node, not just an initiator.
             writeFrame(stream, mapOf("t" to "have",
                 "summary" to store.summary(), "known" to store.knownIdentities(),
-                "peers" to emptyList<Any>(), "addr" to null))
+                "peers" to emptyList<Any>(), "addr" to (store.getMeta("gossip_addr") ?: "")))
             val have = readFrame(stream)
             val known = have.optJSONArray("known") ?: JSONArray()
             for (i in 0 until known.length()) store.addIdentity(known.getString(i))
@@ -345,66 +461,146 @@ object KotlinSync {
      *  respondHandshake explains why: a stray close here would break a
      *  caller -- this one -- that continues on the same connection).
      *
-     *  Deliberately NOT full hearth parity in three places, each documented
-     *  at its phase below: no revocation-ingest model (REVOCATIONS is
-     *  read+discard, not hearth's ingest_revocation), no defriend-apply
-     *  model (DEFRIENDS is read+discard, not hearth's apply-then-ack,
-     *  sync.py:673-721), and peer-address/peer-table merging is dropped
-     *  entirely (HAVE's `peers`/`addr` fields are read but never consulted
-     *  -- arc 3, no peer table exists on the phone yet, the same "read it,
-     *  drop it" shape `KotlinPairing.installPackage` already set for
-     *  `peers`, KotlinPairing.kt:176-183). The first two mirror a gap `run`
-     *  already has today (SyncStore.kt's `enckeys` doc comment: "the
-     *  Kotlin store models no revocations"; `run`'s own DEFRIENDS phase
-     *  already just reads-and-ignores) -- this function's parity target
-     *  for those two phases is `run`'s EXISTING behavior, not hearth's
-     *  fuller responder shape, per the brief. */
+     *  Deliberately NOT full hearth parity in two places, each documented
+     *  at its phase below: DEFRIENDS (phone-onion-reachability Task 4) now
+     *  DOES apply-then-ack, mirroring hearth's responder branch
+     *  (sync.py:705-721), but as a SUBSET -- store.applyDefriendNotice
+     *  skips the peer-table/device-views/disconnected-list cleanup
+     *  node.apply_defriend_notice also does (see DefriendNotice.kt's doc
+     *  comment for the full list; the phone has no peer table yet). And
+     *  peer-address/peer-table merging is dropped entirely (HAVE's
+     *  `peers`/`addr` fields are read but never consulted -- arc 3, no peer
+     *  table exists on the phone yet, the same "read it, drop it" shape
+     *  `KotlinPairing.installPackage` already set for `peers`,
+     *  KotlinPairing.kt:176-183).
+     *  REVOCATIONS (Task 3, phone-onion-reachability) is now a REAL
+     *  ingest, matching `run`'s own REVOCATIONS phase -- see that phase's
+     *  doc below and `RevocationCert.kt`'s `SyncStore.ingestRevocation`. */
     fun serve(stream: Stream, store: SyncStore, fixture: KotlinHandshake.Fixture, peerCert: KotlinWire.CertDict): SyncResult {
         try {
             // -- REVOCATIONS -- (responder: read peer's first, THEN write
-            // ours -- _swap's read-then-write responder branch). The phone
-            // store models no revocations -- no ingest path exists, so
-            // peer revocations are read and DISCARDED (never
-            // store.ingest_revocation'd, because no such method exists);
+            // ours -- _swap's read-then-write responder branch). Each peer
+            // revocation is parsed + ingested via store.ingestRevocation
+            // (Task 3, phone-onion-reachability -- mirrors `run`'s own
+            // REVOCATIONS phase, just reached via the opposite I/O order);
             // own `list_revocations` is unconditionally empty, the phone
-            // has none to offer. The two checks below on the already-read
-            // frame mirror `run`'s own checks on ITS read side exactly
-            // (KotlinSync.kt run(), REVOCATIONS phase), just reached via
-            // the opposite I/O order.
+            // has none to offer.
+            //
+            // SECURITY (remote-wipe fix, phone-onion-reachability Task 6
+            // review): the SelfRevoked check below used to be a RAW
+            // `rev.device_pub == fixture.device_pub` comparison -- see
+            // `run`'s own REVOCATIONS phase doc comment (KotlinSync.kt) for
+            // the full writeup of the exploit this closes (any authenticated
+            // known peer could self-sign a RevocationCert with a throwaway
+            // keypair naming the VICTIM's device_pub, and the raw comparison
+            // fired SelfRevoked -- which Task 6 wired to an irreversible
+            // full wipe). Fixed identically here: SelfRevoked now requires
+            // `rev.identity_pub == fixture.cert.identity_pub` (the
+            // revocation claims to be issued by OUR OWN identity) AND
+            // `rev.verify()` (that claim is actually signed by that
+            // identity's real private key) -- i.e. genuinely signed by our
+            // own identity_priv, which only we and our other paired devices
+            // hold. STRICTER than hearth's own is_known+device-match gate,
+            // deliberately -- see `run`'s doc comment for the full
+            // hearth-parity note (this closes even a known-friend-forges-it
+            // gap hearth's model doesn't need to worry about the same way).
+            //
+            // CORRECTNESS NOTE (own identity IS known -- do not assume
+            // otherwise): our own identity IS seeded into knownIdentities()
+            // at pairing/every sync, so a genuine self-revocation genuinely
+            // runs through ingestRevocation -- markRevoked(ownDevice) +
+            // retro-drop of our own messages -- BEFORE this loop reaches the
+            // tightened check below, exactly mirroring hearth's own
+            // is_self=1 identity also running ingest_revocation
+            // (sync.py:664-671). Safe either way: Task 6's wipe clears the
+            // whole store on SelfRevoked regardless.
             val revs = readFrame(stream)
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             if (revs.optString("t") == "refused") return SyncResult.Failed("revocations", "refused")
             val revArr = revs.optJSONArray("revs") ?: JSONArray()
             for (i in 0 until revArr.length()) {
                 val r = revArr.getJSONObject(i)
-                if (r.optString("device_pub") == fixture.device_pub) return SyncResult.SelfRevoked
+                val rev = RevocationCert.fromDict(toMap(r))
+                store.ingestRevocation(rev)
+                if (rev.identity_pub == fixture.cert.identity_pub && rev.device_pub == fixture.device_pub && rev.verify()) {
+                    return SyncResult.SelfRevoked
+                }
             }
 
-            // -- DEFRIENDS -- (responder: read peer's first, ignore --
-            // mirrors `run`'s own read side exactly, reversed I/O order.
-            // The phone has no DefriendNotice model/apply path at all, so
-            // this is read+discard, not hearth's apply-then-ack (sync.py:
-            // 673-721) -- `run`'s existing behavior is the parity target
-            // for this phase, not hearth's fuller responder shape. Own
-            // notices are unconditionally empty -- the phone has no
-            // defriend outbox to offer either.)
-            readFrame(stream)
-            writeFrame(stream, mapOf("t" to "defriends", "notices" to emptyList<Any>()))
+            // -- DEFRIENDS -- (responder: read peer's first, apply what
+            // targets me, THEN write my own frame -- hearth's responder
+            // branch, sync.py:705-721: apply-before-write, folding the
+            // apply step between the REVOCATIONS-style read and write
+            // above. Task 4, phone-onion-reachability: each peer notice is
+            // parsed + applied via store.applyDefriendNotice (the same
+            // 4-gate order node.apply_defriend_notice uses: target==own,
+            // author!=own self-guard, verify(), isKnown(author) ->
+            // purge+remove). `appliedHere` reports back only notices whose
+            // author_identity IS the peer authenticated THIS session --
+            // hearth's own belt-and-braces Fix 1 (sync.py:712-718): a
+            // notice's signature already makes it self-authenticating
+            // regardless of who relayed it, but the ack is only meaningful
+            // to its true author, so it must never be credited to a
+            // different relaying peer. Own notices are unconditionally
+            // empty -- the phone has no defriend outbox to offer either.)
+            val defriends = readFrame(stream)
+            val appliedHere = mutableListOf<String>()
+            val noticeArr = defriends.optJSONArray("notices") ?: JSONArray()
+            for (i in 0 until noticeArr.length()) {
+                val notice = DefriendNotice.fromDict(toMap(noticeArr.getJSONObject(i)))
+                if (store.applyDefriendNotice(notice, fixture.cert.identity_pub) &&
+                    notice.author_identity == peerCert.identity_pub) {
+                    appliedHere.add(notice.author_identity)
+                }
+            }
+            writeFrame(stream, mapOf("t" to "defriends", "notices" to emptyList<Any>(), "applied" to appliedHere))
+
+            // Mid-session re-check (phone-onion-reachability Task 5, closes
+            // the arc-1 whole-branch-review blocking finding -- mirrors
+            // sync.py:741-758): re-consult BOTH the revoked-device set and
+            // knownIdentities() AFTER REVOCATIONS and DEFRIENDS (both just
+            // above) have already run -- either phase may have just changed
+            // the answer THIS round: a peer revocation cert ingested during
+            // REVOCATIONS can mark peerCert.device_pub revoked, and a
+            // defriend notice applied during DEFRIENDS (just above) can
+            // remove peerCert.identity_pub from knownIdentities() (this is
+            // exactly the "defriended mid-session" case -- the peer's own
+            // notice, applied a few lines up, is what makes isKnown go
+            // false right here). Deliberately NO own-identity exemption
+            // here, unlike respondHandshake's AUTH-phase gate: that
+            // exemption exists ONLY so a revoked sibling can still receive
+            // the REVOCATIONS/DEFRIENDS exchange above and learn of its own
+            // revocation; once that exchange has happened, a revoked or
+            // defriended peer gets nothing further -- no HAVE/MESSAGES/
+            // BLOBS -- sibling or not, exactly like hearth. Ends the session
+            // as an ordinary Ok, not a Failed: the session so far completed
+            // successfully, it simply has nothing left to serve (mirrors
+            // sync.py's own plain `return peer_identity, applied_by_peer`,
+            // not an exception).
+            if (!store.knownIdentities().contains(peerCert.identity_pub) || store.isRevokedDevice(peerCert.device_pub)) {
+                val st = store.stats()
+                return SyncResult.Ok(st.messages, st.blobs, st.identities)
+            }
 
             // -- HAVE -- (responder: read peer's first, THEN write ours)
             val have = readFrame(stream)
             writeFrame(stream, mapOf("t" to "have",
                 "summary" to store.summary(), "known" to store.knownIdentities(),
-                "peers" to emptyList<Any>(), "addr" to ""))
-            // peers / addr (the peer's own advertised address + its peer
-            // table): read above as part of `have`, but intentionally never
-            // consulted below -- arc 3 (friend peering / address merge), no
-            // peer table exists on the phone yet. Same "read it, drop it"
-            // shape KotlinPairing.installPackage already set for `peers`
-            // (KotlinPairing.kt:176-183). Our own `addr` is written as ""
-            // (not null, unlike `run`'s own HAVE write) -- the phone has no
-            // gossip_addr concept yet at this arc (no SyncStore.getMeta
-            // equivalent), so there is no real loopback address to report.
+                "peers" to emptyList<Any>(), "addr" to (store.getMeta("gossip_addr") ?: "")))
+            // peers (the peer's own gossiped peer table): read above as part
+            // of `have`, but intentionally never consulted below -- arc 3
+            // (friend peering / address merge), no peer table exists on the
+            // phone yet. Same "read it, drop it" shape
+            // KotlinPairing.installPackage already set for `peers`
+            // (KotlinPairing.kt:176-183). Our own `addr` (phone-onion-
+            // reachability Task 7, mirrors `run`'s own HAVE write above) is
+            // now the stored gossip_addr -- set by TorNodeService.
+            // publishOnion after a successful ADD_ONION -- or "" if onion
+            // publish never ran/succeeded yet this boot. This is the SAME
+            // shared on-disk store `serve`'s caller (GossipServer) and
+            // TorNodeService's onion publish both read/write (SqliteSyncStore,
+            // fixed DB_NAME), so a `gossip_addr` set moments ago by this same
+            // boot's publish is already visible here.
             val knownArr = have.optJSONArray("known") ?: JSONArray()
             val peerKnown = (0 until knownArr.length()).map { knownArr.getString(it) }.toSet()
             // Own-device trust (sync.py:768-772): only a verified SIBLING

@@ -558,4 +558,145 @@ class SyncStoreTest {
         val out2 = store2.messagesNotIn(emptyMap(), setOf(authorPub, hostileFriendPub), peerPub).map { it.msgId() }
         assertFalse("a non-author-signed grant must never widen the post's audience", post2.msgId() in out2)
     }
+
+    // -- phone-onion-reachability Task 2: store primitives for
+    //    revocation/defriend + onion meta -- removeIdentity, purgeAuthoredBy,
+    //    markRevoked/isRevokedDevice, getMeta/setMeta. Mirror hearth store.py:
+    //    remove_identity (store.py:162), purge_authored_by (store.py:1036),
+    //    the retro-drop loop inside ingest_revocation (store.py:421-427), and
+    //    the meta k/v table (store.py:121-133/set_meta/get_meta). Task 3
+    //    (RevocationCert type + wire ingest) builds on these; this task is
+    //    the store primitives alone.
+
+    @Test fun removeIdentityDropsFromKnownIdentities() {
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        assertTrue(idPub in s.knownIdentities())
+        s.removeIdentity(idPub)
+        assertFalse(idPub in s.knownIdentities())
+    }
+
+    // Cross-check with the arc-1 give-side filter (messagesNotIn): removeIdentity
+    // itself only touches the identities table -- messagesNotIn's `entitled` set
+    // is caller-supplied, not read from knownIdentities() internally -- so this
+    // demonstrates the REAL production composition: a caller that (correctly)
+    // re-derives `entitled` from knownIdentities() after a removeIdentity call
+    // stops serving that author, because the author has fallen out of that
+    // derived set. Uses kind=profile (no audience gate in filterMessagesNotIn --
+    // falls through to the entitled + seen-delta checks only), isolating this
+    // from the wrap/DM/ring audience gates exercised elsewhere in this file.
+    @Test fun removeIdentityStopsMessagesNotInServingViaEntitledFromKnownIdentities() {
+        val s = InMemorySyncStore()
+        val authorPub = "31".repeat(32)
+        val authorDevPriv = "32".repeat(32)
+        s.addIdentity(authorPub)
+        val profileMsg = identityMsg(authorPub, 1,
+            mapOf("kind" to "profile", "name" to "Author", "created_at" to 1.0), authorDevPriv)
+        assertTrue(s.ingestMessage(profileMsg))
+
+        val entitledBefore = s.knownIdentities().toSet()
+        val outBefore = s.messagesNotIn(emptyMap(), entitledBefore, "ff".repeat(32)).map { it.msgId() }
+        assertTrue("author still known -> entitled -> served", profileMsg.msgId() in outBefore)
+
+        s.removeIdentity(authorPub)
+
+        val entitledAfter = s.knownIdentities().toSet()
+        val outAfter = s.messagesNotIn(emptyMap(), entitledAfter, "ff".repeat(32)).map { it.msgId() }
+        assertFalse("author no longer known -> excluded from entitled -> not served", profileMsg.msgId() in outAfter)
+    }
+
+    @Test fun purgeAuthoredByDeletesOnlyThatAuthorsMessagesAndReturnsCount() {
+        val s = InMemorySyncStore()
+        val authorPub = "41".repeat(32)
+        val authorDevPriv = "42".repeat(32)
+        val otherPub = "43".repeat(32)
+        val otherDevPriv = "44".repeat(32)
+        s.addIdentity(authorPub)
+        s.addIdentity(otherPub)
+        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "A1", "created_at" to 1.0), authorDevPriv)
+        val m2 = identityMsg(authorPub, 2, mapOf("kind" to "profile", "name" to "A2", "created_at" to 2.0), authorDevPriv)
+        val other = identityMsg(otherPub, 1, mapOf("kind" to "profile", "name" to "O", "created_at" to 1.0), otherDevPriv)
+        assertTrue(s.ingestMessage(m1))
+        assertTrue(s.ingestMessage(m2))
+        assertTrue(s.ingestMessage(other))
+
+        val count = s.purgeAuthoredBy(authorPub)
+        assertEquals(2, count)
+
+        val remaining = s.allMessages().map { it.msgId }
+        assertFalse(m1.msgId() in remaining)
+        assertFalse(m2.msgId() in remaining)
+        assertTrue("a different author's message is untouched", other.msgId() in remaining)
+    }
+
+    // Cross-check with the arc-1 give-side filter, DISTINCT from the
+    // removeIdentity cross-check above: here `entitled` still names the
+    // purged author (the store doesn't require the caller to also call
+    // removeIdentity), yet the message is still not served -- because
+    // purgeAuthoredBy physically removed the row messagesNotIn scans, not
+    // because of the entitled-set gate.
+    @Test fun purgeAuthoredByMessagesNotInNoLongerServesPurgedAuthorEvenIfStillEntitled() {
+        val s = InMemorySyncStore()
+        val authorPub = "51".repeat(32)
+        val authorDevPriv = "52".repeat(32)
+        s.addIdentity(authorPub)
+        val m = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "A", "created_at" to 1.0), authorDevPriv)
+        assertTrue(s.ingestMessage(m))
+
+        val entitled = setOf(authorPub)
+        val before = s.messagesNotIn(emptyMap(), entitled, "ff".repeat(32)).map { it.msgId() }
+        assertTrue("served before purge", m.msgId() in before)
+
+        assertEquals(1, s.purgeAuthoredBy(authorPub))
+
+        val after = s.messagesNotIn(emptyMap(), entitled, "ff".repeat(32)).map { it.msgId() }
+        assertFalse("purged author's message gone even though still in `entitled`", m.msgId() in after)
+    }
+
+    @Test fun markRevokedSetsIsRevokedDeviceTrueForThatDeviceOnly() {
+        val s = InMemorySyncStore()
+        val devicePub = "61".repeat(32)
+        val otherDevicePub = "62".repeat(32)
+        assertFalse("never revoked -> false", s.isRevokedDevice(devicePub))
+        s.markRevoked(devicePub, 5)
+        assertTrue(s.isRevokedDevice(devicePub))
+        assertFalse("a different device is unaffected", s.isRevokedDevice(otherDevicePub))
+    }
+
+    // Mirrors store.ingest_revocation's retro-drop loop (store.py:421-427):
+    // `WHERE device_pub=? AND seq>?`, dropped; seq<=last_valid_seq survives
+    // (it was validly signed before the revocation took effect).
+    @Test fun markRevokedRetroDropsSeqAboveLastValidKeepsSeqAtOrBelow() {
+        val s = InMemorySyncStore()
+        val authorPub = "71".repeat(32)
+        val devPriv = "72".repeat(32)
+        val devPub = devicePubOf(devPriv)
+        s.addIdentity(authorPub)
+        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devPriv)
+        val m2 = identityMsg(authorPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devPriv)
+        val m3 = identityMsg(authorPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devPriv)
+        val m4 = identityMsg(authorPub, 4, mapOf("kind" to "profile", "name" to "s4", "created_at" to 4.0), devPriv)
+        assertTrue(s.ingestMessage(m1))
+        assertTrue(s.ingestMessage(m2))
+        assertTrue(s.ingestMessage(m3))
+        assertTrue(s.ingestMessage(m4))
+
+        s.markRevoked(devPub, 2)
+
+        val remaining = s.allMessages().map { it.msgId }.toSet()
+        assertTrue("seq<=lastValid kept (seq 1)", m1.msgId() in remaining)
+        assertTrue("seq<=lastValid kept (seq 2)", m2.msgId() in remaining)
+        assertFalse("seq>lastValid retro-dropped (seq 3)", m3.msgId() in remaining)
+        assertFalse("seq>lastValid retro-dropped (seq 4)", m4.msgId() in remaining)
+    }
+
+    @Test fun metaGetSetRoundTripsNullOnAbsentAndOverwrites() {
+        val s = InMemorySyncStore()
+        assertNull("never set -> null", s.getMeta("some_key"))
+        s.setMeta("some_key", "v1")
+        assertEquals("v1", s.getMeta("some_key"))
+        s.setMeta("some_key", "v2")             // a later set overwrites, not appends
+        assertEquals("v2", s.getMeta("some_key"))
+        assertNull("a different key stays absent", s.getMeta("other_key"))
+    }
 }

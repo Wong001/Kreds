@@ -54,7 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
 from hearth import dmcrypt, invitecodec
 from hearth.identity import (
     DeviceKeys, DeviceView, EnrollmentCert, _sig_ok, priv_from_hex)
-from hearth.messages import _valid_story_ref
+from hearth.messages import DEFRIEND_TTL, _valid_story_ref
 from hearth.node import HearthNode
 from hearth.sync import SyncService
 
@@ -1260,12 +1260,12 @@ async def _run_dial(data_dir, spec: dict) -> None:
     JSON text itself; see the __main__ dispatch below for why -- produced
     entirely by the Kotlin test, see SyncServeLoopbackTest.kt's
     dialSpec-building helper):
-      {"scenario": "own_sibling"|"friend"|"stranger", "port": int,
+      {"scenario": "own_sibling"|"friend"|"stranger"|"defriend", "port": int,
        "identity_priv": hex, "device_priv": hex, "device_pub": hex,
        "device_name": str, "cert": {EnrollmentCert.to_dict() shape},
        "also_known": [identity_pub, ...],
        "phone_device_pub": hex,       # own_sibling only
-       "phone_identity_pub": hex}     # friend only
+       "phone_identity_pub": hex}     # friend + defriend
 
     own_sibling: the node's identity IS the phone fixture's identity (an
     own/sibling device) -- BEFORE dialing, publishes one PLAINTEXT marker
@@ -1297,6 +1297,17 @@ async def _run_dial(data_dir, spec: dict) -> None:
     must be present; an inner-ring record, a kreds post not wrapped to
     this device, and a DM addressed to a third party must all be absent.
 
+    "friend" is ALSO reused, byte-unchanged, by Task 8's (loopback gate --
+    revoke + defriend at the real wire) revoked-device-refusal test: the
+    ONLY difference is what the Kotlin test seeds on the phone's side
+    beforehand (`store.markRevoked(nodeDevicePub, ...)` in addition to
+    `store.addIdentity` -- no registrar message, nothing entitled) --
+    respondHandshake's revoked-device gate then refuses this node the
+    exact same way the "stranger" sub-scenario below is refused (same
+    wire slot, same PeerRefused shape), so no separate scenario string or
+    Python-side branch is needed for that proof; see
+    SyncRevokeLoopbackTest.kt's revokedDeviceRefusedNothingServed.
+
     stranger: the node's identity is NOT known to the phone at all (Kotlin
     never calls `store.addIdentity` for it) -- composes nothing, expects
     the dial to fail with the phone's PeerRefused specifically (peer_
@@ -1314,7 +1325,31 @@ async def _run_dial(data_dir, spec: dict) -> None:
     success) is a REAL parity bug and is reported via "failed"/"served"
     respectively rather than silently coerced into "refused", so a
     divergence here surfaces as a Kotlin assertion failure (wrong event
-    name / wrong received content) instead of a false pass."""
+    name / wrong received content) instead of a false pass.
+
+    defriend (Task 8, loopback gate -- revoke + defriend at the real
+    wire; FIXED after a reviewer-caught false-pass -- see
+    SyncRevokeLoopbackTest.kt's class doc for the mutation-testing
+    evidence): the node's identity is a friend identity the phone already
+    knows (same Kotlin-side seeding shape as "friend" above, PLUS
+    `also_known` must include the phone's identity -- see the branch
+    above, right before the dial: unlike the original construction, this
+    node's own store.is_known(phone) is deliberately left TRUE for the
+    whole dial). Queues a REAL DefriendNotice targeting
+    `spec["phone_identity_pub"]` via device.make_defriend + store.
+    add_outbox DIRECTLY (not node.unfriend, which also runs local
+    teardown -- see the branch above for the full why). Reports its OWN
+    dedicated `{"event":"defriend_dial_done","ok":...,"peer_identity":...,
+    "received_ids":...,"applied":...}` (NOT the shared refused/failed/
+    served shape -- see the post-dial handling below for exactly why: the
+    expected completion shape here is a generic IO failure, not a clean
+    refusal or a clean serve). `received_ids` (every message pulled FROM
+    THE PHONE, same computation as "friend") is the load-bearing field:
+    expected EMPTY -- proving the over-serve-negative even though the
+    Kotlin test seeds an entitled kreds post that a plain "friend" sync
+    WOULD otherwise deliver, and that THIS node's own session genuinely
+    asks for (it never independently stops the way the original,
+    node.unfriend-based construction did)."""
     scenario = spec["scenario"]
     port = spec["port"]
     also_known = spec.get("also_known") or []
@@ -1324,12 +1359,82 @@ async def _run_dial(data_dir, spec: dict) -> None:
 
     if scenario == "own_sibling":
         node.set_profile("PushedFromNode")
+    elif scenario == "defriend":
+        # Task 8 FIX (reviewer-mandated, closing a real false-pass finding
+        # -- see SyncRevokeLoopbackTest.kt's class doc for the full
+        # mutation-testing evidence): signs + queues a REAL DefriendNotice
+        # targeting the phone's identity via device.make_defriend +
+        # store.add_outbox DIRECTLY -- deliberately NOT node.unfriend (the
+        # ORIGINAL construction here), which ALSO runs
+        # store.unfriend_teardown as part of the same call. That local
+        # teardown removed the phone from THIS node's own
+        # store.is_known(), which by itself made this node's own
+        # `_session` independently stop right after DEFRIENDS
+        # (sync.py:755-758) -- so the original test's "nothing served"
+        # held regardless of whether the PHONE's own mid-session gate
+        # (KotlinSync.serve, KotlinSync.kt:558-583) did anything at all.
+        # A real mutation test (disabling that phone-side gate) confirmed
+        # this: the original test did NOT fail.
+        #
+        # Skipping unfriend_teardown keeps this node's own
+        # store.is_known(phone) TRUE for the rest of this dial: its
+        # session genuinely proceeds PAST DEFRIENDS into HAVE, exactly
+        # like an ordinary, well-behaved friend sync would (confirmed
+        # empirically -- see the post-dial handling below for exactly
+        # what that produces on the wire). The ONLY thing that can then
+        # stop the seeded entitled post (see SyncRevokeLoopbackTest.kt's
+        # own seeding) from crossing the wire is the PHONE's own
+        # mid-session re-check.
+        notice = node.device.make_defriend(spec["phone_identity_pub"])
+        node.store.add_outbox(notice, "",
+                              expires_at=notice.created_at + DEFRIEND_TTL)
 
     sync = SyncService(node)     # wires node._dial = sync._sync_session
                                  # (sync.py __init__) -- this node never
                                  # calls sync.start(): it only DIALS,
                                  # never listens, so no port is bound here.
-    ok, peer_identity, _applied = await node._dial(f"127.0.0.1:{port}")
+    ok, peer_identity, applied = await node._dial(f"127.0.0.1:{port}")
+
+    if scenario == "defriend":
+        # Task 8 FIX: deliberately does NOT go through the shared
+        # refused/failed/served dispatch below. This node's own session
+        # still believes it is friends with the phone (see the branch
+        # above), so when the PHONE's mid-session gate correctly fires,
+        # `KotlinSync.serve` returns WITHOUT ever writing the HAVE reply
+        # this node's own `_swap` is blocked reading. The EXPECTED
+        # resulting shape, confirmed empirically while building this fix,
+        # is a generic IO failure (asyncio.IncompleteReadError at that
+        # HAVE read, caught by `_sync_session`'s broad except-Exception
+        # branch: ok=False, peer_identity=None, applied=[]) -- NOT a clean
+        # PeerRefused and NOT a clean "served" completion. Rather than pin
+        # this test to that exact exception shape (fragile -- a future
+        # asyncio/transport change could alter exactly HOW a peer that
+        # stops mid-protocol surfaces), this instead reports what is
+        # actually OBSERVABLE and unambiguous regardless of completion
+        # shape: does `node.store` (this REAL node's own store, still
+        # alive in this process either way) hold the seeded entitled post
+        # or not. That is exactly the fact a mutation of the phone's gate
+        # flips: WITH the gate, the connection dies before MESSAGES ever
+        # runs, so `received` stays empty; WITH the gate disabled, the
+        # session completes normally all the way through MESSAGES and the
+        # entitled post genuinely lands here (see the mutation-verification
+        # evidence in task-8-report.md).
+        phone_identity_pub = spec["phone_identity_pub"]
+        received = [m.msg_id for m in
+                   node.store.messages_by_author(phone_identity_pub)]
+        # `applied` rides along for diagnostics only -- reliably populated
+        # ([nodeIdentityPub]) ONLY on the mutation-disabled ("gate
+        # missing") path, where _session runs to full completion and
+        # returns applied_by_peer normally; on the expected/normal path
+        # (gate enabled) it is lost inside the IO exception unwinding
+        # described above and reports as [] regardless of whether the
+        # phone genuinely applied the notice moments earlier -- the
+        # load-bearing assertion is `received_ids`, never this field.
+        print(json.dumps({"event": "defriend_dial_done", "ok": ok,
+                          "peer_identity": peer_identity,
+                          "received_ids": received, "applied": applied}),
+             flush=True)
+        return
 
     if not ok:
         if peer_identity is not None:

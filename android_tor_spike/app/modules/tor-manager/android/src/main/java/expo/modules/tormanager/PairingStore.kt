@@ -90,6 +90,39 @@ object PairingStore {
             KotlinHandshake.parseFixture(legacyFile.readText())
         }.isSuccess)
 
+    /** Self-revoke -> full wipe (Task 6, phone-onion-reachability;
+     *  node.py:3144's `enter_revoked_state` is the desktop analog -- there,
+     *  `device_priv`/`identity_priv`/`enc_priv`/`storage_key` are all set to
+     *  None before `keys.json` is rewritten; here, since this device's
+     *  entire identity is exactly ONE file, wiping means deleting it).
+     *  Deletes pairing.json (device_priv + identity_priv + cert) AND the
+     *  legacy external spike_phone_fixture.json -- BOTH, so a revoked phone
+     *  can never fall back to reading a stale legacy fixture after its
+     *  internal identity is gone (readFixture's whole dual-read point is
+     *  "fall back to legacy when internal is absent"; a wipe that left the
+     *  legacy file behind would silently un-wipe itself through that same
+     *  fallback). Also deletes the atomic-write temp file (`save`'s
+     *  `$FILE_NAME.tmp`) -- a crash between `tmp.writeText` and the atomic
+     *  move could in principle leave a stray tmp file holding key material
+     *  around; wiping it too means this leaves NO trace of key material
+     *  behind, not even a stale half-write. Does not delete `dir` itself
+     *  (other, non-identity files may live there) -- only the three files
+     *  this store ever writes.
+     *
+     *  Idempotent: `File.delete()` on an absent file returns `false` and
+     *  never throws, so a second wipe (e.g. a second SelfRevoked observed
+     *  moments after the first already wiped) is a safe no-op -- exactly
+     *  the property `enterRevokedState` (TorNodeService, the caller this
+     *  exists for) needs to be idempotent itself. After this call,
+     *  `hasIdentity(dir, legacyFile)` is `false` (assuming `legacyFile` is
+     *  the SAME file passed here -- this does not touch any OTHER legacy
+     *  file path). */
+    fun wipe(dir: File, legacyFile: File) {
+        File(dir, FILE_NAME).delete()
+        File(dir, "$FILE_NAME.tmp").delete()
+        legacyFile.delete()
+    }
+
     // -- shared fixture reader (dual-read, Task 3 brief) --------------------
     // Every fixture-read call site (LocalApi.fixtureOrNull, TorManagerModule's
     // two direct-parse sites, TorNodeService.fixture) now routes through one
@@ -118,4 +151,5 @@ object PairingStore {
     fun hasIdentity(ctx: Context): Boolean = hasIdentity(ctx.filesDir, legacyFile())
     fun readFixture(ctx: Context): KotlinHandshake.Fixture = readFixture(ctx.filesDir, legacyFile())
     fun readFixtureOrNull(ctx: Context): KotlinHandshake.Fixture? = readFixtureOrNull(ctx.filesDir, legacyFile())
+    fun wipe(ctx: Context) = wipe(ctx.filesDir, legacyFile())
 }

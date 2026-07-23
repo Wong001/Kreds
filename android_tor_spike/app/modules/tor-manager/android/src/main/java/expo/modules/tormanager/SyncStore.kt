@@ -73,6 +73,70 @@ interface SyncStore {
     fun summary(): Map<String, Map<String, Map<String, Any>>>
     fun knownIdentities(): List<String>
     fun addIdentity(id: String)
+    /** Drops `id` from known identities (phone-onion-reachability Task 2;
+     *  mirrors hearth store.py:162 remove_identity's plain `DELETE FROM
+     *  identities WHERE identity_pub=?` -- no cascading side effects here,
+     *  same as the hearth original). Does NOT itself touch any already-
+     *  stored message authored by `id` -- that is purgeAuthoredBy's job
+     *  (hearth's own defriend path calls both, e.g. node.py's unfriend flow
+     *  calls remove_identity AND purge_authored_by separately). A caller
+     *  that re-derives its `messagesNotIn` `entitled` set from
+     *  knownIdentities() (as real entitlement computation does) will
+     *  naturally stop serving `id`'s messages after this call, since `id`
+     *  has fallen out of that derived set -- but messagesNotIn itself does
+     *  not consult knownIdentities(), only the `entitled` parameter it is
+     *  given. Removing an identity that was never known is a no-op. */
+    fun removeIdentity(id: String)
+    /** Deletes every stored message authored by `id` (identity_pub == id),
+     *  returning the count of rows removed (phone-onion-reachability Task
+     *  2; mirrors hearth store.py:1036 purge_authored_by). hearth's
+     *  purge_authored_by performs a REAL delete, not a tombstone insert
+     *  (unlike _tombstone, which both impls' analog below also uses for
+     *  markRevoked's retro-drop) -- and additionally cleans its `dm_keys`/
+     *  `undecryptable` side tables, which have no phone-store analog (this
+     *  store has neither table), so there is nothing extra to clean here.
+     *  After this call, messagesNotIn can no longer serve any of `id`'s
+     *  (now-deleted) messages regardless of what `entitled` set a caller
+     *  passes -- unlike removeIdentity above, this does not depend on the
+     *  caller re-deriving `entitled` from knownIdentities(), because the
+     *  give-side scan reads directly off the underlying message rows,
+     *  which are now gone. */
+    fun purgeAuthoredBy(id: String): Int
+    /** Marks `devicePub` revoked as of `lastValidSeq`, and retro-drops
+     *  (deletes) that device's already-stored messages with `seq >
+     *  lastValidSeq` (phone-onion-reachability Task 2; mirrors the retro-
+     *  drop loop inside hearth's store.ingest_revocation, store.py:421-427
+     *  -- `SELECT msg_id FROM messages WHERE device_pub=? AND seq>?`, each
+     *  then tombstoned). Messages with `seq <= lastValidSeq` are kept: they
+     *  were validly signed before the revocation took effect, matching
+     *  hearth's own boundary (the retro-drop query is a strict `seq>?`,
+     *  not `seq>=?`). hearth tombstones (INSERT INTO tombstones + DELETE
+     *  FROM messages) because it has a tombstones table to gossip the
+     *  deletion to peers from; this store has no such table (same posture
+     *  as purgeAuthoredBy above), so this deletes the rows outright. A
+     *  second call for the SAME devicePub overwrites the stored
+     *  lastValidSeq (latest call wins, like a plain per-device row) and
+     *  retro-drops again against the NEW threshold -- this is a snapshot
+     *  of "revoked as of seq X", not an accumulating revocation log. This
+     *  task provides only the store primitive; RevocationCert parsing and
+     *  wire ingest are Task 3. */
+    fun markRevoked(devicePub: String, lastValidSeq: Int)
+    /** True if `devicePub` has ever been passed to markRevoked (phone-
+     *  onion-reachability Task 2). A pure membership check against the
+     *  revoked-device set -- it does NOT compare against any particular
+     *  seq (the seq gate is applied once, at markRevoked's retro-drop
+     *  time, not evaluated again here). False for a device that was never
+     *  revoked. */
+    fun isRevokedDevice(devicePub: String): Boolean
+    /** Arbitrary key/value store (phone-onion-reachability Task 2; mirrors
+     *  hearth store.py:121-133's `meta` table / set_meta/get_meta). Task 3's
+     *  wire-ingest layer will use this for onion-reachability bookkeeping
+     *  (e.g. tracking revocation-processing progress); this task only
+     *  provides the primitive, with no defined keys yet. Null if `k` was
+     *  never set. */
+    fun getMeta(k: String): String?
+    /** Overwrites (not appends) any existing value stored for `k`. */
+    fun setMeta(k: String, v: String)
     fun ingestMessage(m: SignedMessage): Boolean
     /** Marks a message as needing to be PUSHED on the next sync (the
      *  outbound task: `Compose.post` calls this immediately after
@@ -424,6 +488,31 @@ class InMemorySyncStore : SyncStore {
 
     override fun knownIdentities(): List<String> = identities.toList()
     override fun addIdentity(id: String) { identities.add(id) }
+
+    override fun removeIdentity(id: String) { identities.remove(id) }
+
+    override fun purgeAuthoredBy(id: String): Int {
+        val toRemove = messages.filterValues { it.cert.identity_pub == id }.keys.toList()
+        for (mid in toRemove) messages.remove(mid)
+        return toRemove.size
+    }
+
+    // devicePub -> lastValidSeq, the per-device revoked set (markRevoked/isRevokedDevice).
+    private val revokedDevices = hashMapOf<String, Int>()
+
+    override fun markRevoked(devicePub: String, lastValidSeq: Int) {
+        revokedDevices[devicePub] = lastValidSeq
+        val toDrop = messages.filterValues {
+            it.cert.device_pub == devicePub && it.seq > lastValidSeq
+        }.keys.toList()
+        for (mid in toDrop) messages.remove(mid)
+    }
+
+    override fun isRevokedDevice(devicePub: String): Boolean = devicePub in revokedDevices
+
+    private val meta = hashMapOf<String, String>()
+    override fun getMeta(k: String): String? = meta[k]
+    override fun setMeta(k: String, v: String) { meta[k] = v }
 
     override fun ingestMessage(m: SignedMessage): Boolean {
         // is_known gate (mirrors hearth Store.ingest_message's first check):

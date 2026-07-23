@@ -31,6 +31,15 @@ object TorEngine {
     private fun dataDir(): File = File(ctx().filesDir, "tordata").apply { mkdirs() }
     fun externalDir(): File = ctx().getExternalFilesDir(null)!!
 
+    /** Cookie file for a fresh `ControlPort` AUTHENTICATE -- the exact path
+     *  `bootstrap`/`suspend` already build internally (`File(dataDir(),
+     *  "control_auth_cookie")`). Exposed (Task 7, phone-onion-reachability)
+     *  so `TorNodeService` can construct its own `ControlPort` for
+     *  `ADD_ONION` the same way this object does, without `dataDir()`
+     *  itself needing to become public. Requires `init` to already have run
+     *  (same precondition as every other method here). */
+    fun cookieFile(): File = File(dataDir(), "control_auth_cookie")
+
     /** Idempotent: if tor is already up, calls onDone immediately. */
     fun bootstrap(
         onProgress: (Int) -> Unit,
