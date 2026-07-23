@@ -52,7 +52,8 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
 from hearth import dmcrypt, invitecodec
-from hearth.identity import _sig_ok
+from hearth.identity import (
+    DeviceKeys, DeviceView, EnrollmentCert, _sig_ok, priv_from_hex)
 from hearth.messages import _valid_story_ref
 from hearth.node import HearthNode
 from hearth.sync import SyncService
@@ -1167,9 +1168,221 @@ async def _run_pairing(data_dir, deny: bool = False) -> None:
         await sync.stop()
 
 
+def _node_from_external_keys(data_dir, identity_priv_hex: str,
+                             device_priv_hex: str, cert_dict: dict,
+                             device_name: str, also_known=()) -> HearthNode:
+    """Task 5 (gossip-server loopback gate -- THE INVERSION): builds a REAL
+    HearthNode whose identity+device keys are exactly the raw Ed25519
+    material the KOTLIN test minted (KotlinWire.signRaw/certBody, already
+    byte-matched to hearth/identity.py via the committed wire_vectors.json
+    -- see KotlinWire.kt's own module doc), rather than HearthNode.create()'s
+    freshly-generated ones.
+
+    Why identity minting moves to the KOTLIN side for this one scenario,
+    unlike every other scenario in this file (which prints a
+    python-generated fixture FIRST and lets Kotlin adopt it): here the
+    DIRECTION of the dial is inverted -- the Kotlin GossipServer is the
+    one LISTENING, so its ephemeral port is only known AFTER `.start()`
+    runs, and the phone's own seeded store (for the friend/own-sibling
+    sub-scenarios) needs the node's identity_pub/device_pub BEFORE that
+    seeding happens (to compute wrap audiences, deviceViews, and
+    known-identity gates). A python-side "print my identity, then wait to
+    be told the port" rendezvous would work too, but requires a stdin
+    round-trip with no precedent anywhere in this file; minting entirely
+    on the Kotlin side (which already has genKeypair/signedCert for
+    exactly this, hoisted from GossipServerTest.kt) lets the whole
+    process spawn in one shot, AFTER the port is known, matching every
+    other scenario's "spawn once, read one line" shape -- just with the
+    identity flowing the opposite direction.
+
+    Mirrors exactly what HearthNode.create()+IdentityCeremony do
+    internally (data_dir/keys.json write, store.add_identity(is_self=True),
+    store.save_views(...)) but from EXTERNALLY supplied key material
+    instead of freshly generating it, and WITHOUT set_profile() (own_sibling
+    calls that explicitly and separately, if/when it wants a marker
+    message -- see _run_dial) -- so a fresh node's store holds NOTHING
+    until the scenario itself decides to compose something.
+
+    `also_known`: identity_pubs this node must report as already known
+    (store.add_identity, non-self) BEFORE it ever dials. This is REQUIRED,
+    not optional, in the friend/stranger sub-scenarios: hearth/sync.py
+    _session's post-AUTH admission check ("if not store.is_known(
+    peer_identity): refuse") runs IDENTICALLY regardless of initiator/
+    responder role (sync.py:630-632, not gated on `initiator` at all) --
+    so without this, THIS node would refuse the PHONE itself (whichever
+    identity it dialed with) before the phone's OWN admission check (the
+    actual thing every sub-scenario is proving) is ever reached. Every
+    sub-scenario's spec carries the phone's identity_pub here for exactly
+    this reason; what differs between friend and stranger is only whether
+    the PHONE's own Kotlin store reciprocally knows THIS node's identity."""
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    identity_priv = priv_from_hex(identity_priv_hex)
+    device_priv = priv_from_hex(device_priv_hex)
+    cert = EnrollmentCert.from_dict(cert_dict)
+    if not cert.verify():
+        raise ValueError(
+            "Kotlin-minted enrollment cert failed EnrollmentCert.verify() "
+            "-- a real Ed25519/canonicalization interop break, not a "
+            "test-scenario bug (see KotlinWire.certBody's own doc: this "
+            "wire shape is supposed to be byte-matched to hearth/identity.py)")
+    device = DeviceKeys(device_name, device_priv, cert, identity_priv)
+    if device.device_pub != cert.device_pub:
+        raise ValueError("device_priv does not match the cert's device_pub")
+    (data_dir / "keys.json").write_text(json.dumps(device.to_json()))
+    node = HearthNode(data_dir)
+    node.store.add_identity(device.identity_pub, is_self=True)
+    node.store.save_views(device.identity_pub,
+                          {device.device_pub: DeviceView(cert=cert)})
+    for ident in also_known:
+        node.store.add_identity(ident)
+    return node
+
+
+async def _run_dial(data_dir, spec: dict) -> None:
+    """Task 5 (gossip-server loopback gate -- THE INVERSION): a REAL hearth
+    node DIALS a port the Kotlin GossipServer is already listening on
+    (`spec["port"]`, minted and bound by the Kotlin test BEFORE this
+    process is even spawned -- see SyncServeLoopbackTest.kt's class doc)
+    and runs hearth's REAL initiator session against it
+    (`node._dial(address)`, the exact bound method `Node.deliver_defriends`
+    already uses in production -- SyncService.__init__ wires it to its own
+    `_sync_session`, sync.py:149 -- returning `(ok, peer_identity,
+    applied_by_peer)` rather than `sync_with`'s bool-only wrapper, so a
+    PeerRefused specifically (peer_identity set, from _sync_session's own
+    `except PeerRefused as e: return False, e.peer_identity, []`) is
+    distinguishable from any other failure (peer_identity None, from the
+    generic `except Exception` branch) -- exactly what the "stranger"
+    sub-scenario needs to prove the PHONE's refusal, not some unrelated
+    connection problem, actually happened).
+
+    `spec` (parsed from the JSON file at sys.argv[3] -- a PATH, not the
+    JSON text itself; see the __main__ dispatch below for why -- produced
+    entirely by the Kotlin test, see SyncServeLoopbackTest.kt's
+    dialSpec-building helper):
+      {"scenario": "own_sibling"|"friend"|"stranger", "port": int,
+       "identity_priv": hex, "device_priv": hex, "device_pub": hex,
+       "device_name": str, "cert": {EnrollmentCert.to_dict() shape},
+       "also_known": [identity_pub, ...],
+       "phone_device_pub": hex,       # own_sibling only
+       "phone_identity_pub": hex}     # friend only
+
+    own_sibling: the node's identity IS the phone fixture's identity (an
+    own/sibling device) -- BEFORE dialing, publishes one PLAINTEXT marker
+    (node.set_profile("PushedFromNode"), KIND_PROFILE has no audience gate
+    anywhere in either store's messages_not_in port, so this deliberately
+    stays out of the wrap/entitlement machinery this gate is not testing)
+    under the node's OWN identity+device -- content the phone (a sibling
+    device of the SAME identity) should PULL. After the dial, reports
+    `received_ids`: every message pulled FROM THE PHONE specifically
+    (identity_pub == node.identity_pub, since own_sibling shares identity,
+    filtered to device_pub == spec["phone_device_pub"] so the node's own
+    just-published marker is never conflated with what it received --
+    mirrors _find_composed_post's own device_pub discriminator elsewhere
+    in this file). Whether the phone actually INGESTED "PushedFromNode" is
+    verified independently by the Kotlin test against ITS OWN store (this
+    process has no visibility into the phone's JVM-side store at all) --
+    see SyncServeLoopbackTest.kt's ownSiblingPullsPhoneContentAndPhoneIngestsNodesPush.
+
+    friend: the node's identity is a friend identity the phone already
+    knows (Kotlin seeded `store.addIdentity(friendIdentityPub)` plus a
+    registrar profile message establishing deviceViews for it -- see the
+    Kotlin test's own doc for exactly what it seeds and why). Composes
+    NOTHING itself (a bare, freshly-adopted identity with an empty store)
+    -- this sub-scenario is purely about what the PHONE serves, the
+    OVER-SERVE NEGATIVE at the real-wire level. After the dial, reports
+    `received_ids` as every message pulled FROM THE PHONE specifically
+    (`spec["phone_identity_pub"]`) -- the Kotlin test cross-checks this
+    list against the msgIds of what it seeded: the one entitled kreds post
+    must be present; an inner-ring record, a kreds post not wrapped to
+    this device, and a DM addressed to a third party must all be absent.
+
+    stranger: the node's identity is NOT known to the phone at all (Kotlin
+    never calls `store.addIdentity` for it) -- composes nothing, expects
+    the dial to fail with the phone's PeerRefused specifically (peer_
+    identity is not None). PeerRefused.peer_identity is the identity of
+    the PARTY THAT REFUSED US -- i.e. the PHONE's own identity_pub, NOT
+    this node's own identity (verified empirically against a real
+    responder while building this gate: hearth/sync.py's `_session`
+    reads `peer_hello["cert"]` -- the RESPONDER's hello frame, since
+    `initiator=True` writes ours first and reads theirs second -- into
+    `peer_identity` BEFORE the REVOCATIONS-phase refusal is ever seen, so
+    "the exact node I dialed just told me it doesn't know me anymore"
+    (PeerRefused's own docstring) names THEM, not us). Reports
+    `{"event":"refused","peer_identity":...}` in that case; any OTHER
+    failure shape (a generic exception, or -- worse -- an unexpected
+    success) is a REAL parity bug and is reported via "failed"/"served"
+    respectively rather than silently coerced into "refused", so a
+    divergence here surfaces as a Kotlin assertion failure (wrong event
+    name / wrong received content) instead of a false pass."""
+    scenario = spec["scenario"]
+    port = spec["port"]
+    also_known = spec.get("also_known") or []
+    node = _node_from_external_keys(
+        Path(data_dir) / "n", spec["identity_priv"], spec["device_priv"],
+        spec["cert"], spec.get("device_name", "node"), also_known=also_known)
+
+    if scenario == "own_sibling":
+        node.set_profile("PushedFromNode")
+
+    sync = SyncService(node)     # wires node._dial = sync._sync_session
+                                 # (sync.py __init__) -- this node never
+                                 # calls sync.start(): it only DIALS,
+                                 # never listens, so no port is bound here.
+    ok, peer_identity, _applied = await node._dial(f"127.0.0.1:{port}")
+
+    if not ok:
+        if peer_identity is not None:
+            print(json.dumps({"event": "refused",
+                              "peer_identity": peer_identity}), flush=True)
+        else:
+            # A real parity bug (a bare connection/IO failure, not the
+            # phone's own AUTH refusal) -- never coerced into "refused",
+            # so this surfaces as a Kotlin assertion failure (unexpected
+            # event name) rather than a false pass on the stranger case.
+            print(json.dumps({"event": "failed"}), flush=True)
+        return
+
+    if scenario == "own_sibling":
+        phone_device_pub = spec["phone_device_pub"]
+        received = [m.msg_id for m in
+                   node.store.messages_by_author(node.identity_pub)
+                   if m.cert.device_pub == phone_device_pub]
+    elif scenario == "friend":
+        phone_identity_pub = spec["phone_identity_pub"]
+        received = [m.msg_id for m in
+                   node.store.messages_by_author(phone_identity_pub)]
+    else:
+        received = []
+    print(json.dumps({"event": "served", "ok": True,
+                      "received_ids": received}), flush=True)
+
+
 if __name__ == "__main__":
     _scenario = sys.argv[2] if len(sys.argv) > 2 else "solo"
-    if _scenario == "outbound_compose":
+    if _scenario == "dial":
+        # Task 5 (gossip-server loopback gate -- the inversion): the ONLY
+        # scenario in this file where THIS process dials OUT instead of
+        # serving until killed -- see _run_dial's own doc. sys.argv[3] is
+        # a PATH to a JSON file (NOT the JSON text itself as a bare argv
+        # element -- found empirically while building this gate: Java's
+        # ProcessBuilder on Windows silently STRIPS embedded double-quote
+        # characters when it builds the native command line, so a raw
+        # `{"scenario":"friend",...}` argv element arrives here as
+        # `{scenario:friend,...}` -- unparseable, and not even a loud
+        # failure at the Kotlin end, since the process still launches and
+        # only fails deep inside json.loads. Writing the spec to a file in
+        # the node's own temp data dir and passing the PATH instead sidesteps
+        # Windows argv quoting entirely -- see SyncServeLoopbackTest.kt's
+        # spawnDialNode, which writes this file before spawning) carrying
+        # the sub-scenario, the port to dial, and the Kotlin-minted
+        # identity/device keys (produced by KotlinWire.dumps, not org.json
+        # -- load-bearing for a different reason, see dialSpec's own doc:
+        # org.json's default double-formatting would silently break cert
+        # signature verification here).
+        asyncio.run(_run_dial(
+            sys.argv[1], json.loads(Path(sys.argv[3]).read_text())))
+    elif _scenario == "outbound_compose":
         # Task 9: a structurally different seed (own enckey + a friend's
         # enckey up front, no desk journal posts) from solo/two_node above
         # -- kept as its own entry point rather than folded into main() as

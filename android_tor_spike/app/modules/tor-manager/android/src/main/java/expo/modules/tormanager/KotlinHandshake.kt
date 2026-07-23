@@ -13,6 +13,14 @@ object KotlinHandshake {
         object Accepted : HandshakeResult()
         object Refused : HandshakeResult()
         data class Failed(val stage: String, val reason: String) : HandshakeResult()
+        /** RESPONDER-only success (respondHandshake): the peer's verified
+         *  CertDict, so the caller (the sync responder, arc 1 Task 3) can
+         *  scope give-side entitlement on the AUTHENTICATED identity, never
+         *  a frame claim. Distinct from Accepted -- that is the INITIATOR's
+         *  node-trust verdict from runOverStream's acceptance probe (a
+         *  phase respondHandshake never runs); completing AUTH here means
+         *  "authenticated", not yet "entitled to anything". */
+        data class Ok(val peerCert: KotlinWire.CertDict) : HandshakeResult()
     }
 
     fun randomHex16(): String {
@@ -133,6 +141,99 @@ object KotlinHandshake {
         } finally {
             if (!accepted) stream.close()
         }
+    }
+
+    /** RESPONDER counterpart to runOverStream (arc 1, kotlin-gossip-server
+     *  Task 2) -- the phone answering an inbound dial instead of making
+     *  one. Mirrors hearth's _session responder half for HELLO+AUTH
+     *  (sync.py:590-641): `_swap`'s initiator=False branch reads the peer's
+     *  frame first and writes ours after, for EACH phase (read-then-write,
+     *  already documented above runOverStream at :76) -- so HELLO is
+     *  read-peer/write-ours, and AUTH is independently read-peer/write-ours
+     *  again (not one combined swap). This works because by the time AUTH
+     *  is read, both nonces are already known to both sides from the HELLO
+     *  phase, so there is no ordering dependency across the read/write
+     *  split.
+     *
+     *  The stranger-refusal gate (hearth sync.py:630-632) runs AFTER a full
+     *  HELLO+AUTH round -- NOT right after the peer's HELLO cert verifies
+     *  (a review-caught interop bug in an earlier version of this function
+     *  moved it too early). This placement is load-bearing, not cosmetic:
+     *  hearth's real initiator only ever recognizes {"t":"refused"} as
+     *  PeerRefused in ONE spot, the REVOCATIONS-phase reply (sync.py:
+     *  657-662) -- an initiator that instead got "refused" back in place of
+     *  the HELLO or AUTH reply would just fail generically ("bad hello" /
+     *  unexpected-t), not see a clean refusal. hearth's responder writes
+     *  the refused frame as a bare `write_frame` right after AUTH succeeds
+     *  and BEFORE it would otherwise enter the REVOCATIONS swap (sync.py:
+     *  630-632, no read precedes this write) -- from the wire's point of
+     *  view this frame lands exactly where the REVOCATIONS-phase reply
+     *  would have gone, which is what makes a real initiator's `_swap`
+     *  (write REVOCATIONS-request, then read) receive it and correctly
+     *  raise PeerRefused. So here too: complete the full HELLO+AUTH
+     *  exchange for ANY cryptographically-valid peer cert and device
+     *  signature FIRST, and only then check `isKnown` and write refused --
+     *  this function stops at that point (arc 1's responder does not model
+     *  REVOCATIONS at all yet; that is Task 3's job), but the refused frame
+     *  it writes here is byte-identical to, and lands in the same wire slot
+     *  as, hearth's own.
+     *
+     *  A bad CERT signature or a bad device-key AUTH proof (as opposed to a
+     *  cryptographically-valid but UNKNOWN identity) is NOT given a refused
+     *  frame at all, matching hearth exactly (sync.py:606-607 and :615-616
+     *  both raise with no write) and runOverStream's own analogous cases
+     *  just below (no refused frame for "node cert failed verification" or
+     *  "node failed device-key proof" either).
+     *
+     *  hearth ALSO refuses post-AUTH when the peer's own device is revoked
+     *  in our views (sync.py:635-641, `peer_identity != own` guarded). NOT
+     *  mirrored here: the Kotlin store models no revocations at all yet
+     *  (SyncStore.enckeys' doc comment already documents this as a known
+     *  outbound limitation) -- there is no per-device revocation state to
+     *  consult without new store plumbing, which is out of this task's
+     *  scope. Tracked as a parity follow-up (see task-2-report.md).
+     *
+     *  Never closes the stream on any path (including refusal) -- unlike
+     *  runOverStream, whose caller (the standalone Tor heartbeat) never
+     *  continues past the verdict on the same connection. Here the caller
+     *  (GossipServer, Task 4) always owns the accepted socket's lifecycle
+     *  in its own finally, exactly mirroring hearth: the responder raises
+     *  on refusal/failure and the OUTER connection handler's finally closes
+     *  (sync.py:560-567), not the responder itself. */
+    fun respondHandshake(
+        stream: Stream, fixture: Fixture, isKnown: (identityPub: String) -> Boolean,
+        rnd: () -> String = ::randomHex16,
+    ): HandshakeResult {
+        // HELLO -- read peer's first.
+        val peerHello = readFrame(stream)
+        if (peerHello.optString("t") != "hello") return HandshakeResult.Failed("hello", "unexpected t=${peerHello.optString("t")}")
+        val peerCert = certFromJson(peerHello.getJSONObject("cert"))
+        if (!KotlinWire.verifyCert(peerCert)) return HandshakeResult.Failed("hello", "peer cert failed verification")
+        val myNonce = rnd()
+        writeFrame(stream, mapOf("t" to "hello", "cert" to certToMap(fixture.cert), "nonce" to myNonce))
+
+        // AUTH -- read peer's proof over OUR nonce first, then prove
+        // ourselves over THEIRS. Byte-identical authBody payload to
+        // runOverStream/hearth's _auth_body, directions swapped: we verify
+        // the peer's sig over myNonce (they read it from our HELLO above),
+        // and we sign peerHello's nonce (which we read at the top).
+        val peerAuth = readFrame(stream)
+        if (peerAuth.optString("t") != "auth") return HandshakeResult.Failed("auth", "unexpected t=${peerAuth.optString("t")}")
+        if (!KotlinWire.verifyRaw(peerCert.device_pub, peerAuth.getString("sig"), KotlinWire.authBody(myNonce)))
+            return HandshakeResult.Failed("auth", "peer failed device-key proof")
+        writeFrame(stream, mapOf("t" to "auth",
+            "sig" to KotlinWire.signRaw(fixture.device_priv, KotlinWire.authBody(peerHello.getString("nonce")))))
+
+        // Stranger gate -- AFTER AUTH, matching hearth's wire position
+        // exactly (see doc comment above): a bare write, no read first,
+        // landing in the slot a real initiator's REVOCATIONS-swap read
+        // expects and recognizes as PeerRefused.
+        if (!isKnown(peerCert.identity_pub)) {
+            writeFrame(stream, mapOf("t" to "refused"))
+            return HandshakeResult.Failed("auth", "refused")
+        }
+
+        return HandshakeResult.Ok(peerCert)
     }
 
     /** HELLO+AUTH only -- no acceptance probe, does not close the stream.

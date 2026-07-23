@@ -274,6 +274,127 @@ interface SyncStore {
     /** The stored message with msgId, or null if not found. Used by
      *  ComposeResponse to resolve a target post's author/kind/placement. */
     fun messageById(msgId: String): SignedMessage?
+    /** Give-side entitlement filter (gossip server Task 1) -- the exact port
+     *  of hearth's store.messages_not_in (store.py:702-750): what THIS
+     *  store may serve to `peerIdentity`, given `entitled` (the set of
+     *  authors both sides are known to share -- computed by the caller, not
+     *  this method) and `summaries` (the peer's own already-seen delta, a
+     *  flattened (identity_pub, device_pub) -> SeenSet map -- the SAME
+     *  shape `summary()` above would need to be re-decoded into off the
+     *  wire, but already-decoded here). For each stored message, ascending
+     *  by seq: skip if the author isn't in `entitled`; DM relays only to
+     *  (author, recipient); RING is author-private (peerIdentity must equal
+     *  the author); POST's audience is its inline `wraps` keys UNIONED with
+     *  any wrap_grant devices the POST'S OWN AUTHOR separately signed for it
+     *  (author-keyed -- a hostile friend's grant for someone else's post can
+     *  never widen that post's audience, see `filterMessagesNotIn`'s
+     *  grant-devs doc); WRAP_GRANT/RESPONSE/RESPONSES gate on their own
+     *  inline `wraps` keys only, deliberately NO grant-union (spec
+     *  2026-07-18: a response is never broadcast to the target post's
+     *  audience). Every other kind (profile/story/enckey/album/
+     *  profile_layout/delete/...) is unconditionally servable once past the
+     *  entitled+seen-delta checks -- store.py's function has no audience
+     *  gate for them, so neither does this port. Finally, an entry already
+     *  covered by the peer's own summary (`dev.has(seq)`, SeenSet's own
+     *  seen-check) is dropped. THIS IS THE SECURITY-CRITICAL BOUNDARY: an
+     *  over-serve here leaks private content to a peer who isn't entitled to
+     *  it. Both store impls delegate to the shared `filterMessagesNotIn` so
+     *  the algorithm cannot drift between them. */
+    fun messagesNotIn(summaries: Map<Pair<String, String>, SeenSet>, entitled: Set<String>, peerIdentity: String): List<SignedMessage>
+    /** Byte length of each stored blob named in `hashes` (gossip server Task
+     *  3's smallest-first blob give order, sync.py:794-815) -- a hash with
+     *  no stored blob is simply absent from the result, not zero, so a
+     *  caller ranking by size can tell "unknown" apart from "empty blob"
+     *  (though an empty blob can't occur in practice -- putBlob's hash gate
+     *  ties hash to content). Empty `hashes` returns an empty map without
+     *  touching storage. */
+    fun blobSizes(hashes: List<String>): Map<String, Long>
+}
+
+/** One stored message's fields `filterMessagesNotIn` needs, kept
+ *  store-representation-agnostic (a plain Kotlin `payload` Map either way --
+ *  InMemorySyncStore's native payload or SqliteSyncStore's `MsgJson`-parsed
+ *  one) so BOTH `SyncStore` impls run the IDENTICAL entitlement algorithm
+ *  below instead of two hand-maintained copies that could silently drift
+ *  apart on this security-critical path. `raw` is the fully reconstructed
+ *  `SignedMessage` returned to the caller when this row survives every
+ *  gate. */
+internal data class GossipRow(
+    val msgId: String, val identityPub: String, val devicePub: String,
+    val seq: Int, val kind: String, val payload: Map<String, Any?>, val raw: SignedMessage,
+)
+
+/** A message payload's `wraps` map, reduced to its device-pub keys (the
+ *  audience it names) -- ignores the wrap VALUES entirely (messagesNotIn
+ *  never decrypts, only routes). Malformed/missing `wraps` is an empty
+ *  audience, not an error. */
+internal fun wrapKeys(payload: Map<String, Any?>): Set<String> =
+    (payload["wraps"] as? Map<*, *>)?.keys?.filterIsInstance<String>()?.toSet() ?: emptySet()
+
+/** The give-side entitlement filter itself (gossip server Task 1) -- the
+ *  exact port of hearth's store.messages_not_in (store.py:702-750),
+ *  factored out of both `SyncStore` impls so they cannot diverge on this
+ *  security-critical boundary. `rows` must already be ordered by seq
+ *  ascending (mirrors store.py's `ORDER BY seq ASC`); `peerDevices` must
+ *  already be `deviceViews(peerIdentity)` (the caller's job, since both
+ *  store impls already have their own `deviceViews`). */
+internal fun filterMessagesNotIn(
+    rows: List<GossipRow>, summaries: Map<Pair<String, String>, SeenSet>,
+    entitled: Set<String>, peerIdentity: String, peerDevices: Set<String>,
+): List<SignedMessage> {
+    // (author, targetMsgId) -> devices named by THAT AUTHOR's own
+    // wrap_grant messages (store.py:707-715) -- author-KEYED so a hostile
+    // friend's grant naming target=someone-else's-post can never widen that
+    // post's audience: the union below only ever consults
+    // grantDevs[(thatPost'sOwnAuthor, thatPost'sMsgId)], and a grant signed
+    // by anyone else lands under a DIFFERENT map key that this post's union
+    // never reads. This is the same author-keying
+    // test_routing_gate_ignores_non_author_grants (hearth) and
+    // ignoresForeignAuthoredGrantAndPrefersOlderOwnAuthoredGrant
+    // (DecryptPassTest, the read-side analog) both pin down.
+    val grantDevs = hashMapOf<Pair<String, String>, MutableSet<String>>()
+    for (r in rows) {
+        if (r.kind != "wrap_grant") continue
+        val target = r.payload["target"] as? String ?: continue
+        grantDevs.getOrPut(r.identityPub to target) { mutableSetOf() }.addAll(wrapKeys(r.payload))
+    }
+
+    val out = mutableListOf<SignedMessage>()
+    for (r in rows) {
+        if (r.identityPub !in entitled) continue
+        when (r.kind) {
+            "dm" -> {
+                val recipient = r.payload["to"] as? String
+                if (peerIdentity != r.identityPub && peerIdentity != recipient)
+                    continue      // DMs never relay through friends
+            }
+            "ring" -> {
+                if (peerIdentity != r.identityPub)
+                    continue      // ring records are author-private
+            }
+            "post" -> {
+                val wr = wrapKeys(r.payload) + (grantDevs[r.identityPub to r.msgId] ?: emptySet())
+                if (peerIdentity != r.identityPub && peerDevices.none { it in wr })
+                    continue      // wrap-set union grant audience + author
+            }
+            "wrap_grant", "response", "responses" -> {
+                // Responder -> author only (spec 2026-07-18): deliberately
+                // NO grant-union here, unlike POST above -- a response's
+                // whole point is that it is NOT broadcast to the author's
+                // audience.
+                val wr = wrapKeys(r.payload)
+                if (peerIdentity != r.identityPub && peerDevices.none { it in wr })
+                    continue      // routes to wrapped devices + author only
+            }
+            // Every other kind (profile/story/enckey/album/profile_layout/
+            // delete/...) has no audience gate in store.py either -- falls
+            // through unconditionally to the seen-delta check below.
+        }
+        val dev = summaries[r.identityPub to r.devicePub]
+        if (dev != null && dev.has(r.seq)) continue
+        out.add(r.raw)
+    }
+    return out
 }
 
 /** Reference impl (JVM-testable, no Android). Also the shape the SQLite
@@ -512,4 +633,19 @@ class InMemorySyncStore : SyncStore {
     }
 
     override fun messageById(msgId: String): SignedMessage? = messages[msgId]
+
+    override fun messagesNotIn(
+        summaries: Map<Pair<String, String>, SeenSet>, entitled: Set<String>, peerIdentity: String
+    ): List<SignedMessage> {
+        val rows = messages.values.sortedBy { it.seq }.map { m ->
+            GossipRow(m.msgId(), m.cert.identity_pub, m.cert.device_pub, m.seq, m.kind, m.payload, m)
+        }
+        return filterMessagesNotIn(rows, summaries, entitled, peerIdentity, deviceViews(peerIdentity))
+    }
+
+    override fun blobSizes(hashes: List<String>): Map<String, Long> {
+        val out = linkedMapOf<String, Long>()
+        for (h in hashes) blobs[h]?.let { out[h] = it.size.toLong() }
+        return out
+    }
 }

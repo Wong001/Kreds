@@ -396,4 +396,166 @@ class SyncStoreTest {
         // messageById returns null for non-existent message
         assertNull(s.messageById("ff".repeat(32)))
     }
+
+    // -- gossip server Task 1: messagesNotIn give-side entitlement filter --
+    // SECURITY-CRITICAL: an over-serve here is a privacy breach. Exact port
+    // of hearth's store.messages_not_in (store.py:702-750).
+
+    // Builds a SIGNED message for an EXPLICIT identity_pub (unlike msg()
+    // above, which is hardwired to a single fixed identity) -- entitlement
+    // scenarios need several distinct identities (friend/peer/hostile
+    // friend/third party) in one store. Mirrors DecryptPassTest's own
+    // signedMessage() helper exactly: device_pub is a REAL derived Ed25519
+    // point (verifyDeviceSignature must pass), identity_pub is passed
+    // straight through as signed DATA, never itself verified as a derived
+    // key (ingestMessage/verifyDeviceSignature never check that).
+    private fun identityMsg(identityPub: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+        val devPub = devicePubOf(devPrivHex)
+        val cert = KotlinWire.CertDict(identityPub, devPub, "d", 1752900000.0, "00")
+        val unsigned = SignedMessage(cert, seq, payload, "")
+        return unsigned.copy(signature = KotlinWire.signRaw(devPrivHex, unsigned.body()))
+    }
+
+    private fun devicePubOf(devPrivHex: String): String = KotlinWire.toHex(
+        org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(KotlinWire.fromHex(devPrivHex), 0).generatePublicKey().encoded)
+
+    @Test fun messagesNotInServesEntitledAndNeverOverServes() {
+        val store = InMemorySyncStore()
+        val friendPub = "b1".repeat(32)
+        val friendDevPriv = "b2".repeat(32)
+        val ringAuthorPub = "c1".repeat(32)
+        val ringAuthorDevPriv = "c2".repeat(32)
+        val peerPub = "d1".repeat(32)
+        val peerDevPriv = "d2".repeat(32)
+        val thirdPartyPub = "e1".repeat(32)
+        val peerDevPub = devicePubOf(peerDevPriv)
+
+        store.addIdentity(friendPub)
+        store.addIdentity(ringAuthorPub)
+        store.addIdentity(peerPub)
+
+        // Seed the peer's OWN device so deviceViews(peerPub) is non-empty --
+        // deviceViews is derived purely from stored (identity_pub,
+        // device_pub) pairs, so the peer needs at least one message of its
+        // own on record for its device set to be known.
+        val peerOwnMsg = identityMsg(peerPub, 1,
+            mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)
+        assertTrue(store.ingestMessage(peerOwnMsg))
+
+        // A friend POST wrapped to the peer's device -- entitled author,
+        // peer's device is in the wrap-set -> must be served.
+        val kredsFriendPost = identityMsg(friendPub, 1, mapOf(
+            "kind" to "post", "scope" to "kreds", "text" to "hi",
+            "wraps" to mapOf(peerDevPub to mapOf("x" to 1)), "blobs" to emptyList<String>()), friendDevPriv)
+        assertTrue(store.ingestMessage(kredsFriendPost))
+
+        // An inner-ring RING record, authored by someone who is NOT the
+        // peer -- RING is author-private, must never relay through a friend
+        // no matter how entitled that friend otherwise is.
+        val innerRingRecord = identityMsg(ringAuthorPub, 1, mapOf(
+            "kind" to "ring", "member" to "cc".repeat(32), "ring" to "inner", "created_at" to 1.0), ringAuthorDevPriv)
+        assertTrue(store.ingestMessage(innerRingRecord))
+
+        // A DM whose recipient is a THIRD party -- the peer is neither its
+        // author nor its recipient -> DMs never relay through friends.
+        val dmToThirdParty = identityMsg(friendPub, 2, mapOf(
+            "kind" to "dm", "to" to thirdPartyPub, "body_nonce" to "ab".repeat(12), "body_ct" to "cd".repeat(20),
+            "wraps" to emptyMap<String, Any?>(), "blobs" to emptyList<String>()), friendDevPriv)
+        assertTrue(store.ingestMessage(dmToThirdParty))
+
+        // A POST wrapped to some OTHER device, NOT the peer's -- entitled
+        // author, but outside the wrap-set -> wrap-set gate blocks it.
+        val postNotWrappedToPeer = identityMsg(friendPub, 3, mapOf(
+            "kind" to "post", "scope" to "kreds", "text" to "nope",
+            "wraps" to mapOf("ff".repeat(32) to mapOf("x" to 1)), "blobs" to emptyList<String>()), friendDevPriv)
+        assertTrue(store.ingestMessage(postNotWrappedToPeer))
+
+        val entitled = setOf(friendPub, ringAuthorPub)
+        val out = store.messagesNotIn(emptyMap(), entitled, peerPub).map { it.msgId() }
+        assertTrue("entitled + wrapped to the peer -> served", kredsFriendPost.msgId() in out)
+        assertFalse("RING author-private -> never relayed", innerRingRecord.msgId() in out)
+        assertFalse("DM to a third party -> never relayed to the peer", dmToThirdParty.msgId() in out)
+        assertFalse("not wrapped to the peer -> wrap-set gate", postNotWrappedToPeer.msgId() in out)
+    }
+
+    @Test fun messagesNotInDropsWhatPeerAlreadyHas() {
+        val store = InMemorySyncStore()
+        val peerPub = "f1".repeat(32)
+        val peerDevPriv = "f2".repeat(32)
+        val peerDevPub = devicePubOf(peerDevPriv)
+        store.addIdentity(peerPub)
+
+        // Messages authored by the peer itself -- peerIdentity == author
+        // bypasses the wrap-set gate entirely (store.py's `peer_identity !=
+        // ipub` guard is false), isolating the seen-delta behavior under
+        // test from the wrap-set gate exercised above.
+        val m1 = identityMsg(peerPub, 1,
+            mapOf("kind" to "post", "scope" to "kreds", "text" to "one", "blobs" to emptyList<String>()), peerDevPriv)
+        val m2 = identityMsg(peerPub, 2,
+            mapOf("kind" to "post", "scope" to "kreds", "text" to "two", "blobs" to emptyList<String>()), peerDevPriv)
+        assertTrue(store.ingestMessage(m1))
+        assertTrue(store.ingestMessage(m2))
+
+        // The peer's own summary claims seq 1 (only) already seen.
+        val summaries = mapOf((peerPub to peerDevPub) to SeenSet(contiguous = 1))
+        val out = store.messagesNotIn(summaries, setOf(peerPub), peerPub).map { it.msgId() }
+        assertFalse("seq already covered by the peer's summary -> dropped", m1.msgId() in out)
+        assertTrue("seq NOT covered by the peer's summary -> still served", m2.msgId() in out)
+    }
+
+    @Test fun messagesNotInPostUnionsAuthorKeyedGrantDevices() {
+        val authorPub = "12".repeat(32)
+        val authorDevPriv1 = "13".repeat(32)
+        val authorDevPriv2 = "14".repeat(32)
+        val hostileFriendPub = "15".repeat(32)
+        val hostileFriendDevPriv = "16".repeat(32)
+        val peerPub = "17".repeat(32)
+        val peerDevPriv = "18".repeat(32)
+        val peerDevPub = devicePubOf(peerDevPriv)
+
+        // Positive case: a friend POST with NO inline wrap for the peer at
+        // all, but an AUTHOR-signed wrap_grant naming the peer's device --
+        // the grant-union must open the gate.
+        val store = InMemorySyncStore()
+        store.addIdentity(authorPub)
+        store.addIdentity(peerPub)
+        assertTrue(store.ingestMessage(identityMsg(peerPub, 1,
+            mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)))
+        val post = identityMsg(authorPub, 1, mapOf(
+            "kind" to "post", "scope" to "kreds", "text" to "grant test",
+            "wraps" to mapOf("ff".repeat(32) to mapOf("x" to 1)), "blobs" to emptyList<String>()), authorDevPriv1)
+        assertTrue(store.ingestMessage(post))
+        // Signed by a DIFFERENT device of the SAME author identity -- proves
+        // the grant match is on identity_pub, not device_pub.
+        val authorGrant = identityMsg(authorPub, 2, mapOf(
+            "kind" to "wrap_grant", "target" to post.msgId(), "created_at" to 1.0,
+            "wraps" to mapOf(peerDevPub to mapOf("x" to 1))), authorDevPriv2)
+        assertTrue(store.ingestMessage(authorGrant))
+
+        val out1 = store.messagesNotIn(emptyMap(), setOf(authorPub), peerPub).map { it.msgId() }
+        assertTrue("author-signed grant naming the peer's device opens the gate", post.msgId() in out1)
+
+        // Negative case (REQUIRED, over-serve guard): a SEPARATE store, same
+        // shape, but the grant naming the peer's device is signed by a
+        // HOSTILE FRIEND (not the post's author) -- grant_devs is
+        // author-keyed, so this must NEVER widen the post's audience,
+        // however genuinely the grant names the peer's real device.
+        val store2 = InMemorySyncStore()
+        store2.addIdentity(authorPub)
+        store2.addIdentity(hostileFriendPub)
+        store2.addIdentity(peerPub)
+        assertTrue(store2.ingestMessage(identityMsg(peerPub, 1,
+            mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)))
+        val post2 = identityMsg(authorPub, 1, mapOf(
+            "kind" to "post", "scope" to "kreds", "text" to "grant test 2",
+            "wraps" to mapOf("ff".repeat(32) to mapOf("x" to 1)), "blobs" to emptyList<String>()), authorDevPriv1)
+        assertTrue(store2.ingestMessage(post2))
+        val hostileGrant = identityMsg(hostileFriendPub, 1, mapOf(
+            "kind" to "wrap_grant", "target" to post2.msgId(), "created_at" to 1.0,
+            "wraps" to mapOf(peerDevPub to mapOf("x" to 1))), hostileFriendDevPriv)
+        assertTrue(store2.ingestMessage(hostileGrant))
+
+        val out2 = store2.messagesNotIn(emptyMap(), setOf(authorPub, hostileFriendPub), peerPub).map { it.msgId() }
+        assertFalse("a non-author-signed grant must never widen the post's audience", post2.msgId() in out2)
+    }
 }

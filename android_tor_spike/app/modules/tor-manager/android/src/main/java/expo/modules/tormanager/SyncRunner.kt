@@ -52,7 +52,15 @@ object SyncRunner {
     // is the whole point: two callers in different components contend on the
     // exact same lock. Reentrant so the visible-for-testing helper and runSync
     // share one lock object.
-    private val syncLock = ReentrantLock()
+    //
+    // `internal` (gossip server Task 4, was `private`): GossipServer's accept
+    // loop must acquire this SAME instance around each inbound handshake+serve
+    // so an inbound connection and an outbound sync (this object's own
+    // runSync) are mutually exclusive over the shared SQLite writer -- see
+    // GossipServer.kt's class doc for the coarse-lock tradeoff this implies.
+    // TorNodeService threads this same reference into both runSync (already
+    // did, indirectly, via this object) and the new GossipServer instance.
+    internal val syncLock = ReentrantLock()
 
     /** Visible-for-testing entry that runs an arbitrary body under the SAME
      *  `syncLock` production `runSync` uses -- lets the process-wide mutex be

@@ -3,7 +3,9 @@ package expo.modules.tormanager
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.json.JSONArray
 import org.json.JSONObject
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -145,5 +147,250 @@ class KotlinSyncTest {
         assertEquals("Zm9vYmFy", Base64Portable.encode("foobar".toByteArray(Charsets.US_ASCII)))
         assertEquals("Zm9v", Base64Portable.encode("foo".toByteArray(Charsets.US_ASCII)))
         assertEquals("Zg==", Base64Portable.encode("f".toByteArray(Charsets.US_ASCII)))
+    }
+
+    // =======================================================================
+    // serve() -- the RESPONDER content phases (gossip server Task 3).
+    // Mirrors _session (sync.py:643-825) in REVERSE I/O order vs. `run`
+    // above (responder = read-then-write per phase, KotlinHandshake.kt:76).
+    // Called AFTER KotlinHandshake.respondHandshake already authenticated
+    // the peer -- serve() never re-verifies peerCert, it trusts it as the
+    // scoping identity (never a frame claim).
+    //
+    // RespondingStream mirrors KotlinHandshakeTest's own fake of the same
+    // name (queued read-frames, captured writes) -- duplicated here rather
+    // than shared, following that file's own precedent of a fresh
+    // file-scoped fake per test file (KotlinHandshakeTest.kt:16-25).
+    // =======================================================================
+
+    private class RespondingStream(readFrames: List<Map<String, Any?>>) : Stream {
+        private val buffer: ByteArray = readFrames.fold(ByteArray(0)) { acc, f -> acc + KotlinWire.writeFrameBytes(f) }
+        private var pos = 0
+        val written = mutableListOf<JSONObject>()
+        override fun write(bytes: ByteArray) {
+            val n = (((bytes[0].toInt() and 0xff) shl 24) or ((bytes[1].toInt() and 0xff) shl 16) or
+                     ((bytes[2].toInt() and 0xff) shl 8) or (bytes[3].toInt() and 0xff))
+            written.add(JSONObject(String(bytes, 4, n, Charsets.US_ASCII)))
+        }
+        override fun readExactSync(n: Int): ByteArray {
+            check(pos + n <= buffer.size) { "RespondingStream exhausted (wanted $n more bytes)" }
+            val out = buffer.copyOfRange(pos, pos + n)
+            pos += n
+            return out
+        }
+        override fun close() {}
+    }
+
+    // Builds a SIGNED message for an EXPLICIT identity_pub, mirroring
+    // SyncStoreTest's identityMsg/devicePubOf idiom exactly (reusing this
+    // file's own devPub() in place of a second devicePubOf()).
+    private fun identityMsg(identityPub: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+        val devicePub = devPub(devPrivHex)
+        val cert = KotlinWire.CertDict(identityPub, devicePub, "d", 1752900000.0, "00")
+        val unsigned = SignedMessage(cert, seq, payload, "")
+        return unsigned.copy(signature = KotlinWire.signRaw(devPrivHex, unsigned.body()))
+    }
+
+    // This device's (the RESPONDER's) own fixture -- serve() reads
+    // fixture.cert.identity_pub (own-device-trust comparison) and
+    // fixture.device_pub (REVOCATIONS self-revoked check). No real
+    // signature needed: serve() never calls KotlinWire.verifyCert on its
+    // own fixture.cert.
+    private fun buildFixture(identityPub: String, devicePriv: String = "aa".repeat(32)): KotlinHandshake.Fixture {
+        val devicePub = devPub(devicePriv)
+        val cert = KotlinWire.CertDict(identityPub, devicePub, "Own Device", 1752900000.0, "00")
+        return KotlinHandshake.Fixture(devicePriv, devicePub, cert, "unused.onion:9000")
+    }
+
+    private fun sha(b: ByteArray) = KotlinWire.toHex(java.security.MessageDigest.getInstance("SHA-256").digest(b))
+
+    /** MESSAGES phase: the entitled delta is written, a RING record is
+     *  excluded even though its author IS entitled (author-private gate --
+     *  mirrors SyncStoreTest's own messagesNotInServesEntitledAndNeverOverServes,
+     *  but driven through serve()'s wire protocol instead of calling
+     *  store.messagesNotIn directly), a POST from an author known to US but
+     *  NOT reported in the peer's own HAVE.known is excluded by the
+     *  entitled-SET INTERSECTION specifically (code review, MEDIUM -- the
+     *  ring-record exclusion above is independent of entitled entirely, since
+     *  RING's author-private gate fires regardless of entitlement, so it does
+     *  NOT by itself prove serve() computes `entitled = knownIdentities ∩
+     *  peerKnown` rather than just `entitled = knownIdentities()`; this case
+     *  is wrapped to the peer's device, so the wrap-set gate alone WOULD
+     *  serve it -- only the intersection excludes it, and this assertion
+     *  fails if that intersection is bypassed), an offered message from an
+     *  already-known identity is ingested, and -- since the peer here is NOT
+     *  fixture's own sibling device -- own-device trust must NOT adopt an
+     *  identity the peer's `known` reports that we don't already know (the
+     *  HAVE-phase negative). */
+    @Test fun serveMessagesPhaseServesEntitledDeltaExcludesRingAndIngestsOfferedMessage() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))   // unrelated to the peer below
+
+        val friendPub = "b1".repeat(32); val friendDevPriv = "b2".repeat(32)
+        val ringAuthorPub = "c1".repeat(32); val ringAuthorDevPriv = "c2".repeat(32)
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerDevPub = devPub(peerDevPriv)
+        val unknownToUsPub = "ee".repeat(32)   // peer reports it as "known"; we must never adopt it (non-sibling)
+        // Known to US (addIdentity below) but NOT reported by the peer's own
+        // HAVE.known -- excluded ONLY by the entitled intersection, since its
+        // post below IS wrapped to the peer's device (wrap-set gate alone
+        // would pass it).
+        val notMutualFriendPub = "f1".repeat(32); val notMutualFriendDevPriv = "f2".repeat(32)
+
+        store.addIdentity(friendPub)
+        store.addIdentity(ringAuthorPub)
+        store.addIdentity(peerPub)
+        store.addIdentity(notMutualFriendPub)
+        // Seed the peer's own device so deviceViews(peerPub) is non-empty --
+        // needed for the wrap-set gate on the POSTs below.
+        assertTrue(store.ingestMessage(identityMsg(peerPub, 1,
+            mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)))
+
+        val kredsFriendPost = identityMsg(friendPub, 1, mapOf(
+            "kind" to "post", "scope" to "kreds", "text" to "hi",
+            "wraps" to mapOf(peerDevPub to mapOf("x" to 1)), "blobs" to emptyList<String>()), friendDevPriv)
+        assertTrue(store.ingestMessage(kredsFriendPost))
+
+        val innerRingRecord = identityMsg(ringAuthorPub, 1, mapOf(
+            "kind" to "ring", "member" to "cc".repeat(32), "ring" to "inner", "created_at" to 1.0), ringAuthorDevPriv)
+        assertTrue(store.ingestMessage(innerRingRecord))
+
+        // Wrapped to the peer's device -- the wrap-set gate alone would
+        // serve this. Only exclusion from `entitled` (peerKnown does NOT
+        // list notMutualFriendPub below) can block it.
+        val postFromNonMutualFriend = identityMsg(notMutualFriendPub, 1, mapOf(
+            "kind" to "post", "scope" to "kreds", "text" to "not mutual",
+            "wraps" to mapOf(peerDevPub to mapOf("x" to 1)), "blobs" to emptyList<String>()), notMutualFriendDevPriv)
+        assertTrue(store.ingestMessage(postFromNonMutualFriend))
+
+        val peerCert = KotlinWire.CertDict(peerPub, peerDevPub, "Peer Phone", 1752900000.0, "")
+
+        // The peer OFFERS a new message from the already-entitled friend
+        // identity -- must be ingested via the existing verify/ingest gates.
+        val offered = identityMsg(friendPub, 2,
+            mapOf("kind" to "profile", "name" to "Friend", "created_at" to 2.0), friendDevPriv)
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(),
+                // notMutualFriendPub deliberately absent -- the peer does not
+                // report it as known, so it must fall out of the intersection.
+                "known" to listOf(friendPub, ringAuthorPub, unknownToUsPub),
+                "peers" to emptyList<Any?>(), "addr" to "127.0.0.1:9999"),
+            mapOf("t" to "messages", "msgs" to listOf(offered.toDict())),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+
+        assertEquals("6 frames written: revocations, defriends, have, messages, blob_want, blobs",
+            6, stream.written.size)
+        val wroteMessages = stream.written[3]
+        assertEquals("messages", wroteMessages.getString("t"))
+        val msgsArr = wroteMessages.getJSONArray("msgs")
+        val servedIds = (0 until msgsArr.length()).map { SignedMessageKt.fromDict(toMap(msgsArr.getJSONObject(it))).msgId() }
+        assertTrue("entitled post wrapped to the peer's device -> served", kredsFriendPost.msgId() in servedIds)
+        assertFalse("RING is author-private -> never relayed to a friend, even an entitled one",
+            innerRingRecord.msgId() in servedIds)
+        assertFalse("author known to us but NOT reported by the peer's HAVE.known -> excluded by " +
+            "the entitled INTERSECTION, even though the wrap-set gate alone would pass it " +
+            "(this must fail if serve() used entitled=knownIdentities() instead of the peerKnown intersection)",
+            postFromNonMutualFriend.msgId() in servedIds)
+
+        assertTrue("offered message from an already-known identity is ingested",
+            store.allMessages().any { it.msgId == offered.msgId() })
+
+        assertFalse("a non-sibling peer's `known` must never auto-widen our friend graph",
+            store.knownIdentities().contains(unknownToUsPub))
+
+        val wroteHave = stream.written[2]
+        assertEquals("have", wroteHave.getString("t"))
+        assertEquals("peers dropped (arc 3, no peer table yet)", 0, wroteHave.getJSONArray("peers").length())
+        assertEquals("no loopback addr concept yet at this arc", "", wroteHave.getString("addr"))
+    }
+
+    /** BLOBS phase: smallest-first within BLOB_GIVE_BUDGET (a wanted blob
+     *  too large to fit alongside a smaller one is excluded, proving the
+     *  sort -- not just "everything requested was given"), and an offered
+     *  blob from the peer is verified + stored. BLOB_GIVE_BUDGET is
+     *  temporarily shrunk (its whole purpose -- see its doc comment in
+     *  KotlinSync.kt) since the production budget (~15 MiB) can't
+     *  realistically be exceeded by small JVM-test fixtures. */
+    @Test fun serveBlobsPhaseGivesSmallestFirstWithinBudgetAndStoresOfferedBlob() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+
+        val smallData = ByteArray(10) { it.toByte() }
+        val largeData = ByteArray(200) { it.toByte() }
+        val smallHash = sha(smallData); val largeHash = sha(largeData)
+        assertTrue(store.putBlob(smallHash, smallData))
+        assertTrue(store.putBlob(largeHash, largeData))
+        val smallB64Len = Base64Portable.encode(smallData).length
+
+        val savedBudget = BLOB_GIVE_BUDGET
+        BLOB_GIVE_BUDGET = smallB64Len + 1   // small alone fits; small+large does not
+        try {
+            val offeredData = byteArrayOf(9, 9, 9)
+            val offeredHash = sha(offeredData)
+            val stream = RespondingStream(listOf(
+                mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+                mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+                mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                    "peers" to emptyList<Any?>(), "addr" to ""),
+                mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+                // Order deliberately large-then-small on the wire -- the
+                // give side must sort by size itself, not rely on request order.
+                mapOf("t" to "blob_want", "hashes" to listOf(largeHash, smallHash)),
+                mapOf("t" to "blobs", "blobs" to mapOf(offeredHash to Base64Portable.encode(offeredData))),
+            ))
+
+            val result = KotlinSync.serve(stream, store, fixture, peerCert)
+            assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+
+            val wroteBlobs = stream.written[5]
+            assertEquals("blobs", wroteBlobs.getString("t"))
+            val givenKeys = wroteBlobs.getJSONObject("blobs").keys().asSequence().toSet()
+            assertEquals("only the SMALLER wanted blob fits the constrained budget",
+                setOf(smallHash), givenKeys)
+
+            assertArrayEquals("offered blob was verified (hash+size) and stored",
+                offeredData, store.getBlob(offeredHash))
+        } finally {
+            BLOB_GIVE_BUDGET = savedBudget
+        }
+    }
+
+    /** HAVE phase, own-device trust: a peer authenticated under fixture's
+     *  OWN identity (a sibling device, sync.py:768-772) has its reported
+     *  `known` identities adopted into our own knownIdentities(). */
+    @Test fun serveOwnDeviceSiblingPeerAdoptsPeersKnownIdentities() {
+        val store = InMemorySyncStore()
+        val ownIdentityPub = "aa".repeat(32)
+        val fixture = buildFixture(ownIdentityPub)
+        val siblingDevPriv = "bb".repeat(32)
+        val peerCert = KotlinWire.CertDict(ownIdentityPub, devPub(siblingDevPriv), "Sibling Phone", 1752900000.0, "")
+
+        val newFriendPub = "cc".repeat(32)
+        assertFalse("not yet known before this sync round", store.knownIdentities().contains(newFriendPub))
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to listOf(newFriendPub),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertTrue("own-device trust adopts the sibling's known identity",
+            store.knownIdentities().contains(newFriendPub))
     }
 }
