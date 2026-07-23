@@ -39,6 +39,22 @@ class TorNodeService : Service() {
     @Volatile private var syncs = 0
     @Volatile private var lastLine = "starting"
 
+    // Gossip server Task 4: the inbound (answering) counterpart to the
+    // outbound syncCycle below. One SqliteSyncStore, opened once here and
+    // held for the service's whole lifetime (NOT the per-round open/close
+    // SyncRunner.runTransport does for its own outbound store -- GossipServer's
+    // constructor takes a single injected store instance, so it must be
+    // long-lived by construction; concurrent SQLiteOpenHelper connections to
+    // the same DB file are already how this app runs today, and writes across
+    // them are serialized by the shared SyncRunner.syncLock both this
+    // server and runSync acquire -- see GossipServer.kt's class doc).
+    // fixtureProvider uses readFixtureOrNull (never throws): before first-load
+    // pairing completes there is no identity to authenticate inbound peers
+    // with, and GossipServer.handle already refuses/closes cleanly on a null
+    // fixture rather than crashing a worker thread.
+    private var gossipStore: SqliteSyncStore? = null
+    private var gossipServer: GossipServer? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -55,6 +71,7 @@ class TorNodeService : Service() {
         startForeground(NOTIF_ID, buildNotification("Kreds node starting..."))
         broadcastState("bootstrapping")
         TorEngine.init(this)
+        startGossipServer()
         scheduler = Executors.newSingleThreadScheduledExecutor()
         // Bootstrap once on the scheduler thread; on success, begin the sync cadence.
         scheduler!!.execute {
@@ -91,6 +108,30 @@ class TorNodeService : Service() {
     // Throws on failure (both call sites here already wrap this in a
     // try/catch) -- see PairingStore.readFixture.
     private fun fixture(): KotlinHandshake.Fixture = PairingStore.readFixture(this)
+
+    // Gossip server Task 4: brings up the inbound (answering) side alongside
+    // Tor. GossipServer binds loopback-only and the real onion-service
+    // forwarding rule only starts working once TorEngine's bootstrap
+    // actually completes, so starting the accept loop this early (right
+    // after TorEngine.init, before bootstrap finishes) is harmless -- it is
+    // simply not reachable from outside until Tor is up, same as how a
+    // friend can't dial an onion address that hasn't bootstrapped yet.
+    // readFixtureOrNull (never throws): before first-load pairing completes
+    // there is no identity to authenticate inbound peers with;
+    // GossipServer.handle already closes cleanly on a null fixture rather
+    // than needing this to throw.
+    private fun startGossipServer() {
+        val store = SqliteSyncStore(this)
+        gossipStore = store
+        gossipServer = GossipServer(
+            store, { PairingStore.readFixtureOrNull(this) }, SyncRunner.syncLock, port = 0,
+        ).also { it.start() }
+    }
+
+    private fun stopGossipServer() {
+        runCatching { gossipServer?.stop() }; gossipServer = null
+        runCatching { gossipStore?.close() }; gossipStore = null
+    }
 
     // Brick C Task 2: was the bare AUTH heartbeat (dial + KotlinHandshake.run).
     // Now drives the full content-sync transport via SyncRunner.runSync, which
@@ -149,13 +190,18 @@ class TorNodeService : Service() {
 
     private fun shutdown() {
         scheduler?.shutdownNow(); scheduler = null
+        stopGossipServer()
         runCatching { TorEngine.suspend() }
         broadcastState("stopped")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    override fun onDestroy() { runCatching { TorEngine.suspend() }; super.onDestroy() }
+    override fun onDestroy() {
+        stopGossipServer()   // idempotent -- a no-op if shutdown() already ran
+        runCatching { TorEngine.suspend() }
+        super.onDestroy()
+    }
 
     private fun ensureChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
