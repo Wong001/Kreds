@@ -107,7 +107,7 @@ class KotlinHandshakeTest {
 
         val stream = RespondingStream(listOf(peerHello, peerAuth))
         val result = KotlinHandshake.respondHandshake(
-            stream, fixture, isKnown = { it == peerIdentityPub }, rnd = { myNonce })
+            stream, fixture, isKnown = { it == peerIdentityPub }, isRevoked = { false }, rnd = { myNonce })
 
         assertTrue("expected Ok, got $result", result is KotlinHandshake.HandshakeResult.Ok)
         val ok = result as KotlinHandshake.HandshakeResult.Ok
@@ -159,7 +159,8 @@ class KotlinHandshakeTest {
         val peerAuth = mapOf("t" to "auth", "sig" to KotlinWire.signRaw(peerDevicePriv, KotlinWire.authBody(myNonce)))
 
         val stream = RespondingStream(listOf(peerHello, peerAuth))
-        val result = KotlinHandshake.respondHandshake(stream, fixture, isKnown = { false }, rnd = { myNonce })
+        val result = KotlinHandshake.respondHandshake(
+            stream, fixture, isKnown = { false }, isRevoked = { false }, rnd = { myNonce })
 
         assertTrue("expected Failed, got $result", result is KotlinHandshake.HandshakeResult.Failed)
         val f = result as KotlinHandshake.HandshakeResult.Failed
@@ -199,7 +200,7 @@ class KotlinHandshakeTest {
 
         val stream = RespondingStream(listOf(peerHello, peerAuth))
         val result = KotlinHandshake.respondHandshake(
-            stream, fixture, isKnown = { it == peerIdentityPub }, rnd = { myNonce })
+            stream, fixture, isKnown = { it == peerIdentityPub }, isRevoked = { false }, rnd = { myNonce })
 
         assertTrue("expected Failed, got $result", result is KotlinHandshake.HandshakeResult.Failed)
         val f = result as KotlinHandshake.HandshakeResult.Failed

@@ -206,10 +206,13 @@ object KotlinHandshake {
         stream: Stream, fixture: Fixture, isKnown: (identityPub: String) -> Boolean,
         // Revoked-device check (phone-onion-reachability Task 5), threaded
         // the same way as `isKnown` -- a lambda, not the store directly, so
-        // this function stays store-agnostic. Defaults to "never revoked" so
-        // every pre-existing call site/test that doesn't care about
-        // revocation compiles and behaves identically unchanged.
-        isRevoked: (devicePub: String) -> Boolean = { false },
+        // this function stays store-agnostic. REQUIRED, no default (code
+        // review fix, matching `isKnown`'s own no-default precedent): a
+        // security gate must never be able to fail open just because a
+        // future second caller forgot to wire it. Every call site must
+        // explicitly pass a value, even `{ false }` for a scenario that
+        // deliberately doesn't care about revocation.
+        isRevoked: (devicePub: String) -> Boolean,
         rnd: () -> String = ::randomHex16,
     ): HandshakeResult {
         // HELLO -- read peer's first.
