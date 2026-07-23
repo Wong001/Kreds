@@ -263,6 +263,55 @@ class KotlinSyncTest {
         assertFalse("tampered signature -> never ingested", store.isRevokedDevice(devicePub))
     }
 
+    /** Code review fix: a GENUINE self-revocation is NOT the "never known"
+     *  case the other run() revocation tests exercise -- our own identity_pub
+     *  IS seeded into knownIdentities() in production, both at pairing
+     *  (KotlinPairing.kt's installPackage: `store.addIdentity(cert.identity_pub)`)
+     *  and on every sync (SyncRunner.kt's runTransport:
+     *  `SqliteSyncStore(ctx).also { it.addIdentity(fx.cert.identity_pub) }`).
+     *  This test seeds `store.addIdentity(ownIdentityPub)` FIRST (mirroring
+     *  that production seeding) so a real, validly identity-signed
+     *  self-revocation cert actually reaches ingestRevocation's is_known
+     *  gate and passes it -- proving `markRevoked` genuinely runs (own
+     *  device marked revoked, own prior messages retro-dropped) BEFORE
+     *  `SelfRevoked` is returned, not that `SelfRevoked` merely fires on an
+     *  ingest that was rejected. If the `SelfRevoked` return were ever
+     *  dropped from `run`, this test would fail differently than the
+     *  assertion below expects: with only one canned frame in the
+     *  `RespondingStream`, `run` would fall through to the DEFRIENDS read
+     *  and throw ("RespondingStream exhausted"), producing
+     *  `SyncResult.Failed(...)`, not `SyncResult.Ok` -- either way NOT
+     *  `SyncResult.SelfRevoked`, so `assertEquals(SyncResult.SelfRevoked,
+     *  result)` below would fail. */
+    @Test fun runIngestsGenuineOwnSelfRevocationThenStillReturnsSelfRevoked() {
+        val store = InMemorySyncStore()
+        val (ownIdentityPriv, ownIdentityPub) = genKeypair()
+        val ownDevicePriv = "cc".repeat(32)
+        val ownDevicePub = devPub(ownDevicePriv)
+        store.addIdentity(ownIdentityPub)   // mirrors production seeding (KotlinPairing.kt / SyncRunner.kt)
+
+        val m1 = identityMsg(ownIdentityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), ownDevicePriv)
+        val m2 = identityMsg(ownIdentityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), ownDevicePriv)
+        val m3 = identityMsg(ownIdentityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), ownDevicePriv)
+        assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2)); assertTrue(store.ingestMessage(m3))
+
+        val rev = signedRevocation(ownIdentityPriv, ownIdentityPub, ownDevicePub, lastValidSeq = 2)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            // run() must return SelfRevoked right after this element -- no further frame is ever read.
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = ownDevicePub)
+        assertEquals("SelfRevoked must still surface for the Task 6 wipe hook, even though " +
+            "ingestRevocation genuinely ran first (own identity IS known)", SyncResult.SelfRevoked, result)
+        assertTrue("ingestRevocation's real effects happened: own device now marked revoked",
+            store.isRevokedDevice(ownDevicePub))
+        val remaining = store.allMessages().map { it.msgId }.toSet()
+        assertTrue("seq<=lastValid kept (seq 1)", m1.msgId() in remaining)
+        assertTrue("seq<=lastValid kept (seq 2)", m2.msgId() in remaining)
+        assertFalse("seq>lastValid retro-dropped (seq 3) -- OWN messages, the real path", m3.msgId() in remaining)
+    }
+
     // =======================================================================
     // serve() -- the RESPONDER content phases (gossip server Task 3).
     // Mirrors _session (sync.py:643-825) in REVERSE I/O order vs. `run`
@@ -620,5 +669,45 @@ class KotlinSyncTest {
         val result = KotlinSync.serve(stream, store, fixture, peerCert)
         assertTrue("expected Ok, got $result", result is SyncResult.Ok)
         assertFalse("tampered signature -> never ingested", store.isRevokedDevice(devicePub))
+    }
+
+    /** Code review fix -- serve() mirror of
+     *  runIngestsGenuineOwnSelfRevocationThenStillReturnsSelfRevoked: our own
+     *  identity IS known in production (seeded at pairing/every sync, and
+     *  serve() reads/writes the SAME on-disk store as run()), so this seeds
+     *  `store.addIdentity(ownIdentityPub)` FIRST and proves a genuine,
+     *  validly-signed self-revocation actually runs ingestRevocation's real
+     *  effects (own device marked revoked, own prior messages retro-dropped)
+     *  before `SelfRevoked` is returned -- not that `SelfRevoked` merely
+     *  fires on a rejected ingest. */
+    @Test fun serveIngestsGenuineOwnSelfRevocationThenStillReturnsSelfRevoked() {
+        val (ownIdentityPriv, ownIdentityPub) = genKeypair()
+        val ownDevicePriv = "dd".repeat(32)
+        val fixture = buildFixture(ownIdentityPub, ownDevicePriv)
+        val store = InMemorySyncStore()
+        store.addIdentity(ownIdentityPub)   // mirrors production seeding (KotlinPairing.kt / SyncRunner.kt)
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+
+        val m1 = identityMsg(ownIdentityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), ownDevicePriv)
+        val m2 = identityMsg(ownIdentityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), ownDevicePriv)
+        val m3 = identityMsg(ownIdentityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), ownDevicePriv)
+        assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2)); assertTrue(store.ingestMessage(m3))
+
+        val rev = signedRevocation(ownIdentityPriv, ownIdentityPub, fixture.device_pub, lastValidSeq = 2)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            // serve() must return SelfRevoked right after this element -- no further frame is ever read.
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertEquals("SelfRevoked must still surface for the Task 6 wipe hook, even though " +
+            "ingestRevocation genuinely ran first (own identity IS known)", SyncResult.SelfRevoked, result)
+        assertTrue("ingestRevocation's real effects happened: own device now marked revoked",
+            store.isRevokedDevice(fixture.device_pub))
+        val remaining = store.allMessages().map { it.msgId }.toSet()
+        assertTrue("seq<=lastValid kept (seq 1)", m1.msgId() in remaining)
+        assertTrue("seq<=lastValid kept (seq 2)", m2.msgId() in remaining)
+        assertFalse("seq>lastValid retro-dropped (seq 3) -- OWN messages, the real path", m3.msgId() in remaining)
     }
 }

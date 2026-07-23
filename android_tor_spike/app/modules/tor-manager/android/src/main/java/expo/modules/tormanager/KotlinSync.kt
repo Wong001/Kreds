@@ -222,11 +222,31 @@ object KotlinSync {
             // + verify() + markRevoked, which performs the retro-drop) --
             // this marks FRIEND devices revoked. The own-device SelfRevoked
             // detection is unchanged from before Task 3 (still a raw field
-            // comparison, not gated on ingestRevocation's result): even a
-            // revocation this store can't/won't ingest (e.g. our own
-            // identity, which is never "known" to ourselves via
-            // knownIdentities()) must still surface SelfRevoked so the wipe
-            // path (Task 6) can act on it.
+            // comparison, run UNCONDITIONALLY after ingestRevocation, not
+            // gated on its result).
+            //
+            // CORRECTNESS NOTE (own identity IS known -- do not assume
+            // otherwise): our own identity_pub is seeded into
+            // knownIdentities() both at pairing (KotlinPairing.kt's
+            // installPackage: `store.addIdentity(cert.identity_pub)`) and on
+            // every sync (SyncRunner.kt's runTransport:
+            // `SqliteSyncStore(ctx).also { it.addIdentity(fx.cert.identity_pub) }`),
+            // and serve() reads/writes the SAME on-disk store. So a GENUINE
+            // self-revocation (real own identity_pub, validly identity-signed,
+            // device_pub == our own) PASSES ingestRevocation's is_known gate
+            // and verify(), and DOES call markRevoked(ownDevicePub,
+            // lastValidSeq) -- marking our own device revoked and retro-
+            // dropping our own prior messages with seq > lastValidSeq --
+            // BEFORE the loop reaches the device_pub == ownDevicePub check
+            // below and returns SelfRevoked. This mirrors hearth exactly:
+            // hearth's own identity row has is_self=1, and sync.py's session
+            // (sync.py:664-671) runs ingest_revocation on a self-revocation
+            // the same as any other -- there is no is_self short-circuit
+            // that skips ingestion. The end state is correct/safe either
+            // way: Task 6's wipe clears the whole store on SelfRevoked, so
+            // markRevoked's effects (now-redundant revoked-device bookkeeping
+            // and retro-dropped own messages) are wiped again moments later
+            // regardless of whether they ran.
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             val revs = readFrame(stream)
             if (revs.optString("t") == "refused") return SyncResult.Failed("revocations", "refused")
@@ -380,10 +400,18 @@ object KotlinSync {
             // REVOCATIONS phase, just reached via the opposite I/O order);
             // own `list_revocations` is unconditionally empty, the phone
             // has none to offer. The self-revoked check below is unchanged
-            // from before Task 3 (a raw field comparison, not gated on
-            // ingestRevocation's result) -- mirrors `run`'s own check on
-            // ITS read side exactly (KotlinSync.kt run(), REVOCATIONS
-            // phase).
+            // from before Task 3 (a raw field comparison, run UNCONDITIONALLY
+            // after ingestRevocation, not gated on its result) -- mirrors
+            // `run`'s own check on ITS read side exactly (KotlinSync.kt
+            // run(), REVOCATIONS phase -- see that phase's doc comment for
+            // the full correctness note: our own identity IS seeded into
+            // knownIdentities() at pairing/every sync, so a genuine
+            // self-revocation genuinely runs through ingestRevocation
+            // -- markRevoked(ownDevice) + retro-drop of our own messages --
+            // BEFORE this loop reaches the check below, exactly mirroring
+            // hearth's own is_self=1 identity also running ingest_revocation
+            // (sync.py:664-671). Safe either way: Task 6's wipe clears the
+            // whole store on SelfRevoked regardless).
             val revs = readFrame(stream)
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             if (revs.optString("t") == "refused") return SyncResult.Failed("revocations", "refused")
