@@ -129,11 +129,15 @@ class SyncRunnerTest {
     // change that lets the phone dial FRIENDS, not just its own home node)
     // and the own-onion-skip / onion-throttle gates are extracted into pure
     // functions (acceptPeerIdentity/shouldSkipOwnOnion/shouldThrottle) for
-    // exactly this reason, and proven here in isolation. The live dial +
-    // the peer-loop's wiring of these decisions into runSync is Task 7/8's
-    // on-device proof; the regression this task must not break (single
-    // home-node-only peer still syncs) is a structural property of runSync's
-    // loop, verified by compiling + reading, not by a JVM test double here.
+    // exactly this reason, and proven here in isolation. The live dial
+    // itself (the actual Tor connection each peer's runTransport makes) is
+    // Task 7/8's on-device proof; the LOOP WIRING around it (own-onion-skip/
+    // throttle applied per peer, the SAME pending-outbound set reaching
+    // every dialed peer, a selfRevoked peer stopping the loop early) is
+    // ALSO JVM-tested below (review Finding 2 fix), via `runPeerLoop`'s
+    // injected-dial seam -- the regression this task must not break (single
+    // home-node-only peer still syncs) is covered by that same seam with a
+    // one-peer list.
 
     private val FRIEND = "aa".repeat(32)
     private val HOME = "bb".repeat(32)
@@ -206,5 +210,88 @@ class SyncRunnerTest {
         assertFalse(SyncRunner.shouldThrottle(a, last, 0L))
         assertFalse("a different address is never throttled by another address's recent dial",
             SyncRunner.shouldThrottle(b, last, 0L))
+    }
+
+    // -- 5. friend-peering Task 4 review fix (Finding 2, MEDIUM-HIGH -- delivery) --
+    //
+    // Pre-fix: `runTransport` read+cleared `store.pendingOutbound()` itself,
+    // PER PEER -- so with multiple peers now dialed in one round
+    // (`listPeers()` is UNORDERED), whichever peer synced successfully FIRST
+    // cleared the queue, and every peer dialed AFTER it saw an already-empty
+    // pending set. A message composed just before a round ran could reach
+    // only ONE peer (possibly a friend, not the home node) and then be
+    // deleted -- with the desktop offline (the arc's whole point), never
+    // reaching it. Fixed: `runSync` now captures the pending-outbound
+    // snapshot ONCE (same idiom as the peers/gossip_addr read), `runPeerLoop`
+    // passes the SAME snapshot to every dialed peer's first transport call,
+    // and the queue is cleared ONCE after the whole loop -- via
+    // `shouldClearPendingOutbound`, gated on at least one ACTUALLY DIALED
+    // peer having succeeded (an empty `results` -- everything skipped this
+    // round -- must NOT clear an unpushed queue; see that function's doc).
+    // `runPeerLoop` itself (the extracted, injectable peer-loop core) is what
+    // makes both this and the own-onion-skip/throttle/selfRevoked wiring
+    // JVM-testable without a real Context/Tor dial.
+
+    @Test fun peerLoopPushesSamePendingSetToEveryDialedPeer() {
+        val pending = listOf(mapOf("cert" to "x", "seq" to 1, "payload" to emptyMap<String, Any?>(), "signature" to "y"))
+        val received = mutableListOf<List<Map<String, Any?>>>()
+        val peers = listOf(Peer("home.onion:9997", "aa".repeat(32)), Peer("friend.onion:9997", "bb".repeat(32)))
+
+        val result = SyncRunner.runPeerLoop(peers, null, pending, hashMapOf(), 0L) { _, pend ->
+            received.add(pend)
+            SyncRunner.SyncOutcome(true, true, 1, 0, 0, false, null)
+        }
+
+        assertEquals("both peers must be dialed", 2, received.size)
+        assertEquals("first peer gets the full pending set", pending, received[0])
+        assertEquals("second peer must ALSO get the SAME pending set (not an already-cleared empty one)",
+            pending, received[1])
+        assertEquals(2, result.results.size)
+        assertNull(result.selfRevokedOutcome)
+    }
+
+    @Test fun peerLoopSkipsOwnOnionAndThrottledPeersWithoutDialingThem() {
+        val dialed = mutableListOf<String>()
+        val peers = listOf(
+            Peer("home.onion:9997", "aa".repeat(32)),     // our own onion -- must not be dialed
+            Peer("friend.onion:9997", "bb".repeat(32)),   // dialed
+        )
+        val result = SyncRunner.runPeerLoop(peers, "home.onion:9997", emptyList(), hashMapOf(), 0L) { peer, _ ->
+            dialed.add(peer.address)
+            SyncRunner.SyncOutcome(true, true, 0, 0, 0, false, null)
+        }
+        assertEquals(listOf("friend.onion:9997"), dialed)
+        assertEquals(1, result.results.size)
+    }
+
+    @Test fun peerLoopStopsAtFirstSelfRevokedAndDoesNotDialFurtherPeers() {
+        val dialed = mutableListOf<String>()
+        val peers = listOf(Peer("a.onion:9997", "aa".repeat(32)), Peer("b.onion:9997", "bb".repeat(32)))
+        val result = SyncRunner.runPeerLoop(peers, null, emptyList(), hashMapOf(), 0L) { peer, _ ->
+            dialed.add(peer.address)
+            if (peer.address == "a.onion:9997") SyncRunner.SyncOutcome(true, false, 0, 0, 0, true, "self-revoked")
+            else SyncRunner.SyncOutcome(true, true, 0, 0, 0, false, null)
+        }
+        assertEquals("must stop dialing after the first selfRevoked peer -- b must never be dialed",
+            listOf("a.onion:9997"), dialed)
+        assertTrue(result.selfRevokedOutcome != null)
+        assertTrue(result.results.isEmpty())
+    }
+
+    @Test fun shouldClearPendingWhenAnyPeerSucceeded() {
+        assertTrue(SyncRunner.shouldClearPendingOutbound(listOf(
+            SyncRunner.SyncOutcome(true, false, 0, 0, 0, false, "offline"),
+            SyncRunner.SyncOutcome(true, true, 1, 0, 0, false, null))))
+    }
+
+    @Test fun shouldNotClearPendingWhenAllPeersFailed() {
+        assertFalse(SyncRunner.shouldClearPendingOutbound(listOf(
+            SyncRunner.SyncOutcome(true, false, 0, 0, 0, false, "offline"),
+            SyncRunner.SyncOutcome(true, false, 0, 0, 0, false, "refused"))))
+    }
+
+    @Test fun shouldNotClearPendingWhenNoPeersWereDialed() {
+        assertFalse("empty results (every peer skipped this round) must never clear an unpushed queue",
+            SyncRunner.shouldClearPendingOutbound(emptyList()))
     }
 }

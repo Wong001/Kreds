@@ -662,6 +662,126 @@ class KotlinSyncTest {
             0, wroteHave.getJSONArray("peers").length())
     }
 
+    // =======================================================================
+    // friend-peering Task 4 review fix (Finding 1, HIGH -- security): `run`'s
+    // known[]-widening (just above, "the phone only ever dials its own home
+    // node" doc comment on runMergesHomeNodeAddrAndRelayedKnownFriendAddress
+    // is now STALE -- friend-peering Task 4 activated exactly the attack
+    // surface this doc used to reason was unreachable) used to be
+    // UNCONDITIONAL: `for (i in ...) store.addIdentity(known.getString(i))`
+    // ran for EVERY peer `run` dialed, with no own-identity gate, unlike
+    // `serve`'s existing gate (KotlinSync.kt:643,
+    // `peerCert.identity_pub == fixture.cert.identity_pub`) and hearth's own
+    // sync.py:768-772. Now that `run` dials FRIENDS (SyncRunner's peer loop),
+    // a malicious friend could widen our knownIdentities() with an arbitrary
+    // attacker identity via its own `known[]`, which would then ALSO pass the
+    // very peers[] relay-merge's is_known gate a few lines below for that
+    // SAME attacker identity in the SAME frame -- planting a dialable address
+    // for a stranger in our peer table, which the next round's
+    // acceptPeerIdentity would then accept (now "known" + address matches).
+    // Fixed: `run` gained a `peerIdentity` param (the AUTH'd peer's identity,
+    // known to the caller -- SyncRunner.runTransport -- from
+    // authOnlyOverStream, BEFORE `run` is ever invoked) and the known[]
+    // widening is now gated on `peerIdentity == ownIdentity`, mirroring
+    // `serve`'s own gate exactly.
+    // =======================================================================
+
+    @Test fun runDoesNotWidenKnownFromFriendPeer() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val friendIdentity = "bb".repeat(32)
+        store.addIdentity(ownIdentity)
+        store.addIdentity(friendIdentity)   // a REAL friend -- but its own known[] must not widen us further
+        val newId = "cc".repeat(32)         // an identity ONLY the friend's HAVE claims to know
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to listOf(newId),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32),
+            ownIdentity = ownIdentity, peerIdentity = friendIdentity)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("a FRIEND's known[] must not widen our identities -- only own-device trust (the " +
+            "home node, peerIdentity == ownIdentity) may do that",
+            store.knownIdentities().contains(newId))
+    }
+
+    @Test fun runRefusesAttackerIdentityInjectedViaFriendsKnownAndPeersRelay() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val friendIdentity = "bb".repeat(32)
+        store.addIdentity(ownIdentity)
+        store.addIdentity(friendIdentity)   // the malicious relayer IS a real (if compromised) friend
+        val attackerIdentity = "cc".repeat(32)      // NOT a real friend
+        val attackerAddr = "attacker.onion:9997"
+
+        // The full attack chain: a single HAVE frame from a friend carries
+        // BOTH known:[attacker] (the widening attempt) AND
+        // peers:[{attacker, attackerAddr}] (the address-plant attempt) --
+        // exactly what a malicious/compromised friend would send in one
+        // round to try to plant a dialable stranger in our peer table.
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to listOf(attackerIdentity),
+                "peers" to listOf(mapOf("identity_pub" to attackerIdentity, "address" to attackerAddr)),
+                "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32),
+            ownIdentity = ownIdentity, peerIdentity = friendIdentity)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("attacker identity must never be added via a friend's known[]",
+            store.knownIdentities().contains(attackerIdentity))
+        assertNull("attacker address must never be merged -- is_known is (correctly) still false for it",
+            store.addressFor(attackerIdentity))
+    }
+
+    @Test fun runStillWidensKnownFromHomeNodeAndMergesSameFrameRelayedAddress() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        store.addIdentity(ownIdentity)
+        val newIdentityX = "dd".repeat(32)   // a legitimately new friend the home node reports
+        assertFalse("X not yet known before this sync round", store.knownIdentities().contains(newIdentityX))
+
+        // Regression (c): the home node IS our own identity (peerIdentity ==
+        // ownIdentity) -- its known[] must still widen us, exactly as before
+        // this fix. Also proves ordering: X's relayed address (SAME frame's
+        // peers[]) is merged too, so known-widen must still run BEFORE the
+        // peers[] relay loop's is_known check (mirrors
+        // serveMergesRelayedAddressForIdentityIntroducedBySameFramesKnownWidening's
+        // twin proof on the serve() side).
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(),
+                "known" to listOf(newIdentityX),
+                "peers" to listOf(mapOf("identity_pub" to newIdentityX, "address" to "xnode.onion:9997")),
+                "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32),
+            ownIdentity = ownIdentity, peerIdentity = ownIdentity)   // the home node -- our own sibling device
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertTrue("the home node (peerIdentity == ownIdentity) must still widen known[] -- legitimate " +
+            "own-device trust, unchanged by this fix", store.knownIdentities().contains(newIdentityX))
+        assertEquals("X's relayed address must still be merged THIS round -- ordering (known-widen " +
+            "before the peers[] relay loop) must be preserved by this fix",
+            "xnode.onion:9997", store.addressFor(newIdentityX))
+    }
+
     @Test fun serveMergesPeerAddrAndRelayedKnownFriendAddress() {
         val store = InMemorySyncStore()
         val fixture = buildFixture("aa".repeat(32))

@@ -524,7 +524,18 @@ class SyncLoopbackTest {
             KotlinHandshake.authOnlyOverStream(stream1, fixture)
             val encKeyMsg = KotlinSync.composeEncKey(
                 fixture, encPub, store.nextSeq(), System.currentTimeMillis() / 1000.0)
-            val res1 = KotlinSync.run(stream1, store, phoneDevicePub, outbound = listOf(encKeyMsg))
+            // ownIdentity/peerIdentity (friend-peering Task 4 review fix,
+            // Finding 1): the desk node dialed here IS the phone's own home
+            // node -- production (SyncRunner.runTransport) always passes
+            // peerIdentity = the AUTH'd cert's identity_pub, which for a real
+            // dial to the home node equals ownIdentity. Mirrored explicitly
+            // here (rather than relying on the defaults) so the HAVE phase's
+            // own-device-trust gate actually widens knownIdentities() with
+            // the friend ("Freja") the desk node reports below -- without
+            // this, the fix correctly (per its own security rule) refuses to
+            // widen, and the friend content this test proves never ingests.
+            val res1 = KotlinSync.run(stream1, store, phoneDevicePub, outbound = listOf(encKeyMsg),
+                ownIdentity = ownIdentityPub, peerIdentity = ownIdentityPub)
             assertTrue("sync 1 (push enckey): $res1", res1 is SyncResult.Ok)
 
             // Deterministic handoff (see NodeProcess.awaitMaintained's doc
@@ -543,7 +554,8 @@ class SyncLoopbackTest {
             // wrapped) DM, alongside the original B.2 own-identity content.
             val stream2 = SocketStream("127.0.0.1", node.port)
             KotlinHandshake.authOnlyOverStream(stream2, fixture)
-            val res2 = KotlinSync.run(stream2, store, phoneDevicePub)
+            val res2 = KotlinSync.run(stream2, store, phoneDevicePub,
+                ownIdentity = ownIdentityPub, peerIdentity = ownIdentityPub)
             assertTrue("sync 2 (pull friend content): $res2", res2 is SyncResult.Ok)
 
             val decrypted = DecryptPass.run(store, phoneDevicePub, encPriv, ownIdentityPub).feed

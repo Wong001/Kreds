@@ -225,7 +225,23 @@ object KotlinSync {
     fun run(stream: Stream, store: SyncStore, ownDevicePub: String,
             outbound: List<Map<String, Any?>> = emptyList(),
             onProgress: (phase: String, count: Int) -> Unit = { _, _ -> },
-            ownIdentity: String = ""): SyncResult {
+            ownIdentity: String = "",
+            // friend-peering Task 4 review fix (Finding 1, HIGH -- security):
+            // the AUTH'd peer's identity_pub, established by the caller
+            // (SyncRunner.runTransport) BEFORE `run` is ever invoked --
+            // mirrors `serve`'s own `peerCert: KotlinWire.CertDict` param,
+            // just narrowed to the one field the HAVE phase's own-device-
+            // trust gate below needs. See that gate's own doc comment for the
+            // full reasoning. Nullable, defaulting to null (never a bare
+            // `""`, which WOULD accidentally equal `ownIdentity`'s own
+            // default and fail OPEN) -- a caller that never passes this (an
+            // old/incomplete integration, or most of this file's own tests,
+            // which don't exercise the HAVE-widening phase at all) fails
+            // CLOSED: the gate below is simply never satisfied, so no
+            // widening happens, matching this file's established
+            // fail-closed-by-default posture (see `ownIdentity`'s own doc on
+            // the SelfRevoked gate just above).
+            peerIdentity: String? = null): SyncResult {
         fun progress(phase: String, count: Int) {
             try { onProgress(phase, count) } catch (_: Throwable) {}
         }
@@ -352,15 +368,51 @@ object KotlinSync {
                 "peers" to emptyList<Any>(), "addr" to (store.getMeta("gossip_addr") ?: "")))
             val have = readFrame(stream)
             val known = have.optJSONArray("known") ?: JSONArray()
-            for (i in 0 until known.length()) store.addIdentity(known.getString(i))
+            // THE SECURITY FIX (friend-peering Task 4 review, Finding 1,
+            // HIGH): own-device trust (sync.py:768-772; mirrors `serve`'s own
+            // gate, KotlinSync.kt's own-device-trust comparison a few hundred
+            // lines below) -- only a verified SIBLING device (peerIdentity ==
+            // our own identity, established by AUTH before `run` is ever
+            // called -- never a frame claim) may widen our known-identities
+            // set from what it reports. Was UNCONDITIONAL before this fix
+            // (every `known[]` entry added regardless of who the peer was) --
+            // harmless while `run`'s ONE caller (SyncRunner.runTransport)
+            // only ever dialed the phone's own home node, but friend-peering
+            // Task 4 made `run` dial FRIENDS too, activating a real hole: a
+            // malicious/compromised friend's `known:[attackerId]` would
+            // widen us to `attackerId`, which would then ALSO satisfy the
+            // peers[] relay-merge's is_known gate a few lines below for that
+            // SAME attacker identity in the SAME frame -- planting a
+            // dialable stranger's address in our peer table, which a later
+            // round would then actually dial and sync with. An ordinary
+            // friend's `known[]` must NEVER widen this set; only our own
+            // sibling devices (the home node, or another paired phone) are
+            // trusted to report new identities this way.
+            if (peerIdentity != null && peerIdentity == ownIdentity) {
+                for (i in 0 until known.length()) store.addIdentity(known.getString(i))
+            }
 
             // -- friend-peering Task 3: address learning (mirrors sync.py's
-            // own HAVE-phase merge, sync.py:774-781). `run`'s ONE production
-            // caller (SyncRunner.runTransport) pins the authenticated peer's
-            // identity_pub to `ownIdentity` BEFORE this ever runs (the phone
-            // only ever dials its own home node here) -- so `ownIdentity` IS
-            // "the peer we're syncing with" for this direct-addr merge,
-            // exactly what `serve` gets explicitly as peerCert.identity_pub.
+            // own HAVE-phase merge, sync.py:774-781).
+            //
+            // STALE-ASSUMPTION NOTE (friend-peering Task 4 review): the
+            // direct-addr merge just below still hardcodes `ownIdentity`
+            // (not `peerIdentity`) -- written back when `run`'s ONE
+            // production caller (SyncRunner.runTransport) only ever dialed
+            // the phone's own home node, so "the peer we're syncing with"
+            // and `ownIdentity` were always the same value. That's no longer
+            // true (friend-peering Task 4: `run` now also dials friends), so
+            // syncing with a FRIEND now merges the FRIEND's own reported
+            // `addr` under OUR OWN identity_pub instead of the friend's --
+            // mislabeled peer-table data. Left AS-IS here (out of the review
+            // findings' scope, and self-mitigated: `acceptPeerIdentity`'s
+            // wrong-address guard, friend-peering Task 4, refuses that
+            // mislabeled row's next dial -- `expectedIdentity` (`ownIdentity`)
+            // won't match the friend's real AUTH'd identity -- so the only
+            // cost is a wasted, refused dial attempt, not a security hole).
+            // Flagged here as a candidate follow-up (use `peerIdentity`
+            // instead of `ownIdentity` for this specific merge) rather than
+            // fixed, to keep this review fix surgical to the findings raised.
             //
             // Direct addr (sync.py:774-776): the peer's own onion, merged
             // under its identity -- gated on is_known (belt-and-braces;

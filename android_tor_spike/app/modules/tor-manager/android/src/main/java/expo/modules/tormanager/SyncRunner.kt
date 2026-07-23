@@ -96,17 +96,17 @@ object SyncRunner {
      *  is already in progress.
      *
      *  Peer loop (mirrors hearth sync.py's `_gossip_round`, sync.py:267-297):
-     *  reads `store.listPeers()` + the stored `gossip_addr` ONCE per round
-     *  (not once per peer -- same as sync.py reading `own_host`/`list_peers()`
-     *  once at the top of `_gossip_round`), then for each peer: skip our own
-     *  published onion (`shouldSkipOwnOnion`), skip an onion peer dialed too
-     *  recently (`shouldThrottle`, `ONION_SYNC_INTERVAL_MS`), else run that
-     *  peer's transport + its own blob-drain rounds (`syncOnePeer`). A peer
-     *  that refuses us or is simply offline is recorded and the loop moves on
-     *  to the NEXT peer (per-peer resilience -- one bad peer never aborts the
-     *  whole round; the peer ROW is left alone, only defriend, Task 5, prunes
-     *  it). The per-peer outcomes are folded into one `SyncOutcome` by
-     *  `aggregate` for this function's (peer-unaware) callers. */
+     *  reads `store.listPeers()` + the stored `gossip_addr` + the pending-
+     *  outbound snapshot ONCE per round (not once per peer -- same as
+     *  sync.py reading `own_host`/`list_peers()` once at the top of
+     *  `_gossip_round`; the pending-outbound snapshot is this file's own
+     *  addition, review Finding 2 fix -- see `shouldClearPendingOutbound`'s
+     *  doc), then delegates the actual per-peer skip/dial/aggregate decisions
+     *  to `runPeerLoop` (the testable seam -- see its own doc). A revocation
+     *  revealed by any peer stops the round immediately via
+     *  `TorNodeService.enterRevokedState`; otherwise the pending-outbound
+     *  queue is cleared once (gated on at least one ACTUALLY DIALED peer
+     *  having succeeded) and the aggregated outcome is returned. */
     fun runSync(
         ctx: Context,
         fx: KotlinHandshake.Fixture,
@@ -128,47 +128,77 @@ object SyncRunner {
                 return SyncOutcome(true, false, 0, 0, 0, false, "peers: ${e.message}")
             }
 
-            val results = mutableListOf<SyncOutcome>()
-            for (peer in peers) {
-                if (shouldSkipOwnOnion(peer.address, ownGossipAddr)) continue
-                if (isOnion(peer.address) &&
-                    shouldThrottle(peer.address, lastOnionSync, System.currentTimeMillis())) continue
-
-                // One sync DRAINS all pending blobs FROM THIS PEER. hearth
-                // sends blobs smallest-first up to a ~15 MiB per-round budget
-                // and leaves the rest "for the next round" (sync.py
-                // BLOB_GIVE_BUDGET), so a profile's large banner + wall
-                // photos need several rounds. Rather than dripping one batch
-                // per 15-min background cycle (leaving big images broken for
-                // up to an hour), loop rounds back-to-back until nothing is
-                // missing, a round pulls no new blobs (the peer doesn't hold
-                // the rest), or a safety cap -- see syncOnePeer/
-                // MAX_DRAIN_ROUNDS. In steady state this is a single round.
-                val outcome = syncOnePeer(ctx, fx, peer, onProgress)
-
-                // Task 6 (phone-onion-reachability): the outbound path's
-                // SelfRevoked trigger -- this is the ONE choke point every
-                // outbound sync runs through (TorNodeService's own background
-                // syncCycle and TorManagerModule's foreground syncNow both
-                // call this same runSync), so wiring it here covers both
-                // callers at once, rather than duplicating the check at each
-                // call site. See TorNodeService.enterRevokedState's doc for
-                // the full ordering/idempotency contract; safe to call while
-                // still holding `syncLock` above (enterRevokedState never
-                // blocks on or re-acquires it). Friend-peering Task 4: a
-                // revocation revealed by ANY peer stops the WHOLE cycle
-                // immediately (not just that peer) and returns that peer's
-                // outcome directly -- there is no "our own identity" left to
-                // sync anything under once this fires, and the wipe
-                // enterRevokedState performs is the very store the remaining
-                // peers' runTransport calls would otherwise try to read/write.
-                if (outcome.selfRevoked) {
-                    TorNodeService.enterRevokedState(ctx)
-                    return outcome
-                }
-                results.add(outcome)
+            // Review fix (Finding 2, MEDIUM-HIGH -- delivery): capture the
+            // pending-outbound snapshot ONCE for the WHOLE round, same idiom
+            // as peers/ownGossipAddr just above -- was read+cleared fresh
+            // INSIDE runTransport, per peer, so with multiple peers now
+            // dialed in one round (friend-peering Task 4), whichever peer
+            // synced successfully FIRST cleared the queue and every peer
+            // dialed after it saw an already-empty pending set: a message
+            // composed just before this round ran could reach only ONE peer
+            // (listPeers() is unordered -- possibly a friend, not the home
+            // node) and then be deleted, never reaching the rest. Fixed:
+            // this single snapshot is passed to EVERY dialed peer's first
+            // transport call (`runPeerLoop`/`syncOnePeer`), and the queue is
+            // cleared exactly once, below, after the whole loop.
+            val (pending, pendingIds) = try {
+                val s = SqliteSyncStore(ctx)
+                try {
+                    val p = s.pendingOutbound()
+                    p to p.map { SignedMessageKt.fromDict(it).msgId() }
+                } finally { s.close() }
+            } catch (e: Exception) {
+                return SyncOutcome(true, false, 0, 0, 0, false, "pending-outbound: ${e.message}")
             }
-            return aggregate(results)
+
+            // One sync DRAINS all pending blobs FROM EACH PEER. hearth sends
+            // blobs smallest-first up to a ~15 MiB per-round budget and
+            // leaves the rest "for the next round" (sync.py
+            // BLOB_GIVE_BUDGET), so a profile's large banner + wall photos
+            // need several rounds. Rather than dripping one batch per 15-min
+            // background cycle (leaving big images broken for up to an
+            // hour), loop rounds back-to-back until nothing is missing, a
+            // round pulls no new blobs (the peer doesn't hold the rest), or
+            // a safety cap -- see syncOnePeer/MAX_DRAIN_ROUNDS. In steady
+            // state this is a single round per peer.
+            val loop = runPeerLoop(peers, ownGossipAddr, pending, lastOnionSync, System.currentTimeMillis()) {
+                peer, peerPending -> syncOnePeer(ctx, fx, peer, peerPending, onProgress)
+            }
+
+            // Task 6 (phone-onion-reachability): the outbound path's
+            // SelfRevoked trigger -- this is the ONE choke point every
+            // outbound sync runs through (TorNodeService's own background
+            // syncCycle and TorManagerModule's foreground syncNow both call
+            // this same runSync), so wiring it here covers both callers at
+            // once, rather than duplicating the check at each call site. See
+            // TorNodeService.enterRevokedState's doc for the full ordering/
+            // idempotency contract; safe to call while still holding
+            // `syncLock` above (enterRevokedState never blocks on or
+            // re-acquires it). Friend-peering Task 4: a revocation revealed
+            // by ANY peer stops the WHOLE cycle immediately (not just that
+            // peer, see `runPeerLoop`'s own doc) -- there is no "our own
+            // identity" left to sync anything under once this fires, and the
+            // wipe enterRevokedState performs is the very store the
+            // remaining peers' runTransport calls would otherwise try to
+            // read/write. The pending-outbound queue is deliberately left
+            // untouched on this path -- the wipe deletes the whole DB file
+            // it lives in anyway.
+            if (loop.selfRevokedOutcome != null) {
+                TorNodeService.enterRevokedState(ctx)
+                return loop.selfRevokedOutcome
+            }
+
+            if (shouldClearPendingOutbound(loop.results) && pendingIds.isNotEmpty()) {
+                // Best-effort: a failure to clear only means the SAME
+                // already-delivered messages get harmlessly re-pushed (and
+                // deduped on ingest) next round -- same resilience posture
+                // as leaving them queued on a Failed/SelfRevoked outcome.
+                runCatching {
+                    val s = SqliteSyncStore(ctx)
+                    try { s.clearPendingOutbound(pendingIds) } finally { s.close() }
+                }
+            }
+            return aggregate(loop.results)
         } finally {
             syncLock.unlock()
         }
@@ -290,6 +320,66 @@ object SyncRunner {
         return true
     }
 
+    /** `runPeerLoop`'s result: `results` is every ACTUALLY DIALED peer's
+     *  outcome (skipped peers -- own-onion/throttle -- never appear here),
+     *  in dial order; `selfRevokedOutcome` is non-null iff the loop stopped
+     *  early because some peer's sync revealed our own revocation, in which
+     *  case `results` holds only the peers dialed BEFORE that one (the
+     *  revoked peer's own outcome lives in `selfRevokedOutcome`, not
+     *  appended to `results` -- mirrors the pre-extraction `runSync`, which
+     *  returned that outcome directly rather than folding it in). */
+    internal data class PeerLoopResult(val results: List<SyncOutcome>, val selfRevokedOutcome: SyncOutcome?)
+
+    /** The peer-loop CORE (friend-peering Task 4 review fix, Finding 2):
+     *  extracted out of `runSync` as a pure, injectable function -- `dial`
+     *  replaces the real `syncOnePeer(ctx, fx, peer, pending, onProgress)`
+     *  call, so this whole loop (own-onion-skip, onion-throttle, per-peer
+     *  dialing, the SAME `pending` set reaching every dialed peer, and the
+     *  selfRevoked-stops-the-round short-circuit) is JVM-unit-testable
+     *  without a real Context or Tor dial (SyncRunnerTest) -- runSync's own
+     *  job then reduces to real I/O: reading peers/pending from the store,
+     *  calling this, and (in `runSync`) acting on the result (wipe-on-
+     *  revoked, clear-pending-on-any-ok). `pending` is passed to `dial`
+     *  UNCHANGED for every peer (the fix itself -- was previously re-read
+     *  fresh, and silently emptied after the first success, per peer inside
+     *  runTransport; see `runSync`'s own doc). `lastOnionSync` is mutated
+     *  in place by `shouldThrottle` (records `now` on the allow path), same
+     *  as before this extraction. */
+    internal fun runPeerLoop(
+        peers: List<Peer>,
+        ownGossipAddr: String?,
+        pending: List<Map<String, Any?>>,
+        lastOnionSync: MutableMap<String, Long>,
+        now: Long,
+        dial: (peer: Peer, pending: List<Map<String, Any?>>) -> SyncOutcome,
+    ): PeerLoopResult {
+        val results = mutableListOf<SyncOutcome>()
+        for (peer in peers) {
+            if (shouldSkipOwnOnion(peer.address, ownGossipAddr)) continue
+            if (isOnion(peer.address) && shouldThrottle(peer.address, lastOnionSync, now)) continue
+
+            val outcome = dial(peer, pending)
+            if (outcome.selfRevoked) return PeerLoopResult(results, outcome)
+            results.add(outcome)
+        }
+        return PeerLoopResult(results, null)
+    }
+
+    /** Should the pending-outbound queue be cleared after this round
+     *  (friend-peering Task 4 review fix, Finding 2)? True iff at least one
+     *  ACTUALLY DIALED peer succeeded -- `results` (from `PeerLoopResult`)
+     *  already excludes skipped peers, so an EMPTY `results` (every peer
+     *  skipped this round -- own-onion/throttle -- or an empty peer table)
+     *  correctly returns false: the pending messages were never pushed to
+     *  ANYONE this round, so clearing them would silently lose them (they
+     *  must stay queued for the next round to retry). Same for "all dialed
+     *  peers failed": nothing was delivered, keep them queued. Deliberately
+     *  NOT the same thing as `aggregate(results).ok` (that field is `true`
+     *  on an empty `results` too, for a DIFFERENT reason -- see its own doc,
+     *  "nothing was wrong, nothing to dial" -- which would be the WRONG
+     *  signal here). */
+    internal fun shouldClearPendingOutbound(results: List<SyncOutcome>): Boolean = results.any { it.ok }
+
     /** Runs one peer's transport, draining blobs FROM THAT PEER across
      *  multiple rounds if needed (friend-peering Task 4 -- the per-peer
      *  scoping of what was, pre-Task-4, `runSync`'s own single-peer drain
@@ -297,20 +387,26 @@ object SyncRunner {
      *  rationale). A SelfRevoked or failed/unsuccessful first attempt
      *  returns immediately without entering the drain loop at all -- the
      *  caller (`runSync`) is what acts on `selfRevoked` (enterRevokedState +
-     *  stop dialing any further peer this round). */
+     *  stop dialing any further peer this round). `pending` (review Finding
+     *  2 fix) is pushed on the FIRST attempt only -- a peer's own drain
+     *  rounds (2..MAX_DRAIN_ROUNDS, same already-authorized session
+     *  continuing) re-dial with an EMPTY pending list, since round 1 already
+     *  delivered it; re-sending it every drain round would be harmless
+     *  (idempotent, dedup'd on ingest) but wasteful. */
     private fun syncOnePeer(
         ctx: Context,
         fx: KotlinHandshake.Fixture,
         peer: Peer,
+        pending: List<Map<String, Any?>>,
         onProgress: (String, Int) -> Unit,
     ): SyncOutcome {
-        var last = runTransport(ctx, fx, peer, onProgress)
+        var last = runTransport(ctx, fx, peer, pending, onProgress)
         if (last.selfRevoked || !last.ran || !last.ok) return last
         var rounds = 1
         while (rounds < MAX_DRAIN_ROUNDS &&
                 runCatching { anyBlobsMissing(ctx) }.getOrDefault(false)) {
             val before = last.blobs
-            val next = runTransport(ctx, fx, peer, onProgress)
+            val next = runTransport(ctx, fx, peer, emptyList(), onProgress)
             rounds++
             if (!next.ran || !next.ok) return last   // keep the last good outcome; next cycle retries
             last = next
@@ -362,6 +458,7 @@ object SyncRunner {
         ctx: Context,
         fx: KotlinHandshake.Fixture,
         peer: Peer,
+        pending: List<Map<String, Any?>>,
         onProgress: (String, Int) -> Unit,
     ): SyncOutcome {
         try {
@@ -432,26 +529,19 @@ object SyncRunner {
                 return SyncOutcome(true, false, 0, 0, 0, false, "enckey: ${e.message}")
             }
 
-            // outbound Task 3: drain the pending-outbound queue (composed-
-            // but-not-yet-pushed messages -- Compose.post queues via
-            // store.addPendingOutbound; see SyncStore.pendingOutbound's doc)
-            // into this sync's outbound, alongside any enc-key push above.
-            // pendingOutbound() is SQLite I/O and can throw (e.g. DB locked)
-            // just like prepareEncKeyOutbound above -- same close-on-failure
-            // shape. pendingIds is recomputed from the returned dicts (not
-            // read back from the store) via the same fromDict().msgId() a
-            // receiving node would use, so clearPendingOutbound below only
-            // ever targets ids that round-tripped through the wire-dict
-            // bridge, matching what was actually pushed.
-            val (pending, pendingIds) = try {
-                val p = store.pendingOutbound()
-                p to p.map { SignedMessageKt.fromDict(it).msgId() }
-            } catch (e: Exception) {
-                stream.close()
-                store.close()
-                return SyncOutcome(true, false, 0, 0, 0, false, "pending-outbound: ${e.message}")
-            }
-
+            // outbound Task 3 / friend-peering Task 4 review fix (Finding 2):
+            // `pending` (composed-but-not-yet-pushed messages -- Compose.post
+            // queues via store.addPendingOutbound; see SyncStore.
+            // pendingOutbound's doc) is now an INJECTED param, not read from
+            // the store here -- `runSync` captures ONE snapshot for the whole
+            // round and passes it to every dialed peer's first attempt, and
+            // clears it ONCE after the whole loop (see runSync's own doc for
+            // why: reading+clearing it per-peer, here, used to mean only the
+            // FIRST peer to sync successfully ever received it). This
+            // function no longer touches `clearPendingOutbound` at all --
+            // `mapSyncResult` below is called with no `pendingIds` (defaults
+            // to empty), a deliberate no-op on that front.
+            //
             // Close the round's store once its result is mapped -- each drain
             // round opens a fresh one, and an unclosed SQLiteOpenHelper leaks a
             // SQLiteConnection (the leak class the LocalApi shared-store fix
@@ -464,10 +554,17 @@ object SyncRunner {
             // real notice) -- this is the ONE production call site of
             // KotlinSync.run, so this is what makes a real friend's defriend
             // notice actually take effect on this device.
+            //
+            // peerIdentity = peerCert.identity_pub (friend-peering Task 4
+            // review fix, Finding 1): the AUTH'd peer's identity, so `run`'s
+            // own HAVE-phase own-device-trust gate can tell "this peer IS our
+            // own home node" (peerIdentity == ownIdentity, widen known[])
+            // apart from "this peer is a friend" (must NOT widen known[]) --
+            // see that gate's doc in KotlinSync.kt for the full reasoning.
             val outcome = mapSyncResult(
                 KotlinSync.run(stream, store, fx.device_pub, prep.outbound + pending, onProgress,
-                    ownIdentity = fx.cert.identity_pub),
-                prep, store, pendingIds)
+                    ownIdentity = fx.cert.identity_pub, peerIdentity = peerCert.identity_pub),
+                prep, store)
             store.close()
             return outcome
         } catch (e: Exception) {
