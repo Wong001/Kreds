@@ -38,26 +38,43 @@ import java.util.concurrent.locks.ReentrantLock
  *  SyncLoopbackTest.kt -- an `internal` top-level class in this same test
  *  source set, already shared cross-file by SyncComposeLoopbackTest.kt.
  */
+
+// -- Shared key/cert minting helpers (Task 5, gossip-server loopback gate) --
+//
+// genKeypair/signedCert originally lived as private members of
+// GossipServerTest. Hoisted to top-level `internal` declarations (same
+// file, same package) so SyncServeLoopbackTest.kt (Task 5 -- the INVERTED
+// loopback gate, where a real hearth node dials the phone and the Kotlin
+// test must mint that node's identity/device/cert itself, since the node
+// process is spawned only AFTER the port is known) can reuse the exact
+// same real-Ed25519-keypair-plus-signed-EnrollmentCert idiom byte-for-byte
+// instead of duplicating it -- "mirror it, don't reinvent", the same
+// rationale SyncLoopbackTest.kt's own hoist of SocketStream/NodeProcess/
+// findRepoRoot/spawnNode already established. Purely a scope move: both
+// function bodies are unchanged, and GossipServerTest's own call sites
+// (buildFixture) keep working unmodified -- an unqualified `genKeypair()`/
+// `signedCert(...)` now resolves to the top-level function instead of a
+// private member, with identical behavior.
+internal fun genKeypair(): Pair<String, String> {
+    val p = Ed25519PrivateKeyParameters(SecureRandom())
+    return KotlinWire.toHex(p.encoded) to KotlinWire.toHex(p.generatePublicKey().encoded)
+}
+
+internal fun signedCert(
+    identityPriv: String, identityPub: String, devicePub: String, name: String,
+): KotlinWire.CertDict {
+    val unsigned = KotlinWire.CertDict(identityPub, devicePub, name, 1752900000.0, "")
+    return unsigned.copy(signature = KotlinWire.signRaw(identityPriv, KotlinWire.certBody(unsigned)))
+}
+
 class GossipServerTest {
 
     // =======================================================================
     // Fixtures -- real Ed25519 keys, same idiom as KotlinHandshakeTest/KotlinSyncTest.
     // =======================================================================
 
-    private fun genKeypair(): Pair<String, String> {
-        val p = Ed25519PrivateKeyParameters(SecureRandom())
-        return KotlinWire.toHex(p.encoded) to KotlinWire.toHex(p.generatePublicKey().encoded)
-    }
-
     private fun devPub(privHex: String) = KotlinWire.toHex(
         Ed25519PrivateKeyParameters(KotlinWire.fromHex(privHex), 0).generatePublicKey().encoded)
-
-    private fun signedCert(
-        identityPriv: String, identityPub: String, devicePub: String, name: String,
-    ): KotlinWire.CertDict {
-        val unsigned = KotlinWire.CertDict(identityPub, devicePub, name, 1752900000.0, "")
-        return unsigned.copy(signature = KotlinWire.signRaw(identityPriv, KotlinWire.certBody(unsigned)))
-    }
 
     /** A full identity+device fixture, own keys generated fresh. */
     private fun buildFixture(name: String): KotlinHandshake.Fixture {
