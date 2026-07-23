@@ -669,6 +669,163 @@ async def _run_dm(data_dir) -> None:
         await sync.stop()
 
 
+def _deliver_referenced_blobs(dst, src, msg_id: str) -> None:
+    """Task 4 (recipient-post-regrants loopback gate): copies every blob
+    hash `msg_id`'s payload references (blobs/poster/thumbs -- the same
+    reference extraction _compute_expect uses to mirror hearth/sync.py's
+    own BLOBS-phase reference scan) from src's store into dst's, for any
+    hash src holds that dst does not yet. Blobs are content-addressed
+    (store.put_blob hashes its OWN input via blob_hash and is an
+    idempotent INSERT OR IGNORE), so re-delivering an already-held blob is
+    always a safe no-op and the resulting hash in dst is guaranteed
+    identical to src's. This is the direct-in-process substitute for the
+    real BLOBS phase's want/have exchange between the two SCRIPT-SEEDED
+    nodes (A and B) -- exactly as _deliver/_gossip_until_converged already
+    substitute direct message delivery for the real MESSAGES phase between
+    them (see that function's own module-level rationale). The REAL wire's
+    BLOBS phase is still exercised for real between B and the phone
+    (Kotlin) -- this helper only gets the bytes from A into B in the first
+    place, the same way _gossip_until_converged gets the post's message
+    row from A into B."""
+    msg = dst.store.get_message(msg_id)
+    p = msg.payload
+    refs = {b for b in (p.get("blobs") or []) if isinstance(b, str)}
+    poster = p.get("poster")
+    if isinstance(poster, str) and poster:
+        refs.add(poster)
+    refs |= {t for t in (p.get("thumbs") or []) if isinstance(t, str) and t}
+    for h in refs:
+        if src.store.has_blob(h) and not dst.store.has_blob(h):
+            dst.store.put_blob(src.store.get_blob(h))
+
+
+async def _run_regrants(data_dir, no_sweep: bool = False) -> None:
+    """Task 4 (recipient-post-regrants): the loopback FIDELITY GATE for the
+    whole slice -- reproduces the field case exactly (spec: docs/
+    superpowers/specs/2026-07-23-recipient-post-regrants-design.md's Goal
+    paragraph: 'a friend's ... old journal posts are visible on August's
+    desktop but undecryptable on his phone until the FRIEND comes back
+    online') against a REAL second hearth node, then proves hearth's REAL
+    maintain_received_post_grants sweep (node.py:2261+) -- not some other
+    path -- is what unlocks it on the phone.
+
+    Seed: B ("Desk") is the phone's OWN identity, exactly like every other
+    scenario (mint_fixture enrolls the phone's device under B's own
+    identity). A ("Freja") is a SECOND real HearthNode, the friend/author.
+    B and A befriend and exchange enc keys FIRST (mirrors tests/
+    test_received_post_grants.py's _befriend_with_enckeys) -- so B's own
+    PRIMARY device already has a published enc key at the moment A
+    composes. A then composes ONE kreds journal post WITH A PHOTO
+    (_tiny_png(), reused from main()'s own seed); compose_post's automatic
+    friend-wrap (_scope_device_pubs("kreds"), node.py:659-676) wraps the
+    content key to every enc-keyed device A currently knows of -- at this
+    instant that is ONLY B's primary device (the phone's device does not
+    exist anywhere yet, not even as a cert) -- exactly 'wrapped only to
+    keys B held THEN'. Gossiping (message via _gossip_until_converged,
+    then the referenced photo blob via _deliver_referenced_blobs) brings
+    the post into B's store, where B can already decrypt it via that
+    inline wrap. This is asserted below as a PRECONDITION (a harness-side
+    sanity check on how the scenario is built, not the thing Kotlin's test
+    proves -- that is the recipient-grant path, gated behind
+    "regrants_ready" below) -- B being unable to decrypt at all would be a
+    scenario-construction bug.
+
+    A is then never touched again: 'the field case' is the friend/author
+    being OFFLINE for the rest of this scenario, matching production where
+    the laptop account may be offline for days.
+
+    The phone's own enc key is published AFTER, over the REAL wire, via
+    the SAME path every sibling scenario uses (KotlinSync.composeEncKey +
+    hearth/sync.py's already-generic MESSAGES-phase ingestion) -- never
+    seeded here directly, and never anything A could have wrapped to.
+
+    node.maintain_received_post_grants() is NEVER invoked automatically by
+    this harness: SyncService.start() (used here, as everywhere else in
+    this file) only starts the TCP accept loop -- the periodic sweep
+    (hearth/sync.py's _gossip_round, where the sweep call actually lives,
+    sync.py:246-252) is driven exclusively by SyncService.gossip_loop,
+    which this script never starts or awaits (verified by reading
+    sync.py: _gossip_round has exactly one caller, gossip_loop's own
+    while-loop, sync.py:289+; _on_conn/_session, the only thing
+    SyncService.start's accept loop ever invokes per connection, never
+    calls it either). So the `no_sweep` sub-scenario needs no monkeypatch
+    at all -- the cleanest possible suppression mechanism is simply never
+    calling the method, which is exactly what an unmodified production
+    accept path already does without any sweep call of its own. The
+    `no_sweep` flag below governs only the ONE explicit call this script
+    itself makes, mirroring _run_phase3's own explicit (not tick-driven)
+    sweep calls for the sibling DM scenario.
+
+    Wrapped _on_conn (mirrors every other scenario's pattern): after EVERY
+    connection fully completes, runs the real sweep (unless no_sweep) and
+    then POLLS the store's actual resulting state (store.wrap_grants,
+    never assumed just because the sweep was called) for a grant covering
+    the phone's fresh device key -- only then, and only once, prints
+    {"event":"regrants_ready"}. {"event":"conn_done"} always follows, in
+    BOTH scenarios, as a deterministic per-connection completion marker
+    the no_sweep negative control blocks on instead (it will never see
+    "regrants_ready", by construction)."""
+    node = HearthNode.create(Path(data_dir) / "n", "Desk", "desk")           # B
+    friend = HearthNode.create(Path(data_dir) / "f", "Freja", "freja-desk")  # A
+
+    node.store.add_identity(friend.identity_pub)
+    friend.store.add_identity(node.identity_pub)
+    node.ensure_enckey()            # B's own primary device enc key --
+                                     # published BEFORE A composes, so A's
+                                     # friend-wrap covers it inline
+    friend.ensure_enckey()
+    _gossip_until_converged(node, friend)   # cross-registers device views
+                                             # + delivers both enc keys
+
+    post_id = friend.compose_post("frejas gamle indlaeg", scope="kreds",
+                                  photos=[_tiny_png()])
+    _gossip_until_converged(node, friend)          # B receives the post
+    _deliver_referenced_blobs(node, friend, post_id)  # + its photo blob
+
+    # Precondition (harness sanity check, not the proof under test): B can
+    # ALREADY decrypt A's post via the inline wrap -- the real field state
+    # before any own-device-fanout concern exists.
+    rmsg = node.store.get_message(post_id)
+    key, _aad = node._content_key(rmsg)
+    assert key is not None, \
+        "scenario bug: B must be able to decrypt A's post via its inline wrap"
+
+    # A goes OFFLINE for the rest of this scenario -- `friend` is never
+    # touched again below.
+
+    sync = SyncService(node)
+
+    ready_emitted = False
+    orig_on_conn = sync._on_conn
+
+    async def _on_conn_then_check(reader, writer):
+        nonlocal ready_emitted
+        await orig_on_conn(reader, writer)
+        if not no_sweep:
+            node.maintain_received_post_grants()
+        if not ready_emitted:
+            grants = node.store.wrap_grants(post_id, node.identity_pub)
+            if fx["device_pub"] in grants:
+                ready_emitted = True
+                print(json.dumps({"event": "regrants_ready"}), flush=True)
+        print(json.dumps({"event": "conn_done"}), flush=True)
+
+    sync._on_conn = _on_conn_then_check
+
+    port = await sync.start("127.0.0.1", 0)
+    try:
+        fx = mint_fixture(node)
+        fx["onion_addr"] = f"127.0.0.1:{port}"
+        fx["friend_identity_pub"] = friend.identity_pub
+        fx["target_msg_id"] = post_id
+        expect = _compute_expect(node)
+        print(json.dumps({"port": port, "fixture": fx, "expect": expect}),
+              flush=True)
+        await asyncio.Event().wait()   # serve until killed
+    finally:
+        await sync.stop()
+
+
 def _deliver(src, dst) -> bool:
     """One-directional content transfer: every message `src` has authored
     that `dst` does not yet hold, via the real store.messages_not_in +
@@ -1037,6 +1194,19 @@ if __name__ == "__main__":
         # _run_responses) stays provably byte-identical to before this
         # task.
         asyncio.run(_run_dm(sys.argv[1]))
+    elif _scenario in ("regrants", "regrants_no_sweep"):
+        # Task 4 (recipient-post-regrants loopback gate): structurally
+        # different from every scenario above -- TWO real nodes from the
+        # very start (not an opt-in "two_node" addition layered onto
+        # main()'s own-identity seed the way two_node is), the friend
+        # author composing BEFORE the phone's enc key exists anywhere, and
+        # the real maintain_received_post_grants sweep (or its deliberate
+        # absence, for the "regrants_no_sweep" negative control) as the
+        # one thing under test. Kept as its own entry point for the same
+        # reason outbound_compose/responses/dm are: every earlier call
+        # site stays byte-identical to before this task.
+        asyncio.run(_run_regrants(
+            sys.argv[1], no_sweep=(_scenario == "regrants_no_sweep")))
     elif _scenario in ("pairing", "pairing_deny"):
         # Task 6 (android first-load pairing loopback gate): a
         # structurally different entry point from every scenario above --
