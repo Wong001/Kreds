@@ -11,6 +11,27 @@ sealed class SyncResult {
 
 private const val MAX_BLOB_BYTES = 10 * 1024 * 1024   // hearth/messages.py:56
 
+/** Give-side per-round byte budget for the BLOBS phase (gossip server Task
+ *  3, `serve`) -- hearth's own `BLOB_GIVE_BUDGET = MAX_FRAME - 1024 * 1024`
+ *  (sync.py:50): leave the rest for the next sync round rather than trying
+ *  to cram every wanted blob into one frame (`KotlinWire.MAX_FRAME` bounds
+ *  a single frame; this stays a safety margin under it). NOT previously
+ *  present anywhere on the Kotlin side -- `run`'s own BLOBS push (the
+ *  initiator direction, Task 8 outbound) has NO frame-size cap at all
+ *  today, a known gap flagged in BRICK_OUTBOUND1_REPORT.md ("Push-side
+ *  BLOB_GIVE_BUDGET"), left unfixed there and out of THIS task's scope
+ *  (`run` stays byte-unchanged -- regression). Declared as a mutable
+ *  top-level `internal var`, not a `const val`, specifically so a test can
+ *  override it to a small value and force the smallest-first cutoff
+ *  deterministically -- mirrors hearth's own test-time override
+ *  (`monkeypatch.setattr(sync_mod, "BLOB_GIVE_BUDGET", ...)`,
+ *  tests/test_sync_session.py:366), since the production value (~15 MiB)
+ *  is impractical to actually exceed inside a JVM unit test. Any test that
+ *  reassigns this MUST restore it in a `finally` -- it is a real
+ *  process-wide singleton (a top-level Kotlin property compiles to a
+ *  static field), not per-test state. */
+internal var BLOB_GIVE_BUDGET = KotlinWire.MAX_FRAME - 1024 * 1024
+
 /** RFC-4648 standard-alphabet base64 codec, hand-rolled instead of either
  *  android.util.Base64 (Android-only, breaks the BB-5 JVM desk gate) or
  *  java.util.Base64 (API 26+, this module's minSdkVersion is 24 -- would
@@ -265,6 +286,184 @@ object KotlinSync {
             return SyncResult.Failed("io", e.toString())
         } finally {
             stream.close()
+        }
+    }
+
+    /** Decodes a HAVE frame's wire-shaped `summary` field (identity_pub ->
+     *  device_pub -> `{"contiguous":Int,"sparse":[Int,...]}`, the exact
+     *  JSON shape `store.summary()` produces, see SyncStore.kt:73) into the
+     *  flattened `Map<Pair<String,String>, SeenSet>` `messagesNotIn`
+     *  requires (SyncStore.kt:303). No prior wire-side decoder existed for
+     *  this shape -- `SeenSet.fromJson`'s only previous caller was
+     *  SeenSetTest's pure in-memory round-trip (SeenSetTest.kt:36), never
+     *  org.json-parsed wire bytes -- so this composes two already-proven
+     *  pieces (this file's own `toMap` org.json bridge + `SeenSet.fromJson`)
+     *  rather than adding a new primitive. A missing/malformed `summary`
+     *  (absent key, non-object entry) is tolerated the same way hearth's
+     *  own `peer_have.get("summary", {})` is -- skipped, not thrown. */
+    private fun parseSummary(o: JSONObject): Map<Pair<String, String>, SeenSet> {
+        val out = linkedMapOf<Pair<String, String>, SeenSet>()
+        for (identityPub in o.keys()) {
+            val devices = o.optJSONObject(identityPub) ?: continue
+            for (devicePub in devices.keys()) {
+                val seen = devices.optJSONObject(devicePub) ?: continue
+                out[identityPub to devicePub] = SeenSet.fromJson(toMap(seen))
+            }
+        }
+        return out
+    }
+
+    /** RESPONDER counterpart to `run` (arc 1, kotlin-gossip-server Task 3)
+     *  -- the content phases of hearth's `_session` (sync.py:643-825),
+     *  answering an inbound connection instead of dialing out. Called
+     *  AFTER `KotlinHandshake.respondHandshake` has already completed
+     *  HELLO+AUTH and returned the peer's authenticated `CertDict` -- this
+     *  function never re-runs or re-verifies AUTH, and `peerCert` (never
+     *  any claim inside a frame this phase reads) is what scopes the give
+     *  side: MESSAGES' `entitled` set, HAVE's own-device-trust check, and
+     *  BLOBS' give order all key off `peerCert.identity_pub`/`device_pub`,
+     *  never off anything the peer's frames themselves assert about who
+     *  they are. `fixture` is THIS device's own identity/keys -- read for
+     *  the REVOCATIONS self-revoked check (`fixture.device_pub`) and the
+     *  HAVE own-device-trust comparison (`fixture.cert.identity_pub`).
+     *
+     *  Mirror of `run`, REVERSED I/O order per phase: `run` (initiator) is
+     *  write-then-read at each phase (`_swap`'s initiator=True branch,
+     *  sync.py:572-574); the responder is read-then-write (`_swap`'s
+     *  initiator=False branch, sync.py:575-577 -- already documented at
+     *  KotlinHandshake.kt:76 and exercised by `respondHandshake`). Phase
+     *  order is identical to `run`'s: REVOCATIONS -> DEFRIENDS -> HAVE ->
+     *  MESSAGES -> BLOBS.
+     *
+     *  Wraps the whole body in the SAME try/catch-to-Failed("io",...)
+     *  contract `run` uses (both return the same `SyncResult` sealed type,
+     *  built around exactly that contract) -- but, UNLIKE `run`, never
+     *  closes `stream`: `run` owns a standalone connection end-to-end, but
+     *  here the caller (`GossipServer`, Task 4) owns the accepted socket's
+     *  lifecycle in its own `finally`, exactly the precedent
+     *  `respondHandshake` already set (KotlinHandshake.kt's doc comment on
+     *  respondHandshake explains why: a stray close here would break a
+     *  caller -- this one -- that continues on the same connection).
+     *
+     *  Deliberately NOT full hearth parity in three places, each documented
+     *  at its phase below: no revocation-ingest model (REVOCATIONS is
+     *  read+discard, not hearth's ingest_revocation), no defriend-apply
+     *  model (DEFRIENDS is read+discard, not hearth's apply-then-ack,
+     *  sync.py:673-721), and peer-address/peer-table merging is dropped
+     *  entirely (HAVE's `peers`/`addr` fields are read but never consulted
+     *  -- arc 3, no peer table exists on the phone yet, the same "read it,
+     *  drop it" shape `KotlinPairing.installPackage` already set for
+     *  `peers`, KotlinPairing.kt:176-183). The first two mirror a gap `run`
+     *  already has today (SyncStore.kt's `enckeys` doc comment: "the
+     *  Kotlin store models no revocations"; `run`'s own DEFRIENDS phase
+     *  already just reads-and-ignores) -- this function's parity target
+     *  for those two phases is `run`'s EXISTING behavior, not hearth's
+     *  fuller responder shape, per the brief. */
+    fun serve(stream: Stream, store: SyncStore, fixture: KotlinHandshake.Fixture, peerCert: KotlinWire.CertDict): SyncResult {
+        try {
+            // -- REVOCATIONS -- (responder: read peer's first, THEN write
+            // ours -- _swap's read-then-write responder branch). The phone
+            // store models no revocations -- no ingest path exists, so
+            // peer revocations are read and DISCARDED (never
+            // store.ingest_revocation'd, because no such method exists);
+            // own `list_revocations` is unconditionally empty, the phone
+            // has none to offer. The two checks below on the already-read
+            // frame mirror `run`'s own checks on ITS read side exactly
+            // (KotlinSync.kt run(), REVOCATIONS phase), just reached via
+            // the opposite I/O order.
+            val revs = readFrame(stream)
+            writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
+            if (revs.optString("t") == "refused") return SyncResult.Failed("revocations", "refused")
+            val revArr = revs.optJSONArray("revs") ?: JSONArray()
+            for (i in 0 until revArr.length()) {
+                val r = revArr.getJSONObject(i)
+                if (r.optString("device_pub") == fixture.device_pub) return SyncResult.SelfRevoked
+            }
+
+            // -- DEFRIENDS -- (responder: read peer's first, ignore --
+            // mirrors `run`'s own read side exactly, reversed I/O order.
+            // The phone has no DefriendNotice model/apply path at all, so
+            // this is read+discard, not hearth's apply-then-ack (sync.py:
+            // 673-721) -- `run`'s existing behavior is the parity target
+            // for this phase, not hearth's fuller responder shape. Own
+            // notices are unconditionally empty -- the phone has no
+            // defriend outbox to offer either.)
+            readFrame(stream)
+            writeFrame(stream, mapOf("t" to "defriends", "notices" to emptyList<Any>()))
+
+            // -- HAVE -- (responder: read peer's first, THEN write ours)
+            val have = readFrame(stream)
+            writeFrame(stream, mapOf("t" to "have",
+                "summary" to store.summary(), "known" to store.knownIdentities(),
+                "peers" to emptyList<Any>(), "addr" to ""))
+            // peers / addr (the peer's own advertised address + its peer
+            // table): read above as part of `have`, but intentionally never
+            // consulted below -- arc 3 (friend peering / address merge), no
+            // peer table exists on the phone yet. Same "read it, drop it"
+            // shape KotlinPairing.installPackage already set for `peers`
+            // (KotlinPairing.kt:176-183). Our own `addr` is written as ""
+            // (not null, unlike `run`'s own HAVE write) -- the phone has no
+            // gossip_addr concept yet at this arc (no SyncStore.getMeta
+            // equivalent), so there is no real loopback address to report.
+            val knownArr = have.optJSONArray("known") ?: JSONArray()
+            val peerKnown = (0 until knownArr.length()).map { knownArr.getString(it) }.toSet()
+            // Own-device trust (sync.py:768-772): only a verified SIBLING
+            // device (peerCert.identity_pub == OUR OWN identity, never a
+            // frame claim) may widen our known-identities set from what it
+            // reports -- an ordinary friend's `known` list must never do
+            // this, or a hostile friend could inject arbitrary identities
+            // into our friend graph.
+            if (peerCert.identity_pub == fixture.cert.identity_pub) {
+                for (ident in peerKnown) store.addIdentity(ident)
+            }
+
+            // -- MESSAGES -- (serve the entitled delta; ingest the peer's)
+            val entitled = store.knownIdentities().filter { it in peerKnown }.toSet()
+            val peerSummary = parseSummary(have.optJSONObject("summary") ?: JSONObject())
+            val toSend = store.messagesNotIn(peerSummary, entitled, peerCert.identity_pub)
+            writeFrame(stream, mapOf("t" to "messages", "msgs" to toSend.map { it.toDict() }))
+            val msgs = readFrame(stream)
+            val msgArr = msgs.optJSONArray("msgs") ?: JSONArray()
+            for (i in 0 until msgArr.length()) {
+                val m = SignedMessageKt.fromDict(toMap(msgArr.getJSONObject(i)))
+                store.ingestMessage(m)   // verifies + dedups internally, same gates as `run`'s ingest side
+            }
+
+            // -- BLOBS -- (want swap, then blobs swap, each read-then-write)
+            val peerWant = readFrame(stream)
+            writeFrame(stream, mapOf("t" to "blob_want", "hashes" to store.missingBlobs()))
+            val wantedArr = peerWant.optJSONArray("hashes") ?: JSONArray()
+            val wanted = (0 until wantedArr.length()).map { wantedArr.getString(it) }
+            // Smallest-first (sync.py:794-815, spec 2026-07-18): sizes come
+            // from blobSizes (Task 1); an unsized (unknown/never-stored)
+            // hash sorts last via the huge sentinel, same as hearth's
+            // `sizes.get(x, 1 << 62)`, and simply drops out at the
+            // getBlob==null continue below.
+            val sizes = store.blobSizes(wanted)
+            val give = linkedMapOf<String, String>()
+            var giveSize = 0
+            for (h in wanted.sortedWith(compareBy({ sizes[it] ?: (1L shl 62) }, { it }))) {
+                val data = store.getBlob(h) ?: continue
+                val b64 = Base64Portable.encode(data)
+                if (give.isNotEmpty() && giveSize + b64.length > BLOB_GIVE_BUDGET) break   // leave the rest for next round
+                give[h] = b64
+                giveSize += b64.length
+            }
+            val peerBlobs = readFrame(stream)
+            writeFrame(stream, mapOf("t" to "blobs", "blobs" to give))
+            val given = peerBlobs.optJSONObject("blobs") ?: JSONObject()
+            for (h in given.keys()) {
+                val data = Base64Portable.decode(given.getString(h))
+                // Mirrors `run`'s own ingest-side size bound (sync.py:661) --
+                // store.putBlob does the hash check, this only bounds size
+                // before it's ever stored.
+                if (data.size <= MAX_BLOB_BYTES) store.putBlob(h, data)
+            }
+
+            val st = store.stats()
+            return SyncResult.Ok(st.messages, st.blobs, st.identities)
+        } catch (e: Exception) {
+            return SyncResult.Failed("io", e.toString())
         }
     }
 }
