@@ -127,30 +127,57 @@ class KotlinHandshakeTest {
         // exactly hearth's auth = sign_raw(_auth_body(peer_hello["nonce"]))
         // (sync.py:610-611), same authBody payload runOverStream signs.
         assertTrue(KotlinWire.verifyRaw(fixture.device_pub, wroteAuth.getString("sig"), KotlinWire.authBody(peerNonce)))
+
+        // respondHandshake must never own the stream's lifecycle -- that is
+        // GossipServer's (Task 4) job. A stray close() here would break a
+        // caller that continues straight into the sync responder (Task 3)
+        // on the same connection.
+        assertTrue("respondHandshake must not close the stream", !stream.closed)
     }
 
-    /** The stranger gate: an UNKNOWN peer identity, after a validly-signed
-     *  HELLO, is refused BEFORE the responder ever sends its own HELLO --
-     *  {"t":"refused"} is the only frame written, and nothing else (hearth
-     *  refuses unknown peers, sync.py:630-632). */
-    @Test fun respondHandshakeUnknownPeerWritesRefusedAndFails() {
+    /** The stranger gate: a peer with a cryptographically VALID cert and a
+     *  genuinely correct device-key proof, but an identity `isKnown` never
+     *  recognizes, still completes the FULL HELLO+AUTH exchange (own HELLO
+     *  sent, own AUTH sent) before being refused -- {"t":"refused"} is
+     *  written as a THIRD frame, in the wire slot hearth's real initiator
+     *  would otherwise read a REVOCATIONS-phase reply from (sync.py:
+     *  630-632 landing in the sync.py:657-662 PeerRefused check). Refusing
+     *  any earlier (in place of the HELLO or AUTH reply) is an interop bug:
+     *  a real hearth initiator only recognizes {"t":"refused"} as
+     *  PeerRefused at that one spot -- anywhere else it just sees a
+     *  malformed HELLO/AUTH and fails generically. */
+    @Test fun respondHandshakeUnknownPeerCompletesAuthThenWritesRefused() {
         val fixture = buildFixture()
+        val myNonce = "cc33".repeat(4)
         val (peerIdentityPriv, peerIdentityPub) = genKeypair()
-        val (_, peerDevicePub) = genKeypair()
+        val (peerDevicePriv, peerDevicePub) = genKeypair()
         val peerCert = signedCert(peerIdentityPriv, peerIdentityPub, peerDevicePub)
-        val peerHello = mapOf("t" to "hello", "cert" to certMap(peerCert), "nonce" to KotlinHandshake.randomHex16())
+        val peerNonce = KotlinHandshake.randomHex16()
+        val peerHello = mapOf("t" to "hello", "cert" to certMap(peerCert), "nonce" to peerNonce)
+        // A genuinely valid device-key proof over OUR nonce -- this peer is
+        // cryptographically legitimate, just not in isKnown's set.
+        val peerAuth = mapOf("t" to "auth", "sig" to KotlinWire.signRaw(peerDevicePriv, KotlinWire.authBody(myNonce)))
 
-        val stream = RespondingStream(listOf(peerHello))
-        val result = KotlinHandshake.respondHandshake(stream, fixture, isKnown = { false })
+        val stream = RespondingStream(listOf(peerHello, peerAuth))
+        val result = KotlinHandshake.respondHandshake(stream, fixture, isKnown = { false }, rnd = { myNonce })
 
         assertTrue("expected Failed, got $result", result is KotlinHandshake.HandshakeResult.Failed)
         val f = result as KotlinHandshake.HandshakeResult.Failed
         assertEquals("auth", f.stage)
         assertEquals("refused", f.reason)
 
-        assertEquals("own HELLO must never be sent to a refused stranger", 1, stream.written.size)
-        assertEquals("refused", stream.written[0].getString("t"))
-        assertEquals(setOf("t"), stream.written[0].keys().asSequence().toSet())
+        assertEquals("own HELLO, own AUTH, THEN refused -- full exchange before the gate", 3, stream.written.size)
+        assertEquals("hello", stream.written[0].getString("t"))
+        assertEquals("auth", stream.written[1].getString("t"))
+        // Our AUTH still proves our own device key over the peer's nonce --
+        // an unknown identity is refused, not starved of a real AUTH proof
+        // (hearth completes AUTH for anyone with a valid cert/sig, sync.py:
+        // 609-616, before the is_known check at :630).
+        assertTrue(KotlinWire.verifyRaw(fixture.device_pub, stream.written[1].getString("sig"), KotlinWire.authBody(peerNonce)))
+        assertEquals("refused", stream.written[2].getString("t"))
+        assertEquals(setOf("t"), stream.written[2].keys().asSequence().toSet())
+
+        assertTrue("respondHandshake must not close the stream", !stream.closed)
     }
 
     /** A peer whose device-key signature over OUR nonce does not verify
@@ -180,5 +207,7 @@ class KotlinHandshakeTest {
 
         assertEquals("own HELLO sent, own AUTH withheld once peer's proof fails", 1, stream.written.size)
         assertEquals("hello", stream.written[0].getString("t"))
+
+        assertTrue("respondHandshake must not close the stream", !stream.closed)
     }
 }
