@@ -434,13 +434,65 @@ internal data class GossipRow(
 internal fun wrapKeys(payload: Map<String, Any?>): Set<String> =
     (payload["wraps"] as? Map<*, *>)?.keys?.filterIsInstance<String>()?.toSet() ?: emptySet()
 
+/** THE per-message audience predicate (friend-peering review fix, Finding 1,
+ *  CRITICAL): given one message's `kind`/`payload`/`authorIdentity`/`msgId`,
+ *  may `peerIdentity` receive it? Extracted out of `filterMessagesNotIn`'s
+ *  own `when(kind)` block so the GIVE side (`filterMessagesNotIn`, below)
+ *  and the PUSH side (`SyncRunner.filterPendingForPeer`, which fans the
+ *  phone's own composed-but-unsent outbound queue to each dialed peer) share
+ *  ONE decision and cannot silently diverge -- before this extraction,
+ *  `SyncRunner` had no gate at all on the push path and fanned the WHOLE
+ *  pending queue (posts/DMs/responses) to every peer unfiltered: a DM meant
+ *  for one friend reached every other friend too, and a reaction/comment
+ *  (kind "response") -- whose whole point is responder-anonymity -- was
+ *  pushed to every friend as a raw wire dict naming the plaintext target
+ *  msg_id, de-anonymizing responder->post attribution.
+ *
+ *  Exact same rules `filterMessagesNotIn` always enforced (byte-faithful to
+ *  hearth's store.messages_not_in, store.py:702-750): DM relays only to
+ *  (author, recipient); RING is author-private; POST's audience is its
+ *  inline `wraps` keys UNIONED with `grantDevs[authorIdentity to msgId]`
+ *  (author-keyed grant union -- see `filterMessagesNotIn`'s own doc on why a
+ *  hostile grant naming someone else's post can never widen it);
+ *  WRAP_GRANT/RESPONSE/RESPONSES gate on their own inline `wraps` keys only,
+ *  deliberately NO grant-union (a response is never broadcast to the target
+ *  post's audience). Every other kind (profile/story/enckey/album/
+ *  profile_layout/delete/...) is unconditionally allowed -- store.py's
+ *  function has no audience gate for them either. */
+internal fun peerMayReceive(
+    kind: String,
+    payload: Map<String, Any?>,
+    authorIdentity: String,
+    msgId: String,
+    peerIdentity: String,
+    peerDevices: Set<String>,
+    grantDevs: Map<Pair<String, String>, Set<String>>,
+): Boolean = when (kind) {
+    "dm" -> {
+        val recipient = payload["to"] as? String
+        peerIdentity == authorIdentity || peerIdentity == recipient
+    }
+    "ring" -> peerIdentity == authorIdentity
+    "post" -> {
+        val wr = wrapKeys(payload) + (grantDevs[authorIdentity to msgId] ?: emptySet())
+        peerIdentity == authorIdentity || peerDevices.any { it in wr }
+    }
+    "wrap_grant", "response", "responses" -> {
+        val wr = wrapKeys(payload)
+        peerIdentity == authorIdentity || peerDevices.any { it in wr }
+    }
+    else -> true
+}
+
 /** The give-side entitlement filter itself (gossip server Task 1) -- the
  *  exact port of hearth's store.messages_not_in (store.py:702-750),
  *  factored out of both `SyncStore` impls so they cannot diverge on this
  *  security-critical boundary. `rows` must already be ordered by seq
  *  ascending (mirrors store.py's `ORDER BY seq ASC`); `peerDevices` must
  *  already be `deviceViews(peerIdentity)` (the caller's job, since both
- *  store impls already have their own `deviceViews`). */
+ *  store impls already have their own `deviceViews`). The audience decision
+ *  itself is `peerMayReceive` (above) -- this function's own remaining job
+ *  is building `grantDevs` from `rows` and applying the seen-delta check. */
 internal fun filterMessagesNotIn(
     rows: List<GossipRow>, summaries: Map<Pair<String, String>, SeenSet>,
     entitled: Set<String>, peerIdentity: String, peerDevices: Set<String>,
@@ -465,34 +517,8 @@ internal fun filterMessagesNotIn(
     val out = mutableListOf<SignedMessage>()
     for (r in rows) {
         if (r.identityPub !in entitled) continue
-        when (r.kind) {
-            "dm" -> {
-                val recipient = r.payload["to"] as? String
-                if (peerIdentity != r.identityPub && peerIdentity != recipient)
-                    continue      // DMs never relay through friends
-            }
-            "ring" -> {
-                if (peerIdentity != r.identityPub)
-                    continue      // ring records are author-private
-            }
-            "post" -> {
-                val wr = wrapKeys(r.payload) + (grantDevs[r.identityPub to r.msgId] ?: emptySet())
-                if (peerIdentity != r.identityPub && peerDevices.none { it in wr })
-                    continue      // wrap-set union grant audience + author
-            }
-            "wrap_grant", "response", "responses" -> {
-                // Responder -> author only (spec 2026-07-18): deliberately
-                // NO grant-union here, unlike POST above -- a response's
-                // whole point is that it is NOT broadcast to the author's
-                // audience.
-                val wr = wrapKeys(r.payload)
-                if (peerIdentity != r.identityPub && peerDevices.none { it in wr })
-                    continue      // routes to wrapped devices + author only
-            }
-            // Every other kind (profile/story/enckey/album/profile_layout/
-            // delete/...) has no audience gate in store.py either -- falls
-            // through unconditionally to the seen-delta check below.
-        }
+        if (!peerMayReceive(r.kind, r.payload, r.identityPub, r.msgId, peerIdentity, peerDevices, grantDevs))
+            continue
         val dev = summaries[r.identityPub to r.devicePub]
         if (dev != null && dev.has(r.seq)) continue
         out.add(r.raw)

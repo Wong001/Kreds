@@ -56,7 +56,12 @@ class AdaptiveBackoff(private val baseMs: Long, private val maxMs: Long) {
         /** Task 6 review fix (Finding 1): pure, JVM-testable decision for
          *  whether a background sweep "pulled new content" -- the value fed
          *  into `nextInterval` above. `newTotal`/`prevTotal` are ABSOLUTE
-         *  store totals (SyncRunner's messages+blobs+identities counts,
+         *  store totals (`SyncRunner.SyncOutcome.storeTotalAfter` -- a
+         *  SINGLE, peer-count-independent `store.stats()` read taken once
+         *  after the whole round; whole-branch review fix, Finding 4 -- an
+         *  earlier caller shape summed each peer's own absolute total
+         *  instead, which is NOT what this doc describes and broke the
+         *  invariant this paragraph assumes, see that field's own doc --
          *  themselves an unconditional `SELECT COUNT(*)` of the whole table
          *  via `store.stats()` -- monotonically non-decreasing, never "new
          *  this round" on their own). The correct signal is whether the

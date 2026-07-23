@@ -38,7 +38,17 @@ class TorNodeService : Service() {
         // regardless of what a stored address says, so a value that ever
         // drifted from the desktop's own constant would silently strand
         // dialbacks.
-        private const val ONION_VIRTUAL_PORT = 9997
+        // `internal` (whole-branch review fix, Finding 2 -- was `private`):
+        // SyncRunner's dial path (`runTransport`) needs this same constant
+        // to normalize every `.onion` dial to this fixed port, mirroring
+        // hearth transport.py's `TorTransport.connect` -- see
+        // `SyncRunner.dialTarget`'s own doc for the DoS this normalization
+        // closes (a poisoned/relayed same-host, different-port peer row
+        // evicting the correct `:9997` row via `mergePeerAddress`'s host-
+        // keyed eviction, whose own safety premise -- documented on
+        // `SyncStore.kt`'s `mergePeerAddress` -- assumes this normalization
+        // already holds at dial time).
+        internal const val ONION_VIRTUAL_PORT = 9997
         // No pre-existing android.util.Log usage anywhere in this file to
         // mirror; TorManagerModule.kt set the "module name as tag" precedent
         // (its own TAG doc comment) -- followed here with this class's name.
@@ -329,6 +339,17 @@ class TorNodeService : Service() {
     // off. Now derived as a DELTA against `lastSyncTotal` via
     // AdaptiveBackoff.pulledNewContent; see that function's doc for the
     // full rationale.
+    //
+    // Whole-branch review fix (Finding 4): `nowTotal` used to be
+    // `o.messages + o.blobs + o.identities` off the AGGREGATED (summed-
+    // across-peers) SyncOutcome -- but each peer's own counts are already
+    // this device's ABSOLUTE whole-store totals (SyncRunner.runTransport's
+    // `mapSyncResult` reads them straight from `store.stats()` per peer), so
+    // with N successful peers `nowTotal` scaled to roughly N times the real
+    // store size, and a flapping peer count alone could spuriously reset or
+    // suppress the backoff. `o.storeTotalAfter` is SyncRunner's own single
+    // post-round `store.stats()` read (peer-count-independent) -- see that
+    // field's doc.
     private fun syncCycle(): Boolean {
         val start = System.currentTimeMillis()
         var pulledNew = false
@@ -336,7 +357,7 @@ class TorNodeService : Service() {
             if (!TorEngine.isUp) throw IllegalStateException("tor not up")
             val fx = fixture()
             val o = SyncRunner.runSync(this, fx)     // default no-op progress; NEVER decrypts
-            val nowTotal = o.messages.toLong() + o.blobs + o.identities
+            val nowTotal = o.storeTotalAfter
             pulledNew = AdaptiveBackoff.pulledNewContent(lastSyncTotal, nowTotal, o.ran, o.ok)
             // Advance the baseline ONLY on a real ran&&ok round -- a
             // skipped (mutex-contended) or failed round must not overwrite
@@ -387,9 +408,24 @@ class TorNodeService : Service() {
      *  call this -- it only resets `backoff` to base and runs one extra,
      *  one-off `syncCycle()` alongside (see onStartCommand). There is
      *  therefore always exactly one live chain per running service
-     *  instance, regardless of how many event triggers fire in between. */
+     *  instance, regardless of how many event triggers fire in between.
+     *
+     *  Whole-branch review fix, Finding M1 (MINOR -- chain can die on a JVM
+     *  Error): `syncCycle()` itself is documented to "never throw to the
+     *  caller" (see its own closing comment), but that guarantee is built on
+     *  `runCatching`/try-catch blocks that only catch `Exception`, not
+     *  `Throwable` -- a JVM `Error` (e.g. `OutOfMemoryError` during the
+     *  1-2 min sync) would propagate straight out of `syncCycle()`, past
+     *  this call, and kill this scheduler thread -- ending the cadence chain
+     *  permanently, contradicting this doc's own "always exactly one live
+     *  chain" guarantee. `runCatching { syncCycle() }.getOrDefault(false)`
+     *  closes that last gap: now only a failure in `scheduler?.schedule`
+     *  itself (e.g. the stop-during-bootstrap race nulling `scheduler`) can
+     *  ever end the chain, matching the Task 6 review fix (Finding 2)
+     *  two-independent-runCatching-blocks reasoning just below -- a bad
+     *  sweep must never take the reschedule down with it. */
     private fun sweepAndReschedule() {
-        val pulledNew = syncCycle()
+        val pulledNew = runCatching { syncCycle() }.getOrDefault(false)
         val next = runCatching { backoff.nextInterval(pulledNew) }.getOrDefault(BASE_SYNC_MS)
         runCatching { scheduler?.schedule({ sweepAndReschedule() }, next, TimeUnit.MILLISECONDS) }
     }
