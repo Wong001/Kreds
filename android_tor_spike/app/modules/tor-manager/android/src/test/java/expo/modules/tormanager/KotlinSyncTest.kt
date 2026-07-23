@@ -313,6 +313,71 @@ class KotlinSyncTest {
     }
 
     // =======================================================================
+    // run() -- DEFRIENDS phase apply (phone-onion-reachability Task 4).
+    // Same RespondingStream frame-order convention as the REVOCATIONS tests
+    // above (REVOCATIONS -> DEFRIENDS -> HAVE -> MESSAGES -> BLOB_WANT ->
+    // BLOBS); only the DEFRIENDS element (index 1) carries real content here.
+    // =======================================================================
+
+    /** A REALLY author-signed DefriendNotice -- mirrors DefriendNoticeTest's
+     *  own `signedDefriend` helper exactly (duplicated here per this file's
+     *  own stated precedent for RespondingStream/signedRevocation: "a fresh
+     *  file-scoped helper per test file" rather than a shared one). */
+    private fun signedDefriend(
+        authorPriv: String, authorPub: String, targetPub: String,
+        createdAt: Double = 1752900000.0,
+    ): DefriendNotice {
+        val unsigned = DefriendNotice(authorPub, targetPub, createdAt, "")
+        return unsigned.copy(signature = KotlinWire.signRaw(authorPriv, unsigned.body()))
+    }
+
+    @Test fun runAppliesValidPeerDefriendNoticeTargetingUsRemovesAuthorAndPurgesContent() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val (authorPriv, authorPub) = genKeypair()
+        val authorDevPriv = "44".repeat(32)
+        store.addIdentity(authorPub)
+        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), authorDevPriv)
+        assertTrue(store.ingestMessage(m1))
+
+        val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to listOf(notice.toDict())),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32), ownIdentity = ownIdentity)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("author removed via wire-applied notice", store.knownIdentities().contains(authorPub))
+        assertFalse("author's content purged", store.allMessages().any { it.msgId == m1.msgId() })
+    }
+
+    @Test fun runDoesNotApplyDefriendNoticeNotTargetingUs() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val (authorPriv, authorPub) = genKeypair()
+        store.addIdentity(authorPub)
+        val notice = signedDefriend(authorPriv, authorPub, "bb".repeat(32))   // targets someone else, not us
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to listOf(notice.toDict())),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32), ownIdentity = ownIdentity)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertTrue("author still known -- notice did not target us", store.knownIdentities().contains(authorPub))
+    }
+
+    // =======================================================================
     // serve() -- the RESPONDER content phases (gossip server Task 3).
     // Mirrors _session (sync.py:643-825) in REVERSE I/O order vs. `run`
     // above (responder = read-then-write per phase, KotlinHandshake.kt:76).
@@ -709,5 +774,129 @@ class KotlinSyncTest {
         assertTrue("seq<=lastValid kept (seq 1)", m1.msgId() in remaining)
         assertTrue("seq<=lastValid kept (seq 2)", m2.msgId() in remaining)
         assertFalse("seq>lastValid retro-dropped (seq 3) -- OWN messages, the real path", m3.msgId() in remaining)
+    }
+
+    // =======================================================================
+    // serve() -- DEFRIENDS phase apply (phone-onion-reachability Task 4).
+    // Same read-call ORDER as `run`'s own DEFRIENDS tests above -- only the
+    // write/read INTERLEAVING per phase differs (responder: read-then-apply-
+    // then-write, hearth's own apply-then-ack responder branch, sync.py:
+    // 705-721).
+    // =======================================================================
+
+    @Test fun serveAppliesValidPeerDefriendNoticeTargetingUsRemovesAuthorPurgesContentAndAcks() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val fixture = buildFixture(ownIdentity)
+        val (authorPriv, authorPub) = genKeypair()   // the authenticated peer IS the notice's author here
+        val authorDevPriv = "44".repeat(32)
+        store.addIdentity(authorPub)
+        val peerCert = KotlinWire.CertDict(authorPub, devPub(authorDevPriv), "Peer", 1752900000.0, "")
+
+        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), authorDevPriv)
+        assertTrue(store.ingestMessage(m1))
+
+        val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to listOf(notice.toDict())),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("author removed via wire-applied notice", store.knownIdentities().contains(authorPub))
+        assertFalse("author's content purged", store.allMessages().any { it.msgId == m1.msgId() })
+
+        val wroteDefriends = stream.written[1]
+        assertEquals("defriends", wroteDefriends.getString("t"))
+        val appliedArr = wroteDefriends.getJSONArray("applied")
+        assertEquals(1, appliedArr.length())
+        assertEquals("ack credits the notice's author, who IS the authenticated peer",
+            authorPub, appliedArr.getString(0))
+    }
+
+    @Test fun serveDoesNotApplyDefriendNoticeNotTargetingUs() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val (authorPriv, authorPub) = genKeypair()
+        store.addIdentity(authorPub)
+        val peerCert = KotlinWire.CertDict(authorPub, devPub("44".repeat(32)), "Peer", 1752900000.0, "")
+        val notice = signedDefriend(authorPriv, authorPub, "bb".repeat(32))   // targets someone else, not us
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to listOf(notice.toDict())),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertTrue("author still known -- notice did not target us", store.knownIdentities().contains(authorPub))
+        assertEquals("no ack for a notice that was never applied", 0, stream.written[1].getJSONArray("applied").length())
+    }
+
+    @Test fun serveAppliesNoticeButWithholdsAckWhenRelayedByADifferentPeerThanItsAuthor() {
+        // Belt-and-braces (hearth Fix 1, sync.py:712-718): the notice is
+        // still APPLIED -- its own signature makes it self-authenticating
+        // regardless of who relayed it -- but the ack must never credit a
+        // peer who merely carried someone else's notice.
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val fixture = buildFixture(ownIdentity)
+        val (authorPriv, authorPub) = genKeypair()
+        store.addIdentity(authorPub)
+        val relayPub = "cc".repeat(32)   // the AUTHENTICATED peer this session -- not the notice's author
+        val peerCert = KotlinWire.CertDict(relayPub, devPub("55".repeat(32)), "Relay", 1752900000.0, "")
+
+        val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to listOf(notice.toDict())),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertFalse("notice still applied regardless of who relayed it", store.knownIdentities().contains(authorPub))
+        assertEquals("ack withheld -- the authenticated peer is not the notice's true author",
+            0, stream.written[1].getJSONArray("applied").length())
+    }
+
+    @Test fun serveDoesNotApplySelfAuthoredDefriendNotice() {
+        // Self-author guard (node.py:1754-1761): a notice that targets AND
+        // claims to be authored by fixture's own identity must never purge
+        // our own content, even if it somehow carried a valid signature.
+        val store = InMemorySyncStore()
+        val (ownPriv, ownIdentity) = genKeypair()
+        val fixture = buildFixture(ownIdentity)
+        store.addIdentity(ownIdentity)
+        val peerPub = "d1".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub("d2".repeat(32)), "Peer", 1752900000.0, "")
+
+        val notice = signedDefriend(ownPriv, ownIdentity, ownIdentity)   // author == target == own
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to listOf(notice.toDict())),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertTrue("own identity still known -- guard fired before any removal",
+            store.knownIdentities().contains(ownIdentity))
+        assertEquals(0, stream.written[1].getJSONArray("applied").length())
     }
 }

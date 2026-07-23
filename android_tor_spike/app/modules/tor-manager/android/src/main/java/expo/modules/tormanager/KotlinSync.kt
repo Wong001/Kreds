@@ -89,6 +89,17 @@ object Base64Portable {
  *  still `run(stream, store, ownDevicePub)`. Always ingests the node's
  *  own-identity messages + blobs.
  *
+ *  `ownIdentity` (phone-onion-reachability Task 4): this device's own
+ *  identity_pub, consulted by the DEFRIENDS phase's
+ *  `store.applyDefriendNotice` (target==own / author!=own gates). Defaults
+ *  to `""` so every pre-existing call site (SyncLoopbackTest and friends,
+ *  none of which exercise DEFRIENDS content) compiles and behaves
+ *  identically unchanged -- an empty-string identity can never equal a real
+ *  notice's `target_identity`, so applyDefriendNotice's first gate simply
+ *  never matches for those callers, same as before this task (a no-op).
+ *  The ONE production call site, `SyncRunner.runTransport`, passes the
+ *  real `fx.cert.identity_pub`.
+ *
  *  Blocking, like KotlinHandshake.run -- callers (BB-7) must invoke this
  *  off the main thread (Dispatchers.IO), same reason TorEngine's own
  *  send/recv must be. */
@@ -210,7 +221,8 @@ object KotlinSync {
      *  `onProgress` failure can never surface as a false sync failure. */
     fun run(stream: Stream, store: SyncStore, ownDevicePub: String,
             outbound: List<Map<String, Any?>> = emptyList(),
-            onProgress: (phase: String, count: Int) -> Unit = { _, _ -> }): SyncResult {
+            onProgress: (phase: String, count: Int) -> Unit = { _, _ -> },
+            ownIdentity: String = ""): SyncResult {
         fun progress(phase: String, count: Int) {
             try { onProgress(phase, count) } catch (_: Throwable) {}
         }
@@ -258,9 +270,28 @@ object KotlinSync {
                 if (rev.device_pub == ownDevicePub) return SyncResult.SelfRevoked
             }
 
-            // -- DEFRIENDS --
+            // -- DEFRIENDS -- (initiator: write then read, same _swap order
+            // as REVOCATIONS above -- hearth's initiator branch, sync.py:
+            // 697-704: write my_defriends first (nothing to apply yet,
+            // since nothing has been read), THEN read the peer's frame and
+            // apply what targets me from it. Own notices are always empty
+            // -- the phone has no unfriend/outbox model yet (out of this
+            // task's scope, phone-onion-reachability Task 4). Each peer
+            // notice is parsed + applied via store.applyDefriendNotice
+            // (Task 4 -- the same 4-gate order node.apply_defriend_notice
+            // uses: target==own, author!=own self-guard, verify(),
+            // isKnown(author) -> purge+remove). No ack write here -- matches
+            // hearth's own initiator branch exactly: it never sends a
+            // second frame reporting what IT applied, only reads
+            // peer_df.get("applied", []) for ITS OWN sent notices (always
+            // empty for us, so there is nothing to consult).
             writeFrame(stream, mapOf("t" to "defriends", "notices" to emptyList<Any>()))
-            readFrame(stream)   // read node's, ignore (own-identity, B.1)
+            val defriends = readFrame(stream)
+            val noticeArr = defriends.optJSONArray("notices") ?: JSONArray()
+            for (i in 0 until noticeArr.length()) {
+                val notice = DefriendNotice.fromDict(toMap(noticeArr.getJSONObject(i)))
+                store.applyDefriendNotice(notice, ownIdentity)
+            }
 
             // -- HAVE --
             writeFrame(stream, mapOf("t" to "have",
@@ -378,16 +409,17 @@ object KotlinSync {
      *  caller -- this one -- that continues on the same connection).
      *
      *  Deliberately NOT full hearth parity in two places, each documented
-     *  at its phase below: no defriend-apply model (DEFRIENDS is
-     *  read+discard, not hearth's apply-then-ack, sync.py:673-721), and
+     *  at its phase below: DEFRIENDS (phone-onion-reachability Task 4) now
+     *  DOES apply-then-ack, mirroring hearth's responder branch
+     *  (sync.py:705-721), but as a SUBSET -- store.applyDefriendNotice
+     *  skips the peer-table/device-views/disconnected-list cleanup
+     *  node.apply_defriend_notice also does (see DefriendNotice.kt's doc
+     *  comment for the full list; the phone has no peer table yet). And
      *  peer-address/peer-table merging is dropped entirely (HAVE's
      *  `peers`/`addr` fields are read but never consulted -- arc 3, no peer
      *  table exists on the phone yet, the same "read it, drop it" shape
      *  `KotlinPairing.installPackage` already set for `peers`,
-     *  KotlinPairing.kt:176-183). DEFRIENDS mirrors a gap `run` already has
-     *  today (`run`'s own DEFRIENDS phase already just reads-and-ignores)
-     *  -- this function's parity target for that phase is `run`'s EXISTING
-     *  behavior, not hearth's fuller responder shape, per the brief.
+     *  KotlinPairing.kt:176-183).
      *  REVOCATIONS (Task 3, phone-onion-reachability) is now a REAL
      *  ingest, matching `run`'s own REVOCATIONS phase -- see that phase's
      *  doc below and `RevocationCert.kt`'s `SyncStore.ingestRevocation`. */
@@ -423,16 +455,33 @@ object KotlinSync {
                 if (rev.device_pub == fixture.device_pub) return SyncResult.SelfRevoked
             }
 
-            // -- DEFRIENDS -- (responder: read peer's first, ignore --
-            // mirrors `run`'s own read side exactly, reversed I/O order.
-            // The phone has no DefriendNotice model/apply path at all, so
-            // this is read+discard, not hearth's apply-then-ack (sync.py:
-            // 673-721) -- `run`'s existing behavior is the parity target
-            // for this phase, not hearth's fuller responder shape. Own
-            // notices are unconditionally empty -- the phone has no
-            // defriend outbox to offer either.)
-            readFrame(stream)
-            writeFrame(stream, mapOf("t" to "defriends", "notices" to emptyList<Any>()))
+            // -- DEFRIENDS -- (responder: read peer's first, apply what
+            // targets me, THEN write my own frame -- hearth's responder
+            // branch, sync.py:705-721: apply-before-write, folding the
+            // apply step between the REVOCATIONS-style read and write
+            // above. Task 4, phone-onion-reachability: each peer notice is
+            // parsed + applied via store.applyDefriendNotice (the same
+            // 4-gate order node.apply_defriend_notice uses: target==own,
+            // author!=own self-guard, verify(), isKnown(author) ->
+            // purge+remove). `appliedHere` reports back only notices whose
+            // author_identity IS the peer authenticated THIS session --
+            // hearth's own belt-and-braces Fix 1 (sync.py:712-718): a
+            // notice's signature already makes it self-authenticating
+            // regardless of who relayed it, but the ack is only meaningful
+            // to its true author, so it must never be credited to a
+            // different relaying peer. Own notices are unconditionally
+            // empty -- the phone has no defriend outbox to offer either.)
+            val defriends = readFrame(stream)
+            val appliedHere = mutableListOf<String>()
+            val noticeArr = defriends.optJSONArray("notices") ?: JSONArray()
+            for (i in 0 until noticeArr.length()) {
+                val notice = DefriendNotice.fromDict(toMap(noticeArr.getJSONObject(i)))
+                if (store.applyDefriendNotice(notice, fixture.cert.identity_pub) &&
+                    notice.author_identity == peerCert.identity_pub) {
+                    appliedHere.add(notice.author_identity)
+                }
+            }
+            writeFrame(stream, mapOf("t" to "defriends", "notices" to emptyList<Any>(), "applied" to appliedHere))
 
             // -- HAVE -- (responder: read peer's first, THEN write ours)
             val have = readFrame(stream)

@@ -237,8 +237,17 @@ object SyncRunner {
             // round opens a fresh one, and an unclosed SQLiteOpenHelper leaks a
             // SQLiteConnection (the leak class the LocalApi shared-store fix
             // addresses). mapSyncResult reads store.stats() first, so map before close.
+            //
+            // ownIdentity = fx.cert.identity_pub (phone-onion-reachability
+            // Task 4): without this, KotlinSync.run's DEFRIENDS phase would
+            // gate every incoming DefriendNotice against the default ""
+            // (applyDefriendNotice's target==own check would never match a
+            // real notice) -- this is the ONE production call site of
+            // KotlinSync.run, so this is what makes a real friend's defriend
+            // notice actually take effect on this device.
             val outcome = mapSyncResult(
-                KotlinSync.run(stream, store, fx.device_pub, prep.outbound + pending, onProgress),
+                KotlinSync.run(stream, store, fx.device_pub, prep.outbound + pending, onProgress,
+                    ownIdentity = fx.cert.identity_pub),
                 prep, store, pendingIds)
             store.close()
             return outcome
