@@ -16,14 +16,19 @@ import kotlin.concurrent.thread
  *  `KotlinSync.serve` (Task 3) -- the responder counterpart to
  *  `SyncRunner.runSync`'s outbound (initiator) path.
  *
- *  Binds `InetAddress.getLoopbackAddress()` ONLY (127.0.0.1) -- this server
- *  is never meant to be reachable directly off-device; a real friend reaches
- *  it by dialing this phone's onion address, which the Tor daemon forwards
- *  to this loopback port as a hidden-service target (the standard Tor
- *  onion-service pattern: the .onion listener is a LOCAL forwarding rule, not
- *  a public bind). Binding anything wider (0.0.0.0 or a real interface
- *  address) would make this reachable to every other app/process on the LAN,
- *  which is never the intent.
+ *  Binds explicit IPv4 loopback (127.0.0.1) ONLY -- this server is never
+ *  meant to be reachable directly off-device; a real friend reaches it by
+ *  dialing this phone's onion address, which the Tor daemon forwards to this
+ *  loopback port as a hidden-service target (the standard Tor onion-service
+ *  pattern: the .onion listener is a LOCAL forwarding rule, not a public
+ *  bind). Binding anything wider (0.0.0.0 or a real interface address) would
+ *  make this reachable to every other app/process on the LAN, which is never
+ *  the intent. MUST be IPv4, not `InetAddress.getLoopbackAddress()`: that
+ *  call is platform-dependent and can resolve to IPv6 `::1` on Android,
+ *  which silently mismatches `ControlPort.addOnion`'s hardcoded IPv4
+ *  `127.0.0.1:<target>` forwarding rule -- Tor's hidden-service exit
+ *  connection then has no IPv4 listener to reach (found via on-device onion-
+ *  reachability diagnosis, brick-phone-onion).
  *
  *  LOCK (coarse, and DELIBERATELY so -- read this before changing it): every
  *  accepted connection's ENTIRE handshake+serve runs while holding the SAME
@@ -134,7 +139,7 @@ class GossipServer(
     @Synchronized
     fun start(): Int {
         serverSocket?.let { return boundPort }
-        val s = ServerSocket(port, BACKLOG, InetAddress.getLoopbackAddress())
+        val s = ServerSocket(port, BACKLOG, InetAddress.getByName("127.0.0.1"))
         serverSocket = s
         boundPort = s.localPort
         val executor = Executors.newFixedThreadPool(POOL_SIZE)
