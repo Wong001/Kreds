@@ -792,3 +792,68 @@ class InMemorySyncStore : SyncStore {
     override fun addressFor(identityPub: String): String? =
         peers.entries.firstOrNull { it.value == identityPub }?.key
 }
+
+// -- friend-peering Task 2: mergePeerAddress (onion-preferred, host-keyed
+//    eviction) -- mirrors hearth sync.py's _is_onion (sync.py:71-73) and
+//    _merge_peer_address (sync.py:93-131).
+
+/** True if `address`'s host (everything before the LAST `:`) ends in
+ *  `.onion` -- byte-faithful port of hearth's `_is_onion` (sync.py:71-73:
+ *  `host = address.rsplit(":", 1)[0]; return host.endswith(".onion")`).
+ *  `substringBeforeLast(":")` matches `rsplit(":", 1)[0]` exactly,
+ *  including the no-colon case (both return the whole string unchanged).
+ *  A free top-level function, not a SyncStore member, matching hearth's
+ *  own module-level `_is_onion` -- it needs no store state at all. */
+internal fun isOnion(address: String): Boolean =
+    address.substringBeforeLast(":").endsWith(".onion")
+
+/** Onion-preferred peer store (friend-peering Task 2): a byte-faithful
+ *  port of hearth sync.py's `_merge_peer_address` (sync.py:93-131). An
+ *  onion address is always kept; a non-onion address is stored only if we
+ *  hold no onion address for that identity yet. Never let a plain-TCP
+ *  address shadow a known onion one -- that would route a Tor peer's
+ *  gossip over the clearnet.
+ *
+ *  Onion eviction is HOST-keyed, not identity-keyed (sync.py's own doc
+ *  comment, reproduced here because the reasoning is load-bearing and this
+ *  is a port, not a paraphrase): TorTransport.connect normalizes every
+ *  .onion dial to the fixed ONION_VIRTUAL_PORT regardless of the stored
+ *  port, so a same-host row at an old port is always a stale duplicate of
+ *  the same node (an onion host uniquely identifies one service) and must
+ *  be drained -- stale-port rows would otherwise both dial the same live
+ *  service: redundant full gossip sessions every round, a stale self-row
+ *  syncing with itself over Tor, and the stale row propagating family-wide
+ *  via HAVE/pairing. A single identity CAN legitimately own multiple
+ *  different onion hosts across devices, so those must not be collapsed --
+ *  only same-host, different-port rows are evicted.
+ *
+ *  A free/extension function rather than a `SyncStore` interface member,
+ *  for the same reason `ingestRevocation`/`applyDefriendNotice` are
+ *  (RevocationCert.kt's doc): it needs no store-impl-specific state beyond
+ *  already-public interface methods (`listPeers`, `addPeer`,
+ *  `removePeer`), so implementing it ONCE here gives both
+ *  `InMemorySyncStore` and `SqliteSyncStore` identical behavior for free. */
+fun SyncStore.mergePeerAddress(identity: String, addr: String) {
+    if (isOnion(addr)) {
+        val host = addr.substringBeforeLast(":")
+        // Evict any non-onion rows for this identity: otherwise the
+        // gossip loop keeps dialing the stale clearnet address every
+        // round, and a have-frame built from listPeers() would keep
+        // propagating a non-onion address for a peer with a known onion --
+        // exactly what this guardrail exists to prevent.
+        for (pe in listPeers()) {
+            if (pe.identityPub != identity) continue
+            if (!isOnion(pe.address)) {
+                removePeer(pe.address)
+            } else if (pe.address != addr && pe.address.substringBeforeLast(":") == host) {
+                removePeer(pe.address)          // stale same-host, old port
+            }
+        }
+        addPeer(addr, identity)
+        return
+    }
+    val known = listPeers().filter { it.identityPub == identity }.map { it.address }
+    if (known.none { isOnion(it) }) {
+        addPeer(addr, identity)
+    }
+}

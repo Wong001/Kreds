@@ -752,4 +752,75 @@ class SyncStoreTest {
         assertEquals(address, peers[0].address)
         assertNull(peers[0].identityPub)
     }
+
+    // -- friend-peering Task 2: mergePeerAddress (onion-preferred, host-
+    //    keyed eviction) -- byte-faithful port of hearth sync.py's
+    //    _merge_peer_address (sync.py:93-131). The five cases below are
+    //    hearth's own scenarios, not invented ones.
+
+    @Test fun mergePeerAddressStoresNewOnionAddress() {
+        val s = InMemorySyncStore()
+        val onion = "abc123.onion:9997"
+        s.mergePeerAddress(idPub, onion)
+        val peers = s.listPeers()
+        assertEquals(1, peers.size)
+        assertEquals(onion, peers[0].address)
+        assertEquals(idPub, peers[0].identityPub)
+    }
+
+    @Test fun mergePeerAddressNonOnionDoesNotShadowKnownOnion() {
+        val s = InMemorySyncStore()
+        val onion = "abc123.onion:9997"
+        val clearnet = "203.0.113.5:9997"
+        s.mergePeerAddress(idPub, onion)
+        s.mergePeerAddress(idPub, clearnet)     // must NOT shadow the known onion
+        val peers = s.listPeers()
+        assertEquals("onion survives, non-onion never added", 1, peers.size)
+        assertEquals(onion, peers[0].address)
+    }
+
+    @Test fun mergePeerAddressOnionEvictsPriorNonOnion() {
+        val s = InMemorySyncStore()
+        val clearnet = "203.0.113.5:9997"
+        val onion = "abc123.onion:9997"
+        s.mergePeerAddress(idPub, clearnet)     // no onion known yet -> stored
+        assertEquals(1, s.listPeers().size)
+        s.mergePeerAddress(idPub, onion)        // onion always kept, evicts non-onion rows
+        val peers = s.listPeers()
+        assertEquals("non-onion evicted, only the onion remains", 1, peers.size)
+        assertEquals(onion, peers[0].address)
+    }
+
+    @Test fun mergePeerAddressSameHostDifferentPortEvictsStalePortRow() {
+        val s = InMemorySyncStore()
+        val host = "abc123.onion"
+        s.mergePeerAddress(idPub, "$host:9997")
+        s.mergePeerAddress(idPub, "$host:1234")     // same host, different port -> stale row evicted
+        val peers = s.listPeers()
+        assertEquals("one row for that host -- the new address", 1, peers.size)
+        assertEquals("$host:1234", peers[0].address)
+    }
+
+    @Test fun mergePeerAddressDifferentOnionHostsCoexist() {
+        val s = InMemorySyncStore()
+        val host1 = "abc123.onion:9997"
+        val host2 = "def456.onion:9997"
+        s.mergePeerAddress(idPub, host1)
+        s.mergePeerAddress(idPub, host2)            // a different device's onion -- must not collapse
+        val peers = s.listPeers()
+        assertEquals("multi-device: both onion hosts kept", 2, peers.size)
+        val addrs = peers.map { it.address }.toSet()
+        assertTrue(host1 in addrs)
+        assertTrue(host2 in addrs)
+    }
+
+    @Test fun mergePeerAddressIdempotentForIdenticalOnion() {
+        val s = InMemorySyncStore()
+        val onion = "abc123.onion:9997"
+        s.mergePeerAddress(idPub, onion)
+        s.mergePeerAddress(idPub, onion)            // identical merge twice
+        val peers = s.listPeers()
+        assertEquals(1, peers.size)
+        assertEquals(onion, peers[0].address)
+    }
 }
