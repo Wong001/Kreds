@@ -395,34 +395,49 @@ object KotlinSync {
             // -- friend-peering Task 3: address learning (mirrors sync.py's
             // own HAVE-phase merge, sync.py:774-781).
             //
-            // STALE-ASSUMPTION NOTE (friend-peering Task 4 review): the
-            // direct-addr merge just below still hardcodes `ownIdentity`
-            // (not `peerIdentity`) -- written back when `run`'s ONE
-            // production caller (SyncRunner.runTransport) only ever dialed
-            // the phone's own home node, so "the peer we're syncing with"
-            // and `ownIdentity` were always the same value. That's no longer
-            // true (friend-peering Task 4: `run` now also dials friends), so
-            // syncing with a FRIEND now merges the FRIEND's own reported
-            // `addr` under OUR OWN identity_pub instead of the friend's --
-            // mislabeled peer-table data. Left AS-IS here (out of the review
-            // findings' scope, and self-mitigated: `acceptPeerIdentity`'s
-            // wrong-address guard, friend-peering Task 4, refuses that
-            // mislabeled row's next dial -- `expectedIdentity` (`ownIdentity`)
-            // won't match the friend's real AUTH'd identity -- so the only
-            // cost is a wasted, refused dial attempt, not a security hole).
-            // Flagged here as a candidate follow-up (use `peerIdentity`
-            // instead of `ownIdentity` for this specific merge) rather than
-            // fixed, to keep this review fix surgical to the findings raised.
+            // FIX (direct-addr merge follow-up to the Task 4 review's Finding
+            // 1): this merge used to hardcode `ownIdentity` -- written back
+            // when `run`'s ONE production caller (SyncRunner.runTransport)
+            // only ever dialed the phone's own home node, so "the peer we're
+            // syncing with" and `ownIdentity` were always the same value.
+            // That stopped being true once friend-peering Task 4 made `run`
+            // also dial FRIENDS: syncing with a FRIEND merged the FRIEND's
+            // own reported `addr` under OUR OWN identity_pub instead of the
+            // friend's -- mislabeled peer-table data, and NOT harmless: the
+            // `peers` table is keyed by `address` as PRIMARY KEY (`addPeer`
+            // is INSERT-OR-REPLACE on address), so
+            // `mergePeerAddress(ownIdentity, friendsAddr)` OVERWRITES the
+            // pre-existing correct `peers[friendsAddr] = friendIdentity` row
+            // with `peers[friendsAddr] = ownIdentity` -- breaking
+            // `addressFor(friendIdentity)` and permanently refusing every
+            // future direct dial of that row via `acceptPeerIdentity`'s
+            // wrong-address guard (`expectedIdentity` would be `ownIdentity`,
+            // never matching the friend's real AUTH'd identity), until some
+            // third node re-heals the mapping via relay -- which does not
+            // exist during a home-node outage, the exact scenario
+            // friend-peering exists for. Fixed: attribute this merge to the
+            // AUTH'd `peerIdentity` instead, exactly like `serve`'s own
+            // version of this same merge
+            // (`store.mergePeerAddress(peerCert.identity_pub, peerAddr)`, a
+            // few hundred lines below) and hearth's own
+            // `_merge_peer_address(store, peer_identity, peer_have["addr"])`
+            // (sync.py:776). Gated on `peerIdentity != null` -- never a
+            // fallback to `ownIdentity` (that fallback IS the bug just
+            // described) -- a null `peerIdentity` means we cannot correctly
+            // attribute this address to anyone, so the merge is simply
+            // skipped for this round rather than mislabeled.
             //
             // Direct addr (sync.py:774-776): the peer's own onion, merged
-            // under its identity -- gated on is_known (belt-and-braces;
-            // always true in production since ownIdentity is seeded at
-            // pairing/every sync) and never our own onion (a peer must never
+            // under the AUTH'd PEER's identity_pub -- gated on is_known
+            // (mirrors `serve`'s own gate on this same merge; belt-and-
+            // braces, hearth's own sync.py:774-776 has no equivalent
+            // is_known gate here) and never our own onion (a peer must never
             // be able to make us dial ourselves).
             val myAddr = store.getMeta("gossip_addr") ?: ""
             val peerAddr = have.optString("addr", "")
-            if (peerAddr.isNotEmpty() && peerAddr != myAddr && store.knownIdentities().contains(ownIdentity)) {
-                store.mergePeerAddress(ownIdentity, peerAddr)
+            if (peerIdentity != null && peerAddr.isNotEmpty() && peerAddr != myAddr &&
+                store.knownIdentities().contains(peerIdentity)) {
+                store.mergePeerAddress(peerIdentity, peerAddr)
             }
             // Transitive relay (sync.py:777-781): each `{identity_pub,
             // address}` entry the peer relays, merged ONLY for an identity

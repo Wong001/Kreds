@@ -81,11 +81,20 @@ object SyncRunner {
      *  `KotlinSync.run`'s result -- proves Ok marks-published-on-shouldPublish
      *  and maps counts, SelfRevoked/Failed map to the right skip/error shape,
      *  and a non-Ok never sets the published marker. `pendingIds` defaults to
-     *  empty so every pre-existing 3-arg call site (SyncRunnerTest,
-     *  SyncLoopbackTest) keeps compiling unchanged -- those scenarios don't
-     *  exercise the pending-outbound queue, so an empty list is a no-op on
-     *  Ok's `store.clearPendingOutbound` call, same as if this parameter
-     *  didn't exist for them. */
+     *  empty -- and, since the friend-peering Task 4 review fix (Finding 2),
+     *  that default is not merely a test convenience: the ONE production call
+     *  site (`runTransport`, below) also ALWAYS calls `mapSyncResult` with no
+     *  `pendingIds` now. Pending-outbound clearing moved out of per-peer
+     *  `runTransport` entirely and into `runSync`'s own once-per-round logic
+     *  (`shouldClearPendingOutbound` + the single `clearPendingOutbound` call
+     *  after the whole peer loop -- see `runSync`'s own doc for why: reading
+     *  +clearing it per-peer used to mean only the FIRST peer to sync
+     *  successfully each round ever received/cleared it). So every call site
+     *  of `mapSyncResult` -- production and test alike -- uses this same
+     *  empty default today; every pre-existing 3-arg call site
+     *  (SyncRunnerTest, SyncLoopbackTest) still compiles/behaves unchanged
+     *  either way, since an empty list is a no-op on Ok's
+     *  `store.clearPendingOutbound` call regardless of caller. */
     internal fun mapSyncResultForTest(
         r: SyncResult, prep: EncKeyPrep, store: SyncStore, pendingIds: List<String> = emptyList()
     ) = mapSyncResult(r, prep, store, pendingIds)

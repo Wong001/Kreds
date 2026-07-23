@@ -560,16 +560,23 @@ class KotlinSyncTest {
     // RespondingStream/full-phase-queue idiom, `have` is written/read at
     // index 2 either way (see the section header above).
     //
-    // `run`'s ONE production caller (SyncRunner.runTransport) always dials
-    // exactly the phone's own home node, pinning the authenticated peer's
-    // identity_pub to `fx.cert.identity_pub` BEFORE KotlinSync.run ever
-    // runs (see that pinning check, SyncRunner.kt:195-198) -- so for `run`,
-    // "the peer we're syncing with" (what `serve` gets explicitly as
-    // `peerCert.identity_pub`) IS the `ownIdentity` param already threaded
-    // through every other phase in this file (DEFRIENDS/REVOCATIONS). These
-    // tests seed `store.addIdentity(ownIdentity)` to mirror that real
+    // `run`'s ONE production caller (SyncRunner.runTransport) now dials
+    // EVERY stored peer -- the phone's own home node AND friends alike
+    // (friend-peering Task 4) -- passing the AUTH'd cert's identity_pub as
+    // `peerIdentity` on every dial (`peerCert.identity_pub`, established by
+    // `authOnlyOverStream` BEFORE KotlinSync.run ever runs -- see
+    // SyncRunner.kt's runTransport doc). So "the peer we're syncing with"
+    // (what `serve` gets explicitly as `peerCert.identity_pub`) is `run`'s
+    // own `peerIdentity` param, NOT necessarily `ownIdentity` -- the two
+    // coincide only for the home-node case (a sibling device dialing back,
+    // peerIdentity == ownIdentity), and differ for every friend dial
+    // (peerIdentity == that friend's identity_pub). Tests below that
+    // exercise the home-node case pass `peerIdentity = ownIdentity`
+    // explicitly and seed `store.addIdentity(ownIdentity)` to mirror real
     // pre-seeding (KotlinPairing.installPackage / SyncRunner.runTransport),
-    // exactly like the pre-existing REVOCATIONS/DEFRIENDS `run` tests above.
+    // exactly like the pre-existing REVOCATIONS/DEFRIENDS `run` tests above;
+    // tests exercising a FRIEND dial pass `peerIdentity = friendIdentity`
+    // instead (see the direct-addr-merge regression test further below).
     // =======================================================================
 
     @Test fun runMergesHomeNodeAddrAndRelayedKnownFriendAddress() {
@@ -590,7 +597,11 @@ class KotlinSyncTest {
             mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
         ))
 
-        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32), ownIdentity = ownIdentity)
+        // peerIdentity = ownIdentity: this test exercises the HOME-NODE case
+        // (a sibling device dialing back under our own identity) -- see the
+        // section header's updated doc above.
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32),
+            ownIdentity = ownIdentity, peerIdentity = ownIdentity)
         assertTrue("expected Ok, got $result", result is SyncResult.Ok)
 
         assertEquals("the peer's own onion merged under the identity we share with it " +
@@ -638,9 +649,68 @@ class KotlinSyncTest {
             mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
         ))
 
-        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32), ownIdentity = ownIdentity)
+        // peerIdentity = ownIdentity (home-node case) so this test genuinely
+        // exercises the addr != myAddr gate below, rather than trivially
+        // passing via the peerIdentity != null gate for an unrelated reason.
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32),
+            ownIdentity = ownIdentity, peerIdentity = ownIdentity)
         assertTrue("expected Ok, got $result", result is SyncResult.Ok)
         assertNull("must never merge our own onion address as a peer of ourselves",
+            store.addressFor(ownIdentity))
+    }
+
+    /** REGRESSION TEST for the direct-addr-merge defect (fixed just above,
+     *  KotlinSync.kt's HAVE phase): syncing with a FRIEND (peerIdentity !=
+     *  ownIdentity) whose HAVE frame advertises the FRIEND's own `addr` must
+     *  attribute that address to the FRIEND's AUTH'd identity, exactly like
+     *  `serve` does (`store.mergePeerAddress(peerCert.identity_pub, ...)`)
+     *  and hearth's own `_merge_peer_address(store, peer_identity, ...)`
+     *  (sync.py:776) -- NEVER to `ownIdentity`.
+     *
+     *  This FAILS under the old `store.mergePeerAddress(ownIdentity,
+     *  peerAddr)` code: the `peers` table is keyed by `address` as PRIMARY
+     *  KEY (`addPeer` is INSERT-OR-REPLACE on address), so the old call
+     *  would write `peers[friendsAddr] = ownIdentity` -- no row's value
+     *  equals `friendIdentity` anymore, so `store.addressFor(friendIdentity)`
+     *  returns null instead of `friendsAddr` (the first assertion below
+     *  fails), and `store.addressFor(ownIdentity)` wrongly returns
+     *  `friendsAddr` (the second assertion below fails too) -- exactly the
+     *  mislabeled-peer-table-row bug described in the fix's own doc comment:
+     *  `addressFor(friendIdentity)` breaks, and every future direct dial of
+     *  that row is refused forever by `acceptPeerIdentity`'s wrong-address
+     *  guard, until some third node re-heals the mapping via relay -- which
+     *  does not exist during a home-node outage, the exact scenario
+     *  friend-peering exists for. */
+    @Test fun runAttributesFriendsAdvertisedAddrToFriendIdentityNotOwnIdentity() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        store.addIdentity(ownIdentity)   // mirrors production seeding (pairing / every sync)
+        val (_, friendIdentity) = genKeypair()
+        store.addIdentity(friendIdentity)   // a known friend -- is_known gate must pass
+        val friendsAddr = "friendhome.onion:9997"
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to friendsAddr),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        // peerIdentity = friendIdentity (NOT ownIdentity): a real friend
+        // dial, exactly what SyncRunner.runTransport's peer loop does since
+        // friend-peering Task 4.
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32),
+            ownIdentity = ownIdentity, peerIdentity = friendIdentity)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+
+        assertEquals("the FRIEND's own advertised addr must be attributed to the FRIEND's " +
+            "AUTH'd identity (mirrors serve + sync.py:776)", friendsAddr, store.addressFor(friendIdentity))
+        assertNull("the friend's address row must NOT be relabeled under our own identity -- " +
+            "peers is keyed by address as PRIMARY KEY, so mislabeling under ownIdentity would " +
+            "overwrite the correct row and make addressFor(ownIdentity) wrongly return it",
             store.addressFor(ownIdentity))
     }
 
