@@ -297,8 +297,9 @@ export function onSync(cb: (r: {
   // success or failure); existing callers that don't read it are unaffected.
   feedUpdated: boolean;
   // `skipped` (Task 3 review fix): true iff this terminal event is a benign
-  // mutex skip (a concurrent sync -- almost always the 15-min background
-  // one -- already held SyncRunner's process-wide lock), not a real
+  // mutex skip (a concurrent sync -- almost always the adaptive background
+  // one, see TorNodeService's AdaptiveBackoff-driven cadence (Task 6) --
+  // already held SyncRunner's process-wide lock), not a real
   // failure. Always present (the module's `emit` defaults it false and sets
   // it true only on the outcome.ran == false branch) -- the dedicated
   // source of truth for the dashboard's neutral-vs-red decision. `reason`

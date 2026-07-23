@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from "react";
-import { ActivityIndicator, StyleSheet, Text, View, useColorScheme } from "react-native";
+import { ActivityIndicator, AppState, StyleSheet, Text, View, useColorScheme } from "react-native";
 import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-import { bootstrap, startNode, syncNow, getWebUrl } from "./modules/tor-manager";
+import { beatNow, bootstrap, startNode, syncNow, getWebUrl } from "./modules/tor-manager";
 
 /** vp1: full-screen host for the desktop web UI, served by the native loopback
  *  server. For slice 1 this component also owns the engine bootstrap (Tor +
@@ -30,7 +30,9 @@ function Shell() {
                                     // fresh launch has current content to render
                                     // (do not await -- fire-and-forget; the feed
                                     // reflects the last successful sync, and the
-                                    // 15-min background cycle keeps it current).
+                                    // adaptive background cadence (Task 6:
+                                    // AdaptiveBackoff, 10 min - 1 hr) keeps it
+                                    // current after that).
         const url = await getWebUrl();
         if (!url) { setErr("web server not available"); return; }
         setUri(url);
@@ -38,6 +40,27 @@ function Shell() {
         setErr(String(e?.message ?? e));
       }
     })();
+  }, []);
+
+  // Task 6 (friend-peering, cadence overhaul): on-app-resume event trigger.
+  // Foreground/background-only ('active' <-> 'background'/'inactive')
+  // transitions are noisy on Android (fired for the OS lock screen, the
+  // notification shade, etc.), so this only fires on the transition INTO
+  // 'active' -- the moment the user is actually back looking at the app --
+  // not on every AppState change. beatNow() resets TorNodeService's
+  // AdaptiveBackoff to base and runs one sweep now (see TorNodeService.
+  // ACTION_BEAT_NOW's doc), same as the on-compose trigger on the native
+  // side. This is separate from (and in addition to) the mount-time
+  // syncNow() above -- mount always fires once on a fresh launch; this
+  // fires on every subsequent return to the foreground, which mount alone
+  // does not cover (a backgrounded-then-resumed app does not remount).
+  useEffect(() => {
+    let prev = AppState.currentState;
+    const sub = AppState.addEventListener("change", (next) => {
+      if (prev !== "active" && next === "active") beatNow();
+      prev = next;
+    });
+    return () => sub.remove();
   }, []);
 
   if (err) return (<View style={styles.center}><Text>{err}</Text></View>);

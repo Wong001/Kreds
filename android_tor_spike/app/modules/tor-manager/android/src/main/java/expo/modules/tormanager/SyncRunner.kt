@@ -164,9 +164,9 @@ object SyncRunner {
             // blobs smallest-first up to a ~15 MiB per-round budget and
             // leaves the rest "for the next round" (sync.py
             // BLOB_GIVE_BUDGET), so a profile's large banner + wall photos
-            // need several rounds. Rather than dripping one batch per 15-min
-            // background cycle (leaving big images broken for up to an
-            // hour), loop rounds back-to-back until nothing is missing, a
+            // need several rounds. Rather than dripping one batch per
+            // background sync cycle (leaving big images broken across
+            // several cycles), loop rounds back-to-back until nothing is missing, a
             // round pulls no new blobs (the peer doesn't hold the rest), or
             // a safety cap -- see syncOnePeer/MAX_DRAIN_ROUNDS. In steady
             // state this is a single round per peer.
