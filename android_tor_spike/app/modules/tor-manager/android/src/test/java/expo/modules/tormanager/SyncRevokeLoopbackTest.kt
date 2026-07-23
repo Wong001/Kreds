@@ -50,55 +50,80 @@ import org.junit.Test
  *  2. defriendedIdentityNotServedMidSession -- THE OVER-SERVE-STOPS
  *     NEGATIVE, the arc-1 whole-branch-review's own blocking concern,
  *     proven closed at the real wire. The phone knows this node as an
- *     ordinary friend (`store.addIdentity` + a registrar profile message,
- *     the exact same shape `SyncServeLoopbackTest.kt`'s own
- *     `friendReceivesOnlyEntitledContentOverServeNegative` uses to
- *     register `deviceViews`) and holds a kreds POST wrapped to this
- *     node's device -- exactly the kind of content that sibling test
- *     proves DOES get served to an ordinary, non-defriended friend. This
- *     node, instead of dialing empty-handed, first calls the REAL
- *     `node.unfriend(phoneIdentityPub)` (hearth's own production method,
- *     node.py:1732-1744 -- never a hand-built notice): local teardown,
- *     then queues a genuinely identity-signed `DefriendNotice` for
- *     direct-only delivery on this very dial (Task 8's new "defriend"
- *     scenario in `sync_loopback_node.py` -- see `_run_dial`'s own doc
- *     there for the exact mechanics).
+ *     ordinary friend (`store.addIdentity`) and holds a PLAINTEXT marker
+ *     authored by the phone's own identity -- content that a normal
+ *     friend sync WOULD deliver (see the entitledMarker seeding below for
+ *     exactly why this shape, not the wrapped-post shape
+ *     `SyncServeLoopbackTest.kt`'s own
+ *     `friendReceivesOnlyEntitledContentOverServeNegative` uses for an
+ *     UN-defriended friend).
  *
- *     PROTOCOL-SYMMETRY NOTE (read before "fixing" this test to look more
- *     like the entitlement-negative above): `node.unfriend`'s local
- *     teardown runs BEFORE the notice is queued, so by the time this node
- *     dials, ITS OWN `store.is_known(phoneIdentityPub)` is already False
- *     -- meaning this node's own `_session`, on its own side, ALSO
- *     independently stops right after the DEFRIENDS phase (hearth's own
- *     `if not store.is_known(peer_identity): return`, sync.py:755-758),
- *     never itself asking for HAVE/MESSAGES. This is REAL production
- *     behavior (`Node.deliver_defriends` always dials a target it has
- *     already forgotten locally), not a test artifact -- but it does mean
- *     `received_ids` coming back empty, by itself, cannot distinguish
- *     "the phone's gate fired" from "this node never asked in the first
- *     place". Two further checks close that gap:
- *       - `applied` (the DEFRIENDS-phase application-level ack the peer
- *         reports back, `_session`'s own `applied_by_peer`) must name
- *         THIS node's identity_pub -- proof the phone's OWN
- *         `store.applyDefriendNotice` genuinely ran, matched this exact
- *         authenticated session, and returned true; not merely that a
- *         notice crossed the wire.
- *       - After the dial, `store.knownIdentities()` (the phone's own
- *         `InMemorySyncStore` -- the SAME reference `GossipServer` holds,
- *         still this JVM process) must no longer contain this node's
- *         identity -- `removeIdentity` genuinely landed, not just an
- *         in-flight wire claim.
- *     Together with the seeded entitled post (content a normal friend
- *     sync WOULD deliver -- the positive baseline
- *     `friendReceivesOnlyEntitledContentOverServeNegative` already
- *     establishes), an empty `received_ids` here is the real proof that
- *     `KotlinSync.serve`'s mid-session re-check (KotlinSync.kt:558-583,
- *     phone-onion-reachability Task 5) -- which runs AFTER REVOCATIONS
- *     and DEFRIENDS but BEFORE HAVE -- is what stands between a
- *     just-defriended peer and content it would otherwise have received,
- *     at the real wire, not merely in the already-thorough Kotlin-only
- *     unit coverage `DefriendNoticeTest.kt` gives `applyDefriendNotice`
- *     in isolation.
+ *     REVISION HISTORY -- READ BEFORE "SIMPLIFYING" THIS TEST BACK: the
+ *     first version of this test built the outbound notice via the REAL
+ *     `node.unfriend(phoneIdentityPub)` (hearth's own production method,
+ *     node.py:1732-1744), which ALSO runs `store.unfriend_teardown` as
+ *     part of the same call -- removing the phone from THIS NODE's own
+ *     `store.is_known()` before it ever dialed. That made this node's own
+ *     `_session`, on its own side, independently stop right after
+ *     DEFRIENDS (hearth's own `if not store.is_known(peer_identity):
+ *     return`, sync.py:755-758) regardless of what the phone did --
+ *     `received_ids` came back empty EITHER WAY, so the test was a FALSE
+ *     PASS on the exact gate it claimed to prove. Caught by a real
+ *     reviewer mutation test: disabling the phone's own mid-session
+ *     re-check (`KotlinSync.serve`, KotlinSync.kt:580-583) did NOT make
+ *     that version fail.
+ *
+ *     THE FIX: `sync_loopback_node.py`'s "defriend" scenario now signs +
+ *     queues the notice via `device.make_defriend` + `store.add_outbox`
+ *     DIRECTLY, skipping `unfriend_teardown` -- this node's own
+ *     `store.is_known(phone)` stays TRUE (seeded via `alsoKnown` below,
+ *     same as the "friend" scenario), so its own session genuinely
+ *     continues PAST DEFRIENDS and asks for HAVE, exactly like an
+ *     ordinary well-behaved friend sync would. The ONLY thing that can
+ *     then stop the seeded entitled marker from crossing the wire is the
+ *     PHONE's own mid-session re-check.
+ *
+ *     A CONSEQUENCE OF THIS FIX worth understanding before reading the
+ *     assertions below: since this node still believes it is friends with
+ *     the phone, when the phone's gate correctly fires, `KotlinSync.serve`
+ *     returns WITHOUT ever writing the HAVE reply this node's own `_swap`
+ *     is blocked reading -- confirmed empirically, this surfaces as a
+ *     generic IO failure (`asyncio.IncompleteReadError`, i.e. the dial's
+ *     own `ok=false`), not a clean refusal or a clean "served"
+ *     completion. `_run_dial`'s "defriend" branch therefore reports its
+ *     own dedicated `defriend_dial_done` event (not the shared
+ *     refused/failed/served shape) whose `received_ids` field is computed
+ *     directly off `node.store` regardless of how the dial itself
+ *     completed or failed -- the one fact that stays unambiguous and
+ *     directly observable either way, and the one fact a mutation of the
+ *     phone's gate flips (see MUTATION-VERIFICATION EVIDENCE below).
+ *
+ *     MUTATION-VERIFICATION EVIDENCE (the load-bearing proof this test is
+ *     actually falsifiable on the gate it claims to prove -- reviewer-
+ *     mandated after the ORIGINAL node.unfriend-based version silently
+ *     passed under this exact mutation, see REVISION HISTORY above).
+ *     `KotlinSync.serve`'s mid-session re-check (KotlinSync.kt:580-583)
+ *     was changed to `if (false && (...))` (dead code -- the gate never
+ *     fires) and the full `SyncRevokeLoopbackTest` suite re-run:
+ *       - `defriendedIdentityNotServedMidSession` FAILED --
+ *         `expected:<0> but was:<1>`, against the dial event
+ *         `{"received_ids":["14b4fe3f..."],"applied":["56348da5..."],
+ *         "event":"defriend_dial_done","ok":true,"peer_identity":
+ *         "4673a6d5..."}` -- `ok:true` (the session ran all the way
+ *         through HAVE/MESSAGES/BLOBS to completion, unlike the expected
+ *         `ok:false` IO-failure shape with the gate intact), `applied`
+ *         non-empty (the DEFRIENDS-phase ack, only reachable via a full
+ *         normal return), and `received_ids` naming exactly the seeded
+ *         entitledMarker's msg_id -- the over-serve the gate exists to
+ *         prevent, reproduced on demand.
+ *       - `revokedDeviceRefusedNothingServed` still PASSED, unaffected --
+ *         confirms the mutation is scoped to the mid-session gate only,
+ *         not a blunt instrument that breaks Scenario 1 too.
+ *     The mutation was then reverted (`git diff` on `KotlinSync.kt`
+ *     empty, confirming byte-for-byte restoration) and the full suite
+ *     re-run clean: both tests pass again, full `:tor-manager:
+ *     testDebugUnitTest` 372/372, full hearth pytest 1105 passed / 9
+ *     skipped.
  *
  *     A THIRD scenario (a node relaying a REVOCATIONS-phase cert that
  *     marks some OTHER, third device revoked, then a SEPARATE dial from
@@ -183,28 +208,37 @@ class SyncRevokeLoopbackTest {
                                               // own knownIdentities(author) gate
                                               // requires this (DefriendNotice.kt).
 
-        // Registers deviceViews(nodeIdentityPub) = {nodeDevicePub} -- mirrors
-        // SyncServeLoopbackTest.kt's own friendReceivesOnlyEntitledContentOverServeNegative
-        // exactly: the exact device the REAL connecting node will authenticate
-        // as. PLAINTEXT (KIND_PROFILE, no audience gate), signed by the
-        // node's own device.
-        val nodeRegistrar = signedMsg(nodeCert, nodeDevicePriv, 1,
-            mapOf("kind" to "profile", "name" to "Node", "created_at" to KotlinWire.PyFloat(1.0)))
-        assertTrue(store.ingestMessage(nodeRegistrar))
-
-        // An entitled kreds post -- wrapped to the node's device -- that a
-        // normal (non-defriended) friend sync WOULD serve, exactly the
-        // positive case friendReceivesOnlyEntitledContentOverServeNegative
-        // already proves for an unrelated friend. This is what makes the
-        // empty received_ids assertion below meaningful rather than vacuous:
-        // there IS real entitled content on the wire this session, and it
-        // must not cross it.
-        val entitledPost = signedMsg(phoneCert, phoneDevicePriv, 2, mapOf(
-            "kind" to "post", "scope" to "kreds", "placement" to "journal",
-            "body_nonce" to "11".repeat(12), "body_ct" to "ab".repeat(8),
-            "wraps" to wrapsFor(nodeDevicePub), "blobs" to emptyList<String>(),
-            "created_at" to KotlinWire.PyFloat(2.0), "media" to "photo"))
-        assertTrue(store.ingestMessage(entitledPost))
+        // ENTITLED content -- a PLAINTEXT marker authored by the PHONE
+        // itself (KIND_PROFILE: "Every other kind [besides dm/ring/post/
+        // wrap_grant/response/responses] ... is unconditionally servable
+        // once past the entitled+seen-delta checks", SyncStore.kt's own
+        // messagesNotIn doc) -- that a normal (non-defriended) friend sync
+        // WOULD deliver, gated on nothing but `entitled` (this node's own
+        // store.is_known(phone), which -- unlike the phone's -- is never
+        // torn down here; see the class doc's REVISION HISTORY).
+        //
+        // Deliberately NOT a "post" wrapped to the node's device (the
+        // shape friendReceivesOnlyEntitledContentOverServeNegative uses
+        // for an UN-defriended friend, where it's the right choice): a
+        // wrap-audience check needs deviceViews(nodeIdentityPub)
+        // populated, which in THIS store (InMemorySyncStore.deviceViews,
+        // SyncStore.kt:657-661) is derived PURELY from messages this
+        // node itself authored -- the exact same messages
+        // applyDefriendNotice's purgeAuthoredBy(node) unconditionally
+        // deletes as soon as the notice is applied during DEFRIENDS,
+        // REGARDLESS of whether the mid-session re-check under test ever
+        // runs. A first attempt at this fix used exactly that "post"
+        // shape and was caught, by directly inspecting the dial event
+        // under the very mutation below, silently filtering the post out
+        // for the WRONG reason (a purged deviceViews entry, not the
+        // re-check) -- reintroducing a false pass one layer deeper than
+        // the original one. A phone-authored, audience-gate-free marker
+        // is immune to that purge (node never authored it) and its only
+        // gate is `entitled` -- so the mid-session re-check is once again
+        // the ONLY thing that can stop it from reaching this node.
+        val entitledMarker = signedMsg(phoneCert, phoneDevicePriv, 1,
+            mapOf("kind" to "profile", "name" to "PhoneProfile", "created_at" to KotlinWire.PyFloat(1.0)))
+        assertTrue(store.ingestMessage(entitledMarker))
 
         val gossipServer = GossipServer(store, { phoneFixture }, ReentrantLock(), 0)
         val port = gossipServer.start()
@@ -212,30 +246,31 @@ class SyncRevokeLoopbackTest {
             val spec = dialSpec(
                 scenario = "defriend", port = port, identityPriv = nodeIdentityPriv,
                 devicePriv = nodeDevicePriv, devicePub = nodeDevicePub, deviceName = "Node Device",
-                cert = nodeCert, phoneIdentityPub = phoneIdentityPub)
+                cert = nodeCert,
+                // Load-bearing for THIS fix (see the class doc's REVISION
+                // HISTORY): this node must keep believing it knows the
+                // phone for the whole dial, so its own session genuinely
+                // continues past DEFRIENDS into HAVE instead of
+                // independently stopping on its own local gate.
+                alsoKnown = listOf(phoneIdentityPub), phoneIdentityPub = phoneIdentityPub)
             val (proc, stdout) = spawnDialNode(spec)
             try {
                 val event = readDialEvent(proc, stdout)
-                assertEquals("dial event: $event", "served", event.optString("event"))
-                assertTrue("session must complete without an unrelated failure: $event",
-                    event.getBoolean("ok"))
+                assertEquals("dial event: $event -- a divergence in event shape here is itself " +
+                    "informative (see _run_dial's own doc for the expected IO-failure shape) but " +
+                    "the load-bearing check is received_ids below, not this event name",
+                    "defriend_dial_done", event.optString("event"))
 
-                // THE REAL APPLICATION-LEVEL ACK: the phone's own
-                // store.applyDefriendNotice genuinely returned true for THIS
-                // authenticated session, credited to the node's real
-                // identity -- not merely "a notice was accepted onto the
-                // wire".
-                val applied = event.getJSONArray("applied")
-                val appliedSet = (0 until applied.length()).map { applied.getString(it) }.toSet()
-                assertTrue("phone must have genuinely applied the defriend notice this session: $event",
-                    appliedSet.contains(nodeIdentityPub))
-
-                // THE OVER-SERVE-STOPS NEGATIVE: despite the entitled post
-                // above being exactly the kind of content a known-friend
-                // sync would otherwise deliver, this node received NOTHING
-                // -- KotlinSync.serve's mid-session re-check (after
-                // REVOCATIONS + DEFRIENDS) cut the session before
-                // HAVE/MESSAGES ever ran.
+                // THE OVER-SERVE-STOPS NEGATIVE -- the ONLY thing that can
+                // make this empty is the PHONE's own mid-session re-check
+                // (KotlinSync.serve, KotlinSync.kt:580-583) firing BEFORE
+                // HAVE/MESSAGES ever ran: this node's own session does NOT
+                // independently stop itself (unlike the original,
+                // node.unfriend-based construction -- see REVISION HISTORY
+                // above), so if that phone-side gate were missing or
+                // mis-ordered, the seeded entitled post WOULD show up here.
+                // Proven falsifiable by mutation-testing this exact gate --
+                // see MUTATION-VERIFICATION EVIDENCE in the class doc.
                 val receivedIds = event.getJSONArray("received_ids")
                 assertEquals("defriended peer must receive NOTHING, not even already-entitled " +
                     "content -- an over-serve here is a REAL security-gate failure: $event",
