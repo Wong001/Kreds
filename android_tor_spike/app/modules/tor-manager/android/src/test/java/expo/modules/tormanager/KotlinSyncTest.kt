@@ -205,14 +205,23 @@ class KotlinSyncTest {
     private fun sha(b: ByteArray) = KotlinWire.toHex(java.security.MessageDigest.getInstance("SHA-256").digest(b))
 
     /** MESSAGES phase: the entitled delta is written, a RING record is
-     *  excluded even though its author IS entitled (the phase-level
-     *  over-serve negative -- mirrors SyncStoreTest's own
-     *  messagesNotInServesEntitledAndNeverOverServes, but driven through
-     *  serve()'s wire protocol instead of calling store.messagesNotIn
-     *  directly), an offered message from an already-known identity is
-     *  ingested, and -- since the peer here is NOT fixture's own sibling
-     *  device -- own-device trust must NOT adopt an identity the peer's
-     *  `known` reports that we don't already know (the HAVE-phase negative). */
+     *  excluded even though its author IS entitled (author-private gate --
+     *  mirrors SyncStoreTest's own messagesNotInServesEntitledAndNeverOverServes,
+     *  but driven through serve()'s wire protocol instead of calling
+     *  store.messagesNotIn directly), a POST from an author known to US but
+     *  NOT reported in the peer's own HAVE.known is excluded by the
+     *  entitled-SET INTERSECTION specifically (code review, MEDIUM -- the
+     *  ring-record exclusion above is independent of entitled entirely, since
+     *  RING's author-private gate fires regardless of entitlement, so it does
+     *  NOT by itself prove serve() computes `entitled = knownIdentities ∩
+     *  peerKnown` rather than just `entitled = knownIdentities()`; this case
+     *  is wrapped to the peer's device, so the wrap-set gate alone WOULD
+     *  serve it -- only the intersection excludes it, and this assertion
+     *  fails if that intersection is bypassed), an offered message from an
+     *  already-known identity is ingested, and -- since the peer here is NOT
+     *  fixture's own sibling device -- own-device trust must NOT adopt an
+     *  identity the peer's `known` reports that we don't already know (the
+     *  HAVE-phase negative). */
     @Test fun serveMessagesPhaseServesEntitledDeltaExcludesRingAndIngestsOfferedMessage() {
         val store = InMemorySyncStore()
         val fixture = buildFixture("aa".repeat(32))   // unrelated to the peer below
@@ -222,12 +231,18 @@ class KotlinSyncTest {
         val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
         val peerDevPub = devPub(peerDevPriv)
         val unknownToUsPub = "ee".repeat(32)   // peer reports it as "known"; we must never adopt it (non-sibling)
+        // Known to US (addIdentity below) but NOT reported by the peer's own
+        // HAVE.known -- excluded ONLY by the entitled intersection, since its
+        // post below IS wrapped to the peer's device (wrap-set gate alone
+        // would pass it).
+        val notMutualFriendPub = "f1".repeat(32); val notMutualFriendDevPriv = "f2".repeat(32)
 
         store.addIdentity(friendPub)
         store.addIdentity(ringAuthorPub)
         store.addIdentity(peerPub)
+        store.addIdentity(notMutualFriendPub)
         // Seed the peer's own device so deviceViews(peerPub) is non-empty --
-        // needed for the wrap-set gate on the POST below.
+        // needed for the wrap-set gate on the POSTs below.
         assertTrue(store.ingestMessage(identityMsg(peerPub, 1,
             mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)))
 
@@ -240,6 +255,14 @@ class KotlinSyncTest {
             "kind" to "ring", "member" to "cc".repeat(32), "ring" to "inner", "created_at" to 1.0), ringAuthorDevPriv)
         assertTrue(store.ingestMessage(innerRingRecord))
 
+        // Wrapped to the peer's device -- the wrap-set gate alone would
+        // serve this. Only exclusion from `entitled` (peerKnown does NOT
+        // list notMutualFriendPub below) can block it.
+        val postFromNonMutualFriend = identityMsg(notMutualFriendPub, 1, mapOf(
+            "kind" to "post", "scope" to "kreds", "text" to "not mutual",
+            "wraps" to mapOf(peerDevPub to mapOf("x" to 1)), "blobs" to emptyList<String>()), notMutualFriendDevPriv)
+        assertTrue(store.ingestMessage(postFromNonMutualFriend))
+
         val peerCert = KotlinWire.CertDict(peerPub, peerDevPub, "Peer Phone", 1752900000.0, "")
 
         // The peer OFFERS a new message from the already-entitled friend
@@ -251,6 +274,8 @@ class KotlinSyncTest {
             mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
             mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
             mapOf("t" to "have", "summary" to emptyMap<String, Any?>(),
+                // notMutualFriendPub deliberately absent -- the peer does not
+                // report it as known, so it must fall out of the intersection.
                 "known" to listOf(friendPub, ringAuthorPub, unknownToUsPub),
                 "peers" to emptyList<Any?>(), "addr" to "127.0.0.1:9999"),
             mapOf("t" to "messages", "msgs" to listOf(offered.toDict())),
@@ -270,6 +295,10 @@ class KotlinSyncTest {
         assertTrue("entitled post wrapped to the peer's device -> served", kredsFriendPost.msgId() in servedIds)
         assertFalse("RING is author-private -> never relayed to a friend, even an entitled one",
             innerRingRecord.msgId() in servedIds)
+        assertFalse("author known to us but NOT reported by the peer's HAVE.known -> excluded by " +
+            "the entitled INTERSECTION, even though the wrap-set gate alone would pass it " +
+            "(this must fail if serve() used entitled=knownIdentities() instead of the peerKnown intersection)",
+            postFromNonMutualFriend.msgId() in servedIds)
 
         assertTrue("offered message from an already-known identity is ingested",
             store.allMessages().any { it.msgId == offered.msgId() })

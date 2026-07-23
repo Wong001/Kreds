@@ -417,12 +417,22 @@ object KotlinSync {
                 for (ident in peerKnown) store.addIdentity(ident)
             }
 
-            // -- MESSAGES -- (serve the entitled delta; ingest the peer's)
+            // -- MESSAGES -- (responder: read peer's first, THEN write ours
+            // -- _swap's read-then-write branch, same as every other phase.
+            // FIX (code review, HIGH): this previously wrote toSend before
+            // reading, the INITIATOR's order -- against a real hearth
+            // initiator (write-then-read), that put both sides writing
+            // before either read, deadlocking once the frame outgrew the
+            // socket/Tor buffer (masked by the buffered test fake, which
+            // has no such buffer limit). toSend is computed entirely from
+            // data already exchanged during HAVE (peerKnown/peerSummary,
+            // both already read above), so it does not depend on this read
+            // -- safe to compute before the read and only defer the WRITE.
             val entitled = store.knownIdentities().filter { it in peerKnown }.toSet()
             val peerSummary = parseSummary(have.optJSONObject("summary") ?: JSONObject())
             val toSend = store.messagesNotIn(peerSummary, entitled, peerCert.identity_pub)
-            writeFrame(stream, mapOf("t" to "messages", "msgs" to toSend.map { it.toDict() }))
             val msgs = readFrame(stream)
+            writeFrame(stream, mapOf("t" to "messages", "msgs" to toSend.map { it.toDict() }))
             val msgArr = msgs.optJSONArray("msgs") ?: JSONArray()
             for (i in 0 until msgArr.length()) {
                 val m = SignedMessageKt.fromDict(toMap(msgArr.getJSONObject(i)))
