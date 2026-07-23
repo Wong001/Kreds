@@ -623,6 +623,28 @@ object SyncRunner {
     internal fun pendingIdsToClear(results: List<SyncOutcome>): Set<String> =
         results.filter { it.ok }.flatMapTo(mutableSetOf()) { it.sentPendingIds }
 
+    /** Drain-round clear fix (Important finding, friend-peering fix-wave
+     *  review): folds a successful blob-drain round's `SyncOutcome` (`next`)
+     *  onto the peer's running outcome (`prev`), carrying `prev`'s
+     *  `sentPendingIds` FORWARD instead of letting `next`'s (always empty on
+     *  a drain round -- see `syncOnePeer`'s doc, `pending` is only ever
+     *  pushed on round 1) silently overwrite it. Everything else about
+     *  `next` (its counts, `ok`, etc.) is authoritative for the merged
+     *  result -- only `sentPendingIds` accumulates. Union, not replace, so a
+     *  peer that somehow received pending ids across MULTIPLE rounds (not
+     *  true in production today -- round 2+ always dials with `emptyList()`
+     *  -- but this keeps the merge correct if that ever changes) still
+     *  carries all of them forward, not just the latest round's.
+     *
+     *  Extracted as its own pure function (no Context, no Tor, no store) so
+     *  the accumulation itself is JVM-unit-testable in isolation
+     *  (SyncRunnerTest) -- `syncOnePeer`, which calls this, is not
+     *  JVM-testable (real Android Context + real Tor dial via
+     *  `runTransport`/`anyBlobsMissing`, same posture as this file's other
+     *  Context-taking functions). */
+    internal fun mergePeerOutcome(prev: SyncOutcome, next: SyncOutcome): SyncOutcome =
+        next.copy(sentPendingIds = prev.sentPendingIds + next.sentPendingIds)
+
     /** Runs one peer's transport, draining blobs FROM THAT PEER across
      *  multiple rounds if needed (friend-peering Task 4 -- the per-peer
      *  scoping of what was, pre-Task-4, `runSync`'s own single-peer drain
@@ -652,7 +674,19 @@ object SyncRunner {
             val next = runTransport(ctx, fx, peer, emptyList(), onProgress)
             rounds++
             if (!next.ran || !next.ok) return last   // keep the last good outcome; next cycle retries
-            last = next
+            // Drain-round clear fix (Important finding, friend-peering
+            // fix-wave review): a bare `last = next` here used to DISCARD
+            // round 1's `sentPendingIds` -- round 1 is the only attempt that
+            // ever carries `pending` (see this function's own doc), so
+            // `next.sentPendingIds` is always empty on a drain round, and
+            // the plain overwrite meant the FINAL outcome this function
+            // returns claimed nothing was pushed even when round 1 actually
+            // delivered messages -- so `runSync`'s `pendingIdsToClear` never
+            // cleared them (a queue leak: re-pushed to this peer every sweep
+            // forever whenever a drain round routinely follows round 1, e.g.
+            // photo/video-heavy syncs). `mergePeerOutcome` carries the
+            // accumulated ids forward instead of overwriting them.
+            last = mergePeerOutcome(last, next)
             if (next.blobs <= before) break          // no new blobs this round -> peer holds no more
         }
         return last

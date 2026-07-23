@@ -528,4 +528,60 @@ class SyncRunnerTest {
         val toStranger = SyncRunner.filterPendingForPeer(listOf(enckey.toDict()), "cc".repeat(32), emptySet())
         assertEquals(listOf(enckey.toDict()), toStranger.wireDicts)
     }
+
+    // -- Drain-round clear fix (Important finding, friend-peering fix-wave
+    //    review) --
+    //
+    // Bug: `syncOnePeer`'s blob-drain loop plainly overwrote `last = next`
+    // after each successful drain round. Round 1 is the ONLY attempt that
+    // ever carries `pending` (every drain round re-dials with
+    // `emptyList()`), so `next.sentPendingIds` is always empty on a drain
+    // round -- the plain overwrite silently dropped round 1's pushed ids
+    // from the outcome `syncOnePeer` returns, so `runSync`'s
+    // `pendingIdsToClear` never cleared messages that were actually
+    // delivered in round 1 whenever a successful drain round followed it
+    // (routine on photo/video-heavy syncs -- `anyBlobsMissing` stays true
+    // after round 1). `syncOnePeer` itself takes a real Android Context
+    // (real Tor dial via `runTransport`/`anyBlobsMissing`), so it is not
+    // directly JVM-testable -- same posture as this file's other
+    // Context-taking functions (see section 4's own doc). The accumulation
+    // fix is extracted into its own pure function, `mergePeerOutcome`
+    // (called from `last = mergePeerOutcome(last, next)` in the drain loop),
+    // and proven here in isolation instead.
+
+    @Test fun mergePeerOutcomeCarriesPrevSentPendingIdsForwardWhenNextHasNone() {
+        // THE bug scenario: round 1 (prev) pushed {m1, m2}; the drain round
+        // (next) that follows -- as every real drain round does, since only
+        // round 1 ever carries `pending` -- pushed none of its own.
+        val prev = SyncRunner.SyncOutcome(true, true, 5, 1, 0, false, null, sentPendingIds = setOf("m1", "m2"))
+        val next = SyncRunner.SyncOutcome(true, true, 5, 3, 0, false, null, sentPendingIds = emptySet())
+        val merged = SyncRunner.mergePeerOutcome(prev, next)
+        assertEquals("round 1's pushed ids must survive a following drain round, not be discarded",
+            setOf("m1", "m2"), merged.sentPendingIds)
+        // Mutation-verify (task-8-report.md): reverting mergePeerOutcome's
+        // body from `next.copy(sentPendingIds = prev.sentPendingIds +
+        // next.sentPendingIds)` to a bare `next` (the pre-fix `last = next`
+        // overwrite this function replaced) makes this assertion fail --
+        // merged.sentPendingIds comes back emptySet() instead of {m1, m2}.
+    }
+
+    @Test fun mergePeerOutcomeUnionsIdsAcrossMultipleRounds() {
+        // Not a case that happens in production today (only round 1 ever
+        // carries `pending`), but the merge itself must stay correct if
+        // that ever changes -- a union, not a "keep prev, ignore next".
+        val prev = SyncRunner.SyncOutcome(true, true, 5, 1, 0, false, null, sentPendingIds = setOf("m1"))
+        val next = SyncRunner.SyncOutcome(true, true, 5, 2, 0, false, null, sentPendingIds = setOf("m2"))
+        val merged = SyncRunner.mergePeerOutcome(prev, next)
+        assertEquals(setOf("m1", "m2"), merged.sentPendingIds)
+    }
+
+    @Test fun mergePeerOutcomeTakesEveryOtherFieldFromNext() {
+        // Only sentPendingIds accumulates -- counts/ok/etc. must reflect the
+        // LATEST round (next), matching the pre-fix `last = next` semantics
+        // for every field except the one this fix targets.
+        val prev = SyncRunner.SyncOutcome(true, true, 5, 1, 0, false, null, sentPendingIds = setOf("m1"))
+        val next = SyncRunner.SyncOutcome(true, true, 7, 4, 2, false, null, sentPendingIds = emptySet())
+        val merged = SyncRunner.mergePeerOutcome(prev, next)
+        assertEquals(7, merged.messages); assertEquals(4, merged.blobs); assertEquals(2, merged.identities)
+    }
 }
