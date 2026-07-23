@@ -38,6 +38,12 @@ data class ProfileLayout(
     val sizes: Map<String, String>,
     val texts: Map<String, Map<String, Any?>>)
 
+/** One stored dialable peer (friend-peering Task 1; mirrors hearth
+ *  store.py's `peers` table, store.py:39-40: `address TEXT PRIMARY KEY,
+ *  identity_pub TEXT`). `identityPub` is null when only the address is
+ *  known so far (e.g. before the peer's identity has been confirmed). */
+data class Peer(val address: String, val identityPub: String?)
+
 /** Parse a layout payload's pins/spans/texts field (a JSON object of
  *  msgId -> sub-object) into a plain Kotlin map, dropping any entry whose
  *  key isn't a String or whose value isn't itself a map. Shared by both
@@ -373,6 +379,39 @@ interface SyncStore {
      *  ties hash to content). Empty `hashes` returns an empty map without
      *  touching storage. */
     fun blobSizes(hashes: List<String>): Map<String, Long>
+
+    // -- friend-peering Task 1: peer table (addPeer/listPeers/removePeer/
+    //    addressFor) -- mirrors hearth store.py's peers table (schema
+    //    store.py:39-40; add_peer store.py:217-221; list_peers store.py:
+    //    223-227; remove_peer store.py:229-232; address_for store.py:
+    //    234-239).
+
+    /** Adds (or updates) a peer address this device knows how to dial
+     *  (friend-peering Task 1; mirrors hearth store.py:217-221 add_peer's
+     *  `INSERT OR REPLACE INTO peers VALUES(?,?)`). `address` is the peers
+     *  table's PRIMARY KEY: a second call for the SAME address overwrites
+     *  its identityPub (newest call wins) rather than erroring or
+     *  duplicating -- there is at most one row per address. `identityPub`
+     *  is null when only the address is known so far (mirrors store.py's
+     *  `identity_pub: Optional[str] = None`). */
+    fun addPeer(address: String, identityPub: String?)
+    /** Every stored peer (friend-peering Task 1; mirrors hearth store.py:
+     *  223-227 list_peers). Order is unspecified, same as store.py's own
+     *  `SELECT address, identity_pub FROM peers` (no ORDER BY). */
+    fun listPeers(): List<Peer>
+    /** Drops the peer at `address`, if any (friend-peering Task 1; mirrors
+     *  hearth store.py:229-232 remove_peer's plain `DELETE FROM peers WHERE
+     *  address=?`). Removing an address that was never added is a no-op. */
+    fun removePeer(address: String)
+    /** The address of the FIRST stored peer whose identityPub equals
+     *  `identityPub`, or null if no peer names that identity (friend-
+     *  peering Task 1; mirrors hearth store.py:234-239 address_for's
+     *  `SELECT address FROM peers WHERE identity_pub=?` + `fetchone()`).
+     *  `address` is the peers table's primary key but `identity_pub` is
+     *  not, so more than one address could in principle name the same
+     *  identity; like store.py, this returns only the first match, not the
+     *  full set. */
+    fun addressFor(identityPub: String): String?
 }
 
 /** One stored message's fields `filterMessagesNotIn` needs, kept
@@ -737,4 +776,19 @@ class InMemorySyncStore : SyncStore {
         for (h in hashes) blobs[h]?.let { out[h] = it.size.toLong() }
         return out
     }
+
+    // address -> identityPub (friend-peering Task 1; mirrors hearth
+    // store.py's peers table, address as PRIMARY KEY). LinkedHashMap.put
+    // naturally gives addPeer's INSERT OR REPLACE semantics -- one row per
+    // address, newest identityPub wins.
+    private val peers = linkedMapOf<String, String?>()
+
+    override fun addPeer(address: String, identityPub: String?) { peers[address] = identityPub }
+
+    override fun listPeers(): List<Peer> = peers.map { (address, identityPub) -> Peer(address, identityPub) }
+
+    override fun removePeer(address: String) { peers.remove(address) }
+
+    override fun addressFor(identityPub: String): String? =
+        peers.entries.firstOrNull { it.value == identityPub }?.key
 }

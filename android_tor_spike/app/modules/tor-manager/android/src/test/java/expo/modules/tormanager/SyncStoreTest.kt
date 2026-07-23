@@ -699,4 +699,57 @@ class SyncStoreTest {
         assertEquals("v2", s.getMeta("some_key"))
         assertNull("a different key stays absent", s.getMeta("other_key"))
     }
+
+    // -- friend-peering Task 1: peer table (addPeer/listPeers/removePeer/
+    //    addressFor) -- mirrors hearth store.py's peers table (schema
+    //    store.py:39-40; add_peer store.py:217-221; list_peers store.py:
+    //    223-227; remove_peer store.py:229-232; address_for store.py:
+    //    234-239).
+
+    @Test fun addPeerListPeersRoundTripsAddressAndIdentityPub() {
+        val s = InMemorySyncStore()
+        val address = "abc123.onion:9001"
+        s.addPeer(address, idPub)
+        val peers = s.listPeers()
+        assertEquals(1, peers.size)
+        assertEquals(address, peers[0].address)
+        assertEquals(idPub, peers[0].identityPub)
+    }
+
+    @Test fun addPeerSameAddressReplacesIdentityPubNotDuplicates() {
+        val s = InMemorySyncStore()
+        val address = "abc123.onion:9001"
+        s.addPeer(address, "11".repeat(32))
+        s.addPeer(address, "22".repeat(32))     // same address, new identity -> INSERT OR REPLACE
+        val peers = s.listPeers()
+        assertEquals("still one row for that address", 1, peers.size)
+        assertEquals("22".repeat(32), peers[0].identityPub)
+    }
+
+    @Test fun removePeerDropsIt() {
+        val s = InMemorySyncStore()
+        val address = "abc123.onion:9001"
+        s.addPeer(address, idPub)
+        assertEquals(1, s.listPeers().size)
+        s.removePeer(address)
+        assertTrue("removed -> no longer listed", s.listPeers().isEmpty())
+    }
+
+    @Test fun addressForReturnsAddressForIdentityNullWhenAbsent() {
+        val s = InMemorySyncStore()
+        val address = "abc123.onion:9001"
+        s.addPeer(address, idPub)
+        assertEquals(address, s.addressFor(idPub))
+        assertNull("no peer holds this identity", s.addressFor("ff".repeat(32)))
+    }
+
+    @Test fun addPeerNullIdentityPubRoundTrips() {
+        val s = InMemorySyncStore()
+        val address = "abc123.onion:9001"
+        s.addPeer(address, null)
+        val peers = s.listPeers()
+        assertEquals(1, peers.size)
+        assertEquals(address, peers[0].address)
+        assertNull(peers[0].identityPub)
+    }
 }
