@@ -280,29 +280,31 @@ class GossipServerTest {
     // 5. Task 6 (phone-onion-reachability): serve() returning SelfRevoked
     //    must drive GossipServer's injected onSelfRevoked callback -- the
     //    wiring this task adds. KotlinSync.serve's own SelfRevoked detection
-    //    is already unit-proven at KotlinSyncTest's level (see
-    //    serveSurfacesSelfRevokedWhenPeerRevocationNamesOwnDeviceRegardless-
-    //    OfIngestOutcome / serveIngestsGenuineOwnSelfRevocationThenStill-
-    //    ReturnsSelfRevoked) -- the only NEW thing to prove here is that
-    //    GossipServer.handle actually captures that result and invokes the
-    //    callback.
+    //    (including the remote-wipe fix's tightened gate -- see KotlinSync.kt's
+    //    serve() REVOCATIONS-phase doc comment for the full exploit/fix
+    //    writeup) is already unit-proven at KotlinSyncTest's level
+    //    (serveGenuineSelfRevocationStillReturnsSelfRevoked /
+    //    serveForgedRevocationFromThrowawayIdentityDoesNotSelfRevoke /
+    //    serveKnownFriendsValidRevocationNamingOurDeviceDoesNotSelfRevoke)
+    //    -- the only NEW thing to prove here is that GossipServer.handle
+    //    actually captures that result and invokes (or correctly withholds)
+    //    the callback.
     //
     //    A raw hand-rolled client, NOT KotlinSync.run: run()'s own REVOCATIONS
     //    write is UNCONDITIONALLY an empty list ("the phone authors none",
     //    see KotlinSync.kt's run() doc) -- a genuine wire-level revocation,
     //    the same shape a real hearth node would send, has to be crafted by
     //    hand here. Completes AUTH via authOnlyOverStream (same as
-    //    clientSync), then writes ONE raw REVOCATIONS frame carrying a real,
-    //    identity-signed RevocationCert naming the SERVER's own device_pub,
-    //    then reads the server's reply frame (serve() writes its own empty
-    //    ack BEFORE the self-revoked check -- see KotlinSync.kt's serve()
-    //    phase order).
+    //    clientSync), then writes ONE raw REVOCATIONS frame carrying a real
+    //    RevocationCert naming the SERVER's own device_pub, then reads the
+    //    server's reply frame (serve() writes its own empty ack BEFORE the
+    //    self-revoked check -- see KotlinSync.kt's serve() phase order).
     //
     //    invoked (a CountDownLatch) is awaited rather than asserted
     //    immediately: onSelfRevoked runs on the SERVER's own worker thread,
     //    strictly AFTER handle()'s lock.unlock() -- there is no synchronous
-    //    signal back to this (client) thread proving that has happened yet
-    //    by the time the read above returns.
+    //    signal back to this (client) thread proving that has happened (or
+    //    definitely will not happen) yet by the time the read above returns.
     // =======================================================================
 
     /** Mirrors KotlinSyncTest's own private `signedRevocation` helper --
@@ -327,19 +329,79 @@ class GossipServerTest {
         return org.json.JSONObject(String(stream.readExactSync(n), Charsets.US_ASCII))
     }
 
-    @Test fun serveSelfRevokedInvokesOnSelfRevokedCallback() {
+    /** SECURITY REGRESSION TEST (remote-wipe fix, Task 6 review) -- the
+     *  GossipServer-level proof that a FORGED revocation can no longer
+     *  trigger the wipe callback. This used to be
+     *  `serveSelfRevokedInvokesOnSelfRevokedCallback`, which used a
+     *  DIFFERENT (throwaway, unrelated) identity to author the revocation
+     *  and asserted the callback FIRED -- i.e. it asserted the exploit
+     *  worked. Under the OLD `KotlinSync.serve` code (a bare
+     *  `rev.device_pub == fixture.device_pub` check) this test's assertion
+     *  below (`invoked.await(...)` must be FALSE) FAILS, because the old
+     *  code invokes the callback here -- that is what makes this a real
+     *  regression guard for the end-to-end GossipServer wiring, not merely
+     *  a restatement of the KotlinSyncTest-level fix. */
+    @Test fun serveForgedRevocationFromThrowawayIdentityDoesNotInvokeOnSelfRevokedCallback() {
         val serverFixture = buildFixture("Server Device")
         val clientFixture = buildFixture("Client Device")
         val serverStore = InMemorySyncStore()
         serverStore.addIdentity(clientFixture.cert.identity_pub)   // AUTH's isKnown gate
 
-        // A DIFFERENT identity authors the revocation -- proves SelfRevoked
-        // (and this callback) fires off the raw device_pub comparison,
-        // independent of whether ingestRevocation itself would accept this
-        // cert (mirrors KotlinSyncTest's own "RegardlessOfIngestOutcome"
-        // tests).
-        val (identityPriv, identityPub) = genKeypair()
-        val rev = signedRevocation(identityPriv, identityPub, serverFixture.device_pub, lastValidSeq = 1)
+        // A throwaway, unrelated identity -- NOT the server's own -- self-signs
+        // a revocation naming the SERVER's device_pub (the exact forged shape
+        // an authenticated-but-malicious peer could send, having learned the
+        // server's device_pub from AUTH's exchanged CertDict).
+        val (throwawayPriv, throwawayPub) = genKeypair()
+        val rev = signedRevocation(throwawayPriv, throwawayPub, serverFixture.device_pub, lastValidSeq = 1)
+
+        val invoked = CountDownLatch(1)
+        val gossipServer = GossipServer(
+            serverStore, { serverFixture }, ReentrantLock(), 0,
+            onSelfRevoked = { invoked.countDown() },
+        )
+        val port = gossipServer.start()
+        try {
+            val stream = SocketStream("127.0.0.1", port)
+            KotlinHandshake.authOnlyOverStream(stream, clientFixture)
+
+            stream.write(KotlinWire.writeFrameBytes(mapOf("t" to "revocations", "revs" to listOf(rev.toDict()))))
+            // REVOCATIONS ack -- proves serve() got past the forged
+            // revocation without self-revoking. Abandon right here (same
+            // reasoning as serveOrdinaryPeerRevocationDoesNotInvoke... just
+            // below): serve()'s NEXT phase (DEFRIENDS) blocks on its own
+            // readFrame, so closing now makes that read fail fast (EOF)
+            // instead of idling until SOCKET_TIMEOUT_MS -- either way
+            // serve() returns something other than SelfRevoked, which is
+            // all this test needs: proof onSelfRevoked was never invoked.
+            readRawFrame(stream)
+            stream.close()
+
+            assertFalse("onSelfRevoked must NOT fire for a forged (non-own-identity-signed) " +
+                "revocation -- this is the remote-wipe exploit this fix closes",
+                invoked.await(2, TimeUnit.SECONDS))
+        } finally {
+            gossipServer.stop()
+        }
+    }
+
+    /** POSITIVE case: a GENUINE self-revocation -- signed by the server's
+     *  OWN identity key, exactly mirroring how the desktop (hearth) would
+     *  revoke this phone device -- must still drive the callback under the
+     *  tightened gate. Builds the fixture/identity manually (rather than
+     *  via `buildFixture`, which discards the generated identity_priv) so
+     *  the SAME identity_priv that signs `serverCert` is available here to
+     *  also sign the revocation. */
+    @Test fun serveGenuineSelfRevocationInvokesOnSelfRevokedCallback() {
+        val (ownIdentityPriv, ownIdentityPub) = genKeypair()
+        val (ownDevicePriv, ownDevicePub) = genKeypair()
+        val serverCert = signedCert(ownIdentityPriv, ownIdentityPub, ownDevicePub, "Server Device")
+        val serverFixture = KotlinHandshake.Fixture(ownDevicePriv, ownDevicePub, serverCert, "unused.onion:9997")
+        val clientFixture = buildFixture("Client Device")
+        val serverStore = InMemorySyncStore()
+        serverStore.addIdentity(clientFixture.cert.identity_pub)   // AUTH's isKnown gate
+        serverStore.addIdentity(ownIdentityPub)                    // mirrors production seeding (own identity IS known)
+
+        val rev = signedRevocation(ownIdentityPriv, ownIdentityPub, ownDevicePub, lastValidSeq = 1)
 
         val invoked = CountDownLatch(1)
         val gossipServer = GossipServer(
@@ -354,17 +416,13 @@ class GossipServerTest {
             stream.write(KotlinWire.writeFrameBytes(mapOf("t" to "revocations", "revs" to listOf(rev.toDict()))))
             readRawFrame(stream)   // server's empty-ack REVOCATIONS reply, written before the self-revoked check
             // Close now, rather than leave the connection open across the
-            // latch wait below: the server's gracefulClose (handle()'s
-            // outer finally, which runs AFTER onSelfRevoked -- see this
-            // section's doc) would otherwise block draining this socket up
-            // to SOCKET_TIMEOUT_MS with nothing more arriving from us.
-            // Closing here lets that drain hit EOF immediately, so
-            // gossipServer.stop() below doesn't have to wait out the pool's
-            // awaitTermination budget for a still-busy worker.
+            // latch wait below -- see the section doc / the forged test
+            // above for why (avoids gracefulClose's drain blocking
+            // gossipServer.stop()'s cleanup).
             stream.close()
 
-            assertTrue("GossipServer must invoke onSelfRevoked once serve() returns SelfRevoked",
-                invoked.await(5, TimeUnit.SECONDS))
+            assertTrue("GossipServer must invoke onSelfRevoked for a GENUINE, own-identity-signed " +
+                "self-revocation", invoked.await(5, TimeUnit.SECONDS))
         } finally {
             gossipServer.stop()
         }

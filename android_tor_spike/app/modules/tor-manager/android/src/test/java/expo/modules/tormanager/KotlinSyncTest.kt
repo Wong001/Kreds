@@ -225,21 +225,85 @@ class KotlinSyncTest {
         assertFalse("unknown identity -> never ingested", store.isRevokedDevice(devicePub))
     }
 
-    @Test fun runSurfacesSelfRevokedWhenPeerRevocationNamesOwnDeviceRegardlessOfIngestOutcome() {
+    /** SECURITY REGRESSION TEST (remote-wipe fix, Task 6 review). This used
+     *  to be `runSurfacesSelfRevokedWhenPeerRevocationNamesOwnDeviceRegardless-
+     *  OfIngestOutcome`, which ASSERTED the vulnerable behavior: a
+     *  revocation self-signed by a throwaway, unrelated keypair (NOT our
+     *  identity key), merely NAMING our own device_pub, used to fire
+     *  SelfRevoked regardless of whether it was ever actually ingested
+     *  (independent of whether the signer was even a known identity).
+     *  RevocationCert.verify() alone never closed this: it only proves the
+     *  cert is internally self-consistent (signed by whoever's key matches
+     *  the cert's OWN, attacker-chosen, identity_pub field), not that the
+     *  signer is us or anyone we trust. Since Task 6 wired SelfRevoked to
+     *  an irreversible full identity+store wipe (TorNodeService.
+     *  enterRevokedState), the old raw `device_pub`-only comparison meant
+     *  ANY authenticated known peer could forge one of these against a
+     *  victim whose device_pub they learned during AUTH -- a remote wipe.
+     *
+     *  This test now proves the closed gate: run() must NOT return
+     *  SelfRevoked for a forged cert like this one -- the session proceeds
+     *  and completes normally (Ok) instead. Under the OLD code (a bare
+     *  `rev.device_pub == ownDevicePub` check with no identity_pub/verify()
+     *  gate) this test FAILS, because the old code returns SelfRevoked
+     *  here -- that is what makes this a real regression guard, not merely
+     *  a restatement of the fix. */
+    @Test fun runForgedRevocationFromThrowawayIdentityDoesNotSelfRevoke() {
         val store = InMemorySyncStore()
-        // A DIFFERENT identity, not known to us -- proves SelfRevoked fires
-        // off the raw device_pub comparison, independent of whether
-        // ingestRevocation itself would have accepted this cert.
-        val (identityPriv, identityPub) = genKeypair()
+        val ownIdentityPub = "33".repeat(32)
         val ownDevicePub = "aa".repeat(32)
-        val rev = signedRevocation(identityPriv, identityPub, ownDevicePub, lastValidSeq = 0)
+        // A throwaway, unrelated identity -- NOT ours -- self-signs a
+        // revocation naming OUR device_pub. verify() actually PASSES for
+        // this cert (genuinely signed by the throwaway key matching its own
+        // identity_pub field) -- the gap was never verify() itself, it was
+        // never checking identity_pub == ownIdentity at all.
+        val (throwawayPriv, throwawayPub) = genKeypair()
+        val rev = signedRevocation(throwawayPriv, throwawayPub, ownDevicePub, lastValidSeq = 0)
         val stream = RespondingStream(listOf(
             mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
-            // run() returns before reading any further frame.
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
         ))
-        val result = KotlinSync.run(stream, store, ownDevicePub = ownDevicePub)
-        assertEquals(SyncResult.SelfRevoked, result)
-        assertFalse("unknown-identity cert was still not ingested", store.isRevokedDevice(ownDevicePub))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = ownDevicePub, ownIdentity = ownIdentityPub)
+
+        assertTrue("a forged (non-own-identity-signed) revocation must NOT self-revoke -- " +
+            "expected Ok (session proceeds/completes normally), got $result", result is SyncResult.Ok)
+        assertFalse("unknown-identity cert must still not be ingested either",
+            store.isRevokedDevice(ownDevicePub))
+    }
+
+    /** Point 3 (Task 6 security review): a KNOWN FRIEND's OWN, validly
+     *  identity-signed revocation -- genuinely theirs, not forged -- naming
+     *  OUR device_pub must ALSO not self-revoke: `rev.identity_pub` is the
+     *  friend's own identity_pub, never equal to our own, so the
+     *  identity_pub==ownIdentity gate excludes it regardless of how validly
+     *  it's signed or how genuinely "known" the signer is. */
+    @Test fun runKnownFriendsValidRevocationNamingOurDeviceDoesNotSelfRevoke() {
+        val store = InMemorySyncStore()
+        val ownIdentityPub = "44".repeat(32)
+        val ownDevicePub = "bb".repeat(32)
+        val (friendPriv, friendPub) = genKeypair()
+        store.addIdentity(friendPub)   // a genuinely KNOWN friend
+        val rev = signedRevocation(friendPriv, friendPub, ownDevicePub, lastValidSeq = 0)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to null),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = ownDevicePub, ownIdentity = ownIdentityPub)
+
+        assertTrue("a known friend's own (not ours) revocation must NOT self-revoke, got $result",
+            result is SyncResult.Ok)
     }
 
     @Test fun runDoesNotIngestRevocationWithTamperedSignature() {
@@ -301,7 +365,13 @@ class KotlinSyncTest {
             // run() must return SelfRevoked right after this element -- no further frame is ever read.
         ))
 
-        val result = KotlinSync.run(stream, store, ownDevicePub = ownDevicePub)
+        // ownIdentity = ownIdentityPub (remote-wipe fix, Task 6 review): the
+        // tightened SelfRevoked gate now requires rev.identity_pub ==
+        // ownIdentity too -- this cert genuinely IS signed by our own
+        // identity, so passing the real value here (mirroring
+        // SyncRunner.runTransport's one production call site) is what lets
+        // this GENUINE self-revocation still pass the tighter gate.
+        val result = KotlinSync.run(stream, store, ownDevicePub = ownDevicePub, ownIdentity = ownIdentityPub)
         assertEquals("SelfRevoked must still surface for the Task 6 wipe hook, even though " +
             "ingestRevocation genuinely ran first (own identity IS known)", SyncResult.SelfRevoked, result)
         assertTrue("ingestRevocation's real effects happened: own device now marked revoked",
@@ -700,26 +770,77 @@ class KotlinSyncTest {
         assertFalse("unknown identity -> never ingested", store.isRevokedDevice(devicePub))
     }
 
-    @Test fun serveSurfacesSelfRevokedWhenPeerRevocationNamesOwnDeviceRegardlessOfIngestOutcome() {
+    /** SECURITY REGRESSION TEST (remote-wipe fix, Task 6 review) -- serve()
+     *  mirror of run()'s `runForgedRevocationFromThrowawayIdentityDoesNot-
+     *  SelfRevoke`. This used to be `serveSurfacesSelfRevokedWhenPeerRevoc-
+     *  ationNamesOwnDeviceRegardlessOfIngestOutcome`, which ASSERTED the
+     *  vulnerable behavior (see that fun's replacement and `run`'s own
+     *  REVOCATIONS-phase doc comment in KotlinSync.kt for the full exploit
+     *  writeup -- identical here, just reached via serve()'s AUTH'd-peer
+     *  inbound path instead of run()'s outbound one: an authenticated known
+     *  peer forges a RevocationCert under a throwaway identity, naming the
+     *  server's OWN device_pub). Proves the closed gate: serve() must NOT
+     *  return SelfRevoked for a forged cert like this -- the session
+     *  proceeds and completes normally (Ok) instead. Under the OLD code (a
+     *  bare `rev.device_pub == fixture.device_pub` check) this test FAILS,
+     *  because the old code returns SelfRevoked here. */
+    @Test fun serveForgedRevocationFromThrowawayIdentityDoesNotSelfRevoke() {
         val ownIdentityPub = "aa".repeat(32)
         val fixture = buildFixture(ownIdentityPub)   // fixture.device_pub is devPub("aa"-fixture's default "aa".repeat(32) priv)
         val store = InMemorySyncStore()
         val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
         val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
 
-        // A DIFFERENT identity, not known to us -- proves SelfRevoked fires
-        // off the raw device_pub comparison, independent of whether
-        // ingestRevocation itself would have accepted this cert.
-        val (identityPriv, identityPub) = genKeypair()
-        val rev = signedRevocation(identityPriv, identityPub, fixture.device_pub, lastValidSeq = 0)
+        // A throwaway, unrelated identity -- NOT the server's own -- self-signs
+        // a revocation naming the SERVER's device_pub.
+        val (throwawayPriv, throwawayPub) = genKeypair()
+        val rev = signedRevocation(throwawayPriv, throwawayPub, fixture.device_pub, lastValidSeq = 0)
         val stream = RespondingStream(listOf(
             mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
-            // serve() returns before reading any further frame.
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
         ))
 
         val result = KotlinSync.serve(stream, store, fixture, peerCert)
-        assertEquals(SyncResult.SelfRevoked, result)
-        assertFalse("unknown-identity cert was still not ingested", store.isRevokedDevice(fixture.device_pub))
+
+        assertTrue("a forged (non-own-identity-signed) revocation must NOT self-revoke -- " +
+            "expected Ok (session proceeds/completes normally), got $result", result is SyncResult.Ok)
+        assertFalse("unknown-identity cert must still not be ingested either",
+            store.isRevokedDevice(fixture.device_pub))
+    }
+
+    /** Point 3 (Task 6 security review), serve() mirror of run()'s
+     *  `runKnownFriendsValidRevocationNamingOurDeviceDoesNotSelfRevoke`: a
+     *  KNOWN FRIEND's OWN, validly identity-signed revocation naming the
+     *  SERVER's own device_pub must also not self-revoke. */
+    @Test fun serveKnownFriendsValidRevocationNamingOurDeviceDoesNotSelfRevoke() {
+        val ownIdentityPub = "bb".repeat(32)
+        val fixture = buildFixture(ownIdentityPub)
+        val store = InMemorySyncStore()
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+
+        val (friendPriv, friendPub) = genKeypair()
+        store.addIdentity(friendPub)   // a genuinely KNOWN friend
+        val rev = signedRevocation(friendPriv, friendPub, fixture.device_pub, lastValidSeq = 0)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to listOf(rev.toDict())),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+
+        assertTrue("a known friend's own (not ours) revocation must NOT self-revoke, got $result",
+            result is SyncResult.Ok)
     }
 
     @Test fun serveDoesNotIngestRevocationWithTamperedSignature() {

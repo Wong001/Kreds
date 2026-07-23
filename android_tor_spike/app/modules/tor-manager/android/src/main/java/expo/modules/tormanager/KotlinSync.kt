@@ -91,14 +91,17 @@ object Base64Portable {
  *
  *  `ownIdentity` (phone-onion-reachability Task 4): this device's own
  *  identity_pub, consulted by the DEFRIENDS phase's
- *  `store.applyDefriendNotice` (target==own / author!=own gates). Defaults
- *  to `""` so every pre-existing call site (SyncLoopbackTest and friends,
- *  none of which exercise DEFRIENDS content) compiles and behaves
- *  identically unchanged -- an empty-string identity can never equal a real
- *  notice's `target_identity`, so applyDefriendNotice's first gate simply
- *  never matches for those callers, same as before this task (a no-op).
- *  The ONE production call site, `SyncRunner.runTransport`, passes the
- *  real `fx.cert.identity_pub`.
+ *  `store.applyDefriendNotice` (target==own / author!=own gates) AND
+ *  (remote-wipe fix, Task 6 review) the REVOCATIONS phase's SelfRevoked
+ *  gate -- see that phase's doc comment below for the full exploit/fix
+ *  writeup. Defaults to `""` so every pre-existing call site that never
+ *  exercises DEFRIENDS/REVOCATIONS content compiles and behaves identically
+ *  unchanged -- an empty-string identity can never equal a real notice's
+ *  `target_identity` or a real revocation's `identity_pub`, so both gates
+ *  simply never match for those callers (a no-op for DEFRIENDS; FAILS
+ *  CLOSED, never self-revokes, for REVOCATIONS -- the safe direction for a
+ *  caller that omits this). The ONE production call site,
+ *  `SyncRunner.runTransport`, passes the real `fx.cert.identity_pub`.
  *
  *  Blocking, like KotlinHandshake.run -- callers (BB-7) must invoke this
  *  off the main thread (Dispatchers.IO), same reason TorEngine's own
@@ -232,10 +235,50 @@ object KotlinSync {
             // always empty (the phone authors none). Each peer revocation is
             // parsed + ingested via store.ingestRevocation (Task 3: is_known
             // + verify() + markRevoked, which performs the retro-drop) --
-            // this marks FRIEND devices revoked. The own-device SelfRevoked
-            // detection is unchanged from before Task 3 (still a raw field
-            // comparison, run UNCONDITIONALLY after ingestRevocation, not
-            // gated on its result).
+            // this marks FRIEND devices revoked, independent of the
+            // SelfRevoked gate just below.
+            //
+            // SECURITY (remote-wipe fix, phone-onion-reachability Task 6
+            // review): the SelfRevoked check below used to be a RAW
+            // `rev.device_pub == ownDevicePub` comparison, run
+            // UNCONDITIONALLY after ingestRevocation and NOT gated on its
+            // result. That was exploitable: ingestRevocation's is_known+
+            // verify() gate only decides whether the cert gets INGESTED
+            // (recorded as revoking some FRIEND device) -- it does nothing
+            // to gate the SelfRevoked return, and RevocationCert.verify()
+            // only proves internal self-consistency (the cert was signed by
+            // WHOEVER'S key matches the cert's OWN, attacker-chosen,
+            // `identity_pub` field), not that the signer is us or anyone we
+            // trust. So ANY authenticated known peer could self-sign a
+            // RevocationCert with a THROWAWAY keypair, naming the VICTIM's
+            // device_pub (learnable from AUTH's exchanged CertDict), and the
+            // raw comparison would fire SelfRevoked regardless -- which,
+            // since Task 6, triggers an irreversible full identity+store
+            // wipe (TorNodeService.enterRevokedState). The fix: SelfRevoked
+            // now additionally requires `rev.identity_pub == ownIdentity`
+            // (the revocation claims to be issued by OUR OWN identity, not
+            // an attacker-chosen one) AND `rev.verify()` (that claim is
+            // actually signed by that identity's real private key) -- i.e.
+            // the revocation must be signed by OUR OWN identity_priv, the
+            // secret only we and our other paired devices hold. An attacker
+            // without that key cannot forge this, no matter which identity
+            // they authenticate as. `ownIdentity` defaults to `""` (see this
+            // fun's own param doc) so no real hex64 `rev.identity_pub` can
+            // ever accidentally match it -- a caller that never passes
+            // `ownIdentity` (an old/incomplete integration) fails CLOSED
+            // (never self-revokes), not open.
+            //
+            // This is STRICTER than hearth's own is_known+device-match gate
+            // (sync.py's session has no equivalent extra identity-match
+            // requirement for its own is_self row) -- deliberately so: it
+            // closes even a KNOWN-FRIEND-forges-it gap hearth's model
+            // doesn't need to worry about the same way (hearth's revocation
+            // model assumes ingest's is_known+verify is sufficient because a
+            // friend has no reason to send a cert naming a device that
+            // isn't theirs; the phone's SelfRevoked->wipe coupling makes
+            // that assumption load-bearing in a way hearth's model never
+            // was, so the phone closes it explicitly instead of inheriting
+            // the assumption).
             //
             // CORRECTNESS NOTE (own identity IS known -- do not assume
             // otherwise): our own identity_pub is seeded into
@@ -249,15 +292,15 @@ object KotlinSync {
             // and verify(), and DOES call markRevoked(ownDevicePub,
             // lastValidSeq) -- marking our own device revoked and retro-
             // dropping our own prior messages with seq > lastValidSeq --
-            // BEFORE the loop reaches the device_pub == ownDevicePub check
-            // below and returns SelfRevoked. This mirrors hearth exactly:
-            // hearth's own identity row has is_self=1, and sync.py's session
-            // (sync.py:664-671) runs ingest_revocation on a self-revocation
-            // the same as any other -- there is no is_self short-circuit
-            // that skips ingestion. The end state is correct/safe either
-            // way: Task 6's wipe clears the whole store on SelfRevoked, so
-            // markRevoked's effects (now-redundant revoked-device bookkeeping
-            // and retro-dropped own messages) are wiped again moments later
+            // BEFORE the loop reaches the tightened check below and returns
+            // SelfRevoked. This mirrors hearth exactly: hearth's own identity
+            // row has is_self=1, and sync.py's session (sync.py:664-671)
+            // runs ingest_revocation on a self-revocation the same as any
+            // other -- there is no is_self short-circuit that skips
+            // ingestion. The end state is correct/safe either way: Task 6's
+            // wipe clears the whole store on SelfRevoked, so markRevoked's
+            // effects (now-redundant revoked-device bookkeeping and
+            // retro-dropped own messages) are wiped again moments later
             // regardless of whether they ran.
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             val revs = readFrame(stream)
@@ -267,7 +310,9 @@ object KotlinSync {
                 val r = revArr.getJSONObject(i)
                 val rev = RevocationCert.fromDict(toMap(r))
                 store.ingestRevocation(rev)
-                if (rev.device_pub == ownDevicePub) return SyncResult.SelfRevoked
+                if (rev.identity_pub == ownIdentity && rev.device_pub == ownDevicePub && rev.verify()) {
+                    return SyncResult.SelfRevoked
+                }
             }
 
             // -- DEFRIENDS -- (initiator: write then read, same _swap order
@@ -431,19 +476,36 @@ object KotlinSync {
             // (Task 3, phone-onion-reachability -- mirrors `run`'s own
             // REVOCATIONS phase, just reached via the opposite I/O order);
             // own `list_revocations` is unconditionally empty, the phone
-            // has none to offer. The self-revoked check below is unchanged
-            // from before Task 3 (a raw field comparison, run UNCONDITIONALLY
-            // after ingestRevocation, not gated on its result) -- mirrors
-            // `run`'s own check on ITS read side exactly (KotlinSync.kt
-            // run(), REVOCATIONS phase -- see that phase's doc comment for
-            // the full correctness note: our own identity IS seeded into
-            // knownIdentities() at pairing/every sync, so a genuine
-            // self-revocation genuinely runs through ingestRevocation
-            // -- markRevoked(ownDevice) + retro-drop of our own messages --
-            // BEFORE this loop reaches the check below, exactly mirroring
-            // hearth's own is_self=1 identity also running ingest_revocation
+            // has none to offer.
+            //
+            // SECURITY (remote-wipe fix, phone-onion-reachability Task 6
+            // review): the SelfRevoked check below used to be a RAW
+            // `rev.device_pub == fixture.device_pub` comparison -- see
+            // `run`'s own REVOCATIONS phase doc comment (KotlinSync.kt) for
+            // the full writeup of the exploit this closes (any authenticated
+            // known peer could self-sign a RevocationCert with a throwaway
+            // keypair naming the VICTIM's device_pub, and the raw comparison
+            // fired SelfRevoked -- which Task 6 wired to an irreversible
+            // full wipe). Fixed identically here: SelfRevoked now requires
+            // `rev.identity_pub == fixture.cert.identity_pub` (the
+            // revocation claims to be issued by OUR OWN identity) AND
+            // `rev.verify()` (that claim is actually signed by that
+            // identity's real private key) -- i.e. genuinely signed by our
+            // own identity_priv, which only we and our other paired devices
+            // hold. STRICTER than hearth's own is_known+device-match gate,
+            // deliberately -- see `run`'s doc comment for the full
+            // hearth-parity note (this closes even a known-friend-forges-it
+            // gap hearth's model doesn't need to worry about the same way).
+            //
+            // CORRECTNESS NOTE (own identity IS known -- do not assume
+            // otherwise): our own identity IS seeded into knownIdentities()
+            // at pairing/every sync, so a genuine self-revocation genuinely
+            // runs through ingestRevocation -- markRevoked(ownDevice) +
+            // retro-drop of our own messages -- BEFORE this loop reaches the
+            // tightened check below, exactly mirroring hearth's own
+            // is_self=1 identity also running ingest_revocation
             // (sync.py:664-671). Safe either way: Task 6's wipe clears the
-            // whole store on SelfRevoked regardless).
+            // whole store on SelfRevoked regardless.
             val revs = readFrame(stream)
             writeFrame(stream, mapOf("t" to "revocations", "revs" to emptyList<Any>()))
             if (revs.optString("t") == "refused") return SyncResult.Failed("revocations", "refused")
@@ -452,7 +514,9 @@ object KotlinSync {
                 val r = revArr.getJSONObject(i)
                 val rev = RevocationCert.fromDict(toMap(r))
                 store.ingestRevocation(rev)
-                if (rev.device_pub == fixture.device_pub) return SyncResult.SelfRevoked
+                if (rev.identity_pub == fixture.cert.identity_pub && rev.device_pub == fixture.device_pub && rev.verify()) {
+                    return SyncResult.SelfRevoked
+                }
             }
 
             // -- DEFRIENDS -- (responder: read peer's first, apply what
