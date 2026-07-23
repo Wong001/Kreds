@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from . import applock, invitecodec, update
+from . import applock, invitecodec, pairingcodes, update
 from .dmcrypt import (decrypt_blob, decrypt_body, dm_aad, encrypt_blob,
                       encrypt_body, new_content_key, open_content_key,
                       post_aad, response_aad, responses_aad,
@@ -233,6 +233,55 @@ class HearthNode:
         # SyncService wraps this node, in which case add_friend_via_invite
         # simply falls back to the manual {"status": "manual"} response.
         self._friend_dial = None
+        # Phone/desktop pairing over Tor (spec 2026-07-22-android-first-
+        # load-pairing-design). In-memory only, fresh on every process
+        # start -- same posture as _pending_invites above.
+        #
+        # self.pairing mints/verifies the short-lived bearer code the
+        # desktop's Add-device screen shows as a QR (PairingCodes,
+        # hearth/pairingcodes.py).
+        #
+        # self.pending_pair is the HANDOFF between the Tor wire handler
+        # (Task 2's sync.py coroutine: receives the phone's
+        # "hearth-pair-request" frame, verifies its code against
+        # self.pairing, and then blocks holding that connection open)
+        # and this process's HTTP API (api.py's GET /api/pair/pending +
+        # POST /api/pair/accept, which the desktop UI polls/posts to for
+        # the human Accept/Deny step). Shape:
+        #   None -- no pairing request in flight.
+        #   {"device_name": str, "device_pub": str,
+        #    "request_json": str,   # exactly what node.accept_pairing
+        #                           # expects (node.py:1966) -- the wire
+        #                           # handler builds this from the
+        #                           # frame's own device_pub/device_name
+        #                           # the same shape HearthNode.
+        #                           # pair_request produces.
+        #    "verdict": bool,       # ABSENT until the human decides --
+        #                           # so "still waiting" is exactly
+        #                           # "pending_pair exists but has no
+        #                           # verdict key yet". Set by POST
+        #                           # /api/pair/accept.
+        #    "package": str}        # present only when verdict is True:
+        #                           # node.accept_pairing's return value
+        #                           # (the pair-package), which the wire
+        #                           # handler sends back over the SAME
+        #                           # held connection. Absent (the wire
+        #                           # handler must .get() it) when
+        #                           # verdict is False.
+        # Ownership split, so a coroutine mid-await never has the dict
+        # yanked out from under it: the wire handler is the ONLY writer
+        # of device_name/device_pub/request_json, and the ONLY one that
+        # ever resets pending_pair back to None -- it does that AFTER it
+        # has read verdict/package and replied over the wire. The API
+        # only ever ADDS verdict/package keys to an already-live dict,
+        # never clears it. pending_pair_event is set by the API once a
+        # verdict is recorded; the wire handler is responsible for
+        # giving itself a fresh (or .clear()ed) Event before it starts
+        # waiting on a NEW request, since asyncio.Event stays set until
+        # explicitly cleared.
+        self.pairing = pairingcodes.PairingCodes()
+        self.pending_pair: Optional[dict] = None
+        self.pending_pair_event = asyncio.Event()
         okp = self.data_dir / "onion_key"
         self.onion_key = okp.read_text() if okp.exists() else None
         if self.applock_enabled:

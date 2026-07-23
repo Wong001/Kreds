@@ -203,14 +203,18 @@ internal fun findRepoRoot(): File {
         ".venv/Scripts/python.exe at each level)")
 }
 
-/** `scenario`: null (every pre-Task-4 call site) reproduces the
- *  ORIGINAL single-node invocation byte-for-byte (sync_loopback_node.py
- *  defaults to "solo" with no second arg). "two_node" (Task 4, B.2c)
- *  passes the opt-in scenario flag that spawns the second, real friend
- *  node -- see that script's module docstring. "outbound_compose"
- *  (Task 9) passes the outbound loopback gate's scenario -- see
- *  SyncComposeLoopbackTest.kt. */
-internal fun startNode(scenario: String? = null): NodeProcess {
+/** Shared process-spawn plumbing (Task 6, pairing loopback gate): spawns
+ *  sync_loopback_node.py with `scenario` as argv[2] (repo-root discovery,
+ *  the real venv python, temp data dir, "no line -> dump stderr" failure
+ *  diagnostics) and returns the raw process, its stdout reader, and the
+ *  first JSON line it printed -- WITHOUT interpreting that line's shape.
+ *  Hoisted out of startNode's body (below, unchanged in every other way)
+ *  so startPairingNode (SyncPairLoopbackTest.kt) can reuse the exact same
+ *  spawn mechanics for a DIFFERENTLY-shaped first line
+ *  ({"event":"pair_ready",...} rather than {"port":...,"fixture":...,
+ *  "expect":...}) instead of duplicating ~20 lines of ProcessBuilder/
+ *  repo-root/error-diagnostics code. */
+internal fun spawnNode(scenario: String?): Triple<Process, BufferedReader, String> {
     val repo = findRepoRoot()
     val venvPy = File(repo, ".venv/Scripts/python.exe")
     val script = File(repo, "android_tor_spike/tools/sync_loopback_node.py")
@@ -230,6 +234,18 @@ internal fun startNode(scenario: String? = null): NodeProcess {
             "(venvPy=${venvPy.absolutePath} exists=${venvPy.isFile}, " +
             "script=${script.absolutePath} exists=${script.isFile}); stderr:\n$err")
     }
+    return Triple(proc, stdout, line)
+}
+
+/** `scenario`: null (every pre-Task-4 call site) reproduces the
+ *  ORIGINAL single-node invocation byte-for-byte (sync_loopback_node.py
+ *  defaults to "solo" with no second arg). "two_node" (Task 4, B.2c)
+ *  passes the opt-in scenario flag that spawns the second, real friend
+ *  node -- see that script's module docstring. "outbound_compose"
+ *  (Task 9) passes the outbound loopback gate's scenario -- see
+ *  SyncComposeLoopbackTest.kt. */
+internal fun startNode(scenario: String? = null): NodeProcess {
+    val (proc, stdout, line) = spawnNode(scenario)
     val info = JSONObject(line)
     val fx = info.getJSONObject("fixture")
     val port = info.getInt("port")

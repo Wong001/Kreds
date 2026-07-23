@@ -3469,7 +3469,7 @@ function renderFirstRun() {
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
       const {request} = await r.json();
       startBtn.remove();
-      connectStatus.textContent = "On your other device: Settings -> add device, "
+      connectStatus.textContent = "On your other device: Settings -> Devices -> Add device, "
         + "paste this, paste the result back below.";
       const reqField = document.createElement("input");
       reqField.type = "text";
@@ -4501,6 +4501,168 @@ function ceremonyUI() {
   root.append(toggle, panel);
 }
 
+// Desktop's Add-device screen (Task 5, phone/desktop pairing over Tor --
+// spec 2026-07-22-android-first-load-pairing-design): same toggle-button-
+// reveals-a-panel idiom as ceremonyUI/#ceremony above, built once here
+// (bootData calls this alongside ceremonyUI) into the static #add-device
+// div living next to #devices inside Settings > Devices (index.html).
+//
+// Opening the panel POSTs /api/pair/begin, which mints a short-lived
+// pairing code and returns {link, expires_at}; the panel shows it as a
+// QR (existing /api/qr renderer, same img-src idiom as buildManualCeremony)
+// plus the raw link in a copyable readonly input, with a live "expires in
+// MM:SS" countdown (buildShareTab's tickCountdown pattern). While open it
+// polls GET /api/pair/pending every 2s for the other device's request.
+//
+// device_name in a pending request is attacker-influenced (anyone who saw
+// the QR/link can dial in with any name) -- it is rendered with el()'s
+// textContent assignment, never innerHTML, same house rule renderResponses
+// follows for comment bodies (test_friend_add_notes_use_textcontent_not_
+// innerhtml's equivalent for this panel).
+//
+// `resolved` gates the three timer-driven outcomes (pending arrives,
+// countdown hits 0, or the human decides Accept/Deny) so only the first
+// one to fire wins and both timers always get torn down with it -- no
+// interval ever keeps ticking after the panel has moved on. Closing the
+// panel (toggling it hidden) also stops both timers unconditionally;
+// reopening always calls begin() fresh, matching pair/begin's own
+// stale-ceremony release (reopening is the documented unblock path).
+function addDeviceUI() {
+  const root = document.getElementById("add-device");
+  root.replaceChildren();
+  const toggle = el("button", "btn-accent", "Add device");
+  toggle.type = "button";
+  toggle.innerHTML = ICONS.plus + "<span>Add device</span>";
+  const panel = el("div", "ceremony-panel hidden");
+  root.append(toggle, panel);
+
+  let pollTimer = null;
+  let countdownTimer = null;
+  let expiresAt = 0;
+  let resolved = false;
+
+  const stopTimers = () => {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+  };
+
+  const showPending = (p) => {
+    if (resolved) return;
+    resolved = true;
+    stopTimers();
+    panel.replaceChildren();
+    const line = el("div", "hint");
+    line.append(el("b", "", p.device_name),
+      document.createTextNode(" wants to link."));
+    const acceptBtn = el("button", "btn-accent", "Accept");
+    acceptBtn.type = "button";
+    const denyBtn = el("button", "", "Deny");
+    denyBtn.type = "button";
+    const status = el("div", "hint");
+    const decide = async (accept) => {
+      acceptBtn.disabled = true;
+      denyBtn.disabled = true;
+      status.textContent = accept ? "Linking..." : "Denying...";
+      try {
+        await j("/api/pair/accept", {method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({device_pub: p.device_pub, accept})});
+        panel.replaceChildren(el("div", "hint",
+          accept ? p.device_name + " is now linked." : "Request denied."));
+        if (accept) refresh();   // the new device shows up in the Devices list
+      } catch (e) {
+        status.textContent = "Couldn't respond: " + e.message;
+        acceptBtn.disabled = false;
+        denyBtn.disabled = false;
+      }
+    };
+    acceptBtn.onclick = () => decide(true);
+    denyBtn.onclick = () => decide(false);
+    panel.append(line, acceptBtn, denyBtn, status);
+  };
+
+  const showExpired = () => {
+    if (resolved) return;
+    resolved = true;
+    stopTimers();
+    panel.replaceChildren();
+    panel.append(el("div", "hint", "Code expired."));
+    const again = el("button", "btn-accent", "New code");
+    again.type = "button";
+    again.onclick = startFlow;
+    panel.append(again);
+  };
+
+  const tickCountdown = () => {
+    // Host-agnostic self-cleanup, same guard as buildShareTab's
+    // tickCountdown: if the panel got torn down mid-countdown, stop
+    // ticking against dead DOM instead of leaking the interval forever.
+    if (!panel.isConnected) { stopTimers(); return; }
+    const cd = panel.querySelector(".add-device-countdown");
+    if (!cd) return;   // panel has already moved on to pending/expired/result
+    const remaining = Math.max(0, Math.floor(expiresAt - Date.now() / 1000));
+    if (remaining <= 0) { showExpired(); return; }
+    const mm = String(Math.floor(remaining / 60)).padStart(2, "0");
+    const ss = String(remaining % 60).padStart(2, "0");
+    cd.textContent = "expires in " + mm + ":" + ss;
+  };
+
+  const pollPending = async () => {
+    try {
+      const r = await j("/api/pair/pending");
+      if (r.pending) showPending(r.pending);
+    } catch (e) { /* transient - the next 2s tick retries */ }
+  };
+
+  const startFlow = async () => {
+    resolved = false;
+    stopTimers();
+    panel.replaceChildren(el("div", "hint", "Starting..."));
+    toggle.disabled = true;
+    let r;
+    try {
+      r = await j("/api/pair/begin", {method: "POST"});
+    } catch (e) {
+      panel.replaceChildren(el("div", "hint", "Couldn't start pairing: " + e.message));
+      return;
+    } finally {
+      toggle.disabled = false;
+    }
+    expiresAt = r.expires_at;
+    panel.replaceChildren();
+    panel.append(el("div", "hint",
+      "Open Kreds on your other device, then scan this code or paste the link."));
+    const img = document.createElement("img");
+    img.className = "qr-code";
+    img.alt = "Pairing QR code";
+    img.src = "/api/qr?text=" + encodeURIComponent(r.link);
+    const linkField = document.createElement("input");
+    linkField.type = "text";
+    linkField.className = "friendadd-code";
+    linkField.readOnly = true;
+    linkField.value = r.link;
+    linkField.setAttribute("aria-label", "Pairing link - copy to your other device");
+    linkField.onfocus = () => linkField.select();
+    const copyBtn = el("button", "", "Copy link");
+    copyBtn.type = "button";
+    wireCopyButton(copyBtn, () => r.link);
+    const countdown = el("div", "hint friendadd-countdown add-device-countdown");
+    countdown.setAttribute("aria-live", "polite");
+    panel.append(img, linkField, copyBtn, countdown);
+    tickCountdown();
+    countdownTimer = setInterval(tickCountdown, 1000);
+    pollPending();   // don't wait a full 2s for the first check
+    pollTimer = setInterval(pollPending, 2000);
+  };
+
+  toggle.onclick = () => {
+    const opening = panel.classList.contains("hidden");
+    panel.classList.toggle("hidden");
+    if (opening) startFlow();
+    else stopTimers();
+  };
+}
+
 // Topbar "+" (spec 2026-07-15): quick add-friend without leaving the
 // profile. Rebuilt fresh per open so a prior invite's countdown state
 // never leaks into a new session.
@@ -5186,6 +5348,7 @@ async function bootData() {
   restoreView();
   connectWs();
   ceremonyUI();
+  addDeviceUI();
   startApplockHeartbeat();
   startActivityPing();
   // PWA: register the service worker at the app ROOT. A worker served from

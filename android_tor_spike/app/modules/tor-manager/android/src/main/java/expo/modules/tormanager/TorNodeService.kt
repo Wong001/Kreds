@@ -9,7 +9,6 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -87,10 +86,11 @@ class TorNodeService : Service() {
         }
     }
 
-    private fun fixture(): KotlinHandshake.Fixture {
-        val f = File(TorEngine.externalDir(), "spike_phone_fixture.json")
-        return KotlinHandshake.parseFixture(f.readText())
-    }
+    // Dual-read (Task 3, first-load pairing): internal pairing.json first,
+    // else the legacy external spike_phone_fixture.json exactly as before.
+    // Throws on failure (both call sites here already wrap this in a
+    // try/catch) -- see PairingStore.readFixture.
+    private fun fixture(): KotlinHandshake.Fixture = PairingStore.readFixture(this)
 
     // Brick C Task 2: was the bare AUTH heartbeat (dial + KotlinHandshake.run).
     // Now drives the full content-sync transport via SyncRunner.runSync, which

@@ -143,6 +143,21 @@ def encode_final(nonce_hex, sig_hex, cert) -> str:
     body = bytes.fromhex(nonce_hex) + bytes.fromhex(sig_hex) + pack_cert(cert)
     return _wrap(3, body)
 
+def encode_pair(addr, code: str) -> str:
+    """The android first-load pairing link (spec 2026-07-22-android-
+    first-load-pairing-design): the desktop's own gossip address plus a
+    short-lived pairing code (hearth/pairingcodes.py), packed together
+    so a phone's QR scan/typed entry carries both the "where" and the
+    "one-time authorization" in one string. addr uses the same
+    pack_addr encoding (and the same None/onion/plain fallback) as
+    every other message here; code is length-prefixed UTF-8, same
+    convention as pack_cert's device_name field."""
+    code_b = code.encode("utf-8")
+    if len(code_b) > 0xFFFF:
+        raise ValueError("code too long")
+    body = pack_addr(addr) + struct.pack(">H", len(code_b)) + code_b
+    return _wrap(4, body)
+
 def decode(code: str):
     raw = b58decode(code)
     if len(raw) < 2 or raw[0] != _VER:
@@ -176,6 +191,18 @@ def decode(code: str):
             nonce = body[0:16].hex(); sig = body[16:80].hex()
             cert, _ = unpack_cert(body, 80)
             return "final", {"nonce": nonce, "sig": sig, "cert": cert}
+        if typ == 4:
+            addr, off = unpack_addr(body, 0)
+            if len(body) - off < 2:
+                raise ValueError("truncated pair code length")
+            clen = struct.unpack(">H", body[off:off+2])[0]; off += 2
+            if len(body) - off < clen:
+                raise ValueError("truncated pair code")
+            code = body[off:off+clen].decode("utf-8")
+            # A "pair" result is a 3-tuple (not the ("type", {dict})
+            # shape the other three messages use) -- it carries exactly
+            # two scalar fields, no nested cert/dict worth naming.
+            return "pair", addr, code
         raise ValueError("unknown message type")
     except (struct.error, IndexError) as e:
         raise ValueError("malformed invite") from e

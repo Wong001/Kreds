@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import time
 
@@ -13,7 +14,7 @@ from .identity import (
     DefriendNotice, PROTOCOL, EnrollmentCert, RevocationCert, SignedMessage,
     canonical, _sig_ok,
 )
-from .messages import MAX_BLOB_BYTES, ONION_SYNC_INTERVAL, blob_hash
+from .messages import MAX_BLOB_BYTES, ONION_SYNC_INTERVAL, _is_hexn, blob_hash
 from .tor import onion_host
 from .transport import MAX_FRAME, TcpTransport, read_frame, write_frame
 
@@ -153,6 +154,12 @@ class SyncService:
         # copy-paste of the response.
         node._friend_dial = self.deliver_friend_add
         self._friend_add_times = []          # inbound rate-limit window
+        # Own budget, separate from _friend_add_times above: pair-request
+        # and friend-add are two unrelated pre-auth bootstrap channels with
+        # their own guessing-oracle risk (verify_and_consume for pairing,
+        # finalize_invite's nonce for friend-add) -- a flood on one must
+        # not exhaust the other's legitimate budget.
+        self._pair_request_times = []
 
     async def start(self, host: str, port: int) -> int:
         self._server = await self.transport.serve(host, port, self._on_conn)
@@ -171,10 +178,19 @@ class SyncService:
         try:
             # Peek the first frame to dispatch: a `friend-add` frame is the
             # pre-friend handshake (authenticated solely by node.
-            # finalize_invite, never by the friend-auth below); anything
-            # else is a normal gossip/AUTH session, and peer_hello=first
-            # hands _session the frame already read here so it doesn't
-            # block trying to read it a second time.
+            # finalize_invite, never by the friend-auth below); a
+            # `hearth-pair-request` frame is the phone/desktop pairing
+            # ceremony's pre-auth handshake (Task 2, spec 2026-07-22-
+            # android-first-load-pairing-design) -- authenticated solely
+            # by node.pairing.verify_and_consume, a SECOND citizen of this
+            # exact peek-dispatch precedent; anything else is a normal
+            # gossip/AUTH session, and peer_hello=first hands _session the
+            # frame already read here so it doesn't block trying to read
+            # it a second time. This peek is the entire scoping invariant:
+            # an unauthenticated peer can reach ONLY these two named
+            # branches pre-auth -- every other first frame (garbage,
+            # `hello` included) falls through to the ordinary AUTH-or-
+            # refused session below, unchanged.
             #
             # Bounded (whole-branch review, Fix 2): this read is shared by
             # BOTH the friend-add path and the normal gossip/AUTH session
@@ -184,11 +200,16 @@ class SyncService:
             # generous so a real hello (gossip or friend-add) always
             # completes well inside it; asyncio.TimeoutError falls through
             # to the except Exception below, which already drops the
-            # connection via the existing finally.
+            # connection via the existing finally. (The pair-request
+            # branch's OWN held-connection wait, once the frame itself has
+            # been read, is bounded separately -- by the code's remaining
+            # TTL, not this timeout; see _handle_pair_request.)
             first = await asyncio.wait_for(read_frame(reader),
                                            timeout=FRIEND_ADD_TIMEOUT)
             if first.get("t") == "friend-add":
                 await self._handle_friend_add(first, writer)
+            elif first.get("t") == "hearth-pair-request":
+                await self._handle_pair_request(first, writer)
             else:
                 await self._session(reader, writer, initiator=False,
                                     peer_hello=first)
@@ -381,6 +402,140 @@ class SyncService:
             await write_frame(writer, {"t": "refused"})
             return
         await write_frame(writer, {"t": "friend-final", "payload": final})
+
+    # -- phone/desktop pairing (pre-auth, held-connection accept) ---------
+    #
+    # A second citizen of the SAME pre-auth peek precedent as friend-add
+    # above (spec 2026-07-22-android-first-load-pairing-design): the phone
+    # has no device cert yet, so this frame must be admitted BEFORE the
+    # normal AUTH session. The code (node.pairing.verify_and_consume) is
+    # the ONLY authenticator -- proof of nothing more than "saw the
+    # desktop's Add-device screen inside the last 10 minutes". The real
+    # trust decision is the human Accept/Deny step (api.py's POST
+    # /api/pair/accept), which this coroutine blocks on by holding the
+    # connection open and awaiting node.pending_pair_event -- see node.py's
+    # pending_pair docstring for the full handoff contract.
+    #
+    # Reply is EXACTLY ONE of hearth-pair-package / pair-denied /
+    # pair-expired, then the connection closes (via _on_conn's finally).
+
+    def _pair_request_allowed(self) -> bool:
+        """Inbound rate-limit: caps pair-request attempts a stranger can
+        throw at this listener to ~20/min, same shape as _friend_add_
+        allowed above but its OWN budget -- verify_and_consume is its own
+        guessing-oracle surface, unrelated to finalize_invite's, and a
+        flood on one bootstrap channel must not starve the other."""
+        now = time.time()
+        self._pair_request_times = [t for t in self._pair_request_times
+                                    if now - t < 60]
+        if len(self._pair_request_times) >= 20:
+            return False
+        self._pair_request_times.append(now)
+        return True
+
+    async def _handle_pair_request(self, frame, writer):
+        """Checks are ordered cheapest/free-est first, exactly like
+        _handle_friend_add's locked -> no-pending-invite -> rate-limit ->
+        authenticator ordering above -- so a stranger can never spend a
+        more expensive/limited resource (rate-limit budget, then the
+        human's one live code) chasing a request that was always going to
+        be refused."""
+        if self.node.pairing._hash is None:
+            # Cheaper rate-limit (mirrors _handle_friend_add's Fix 1,
+            # sync.py:377-390): with no code minted at all, there is
+            # nothing for verify_and_consume to protect -- refuse
+            # immediately WITHOUT spending rate-limit budget. Otherwise an
+            # onion-address-knowing attacker could sustain a flood with no
+            # code ever live and permanently exhaust the shared 20/60s
+            # budget, denying every real pairing attempt for as long as
+            # the flood continues (not just a transient blip).
+            await write_frame(writer, {"t": "pair-expired"})
+            return
+        if not self._pair_request_allowed():
+            await write_frame(writer, {"t": "pair-expired"})
+            return
+        if self.node.pending_pair is not None:
+            # Single active ceremony, checked BEFORE verify_and_consume:
+            # a second frame presenting a fresh, otherwise-valid code
+            # while an earlier request is still parked awaiting the
+            # human's Accept/Deny must not clobber it (that would strand
+            # the first request's held connection with no writer left to
+            # ever resolve it) -- AND must not burn that second code
+            # either, since verify_and_consume never even runs. The human
+            # who just minted it can still redeem it once the first
+            # ceremony resolves.
+            await write_frame(writer, {"t": "pair-expired"})
+            return
+
+        # Frame-shape validated BEFORE verify_and_consume (whole-branch
+        # review): a malformed frame from a buggy-but-legitimate client
+        # must not burn the human's live code. This costs nothing security-
+        # wise -- a malformed frame gets the exact same uniform pair-
+        # expired reply regardless of whether the code it carried was
+        # valid, and an attacker who genuinely HOLDS a valid code can just
+        # resend a well-formed frame and succeed anyway, so there was never
+        # any protection in consuming first.
+        device_pub = frame.get("device_pub")
+        device_name = frame.get("device_name")
+        if not (_is_hexn(device_pub, 64)
+                and isinstance(device_name, str) and device_name.strip()):
+            await write_frame(writer, {"t": "pair-expired"})
+            return
+        device_name = device_name.strip()
+
+        # Capture expires_at BEFORE consuming: verify_and_consume clears it
+        # to None on success, and the held-connection wait below must use
+        # the code's OWN remaining window (it was already live for up to
+        # TTL_SECONDS before this frame arrived), never a fresh TTL per
+        # request -- that would let a request that shows up at minute 9
+        # hold the connection open for another full 10 minutes.
+        expires_at = self.node.pairing.expires_at
+        now = time.time()
+        if not self.node.pairing.verify_and_consume(frame.get("code"), now):
+            # Bad, expired, or already-consumed code: nothing is parked,
+            # and -- per verify_and_consume's own contract -- a genuinely
+            # live code is left untouched, so an honest retry with the
+            # right code still works. Same close-without-detail posture as
+            # every other refusal on this pre-auth surface.
+            await write_frame(writer, {"t": "pair-expired"})
+            return
+
+        request_json = json.dumps({
+            "t": "hearth-pair-request", "protocol": PROTOCOL,
+            "device_pub": device_pub, "device_name": device_name,
+        })
+        self.node.pending_pair = {"device_name": device_name,
+                                  "device_pub": device_pub,
+                                  "request_json": request_json}
+        # A fresh Event, never one a PRIOR ceremony may have left set --
+        # asyncio.Event has no auto-reset, and node.py's pending_pair
+        # docstring flags this exact footgun: the API only ever .set()s,
+        # it never clears. This coroutine is the sole party that starts a
+        # NEW wait, so it is the one responsible for a clean Event.
+        self.node.pending_pair_event = asyncio.Event()
+        remaining = max(expires_at - now, 0.0)
+        try:
+            try:
+                await asyncio.wait_for(self.node.pending_pair_event.wait(),
+                                       timeout=remaining)
+            except asyncio.TimeoutError:
+                await write_frame(writer, {"t": "pair-expired"})
+                return
+            pending = self.node.pending_pair
+            if pending.get("verdict"):
+                # The untouched node.accept_pairing output (api.py's
+                # /api/pair/accept), a JSON STRING -- parse it back to a
+                # dict for write_frame, which serializes dicts, not
+                # pre-encoded JSON text.
+                await write_frame(writer, json.loads(pending["package"]))
+            else:
+                await write_frame(writer, {"t": "pair-denied"})
+        finally:
+            # ALWAYS clear on exit (timeout, deny, accept, or any
+            # exception) -- this coroutine is the sole owner of resetting
+            # pending_pair (see node.py's pending_pair docstring); the API
+            # only ever adds keys to an already-live dict.
+            self.node.pending_pair = None
 
     async def deliver_friend_add(self, address: str, response_json: str):
         """B's side: dial A, send the response, return A's final (or None)

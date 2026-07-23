@@ -1,14 +1,15 @@
 package expo.modules.tormanager
 
+import android.content.Context
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import java.io.File
 
 /** Reserved msgId for the MediaServer resolver's story branch (B.2d-3 Task 2).
  *  Real msgIds are hex64 (a message id), so this string can never collide
@@ -18,6 +19,36 @@ import java.io.File
  *  resolver's doc comment for why a story must never go through
  *  blobKeys/decryptBlob). */
 private const val STORY_MARKER = "story"
+
+/** Log tag for this module -- no pre-existing android.util.Log usage
+ *  exists anywhere in this app to mirror (grepped the whole
+ *  android_tor_spike tree, none found); "TorManager" matches this module's
+ *  own Name("TorManager") in `definition()` below. */
+private const val TAG = "TorManager"
+
+/** Task 4 (first-load pairing): bounds pairWithNode's single request/reply
+ *  round trip (KotlinPairing.runCeremony's timeoutMs).
+ *
+ *  POST-REVIEW FIX: this was originally 30_000L ("a live node should answer
+ *  quickly") -- wrong. The wait this bounds is NOT "how long a node takes
+ *  to answer a frame"; it's "how long the SERVER holds the connection open
+ *  while a HUMAN walks to the desktop and clicks Accept/Deny" --
+ *  node.accept_pairing / api.py's /api/pair/accept gates on
+ *  node.pending_pair, and the server only gives up once the pairing code
+ *  itself expires. So this must be anchored to the code's server-side TTL,
+ *  not to network/handshake latency: hearth/pairingcodes.py's
+ *  `TTL_SECONDS = 600` (10 minutes -- "design doc: short TTL (10 min)").
+ *  610_000L = that 600s window + 10s margin for clock skew / the last leg
+ *  of frame delivery. A client bound shorter than the server's own window
+ *  abandons a still-live ceremony mid-wait: the code is already consumed
+ *  server-side by the time the human sees the Accept screen, so a client
+ *  retry can't reuse it (a fresh code + a fresh QR scan is the only
+ *  recovery), a late Accept enrolls a device the phone gave up hearing
+ *  about, and a retry racing a stale Accept risks double-enrolling.
+ *  IF hearth/pairingcodes.py's TTL_SECONDS ever changes, THIS CONSTANT
+ *  MUST FOLLOW IT -- nothing on the wire carries the TTL for this to derive
+ *  automatically; there is no cross-check that would catch drift. */
+private const val PAIR_TIMEOUT_MS = 610_000L
 
 class TorManagerModule : Module() {
     // recv/send/dial block on socket I/O; keep them OFF the single default
@@ -241,12 +272,11 @@ class TorManagerModule : Module() {
      *  function exists to fix). A caller seeing 0 friends when the fixture
      *  is temporarily unreadable is the safe failure shape; seeing an
      *  inflated count never is. */
-    private fun friendsCount(store: SyncStore): Int {
-        val ownIdentityPub = try {
-            KotlinHandshake.parseFixture(
-                File(TorEngine.externalDir(), "spike_phone_fixture.json").readText()
-            ).cert.identity_pub
-        } catch (e: Exception) { return 0 }
+    // Dual-read (Task 3, first-load pairing): internal pairing.json first,
+    // else the legacy external spike_phone_fixture.json exactly as before.
+    // See PairingStore.readFixtureOrNull.
+    private fun friendsCount(ctx: Context, store: SyncStore): Int {
+        val ownIdentityPub = PairingStore.readFixtureOrNull(ctx)?.cert?.identity_pub ?: return 0
         return store.knownIdentities().count { it != ownIdentityPub }
     }
 
@@ -257,7 +287,7 @@ class TorManagerModule : Module() {
             "fixtureDir" to (appContext.reactContext?.getExternalFilesDir(null)?.absolutePath ?: "")
         )
 
-        Events("torProgress", "nodeBeat", "nodeState", "nodeSync", "onSyncProgress")
+        Events("torProgress", "nodeBeat", "nodeState", "nodeSync", "onSyncProgress", "pairProgress")
 
         OnCreate {
             val ctx = appContext.reactContext ?: return@OnCreate
@@ -333,6 +363,72 @@ class TorManagerModule : Module() {
 
         AsyncFunction("suspendTor") { TorEngine.suspend() }
 
+        // -- Task 4 (first-load pairing): ceremony client bridge --
+        // hasIdentity is a quick local file check (PairingStore.hasIdentity,
+        // via the same internal-then-legacy dual read every other fixture
+        // call site uses) -- a plain Function, same shape as isBatteryExempt
+        // below, not an AsyncFunction: no network I/O, just a small file
+        // read/parse, cheap enough for the default queue.
+        Function("hasIdentity") {
+            val ctx = appContext.reactContext ?: return@Function false
+            PairingStore.hasIdentity(ctx)
+        }
+
+        // pairWithNode runs the full ceremony (dial -> pair-request ->
+        // ONE bounded reply -> install+persist on a package) off the main
+        // thread -- mirrors syncNow's ioScope + TorEngine.dial wiring and
+        // its "Tor must be bootstrapped first" guard (dial blocks on a real
+        // SOCKS connect, same reasoning as syncNow's dial inside
+        // SyncRunner.runTransport). Resolves a single {"status": ...} map --
+        // never throws/rejects for an ordinary ceremony outcome (ceremony
+        // failures are VALUES, status="unreachable"/"bad_link"/etc, not
+        // promise rejections) so the JS side has one flat switch instead of
+        // a try/catch-plus-switch. The 5 statuses are Task 7's UI contract
+        // and stay fixed; an "unreachable" result additionally carries a
+        // "reason" string (post-review addition) so a REJECTED package
+        // (forged/tampered cert, device_pub mismatch, ...) doesn't read to
+        // the human as an indistinguishable Wi-Fi hiccup -- the same
+        // installPackage IllegalArgumentException message that used to be
+        // swallowed into a bare "unreachable" now surfaces in both logcat
+        // (Log.w, for on-device debugging) and the resolved map (for a
+        // future UI that wants to show it). "dialing"/"waiting"
+        // pairProgress events (post-review addition) mirror syncNow's own
+        // onSyncProgress -- Task 7's UI is the consumer; a ceremony that
+        // can legitimately wait most of PAIR_TIMEOUT_MS (600s) for the
+        // human's desktop Accept click needs a "still waiting" signal.
+        AsyncFunction("pairWithNode") { link: String, deviceName: String ->
+            fun unreachable(reason: String): Map<String, Any?> {
+                Log.w(TAG, "pairWithNode: unreachable - $reason")
+                return mapOf("status" to "unreachable", "reason" to reason)
+            }
+
+            val ctx = appContext.reactContext ?: return@AsyncFunction unreachable("no context")
+            if (!TorEngine.isUp) return@AsyncFunction unreachable("tor not up - start the node first")
+
+            val store = SqliteSyncStore(ctx)
+            val result = try {
+                KotlinPairing.runCeremony(
+                    dial = { host, port -> TorStream(TorEngine.dial(host, port)) },
+                    link = link,
+                    deviceName = deviceName,
+                    timeoutMs = PAIR_TIMEOUT_MS,
+                    store = store,
+                    dir = ctx.filesDir,
+                    onProgress = { stage -> sendEvent("pairProgress", mapOf("stage" to stage)) },
+                )
+            } finally {
+                store.close()   // SQLiteOpenHelper leaks its connection if not closed
+            }
+
+            when (result) {
+                is KotlinPairing.CeremonyResult.Linked -> mapOf("status" to "linked")
+                is KotlinPairing.CeremonyResult.Denied -> mapOf("status" to "denied")
+                is KotlinPairing.CeremonyResult.Expired -> mapOf("status" to "expired")
+                is KotlinPairing.CeremonyResult.BadLink -> mapOf("status" to "bad_link")
+                is KotlinPairing.CeremonyResult.Unreachable -> unreachable(result.reason)
+            }
+        }.runOnQueue(ioScope)
+
         // -- Brick A: background node control --
         Function("startNode") { appContext.reactContext?.let { TorNodeService.start(it) } }
         Function("stopNode") { appContext.reactContext?.let { TorNodeService.stop(it) } }
@@ -391,10 +487,12 @@ class TorManagerModule : Module() {
             }
             // Fixture read stays foreground (SyncRunner takes an already-parsed
             // Fixture). A read/parse failure emits the same "io:" nodeSync the
-            // pre-refactor single outer try/catch did.
+            // pre-refactor single outer try/catch did. Dual-read (Task 3):
+            // internal pairing.json first, else the legacy external
+            // spike_phone_fixture.json exactly as before -- see
+            // PairingStore.readFixture.
             val fx = try {
-                KotlinHandshake.parseFixture(
-                    File(TorEngine.externalDir(), "spike_phone_fixture.json").readText())
+                PairingStore.readFixture(ctx)
             } catch (e: Exception) {
                 emit(false, 0, 0, 0, "io: ${e.message}", false)
                 return@AsyncFunction Unit
@@ -479,7 +577,7 @@ class TorManagerModule : Module() {
                     // the sync) -- see friendsCount's doc for why that's the
                     // wrong number to label "friends" downstream. Preserves the
                     // exact value the pre-refactor success branch emitted.
-                    emit(true, outcome.messages, outcome.blobs, friendsCount(store), null, true)
+                    emit(true, outcome.messages, outcome.blobs, friendsCount(ctx, store), null, true)
                 } catch (e: Exception) {
                     emit(false, 0, 0, 0, "io: ${e.message}", false)
                 }
@@ -674,7 +772,7 @@ class TorManagerModule : Module() {
                 ?: return@AsyncFunction mapOf("messages" to 0, "blobs" to 0, "identities" to 0)
             val store = SqliteSyncStore(ctx)
             val st = store.stats()
-            mapOf("messages" to st.messages, "blobs" to st.blobs, "identities" to friendsCount(store))
+            mapOf("messages" to st.messages, "blobs" to st.blobs, "identities" to friendsCount(ctx, store))
         }
 
         Function("isBatteryExempt") {

@@ -22,6 +22,7 @@ const HIDDEN_SELECTORS = [
   "#profile-addfriend",
   "#profile-actions .ring-move",   // vp3: friend-profile ring-move (POST write)
   "#profile-actions .btn-danger",  // vp3: friend-profile Unfriend (POST write), scoped
+  "#add-device",   // Task 5 review fix: pairing is desktop-side; phone LocalApi has no /api/pair routes
 ];
 
 // The subset where a dropped `display: none` (not just a dropped selector)

@@ -651,10 +651,95 @@ def build_app(node: HearthNode, web_dir: Path | None = None) -> FastAPI:
         except (ValueError, KeyError, TypeError) as e:
             raise HTTPException(400, str(e))
 
+    # -- phone/desktop pairing over Tor (spec 2026-07-22-android-first-
+    # load-pairing-design) -------------------------------------------------
+    # Desktop's Add-device screen: begin mints a code + link, pending is
+    # polled for an arriving request, accept records the human's
+    # Accept/Deny verdict. The Tor wire handler that actually receives a
+    # phone's request and fills node.pending_pair is Task 2 (sync.py) --
+    # these three routes are the API half of the handoff; see node.py's
+    # pending_pair docstring for the full contract between them.
+    #
+    # This REPLACES the old, never-wired, never-tested /api/pair/accept
+    # (body {"payload": ...} -> {"payload": <package>}, a direct
+    # passthrough to node.accept_pairing with no pending/human-confirm
+    # step) -- desktop<->desktop pairing keeps working exactly as before
+    # via node.accept_pairing itself (unchanged) called straight from the
+    # CLI (hearth/cli.py) or bootstrap's copy-paste flow; only this
+    # unused HTTP route's shape changes.
+
+    @app.post("/api/pair/begin")
+    async def pair_begin():
+        addr = node.store.get_meta("gossip_addr")
+        if not addr:
+            raise HTTPException(400, "node is not serving yet")
+        # Stale-ceremony release (whole-branch review): an orphaned wire
+        # ceremony (the phone dropped mid-wait -- crashed, lost Tor, user
+        # backed out -- with no accept/deny ever posted) would otherwise
+        # block every retry until the code's own TTL, since only ONE
+        # ceremony can be parked at a time (sync.py's _handle_pair_request).
+        # begin already invalidates the prior CODE (PairingCodes.mint's
+        # "one active code" contract) -- extend that same semantics to the
+        # prior CEREMONY: resolve it as denied (exactly pair/accept's own
+        # deny path: set verdict, fire the event) so its held connection
+        # wakes up immediately instead of hanging, and the desktop user can
+        # unblock themselves by simply reopening/restarting Add-device.
+        # Guarded on "no verdict yet" so a ceremony the human ALREADY
+        # decided (verdict set, event fired, wire handler not yet
+        # scheduled to consume it) is never flipped from accept to deny --
+        # see node.py's pending_pair docstring: "still waiting" is exactly
+        # "pending_pair exists but has no verdict key yet".
+        if node.pending_pair is not None and "verdict" not in node.pending_pair:
+            node.pending_pair["verdict"] = False
+            node.pending_pair_event.set()
+        code = node.pairing.mint(time.time())
+        return {"link": invitecodec.encode_pair(addr, code),
+                "expires_at": node.pairing.expires_at}
+
+    @app.get("/api/pair/pending")
+    async def pair_pending():
+        p = node.pending_pair
+        if p is None:
+            return {"pending": None}
+        # Only the two fields the Accept/Deny UI needs to show a human --
+        # request_json/verdict/package are this handoff's internal
+        # bookkeeping, not for display.
+        return {"pending": {"device_name": p["device_name"],
+                            "device_pub": p["device_pub"]}}
+
     @app.post("/api/pair/accept")
     async def pair_accept(body: dict = Body(...)):
-        return {"payload": _400(lambda: node.accept_pairing(
-            body["payload"]))}
+        try:
+            pending = node.pending_pair
+            if pending is None:
+                raise ValueError("no pending pairing request")
+            # Mirror pair_begin's "never flip a decided verdict" guard: a
+            # deny-then-accept (or accept-then-deny) from a second tab, in
+            # the near-nil window before the wire coroutine consumes the
+            # verdict, would otherwise silently overwrite it here --
+            # e.g. turning a real deny into a real enrollment.
+            if "verdict" in pending:
+                raise ValueError("pairing request already decided")
+            if body["device_pub"] != pending["device_pub"]:
+                raise ValueError("device_pub mismatch")
+            if body["accept"]:
+                # node.accept_pairing is UNCHANGED (node.py:1966) -- it
+                # already enrolls the device, saves the view, and
+                # notifies; this just files its result where Task 2's
+                # wire handler will pick it up.
+                pending["package"] = node.accept_pairing(
+                    pending["request_json"])
+                pending["verdict"] = True
+            else:
+                pending["verdict"] = False
+        except (ValueError, KeyError, TypeError) as e:
+            raise HTTPException(400, str(e))
+        # Wakes the wire handler's await -- it reads verdict/package back
+        # off node.pending_pair and is the one that resets it to None
+        # once it has replied over the held connection (see the
+        # ownership note in node.py's pending_pair docstring).
+        node.pending_pair_event.set()
+        return {"ok": True}
 
     @app.get("/api/conversations")
     async def conversations():
