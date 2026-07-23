@@ -119,4 +119,92 @@ class SyncRunnerTest {
             device_name = "test", enrolled_at = 1.0, signature = "cc".repeat(32))
         return KotlinHandshake.Fixture(devPriv, "bb".repeat(32), cert, "example.onion:1234")
     }
+
+    // -- 4. friend-peering Task 4: peer-loop decision helpers --
+    //
+    // runTransport/runSync themselves take an Android Context and dial real
+    // Tor (TorEngine.dial), so -- same posture as the rest of this file --
+    // they are not JVM-testable; there is no Robolectric/Context test double
+    // in this module. The SECURITY-CRITICAL bit (the identity-acceptance
+    // change that lets the phone dial FRIENDS, not just its own home node)
+    // and the own-onion-skip / onion-throttle gates are extracted into pure
+    // functions (acceptPeerIdentity/shouldSkipOwnOnion/shouldThrottle) for
+    // exactly this reason, and proven here in isolation. The live dial +
+    // the peer-loop's wiring of these decisions into runSync is Task 7/8's
+    // on-device proof; the regression this task must not break (single
+    // home-node-only peer still syncs) is a structural property of runSync's
+    // loop, verified by compiling + reading, not by a JVM test double here.
+
+    private val FRIEND = "aa".repeat(32)
+    private val HOME = "bb".repeat(32)
+    private val STRANGER = "cc".repeat(32)
+    private val KNOWN = listOf(FRIEND, HOME)
+
+    @Test fun acceptsKnownFriendWithNoExpectedIdentity() {
+        assertTrue(SyncRunner.acceptPeerIdentity(FRIEND, null, KNOWN))
+    }
+
+    @Test fun acceptsKnownFriendMatchingExpectedIdentity() {
+        assertTrue(SyncRunner.acceptPeerIdentity(FRIEND, FRIEND, KNOWN))
+    }
+
+    @Test fun refusesKnownIdentityAtWrongExpectedAddressSlot() {
+        // FRIEND authenticates, but this peer ROW expected HOME to answer at
+        // that address -- a wrong/hostile node squatting on a friend's
+        // stored address slot must be refused even though ITS OWN identity
+        // is separately known (the wrong-address guard).
+        assertFalse(SyncRunner.acceptPeerIdentity(FRIEND, HOME, KNOWN))
+    }
+
+    @Test fun refusesUnknownStrangerIdentity() {
+        assertFalse(SyncRunner.acceptPeerIdentity(STRANGER, null, KNOWN))
+    }
+
+    @Test fun acceptsOwnHomeIdentity() {
+        assertTrue(SyncRunner.acceptPeerIdentity(HOME, HOME, KNOWN))
+    }
+
+    @Test fun skipsSameOnionHostAsOwnGossipAddr() {
+        // Host-keyed, not full-address-keyed (sync.py:282-286 doc): a
+        // same-host row at a DIFFERENT port must still be recognized as our
+        // own onion service.
+        assertTrue("same onion host, different port, is still our own onion",
+            SyncRunner.shouldSkipOwnOnion("home.onion:1234", "home.onion:9997"))
+    }
+
+    @Test fun doesNotSkipDifferentOnionHost() {
+        assertFalse(SyncRunner.shouldSkipOwnOnion("friend.onion:9997", "home.onion:9997"))
+    }
+
+    @Test fun doesNotSkipNonOnionAddress() {
+        assertFalse(SyncRunner.shouldSkipOwnOnion("192.168.1.5:9997", "home.onion:9997"))
+    }
+
+    @Test fun doesNotSkipWhenOwnGossipAddrUnset() {
+        assertFalse(SyncRunner.shouldSkipOwnOnion("friend.onion:9997", null))
+    }
+
+    @Test fun throttlesSameAddrWithinWindow() {
+        val addr = "friend.onion:9997"
+        val last = hashMapOf<String, Long>()
+        assertFalse("first dial is never throttled", SyncRunner.shouldThrottle(addr, last, 0L))
+        assertTrue("re-dial 10s later, inside the 45s window, must be throttled",
+            SyncRunner.shouldThrottle(addr, last, 10_000L))
+    }
+
+    @Test fun allowsSameAddrAfterWindowElapses() {
+        val addr = "friend.onion:9997"
+        val last = hashMapOf<String, Long>()
+        assertFalse(SyncRunner.shouldThrottle(addr, last, 0L))
+        assertFalse("45s later the window has fully elapsed",
+            SyncRunner.shouldThrottle(addr, last, 45_000L))
+    }
+
+    @Test fun throttleIsPerAddress() {
+        val a = "friend-a.onion:9997"; val b = "friend-b.onion:9997"
+        val last = hashMapOf<String, Long>()
+        assertFalse(SyncRunner.shouldThrottle(a, last, 0L))
+        assertFalse("a different address is never throttled by another address's recent dial",
+            SyncRunner.shouldThrottle(b, last, 0L))
+    }
 }

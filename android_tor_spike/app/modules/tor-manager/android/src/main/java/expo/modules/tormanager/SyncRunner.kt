@@ -90,8 +90,23 @@ object SyncRunner {
         r: SyncResult, prep: EncKeyPrep, store: SyncStore, pendingIds: List<String> = emptyList()
     ) = mapSyncResult(r, prep, store, pendingIds)
 
-    /** Runs the full transport under the process-wide mutex. NEVER decrypts.
-     *  Returns `ran=false` immediately if a sync is already in progress. */
+    /** Runs the full transport, over EVERY stored peer (friend-peering Task
+     *  4 -- was a single hardcoded `fx.onion_addr` dial), under the process-
+     *  wide mutex. NEVER decrypts. Returns `ran=false` immediately if a sync
+     *  is already in progress.
+     *
+     *  Peer loop (mirrors hearth sync.py's `_gossip_round`, sync.py:267-297):
+     *  reads `store.listPeers()` + the stored `gossip_addr` ONCE per round
+     *  (not once per peer -- same as sync.py reading `own_host`/`list_peers()`
+     *  once at the top of `_gossip_round`), then for each peer: skip our own
+     *  published onion (`shouldSkipOwnOnion`), skip an onion peer dialed too
+     *  recently (`shouldThrottle`, `ONION_SYNC_INTERVAL_MS`), else run that
+     *  peer's transport + its own blob-drain rounds (`syncOnePeer`). A peer
+     *  that refuses us or is simply offline is recorded and the loop moves on
+     *  to the NEXT peer (per-peer resilience -- one bad peer never aborts the
+     *  whole round; the peer ROW is left alone, only defriend, Task 5, prunes
+     *  it). The per-peer outcomes are folded into one `SyncOutcome` by
+     *  `aggregate` for this function's (peer-unaware) callers. */
     fun runSync(
         ctx: Context,
         fx: KotlinHandshake.Fixture,
@@ -101,45 +116,59 @@ object SyncRunner {
             return SyncOutcome(ran = false, ok = false, 0, 0, 0, false, "sync already in progress")
         }
         try {
-            // One sync DRAINS all pending blobs. hearth sends blobs
-            // smallest-first up to a ~15 MiB per-round budget and leaves the
-            // rest "for the next round" (sync.py BLOB_GIVE_BUDGET), so a
-            // profile's large banner + wall photos need several rounds. Rather
-            // than dripping one batch per 15-min background cycle (leaving big
-            // images broken for up to an hour), loop rounds back-to-back until
-            // nothing is missing, a round pulls no new blobs (the peer doesn't
-            // hold the rest), or a safety cap. In steady state missingBlobs()
-            // is empty after round 1, so this is a single round -- the extra
-            // rounds happen only when there is a real backlog to drain.
-            var last = runTransport(ctx, fx, onProgress)
-            // Task 6 (phone-onion-reachability): the outbound path's
-            // SelfRevoked trigger -- this is the ONE choke point every
-            // outbound sync runs through (TorNodeService's own background
-            // syncCycle and TorManagerModule's foreground syncNow both call
-            // this same runSync), so wiring it here covers both callers at
-            // once, rather than duplicating the check at each call site.
-            // See TorNodeService.enterRevokedState's doc for the full
-            // ordering/idempotency contract; safe to call while still
-            // holding `syncLock` above (enterRevokedState never blocks on
-            // or re-acquires it -- PairingStore.wipe/SqliteSyncStore.wipe
-            // are plain file I/O, and stop()/the broadcast are both
-            // fire-and-forget). last.selfRevoked implies !last.ok (see
-            // mapSyncResult), so the guard just below still returns
-            // immediately after this -- the drain loop never runs a
-            // further round on a revoked identity.
-            if (last.selfRevoked) TorNodeService.enterRevokedState(ctx)
-            if (!last.ran || !last.ok) return last
-            var rounds = 1
-            while (rounds < MAX_DRAIN_ROUNDS &&
-                    runCatching { anyBlobsMissing(ctx) }.getOrDefault(false)) {
-                val before = last.blobs
-                val next = runTransport(ctx, fx, onProgress)
-                rounds++
-                if (!next.ran || !next.ok) return last   // keep the last good outcome; next cycle retries
-                last = next
-                if (next.blobs <= before) break          // no new blobs this round -> peer holds no more
+            // Throwaway store just to read the peer table + our own
+            // published onion, closed immediately -- same idiom as
+            // anyBlobsMissing below. A failure here (e.g. DB locked) fails
+            // the whole round the same way a pre-Task-4 store-open failure
+            // inside runTransport did.
+            val (peers, ownGossipAddr) = try {
+                val s = SqliteSyncStore(ctx)
+                try { s.listPeers() to s.getMeta("gossip_addr") } finally { s.close() }
+            } catch (e: Exception) {
+                return SyncOutcome(true, false, 0, 0, 0, false, "peers: ${e.message}")
             }
-            return last
+
+            val results = mutableListOf<SyncOutcome>()
+            for (peer in peers) {
+                if (shouldSkipOwnOnion(peer.address, ownGossipAddr)) continue
+                if (isOnion(peer.address) &&
+                    shouldThrottle(peer.address, lastOnionSync, System.currentTimeMillis())) continue
+
+                // One sync DRAINS all pending blobs FROM THIS PEER. hearth
+                // sends blobs smallest-first up to a ~15 MiB per-round budget
+                // and leaves the rest "for the next round" (sync.py
+                // BLOB_GIVE_BUDGET), so a profile's large banner + wall
+                // photos need several rounds. Rather than dripping one batch
+                // per 15-min background cycle (leaving big images broken for
+                // up to an hour), loop rounds back-to-back until nothing is
+                // missing, a round pulls no new blobs (the peer doesn't hold
+                // the rest), or a safety cap -- see syncOnePeer/
+                // MAX_DRAIN_ROUNDS. In steady state this is a single round.
+                val outcome = syncOnePeer(ctx, fx, peer, onProgress)
+
+                // Task 6 (phone-onion-reachability): the outbound path's
+                // SelfRevoked trigger -- this is the ONE choke point every
+                // outbound sync runs through (TorNodeService's own background
+                // syncCycle and TorManagerModule's foreground syncNow both
+                // call this same runSync), so wiring it here covers both
+                // callers at once, rather than duplicating the check at each
+                // call site. See TorNodeService.enterRevokedState's doc for
+                // the full ordering/idempotency contract; safe to call while
+                // still holding `syncLock` above (enterRevokedState never
+                // blocks on or re-acquires it). Friend-peering Task 4: a
+                // revocation revealed by ANY peer stops the WHOLE cycle
+                // immediately (not just that peer) and returns that peer's
+                // outcome directly -- there is no "our own identity" left to
+                // sync anything under once this fires, and the wipe
+                // enterRevokedState performs is the very store the remaining
+                // peers' runTransport calls would otherwise try to read/write.
+                if (outcome.selfRevoked) {
+                    TorNodeService.enterRevokedState(ctx)
+                    return outcome
+                }
+                results.add(outcome)
+            }
+            return aggregate(results)
         } finally {
             syncLock.unlock()
         }
@@ -159,6 +188,170 @@ object SyncRunner {
         return try { s.missingBlobs().isNotEmpty() } finally { s.close() }
     }
 
+    // -- friend-peering Task 4: peer-loop decision helpers -----------------
+    //
+    // Extracted as pure functions (no Context, no Tor, no store) specifically
+    // so the SECURITY-CRITICAL identity-acceptance decision -- and the own-
+    // onion-skip / onion-throttle gates around it -- are JVM-unit-testable
+    // (SyncRunnerTest) even though runTransport/runSync themselves are not
+    // (real Android Context + real Tor dial; see SyncRunnerTest's doc on
+    // this section). The live dial is Task 7/8's on-device proof.
+
+    // Mirrors hearth sync.py's ONION_SYNC_INTERVAL (messages.py:67, 45.0
+    // seconds): don't re-dial the same onion peer within this window across
+    // back-to-back runSync calls (e.g. a manual foreground sync shortly
+    // after the background service's own cycle already dialed it).
+    private const val ONION_SYNC_INTERVAL_MS = 45_000L
+
+    // address -> last dial attempt's wall-clock millis (onion peers only).
+    // Object-level (SyncRunner is itself a process-wide singleton), so
+    // consecutive runSync calls across the foreground module and the
+    // background service's cycles share the same throttle window per
+    // address. Access is already serialized by syncLock (every runSync call
+    // holds it for the call's full duration), so a plain mutable map is
+    // sufficient -- no separate synchronization needed.
+    private val lastOnionSync: MutableMap<String, Long> = mutableMapOf()
+
+    /** The `.onion` host part of `addr` ("host:port"), or null if `addr` is
+     *  null/empty or its host doesn't end in `.onion` -- byte-faithful port
+     *  of hearth's `tor.onion_host` (tor.py:44-54). */
+    internal fun onionHost(addr: String?): String? {
+        if (addr.isNullOrEmpty()) return null
+        val host = addr.substringBeforeLast(":")
+        return if (host.endsWith(".onion")) host else null
+    }
+
+    /** True if `peerAddr` is OUR OWN published onion service -- never dial
+     *  ourselves (mirrors sync.py:282-286's host-keyed self-skip). Host-
+     *  keyed, not identity-keyed or full-address-keyed: a paired sibling
+     *  device (the home node) shares our identity_pub but runs its OWN onion
+     *  service and is a legitimate peer to dial, while a same-host row at a
+     *  DIFFERENT port is still recognized as our own service (an onion host
+     *  uniquely identifies one service regardless of the stored port).
+     *  `ownGossipAddr` null or non-onion (not yet published, or publish
+     *  never ran this boot) never skips anything. */
+    internal fun shouldSkipOwnOnion(peerAddr: String, ownGossipAddr: String?): Boolean {
+        val ownHost = onionHost(ownGossipAddr) ?: return false
+        return onionHost(peerAddr) == ownHost
+    }
+
+    /** True if `addr` was dialed within the last `intervalMs` and this dial
+     *  should be SKIPPED -- mirrors sync.py:287-292's onion throttle. Records
+     *  `now` into `lastOnionSync` ONLY on the allow (non-throttled) path,
+     *  exactly like sync.py's `self._last_onion_sync[addr] = t`, which runs
+     *  right before the dial and is never reached on the skipped branch --
+     *  so a throttled call never refreshes the window (a burst of back-to-
+     *  back calls all skip until the ORIGINAL window elapses, not a rolling
+     *  one). An address never seen before is never throttled (first dial for
+     *  a given address is always allowed). Applies only to onion addresses
+     *  by convention of the caller (`runSync` gates this call on `isOnion`);
+     *  the function itself doesn't care what kind of address string it's
+     *  given. */
+    internal fun shouldThrottle(
+        addr: String,
+        lastOnionSync: MutableMap<String, Long>,
+        now: Long,
+        intervalMs: Long = ONION_SYNC_INTERVAL_MS,
+    ): Boolean {
+        val last = lastOnionSync[addr]
+        if (last != null && now - last < intervalMs) return true
+        lastOnionSync[addr] = now
+        return false
+    }
+
+    /** THE SECURITY-CRITICAL decision (friend-peering Task 4): should we
+     *  accept `peerCertIdentity` (the AUTH'd cert's identity_pub, already
+     *  signature-verified by `authOnlyOverStream`) as the peer we intended
+     *  to sync with? Two independent gates:
+     *   1. `peerCertIdentity` must be a KNOWN identity (friend OR our own
+     *      home identity -- `knownIdentities` carries both) -- an unknown
+     *      stranger is refused even though its signature verified fine (AUTH
+     *      proves the peer CONTROLS that identity's device key, not that we
+     *      trust that identity at all).
+     *   2. If `expectedIdentity` (the dialed peer ROW's own `identityPub`,
+     *      when known) is non-null, the AUTH'd identity must equal it
+     *      exactly -- a KNOWN-but-different identity answering at a peer row
+     *      we expected a SPECIFIC identity at is refused: a wrong/hostile
+     *      node squatting on a friend's stored address slot must not be
+     *      synced as if it were the expected friend, even if it separately
+     *      authenticates as some OTHER identity we happen to know.
+     *  `expectedIdentity == null` (address-only peer row, identity not yet
+     *  confirmed) skips gate 2 entirely -- gate 1 (known-identity) is still
+     *  the full refusal boundary for that row. Was, pre-Task-4, a single
+     *  hardcoded `peerCert.identity_pub != fx.cert.identity_pub` (home-only)
+     *  check in `runTransport`. */
+    internal fun acceptPeerIdentity(
+        peerCertIdentity: String,
+        expectedIdentity: String?,
+        knownIdentities: Collection<String>,
+    ): Boolean {
+        if (peerCertIdentity !in knownIdentities) return false
+        if (expectedIdentity != null && peerCertIdentity != expectedIdentity) return false
+        return true
+    }
+
+    /** Runs one peer's transport, draining blobs FROM THAT PEER across
+     *  multiple rounds if needed (friend-peering Task 4 -- the per-peer
+     *  scoping of what was, pre-Task-4, `runSync`'s own single-peer drain
+     *  loop; see `MAX_DRAIN_ROUNDS`'s doc for the unchanged drain
+     *  rationale). A SelfRevoked or failed/unsuccessful first attempt
+     *  returns immediately without entering the drain loop at all -- the
+     *  caller (`runSync`) is what acts on `selfRevoked` (enterRevokedState +
+     *  stop dialing any further peer this round). */
+    private fun syncOnePeer(
+        ctx: Context,
+        fx: KotlinHandshake.Fixture,
+        peer: Peer,
+        onProgress: (String, Int) -> Unit,
+    ): SyncOutcome {
+        var last = runTransport(ctx, fx, peer, onProgress)
+        if (last.selfRevoked || !last.ran || !last.ok) return last
+        var rounds = 1
+        while (rounds < MAX_DRAIN_ROUNDS &&
+                runCatching { anyBlobsMissing(ctx) }.getOrDefault(false)) {
+            val before = last.blobs
+            val next = runTransport(ctx, fx, peer, onProgress)
+            rounds++
+            if (!next.ran || !next.ok) return last   // keep the last good outcome; next cycle retries
+            last = next
+            if (next.blobs <= before) break          // no new blobs this round -> peer holds no more
+        }
+        return last
+    }
+
+    /** Folds every dialed peer's `SyncOutcome` (friend-peering Task 4) into
+     *  the single `SyncOutcome` `runSync` returns to its peer-unaware
+     *  callers (`TorManagerModule.syncNow`, `TorNodeService.syncCycle`).
+     *  Per-peer resilience (one offline/refused peer never kills the round)
+     *  means `ok` is true if ANY dialed peer's sync succeeded, not only when
+     *  ALL did: a friend being offline while the home node syncs fine is a
+     *  routine, healthy round, not a failure worth flagging red in the UI or
+     *  skipping the decrypt-pass `TorManagerModule.syncNow` gates on
+     *  `outcome.ok` for. Counts sum across every peer -- a failed/refused
+     *  peer's `SyncOutcome` always carries all-0 counts (`mapSyncResult`'s
+     *  SelfRevoked/Failed branches), so summing unconditionally is safe and
+     *  reduces, for the single-peer (home-node-only) case, to exactly that
+     *  peer's own outcome. `error` is display text only (see
+     *  `TorManagerModule`'s own doc on `reason`) -- null once anything
+     *  succeeded (nothing useful to show), else every distinct failure
+     *  reason joined, so a fully-failed round still surfaces diagnostic
+     *  text rather than a bare fallback string. An EMPTY `results` (every
+     *  peer skipped by own-onion/throttle, or an empty peer table) is a
+     *  no-op success: nothing was wrong, there was simply nothing to dial. */
+    private fun aggregate(results: List<SyncOutcome>): SyncOutcome {
+        if (results.isEmpty()) return SyncOutcome(true, true, 0, 0, 0, false, null)
+        val anyOk = results.any { it.ok }
+        val messages = results.sumOf { it.messages }
+        val blobs = results.sumOf { it.blobs }
+        val identities = results.sumOf { it.identities }
+        val selfRevoked = results.any { it.selfRevoked }   // always false in practice -- runSync
+                                                             // returns as soon as one fires, before
+                                                             // it ever reaches this fold
+        val error = if (anyOk) null
+                    else results.mapNotNull { it.error }.distinct().joinToString("; ").ifEmpty { "sync failed" }
+        return SyncOutcome(true, anyOk, messages, blobs, identities, selfRevoked, error)
+    }
+
     /** The transport block, moved verbatim from `TorManagerModule.syncNow`.
      *  Every fragile step closes the Tor stream on failure: `authOnlyOverStream`
      *  leaves the stream OPEN by contract (only `KotlinSync.run`'s finally
@@ -168,10 +361,11 @@ object SyncRunner {
     private fun runTransport(
         ctx: Context,
         fx: KotlinHandshake.Fixture,
+        peer: Peer,
         onProgress: (String, Int) -> Unit,
     ): SyncOutcome {
         try {
-            val (host, port) = KotlinHandshake.splitAddr(fx.onion_addr)
+            val (host, port) = KotlinHandshake.splitAddr(peer.address)
             val stream = TorStream(TorEngine.dial(host, port))
 
             // AUTH ONLY -- do NOT use KotlinHandshake.run/runOverStream here: their
@@ -188,20 +382,13 @@ object SyncRunner {
                 return SyncOutcome(true, false, 0, 0, 0, false, "auth: ${e.message}")
             }
 
-            // authOnlyOverStream verifies the peer cert is validly signed but does
-            // NOT pin it to our home identity (only runOverStream's accepted branch
-            // does that). Pin here so a wrong onion address can never sync us into
-            // a stranger's node.
-            if (peerCert.identity_pub != fx.cert.identity_pub) {
-                stream.close()
-                return SyncOutcome(true, false, 0, 0, 0, false, "auth: node identity is not our home identity")
-            }
-
             // SqliteSyncStore construction / addIdentity are SQLite I/O and can throw
             // (e.g. DB locked). authOnlyOverStream succeeding leaves the stream open
             // by contract -- only KotlinSync.run's finally closes it -- so a failure
             // here, before KotlinSync.run ever runs, must close the stream itself or
-            // the Tor connection leaks for the process lifetime.
+            // the Tor connection leaks for the process lifetime. Moved ahead of the
+            // identity-acceptance check below (friend-peering Task 4): that check now
+            // needs `store.knownIdentities()`, so the store must exist first.
             val store = try {
                 SqliteSyncStore(ctx).also { it.addIdentity(fx.cert.identity_pub) }
             } catch (e: Exception) {
@@ -211,6 +398,22 @@ object SyncRunner {
             // (own identity is seeded above, inside the try, so ingest's is_known
             // gate admits its own-identity messages; the HAVE phase adds the node's
             // known identities.)
+
+            // THE SECURITY CHANGE (friend-peering Task 4): authOnlyOverStream
+            // verifies the peer cert is validly signed but does NOT pin it to any
+            // particular identity -- pin it here so dialing a peer row can never
+            // sync us into a stranger's node. Was a single hardcoded `==
+            // fx.cert.identity_pub` (home-only, pre-Task-4); now accepts ANY known
+            // identity (friend or our own home identity -- store.knownIdentities()
+            // carries both) at an address-only peer row, AND, when this peer row
+            // names an expected identity (`peer.identityPub`), requires the AUTH'd
+            // cert to match it exactly -- see acceptPeerIdentity's doc for the full
+            // reasoning (the wrong-address guard).
+            if (!acceptPeerIdentity(peerCert.identity_pub, peer.identityPub, store.knownIdentities())) {
+                stream.close()
+                store.close()
+                return SyncOutcome(true, false, 0, 0, 0, false, "auth: peer identity not accepted")
+            }
 
             // This device's own enc keypair (generated once, persisted --
             // EncKeys.getOrCreate), the already-published guard
