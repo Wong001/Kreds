@@ -14,12 +14,33 @@ import org.json.JSONObject
  *
  *  B.2's scope fence (own-authored content ONLY) is GONE as of B.2c --
  *  replaced by a per-message entitlement rule (see resolveWrap): a post's
- *  grant must be signed by the post's own author; a DM's grant must be
+ *  grant must be signed by the post's own author OR (Task 3, below) by our
+ *  own identity when the author is a known friend; a DM's grant must be
  *  signed by the DM's author OR, only when WE are the DM's recipient, by
  *  our own identity (hearth's recipient-signed backfill). Friend-authored
  *  content is therefore now readable, but ONLY via a grant signed by an
  *  entitled identity -- never via a grant from anyone else, however
  *  "recipient-shaped" that grant's target/wraps make it look.
+ *
+ *  Task 3 (recipient-post-regrants) extends the post half of that rule: a
+ *  post's grant is ALSO trusted when signed by OUR OWN identity AND the
+ *  post's author is a KNOWN identity (a friend) other than ourselves --
+ *  hearth's `maintain_received_post_grants` backfill (node.py:2261+),
+ *  consumed on the read side by `_content_key`'s KIND_POST branch
+ *  (node.py:2966-2999). This lets a second own device with no inline wrap
+ *  and no author-side coverage still unwrap a friend's post via a grant WE
+ *  minted for it. On a same-device collision -- both an author-signed AND
+ *  an own-recipient-signed grant wrap this device, with DIFFERENT keys --
+ *  the AUTHOR-SIGNED grant wins UNCONDITIONALLY, never "whichever is
+ *  chronologically newest" (mirrors node.py's `grants = {**recipient_
+ *  grants, **grants}`, where the author-signed dict is merged in LAST and
+ *  so always overrides): the author-signed grant is the audience-scoped,
+ *  canonical one (re-minted on the AUTHOR's own enc-key rotation), while
+ *  the recipient-signed one exists purely to backfill a gap that sweep has
+ *  not yet reached, never to override it. As with the DM half above, an
+ *  own-recipient-signed grant is trusted ONLY when genuinely signed by our
+ *  own identity for a genuinely-known author -- never a third identity's
+ *  grant, however "recipient-shaped" it looks.
  *
  *  Anything that fails at ANY step -- no wrap/grant for this device, a
  *  wrong-device or tampered wrap/body that fails AEAD auth, a malformed
@@ -464,33 +485,66 @@ object DecryptPass {
      *  the newest grant, matching hearth's own per-device latest-wins
      *  semantics (store.wrap_grants' `out.update(...)` fold).
      *
-     *  Entitlement set (B.2c): posts trust a grant from the post's own
-     *  author only (unchanged rule from B.2 -- friend authors are now
-     *  allowed to BE that author, since the outer own-author-only filter is
-     *  gone). DMs trust the author OR the recipient (our own identity) --
-     *  but recipient-trust applies ONLY when we ARE that DM's recipient
-     *  (`payload["to"] == ownIdentityPub`); a hostile "recipient-signed"
-     *  grant from any other identity, targeting a DM not addressed to us,
-     *  must never be trusted just because its shape looks like a recipient
-     *  backfill grant. */
+     *  Entitlement set (B.2c, extended by Task 3 for posts): posts trust a
+     *  grant from the post's own author FIRST (unchanged rule from B.2 --
+     *  friend authors are now allowed to BE that author, since the outer
+     *  own-author-only filter is gone) and, ONLY when no author-signed
+     *  grant covers this device, a grant WE (own identity) signed for the
+     *  post -- but ONLY when the post's author is a KNOWN identity (a
+     *  friend) other than ourselves (mirrors hearth's `author in store.
+     *  known_identities()` guard, node.py:2982-2983 -- an own post's own-
+     *  device coverage is `maintain_own_device_grants`' job, already
+     *  covered by the author-signed branch above since we ARE that
+     *  author). This two-step, author-first order is what makes the
+     *  author-signed grant win UNCONDITIONALLY on a same-device collision,
+     *  not merely "whichever is newest" -- see this file's top-of-file doc
+     *  for the full rationale, matching node.py's `_content_key` KIND_POST
+     *  branch (node.py:2966-2999) exactly. DMs trust the author OR the
+     *  recipient (our own identity) -- but recipient-trust applies ONLY
+     *  when we ARE that DM's recipient (`payload["to"] == ownIdentityPub`);
+     *  a hostile "recipient-signed" grant from any other identity,
+     *  targeting a DM not addressed to us, must never be trusted just
+     *  because its shape looks like a recipient backfill grant. */
     @Suppress("UNCHECKED_CAST")
     private fun resolveWrap(store: SyncStore, m: StoredMsg, phoneDevicePub: String, ownIdentityPub: String): Map<String, Any?>? {
         (m.payload["wraps"] as? Map<*, *>)?.get(phoneDevicePub)?.let {
             return it as? Map<String, Any?>
         }
-        // posts: grants trusted from the author only (unchanged rule, friend
-        // authors now allowed). DMs: author OR the recipient (own identity), and
-        // recipient-trust applies only when WE are the DM's recipient -- a
-        // hostile "recipient-signed" grant from anyone else stays untrusted.
-        val to = m.payload["to"] as? String
-        val accepted: Set<String> = when {
-            m.kind == "post" -> setOf(m.identityPub)
-            m.kind == "dm" && to == ownIdentityPub -> setOf(m.identityPub, ownIdentityPub)
-            else -> setOf(m.identityPub)
+        if (m.kind == "post") {
+            // Author-signed first, always -- if it covers this device, it
+            // wins, full stop, regardless of whether a recipient-signed
+            // grant also exists or is chronologically newer (see this
+            // function's own doc + the file-top doc for why that order is
+            // load-bearing, not incidental).
+            newestGrantWrap(store, m.msgId, setOf(m.identityPub), phoneDevicePub)?.let { return it }
+            // Recipient-signed fallback (Task 3): only reached when the
+            // author-signed branch above found nothing for this device,
+            // and only trusted when the author is a currently-known friend
+            // (not ourselves) -- mirrors node.py:2982-2983 exactly.
+            return if (m.identityPub != ownIdentityPub && m.identityPub in store.knownIdentities())
+                newestGrantWrap(store, m.msgId, setOf(ownIdentityPub), phoneDevicePub)
+            else null
         }
-        val grants = store.wrapGrantsFor(m.msgId, accepted)
+        // DMs (and any other kind, defensively): author OR the recipient
+        // (own identity), and recipient-trust applies only when WE are the
+        // DM's recipient -- a hostile "recipient-signed" grant from anyone
+        // else stays untrusted. Unchanged from B.2c.
+        val to = m.payload["to"] as? String
+        val accepted: Set<String> =
+            if (m.kind == "dm" && to == ownIdentityPub) setOf(m.identityPub, ownIdentityPub) else setOf(m.identityPub)
+        return newestGrantWrap(store, m.msgId, accepted, phoneDevicePub)
+    }
+
+    /** Folds wrapGrantsFor's oldest-to-newest result, keeping the LAST
+     *  match for `phoneDevicePub` -- i.e. the newest grant among `signers`
+     *  alone. Extracted once both resolveWrap's post branch (two separate
+     *  single-signer-set calls, author then recipient, mirroring node.py's
+     *  two separate `store.wrap_grants` calls) and its DM/else branch (one
+     *  combined-signer-set call) need the identical fold. */
+    @Suppress("UNCHECKED_CAST")
+    private fun newestGrantWrap(store: SyncStore, msgId: String, signers: Set<String>, phoneDevicePub: String): Map<String, Any?>? {
         var newest: Map<String, Any?>? = null
-        for (wraps in grants) {
+        for (wraps in store.wrapGrantsFor(msgId, signers)) {
             (wraps[phoneDevicePub] as? Map<String, Any?>)?.let { newest = it }
         }
         return newest

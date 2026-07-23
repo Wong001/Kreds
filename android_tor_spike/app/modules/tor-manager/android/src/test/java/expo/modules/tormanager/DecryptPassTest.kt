@@ -381,6 +381,209 @@ class DecryptPassTest {
             0, out.size)
     }
 
+    // -- Task 3 (recipient-post-regrants): posts also trust a grant WE
+    // (own identity) signed for a friend's post, hearth's
+    // maintain_received_post_grants backfill (node.py:2261+) consumed on
+    // the read side by _content_key's KIND_POST branch (node.py:2966-
+    // 2999). Mirrors the DM recipient-trust tests above structurally, but
+    // gated on "author is a known friend, not ourselves" rather than a
+    // per-message `to` field (posts carry no addressee).
+
+    @Test fun friendPostDecryptsViaOwnRecipientSignedGrant() {
+        // Friend-authored post, NOT wrapped inline and with NO author-signed
+        // grant at all -- an own-recipient-signed grant is the ONLY path to
+        // the content key. Uses case 4 (a post whose body carries real blob
+        // refs, same fixture case surfacesBlobsFromBodyAndThumbsFrom
+        // PayloadAlongsideContentKey uses) so this also proves the blob
+        // content key is recovered via this new path, not just the text.
+        val c = cases().getJSONObject(4)
+        assertEquals("post", c.getString("kind"))
+        val expectedText = c.getJSONObject("plaintext").getString("text")
+        val expectedBlobs = jsonStringList(c.getJSONObject("plaintext").getJSONArray("blobs"))
+        assertTrue("fixture precondition: this case's body actually carries blob refs",
+            expectedBlobs.isNotEmpty())
+
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))         // the friend who posted
+        store.addIdentity(phoneOwnIdentityPub)            // our own identity, also known to itself
+
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "12".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val grantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        // Signed by OUR OWN identity, not the post's author.
+        val grant = signedMessage(phoneOwnIdentityPub, 1, grantPayload, "13".repeat(32))
+        assertTrue(store.ingestMessage(grant))
+
+        val result = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub)
+        assertEquals("friend post must decrypt via an own-recipient-signed grant alone",
+            1, result.feed.size)
+        assertEquals(expectedText, result.feed[0].text)
+        assertEquals(expectedBlobs, result.feed[0].blobs)
+        assertArrayEquals(
+            "the blob content key must also be recovered via the recipient-signed grant",
+            KotlinWire.fromHex(c.getString("content_key")), result.keys[msg.msgId()])
+    }
+
+    @Test fun thirdIdentityRecipientShapedGrantSkipped() {
+        // Same shape as the positive test above, but the "recipient-style"
+        // grant is signed by a THIRD identity -- neither the post's author
+        // NOR our own identity. Must stay untrusted regardless of how
+        // genuinely valid the wrap inside it is (mirrors
+        // skipsReceivedDmGrantSignedByAHostileThirdIdentity's DM analog).
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        store.addIdentity(phoneOwnIdentityPub)
+        store.addIdentity(foreignIdentityPub)   // the hostile third identity, also known
+
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "14".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val grantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        // Signed by neither the author nor our own identity.
+        val hostileGrant = signedMessage(foreignIdentityPub, 1, grantPayload, "15".repeat(32))
+        assertTrue(store.ingestMessage(hostileGrant))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
+        assertEquals("a third-identity-signed 'recipient-style' grant for a post must never be trusted",
+            0, out.size)
+    }
+
+    /** Thin delegate overriding ONLY knownIdentities() -- lets a test
+     *  simulate "the post's author is no longer a known friend" (e.g.
+     *  unfriended after the post already synced) while still letting the
+     *  underlying InMemorySyncStore ingest messages SIGNED BY that identity
+     *  (ingestMessage's own is_known gate reads its own private `identities`
+     *  set, never this override). Same delegate idiom as this file's
+     *  existing TargetInjectingStore (see responsesPass tests below). */
+    private class KnownIdentitiesOverrideStore(
+        private val backing: InMemorySyncStore, private val overrideKnown: List<String>,
+    ) : SyncStore by backing {
+        override fun knownIdentities(): List<String> = overrideKnown
+    }
+
+    @Test fun ownGrantForNonFriendAuthorSkipped() {
+        // Task 3's entitlement gate: the recipient-signed fallback requires
+        // `author in store.knownIdentities()` (mirrors hearth's `author in
+        // self.store.known_identities()`, node.py:2982-2983) -- an
+        // own-signed grant for a post whose author we do NOT currently
+        // regard as a friend must never be trusted, however genuine the
+        // wrap inside it.
+        val c = cases().getJSONObject(0)
+        val backing = InMemorySyncStore()
+        backing.addIdentity(c.getString("author"))       // known AT INGEST TIME...
+        backing.addIdentity(phoneOwnIdentityPub)
+
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "16".repeat(32))
+        assertTrue(backing.ingestMessage(msg))
+
+        val grantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        val grant = signedMessage(phoneOwnIdentityPub, 1, grantPayload, "17".repeat(32))
+        assertTrue(backing.ingestMessage(grant))
+
+        // ...but knownIdentities() no longer reports the author (e.g.
+        // unfriended after the post synced) -- the gate must read THIS.
+        val store = KnownIdentitiesOverrideStore(backing, listOf(phoneOwnIdentityPub))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
+        assertEquals("an own-signed grant for a non-friend author's post must be skipped", 0, out.size)
+    }
+
+    @Test fun authorSignedPathByteUnchanged() {
+        // Regression: the pre-existing author-signed grant path (posts'
+        // original B.2c entitlement rule) must resolve identically after
+        // adding the Task 3 recipient-signed fallback -- an author-signed
+        // grant, when present, is still tried FIRST and is still
+        // sufficient on its own (same scenario as
+        // decryptsFriendAuthoredPostViaAuthorSignedGrant above, re-asserted
+        // here as this task's own named regression gate).
+        val c = cases().getJSONObject(0)
+        assertEquals("post", c.getString("kind"))
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "18".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        val grantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at"),
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        val grant = signedMessage(c.getString("author"), 2, grantPayload, "18".repeat(32))
+        assertTrue(store.ingestMessage(grant))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
+        assertEquals("author-signed grant path must still resolve identically", 1, out.size)
+        assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
+    }
+
+    @Test fun authorSignedGrantWinsOverOwnRecipientGrantOnCollision() {
+        // Task 3's collision rule, byte-identical to hearth's
+        // _content_key KIND_POST branch (node.py:2966-2999, `grants =
+        // {**recipient_grants, **grants}`): when BOTH an author-signed
+        // grant AND an own-recipient-signed grant wrap this device, the
+        // AUTHOR-SIGNED one must win -- unconditionally, not merely
+        // "whichever is chronologically newest". The recipient-signed
+        // grant here is deliberately NEWER (created_at) and carries a
+        // BOGUS wrap that would fail to decrypt if it were ever tried -- a
+        // naive "combine both signers into one newest-wins fold"
+        // implementation (the DM branch's OWN structural shape) would
+        // incorrectly prefer it and the post would vanish from the feed;
+        // author-priority must keep it decrypting.
+        val c = cases().getJSONObject(0)
+        val store = InMemorySyncStore()
+        store.addIdentity(c.getString("author"))
+        store.addIdentity(phoneOwnIdentityPub)
+
+        val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
+        val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "19".repeat(32))
+        assertTrue(store.ingestMessage(msg))
+
+        // Author-signed grant: OLDER created_at, the REAL wrap.
+        val authorGrantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at") - 10.0,
+            "wraps" to mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap"))),
+        )
+        val authorGrant = signedMessage(c.getString("author"), 2, authorGrantPayload, "1a".repeat(32))
+        assertTrue(store.ingestMessage(authorGrant))
+
+        // Own-recipient-signed grant: NEWER created_at, a bogus (syntactically
+        // valid, semantically wrong) wrap.
+        val bogusWrap = mapOf("eph_pub" to "ab".repeat(32), "nonce" to "cd".repeat(12), "wrapped_key" to "ef".repeat(48))
+        val recipientGrantPayload = mapOf(
+            "kind" to "wrap_grant", "target" to msg.msgId(),
+            "created_at" to c.getDouble("created_at") + 10.0,
+            "wraps" to mapOf(phoneDevicePub to bogusWrap),
+        )
+        val recipientGrant = signedMessage(phoneOwnIdentityPub, 1, recipientGrantPayload, "1b".repeat(32))
+        assertTrue(store.ingestMessage(recipientGrant))
+
+        val out = DecryptPass.run(store, phoneDevicePub, c.getString("enc_priv"), phoneOwnIdentityPub).feed
+        assertEquals(
+            "author-signed grant must win on collision even though the recipient-signed grant is chronologically newer",
+            1, out.size)
+        assertEquals(c.getJSONObject("plaintext").getString("text"), out[0].text)
+    }
+
     @Test fun ownPostAndOwnSentDmStillDecryptTogetherNewestFirst() {
         // Brief behavior (d)+(e) combined: the B.2 own-content regression
         // (an own-authored post AND an own-sent DM both still decrypt) PLUS
