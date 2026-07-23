@@ -148,7 +148,15 @@ import org.junit.Test
  *  or a message that SHOULD be entitled would be silently dropped by the
  *  real node's own admission gate, masquerading as an over-serve-negative
  *  false pass. */
-private fun signedMsg(
+// Hoisted to `internal` (Task 8, phone-onion-reachability -- loopback gate:
+// revoke + defriend at the real wire): SyncRevokeLoopbackTest.kt reuses
+// signedMsg/wrapsFor/dialSpec/spawnDialNode/readDialEvent/awaitDialExit
+// verbatim -- same "REAL hearth node dials the phone" harness this file's
+// own class doc introduced, just proving the revoke/defriend gates instead
+// of the plain routing/entitlement/stranger ones. `certWireMap` stays
+// `private`: it is only ever called from `dialSpec`, which lives in THIS
+// file, so nothing outside it needs to see it directly.
+internal fun signedMsg(
     cert: KotlinWire.CertDict, devicePriv: String, seq: Int, payload: Map<String, Any?>,
 ): SignedMessage {
     val unsigned = SignedMessage(cert, seq, payload, "")
@@ -162,7 +170,7 @@ private fun signedMsg(
  *  never decrypt fidelity (already covered by phoneDecryptsRealBackfilled
  *  Content/phoneReadsFriendContentEndToEnd in SyncLoopbackTest.kt), so the
  *  wrapped-key bytes never need to actually unwrap to anything. */
-private fun wrapsFor(vararg devicePubs: String): Map<String, Any?> =
+internal fun wrapsFor(vararg devicePubs: String): Map<String, Any?> =
     devicePubs.associateWith {
         mapOf("eph_pub" to "00".repeat(32), "nonce" to "00".repeat(12), "wrapped_key" to "ab".repeat(16))
     }
@@ -178,7 +186,7 @@ private fun certWireMap(c: KotlinWire.CertDict): Map<String, Any?> = mapOf(
  *  own doc for the exact shape). Serialized via `KotlinWire.dumps`, NOT
  *  `org.json` -- see this file's class doc for why that distinction is
  *  load-bearing for the embedded cert's `enrolled_at` float. */
-private fun dialSpec(
+internal fun dialSpec(
     scenario: String, port: Int, identityPriv: String, devicePriv: String,
     devicePub: String, deviceName: String, cert: KotlinWire.CertDict,
     alsoKnown: List<String> = emptyList(),
@@ -214,7 +222,7 @@ private fun dialSpec(
  *  even a loud failure at this end, since the process still launches and
  *  only fails deep inside python's `json.loads` on the mangled text. A
  *  file path contains no quote characters and sidesteps the whole problem. */
-private fun spawnDialNode(jsonSpec: String): Pair<Process, BufferedReader> {
+internal fun spawnDialNode(jsonSpec: String): Pair<Process, BufferedReader> {
     val repo = findRepoRoot()
     val venvPy = File(repo, ".venv/Scripts/python.exe")
     val script = File(repo, "android_tor_spike/tools/sync_loopback_node.py")
@@ -233,7 +241,7 @@ private fun spawnDialNode(jsonSpec: String): Pair<Process, BufferedReader> {
  *  crashed before printing anything), dumps stderr for diagnostics and
  *  fails loudly -- mirrors `spawnNode`'s own "no line -> dump stderr"
  *  failure shape (SyncLoopbackTest.kt). */
-private fun readDialEvent(proc: Process, stdout: BufferedReader): JSONObject {
+internal fun readDialEvent(proc: Process, stdout: BufferedReader): JSONObject {
     val line = stdout.readLine()
         ?: run {
             val err = proc.errorStream.bufferedReader().readText()
@@ -247,7 +255,7 @@ private fun readDialEvent(proc: Process, stdout: BufferedReader): JSONObject {
  *  line -- this just bounds how long the test waits for that exit before
  *  giving up and forcing it, so a hung child process can never wedge the
  *  JVM test runner. */
-private fun awaitDialExit(proc: Process) {
+internal fun awaitDialExit(proc: Process) {
     if (!proc.waitFor(10, TimeUnit.SECONDS)) proc.destroyForcibly()
 }
 
