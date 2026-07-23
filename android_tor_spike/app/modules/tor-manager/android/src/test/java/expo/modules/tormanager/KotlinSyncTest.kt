@@ -552,6 +552,12 @@ class KotlinSyncTest {
         val fixture = buildFixture("aa".repeat(32))
         val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
         val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+        // In production the peer only ever reaches serve() after
+        // respondHandshake's isKnown gate already confirmed it -- needed
+        // explicitly here as of the Task 5 mid-session re-check, which now
+        // consults knownIdentities() for peerCert.identity_pub right after
+        // DEFRIENDS, before HAVE/MESSAGES/BLOBS.
+        store.addIdentity(peerPub)
 
         val smallData = ByteArray(10) { it.toByte() }
         val largeData = ByteArray(200) { it.toByte() }
@@ -599,6 +605,12 @@ class KotlinSyncTest {
     @Test fun serveOwnDeviceSiblingPeerAdoptsPeersKnownIdentities() {
         val store = InMemorySyncStore()
         val ownIdentityPub = "aa".repeat(32)
+        // Mirrors production seeding (KotlinPairing.kt / SyncRunner.kt: own
+        // identity_pub is always known by the time serve() runs) -- needed
+        // as of the Task 5 mid-session re-check, which now consults
+        // knownIdentities() for peerCert.identity_pub (here, the sibling's
+        // claimed identity == our own) right after DEFRIENDS, before HAVE.
+        store.addIdentity(ownIdentityPub)
         val fixture = buildFixture(ownIdentityPub)
         val siblingDevPriv = "bb".repeat(32)
         val peerCert = KotlinWire.CertDict(ownIdentityPub, devPub(siblingDevPriv), "Sibling Phone", 1752900000.0, "")
@@ -898,5 +910,102 @@ class KotlinSyncTest {
         assertTrue("own identity still known -- guard fired before any removal",
             store.knownIdentities().contains(ownIdentity))
         assertEquals(0, stream.written[1].getJSONArray("applied").length())
+    }
+
+    // =======================================================================
+    // serve() -- mid-session re-check (phone-onion-reachability Task 5,
+    // closes the arc-1 whole-branch-review blocking finding). Mirrors
+    // sync.py:741-758: AFTER REVOCATIONS+DEFRIENDS have run, if the peer
+    // is no longer known OR its device is revoked, the session ends there
+    // -- no HAVE/MESSAGES/BLOBS. Only revocations+defriends frames are
+    // ever written; a RespondingStream with no further queued frames
+    // proves serve() never attempts to read past DEFRIENDS (it would throw
+    // "exhausted", surfacing as Failed("io", ...), not Ok, if it did).
+    // =======================================================================
+
+    /** A peer defriended DURING this very session: the notice applied in
+     *  the DEFRIENDS phase (this session's own read, a few lines above the
+     *  re-check) removes the AUTHENTICATED peer's identity from
+     *  knownIdentities() -- the re-check must catch this immediately,
+     *  ending the session before HAVE is ever read/written. */
+    @Test fun serveEndsSessionBeforeHaveWhenPeerDefriendedThisSession() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val fixture = buildFixture(ownIdentity)
+        val (authorPriv, authorPub) = genKeypair()   // the authenticated peer IS the notice's author
+        val authorDevPriv = "44".repeat(32)
+        store.addIdentity(authorPub)
+        val peerCert = KotlinWire.CertDict(authorPub, devPub(authorDevPriv), "Peer", 1752900000.0, "")
+
+        val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to listOf(notice.toDict())),
+            // No further frames queued -- serve() must never read past
+            // DEFRIENDS once the mid-session re-check fires.
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok (session completed, just truncated), got $result", result is SyncResult.Ok)
+        assertFalse("author removed via the notice applied in DEFRIENDS just above",
+            store.knownIdentities().contains(authorPub))
+
+        assertEquals("only revocations+defriends written -- HAVE/MESSAGES/BLOBS never reached",
+            2, stream.written.size)
+        assertEquals("revocations", stream.written[0].getString("t"))
+        assertEquals("defriends", stream.written[1].getString("t"))
+    }
+
+    /** A peer whose DEVICE is already in the revoked set (e.g. marked
+     *  revoked in an earlier session/round, so REVOCATIONS this round has
+     *  nothing new to ingest) -- the re-check must still catch it off the
+     *  store's persisted revoked-device state, ending the session before
+     *  HAVE. */
+    @Test fun serveEndsSessionBeforeHaveWhenPeerDeviceIsRevoked() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerDevPub = devPub(peerDevPriv)
+        val peerCert = KotlinWire.CertDict(peerPub, peerDevPub, "Peer", 1752900000.0, "")
+        store.addIdentity(peerPub)
+        store.markRevoked(peerDevPub, lastValidSeq = 0)   // already revoked, prior to this session
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            // No further frames queued -- same reasoning as above.
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok (session completed, just truncated), got $result", result is SyncResult.Ok)
+        assertEquals("only revocations+defriends written -- HAVE/MESSAGES/BLOBS never reached",
+            2, stream.written.size)
+    }
+
+    /** Regression: an ordinary KNOWN, non-revoked peer is unaffected by the
+     *  Task 5 re-check -- all six phases still run to completion. Guards
+     *  against the re-check false-positiving (e.g. an inverted condition
+     *  that would end every session early). */
+    @Test fun serveContinuesThroughAllPhasesForOrdinaryKnownNonRevokedPeer() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+        store.addIdentity(peerPub)
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertEquals("all six phases reached -- known, non-revoked peer is unaffected by the Task 5 re-check",
+            6, stream.written.size)
     }
 }

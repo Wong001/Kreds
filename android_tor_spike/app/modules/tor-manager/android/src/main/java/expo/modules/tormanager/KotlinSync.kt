@@ -483,6 +483,33 @@ object KotlinSync {
             }
             writeFrame(stream, mapOf("t" to "defriends", "notices" to emptyList<Any>(), "applied" to appliedHere))
 
+            // Mid-session re-check (phone-onion-reachability Task 5, closes
+            // the arc-1 whole-branch-review blocking finding -- mirrors
+            // sync.py:741-758): re-consult BOTH the revoked-device set and
+            // knownIdentities() AFTER REVOCATIONS and DEFRIENDS (both just
+            // above) have already run -- either phase may have just changed
+            // the answer THIS round: a peer revocation cert ingested during
+            // REVOCATIONS can mark peerCert.device_pub revoked, and a
+            // defriend notice applied during DEFRIENDS (just above) can
+            // remove peerCert.identity_pub from knownIdentities() (this is
+            // exactly the "defriended mid-session" case -- the peer's own
+            // notice, applied a few lines up, is what makes isKnown go
+            // false right here). Deliberately NO own-identity exemption
+            // here, unlike respondHandshake's AUTH-phase gate: that
+            // exemption exists ONLY so a revoked sibling can still receive
+            // the REVOCATIONS/DEFRIENDS exchange above and learn of its own
+            // revocation; once that exchange has happened, a revoked or
+            // defriended peer gets nothing further -- no HAVE/MESSAGES/
+            // BLOBS -- sibling or not, exactly like hearth. Ends the session
+            // as an ordinary Ok, not a Failed: the session so far completed
+            // successfully, it simply has nothing left to serve (mirrors
+            // sync.py's own plain `return peer_identity, applied_by_peer`,
+            // not an exception).
+            if (!store.knownIdentities().contains(peerCert.identity_pub) || store.isRevokedDevice(peerCert.device_pub)) {
+                val st = store.stats()
+                return SyncResult.Ok(st.messages, st.blobs, st.identities)
+            }
+
             // -- HAVE -- (responder: read peer's first, THEN write ours)
             val have = readFrame(stream)
             writeFrame(stream, mapOf("t" to "have",

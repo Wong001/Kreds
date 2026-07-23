@@ -191,7 +191,8 @@ class GossipServer(
             lock.lock()
             try {
                 val result = KotlinHandshake.respondHandshake(
-                    stream, fixture, isKnown = { store.knownIdentities().contains(it) })
+                    stream, fixture, isKnown = { store.knownIdentities().contains(it) },
+                    isRevoked = { store.isRevokedDevice(it) })
                 if (result is KotlinHandshake.HandshakeResult.Ok) {
                     KotlinSync.serve(stream, store, fixture, result.peerCert)
                 }

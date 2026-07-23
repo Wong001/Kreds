@@ -210,4 +210,89 @@ class KotlinHandshakeTest {
 
         assertTrue("respondHandshake must not close the stream", !stream.closed)
     }
+
+    // =======================================================================
+    // Revoked-device gate (phone-onion-reachability Task 5, closes the arc-1
+    // whole-branch-review blocking finding): a KNOWN peer whose device is in
+    // our revoked set is refused post-AUTH, same wire slot/position as the
+    // stranger gate above (respondHandshakeUnknownPeerCompletesAuthThenWritesRefused).
+    // =======================================================================
+
+    /** A KNOWN peer (isKnown=true) whose device IS in the revoked set
+     *  (isRevoked=true) still completes the FULL HELLO+AUTH exchange before
+     *  being refused -- same position-sensitive shape as the stranger gate:
+     *  own HELLO, own AUTH, THEN a bare {"t":"refused"} landing in the wire
+     *  slot a real initiator's REVOCATIONS-swap read recognizes as
+     *  PeerRefused (mirrors sync.py:637-641). */
+    @Test fun respondHandshakeRevokedKnownPeerCompletesAuthThenWritesRefused() {
+        val fixture = buildFixture()
+        val myNonce = "dd44".repeat(4)
+        val (peerIdentityPriv, peerIdentityPub) = genKeypair()
+        val (peerDevicePriv, peerDevicePub) = genKeypair()
+        val peerCert = signedCert(peerIdentityPriv, peerIdentityPub, peerDevicePub)
+        val peerNonce = KotlinHandshake.randomHex16()
+        val peerHello = mapOf("t" to "hello", "cert" to certMap(peerCert), "nonce" to peerNonce)
+        // A genuinely valid device-key proof over OUR nonce -- this peer is
+        // cryptographically legitimate AND known, just revoked.
+        val peerAuth = mapOf("t" to "auth", "sig" to KotlinWire.signRaw(peerDevicePriv, KotlinWire.authBody(myNonce)))
+
+        val stream = RespondingStream(listOf(peerHello, peerAuth))
+        val result = KotlinHandshake.respondHandshake(
+            stream, fixture, isKnown = { it == peerIdentityPub },
+            isRevoked = { it == peerDevicePub }, rnd = { myNonce })
+
+        assertTrue("expected Failed, got $result", result is KotlinHandshake.HandshakeResult.Failed)
+        val f = result as KotlinHandshake.HandshakeResult.Failed
+        assertEquals("auth", f.stage)
+        assertEquals("revoked", f.reason)
+
+        assertEquals("own HELLO, own AUTH, THEN refused -- full exchange before the gate", 3, stream.written.size)
+        assertEquals("hello", stream.written[0].getString("t"))
+        assertEquals("auth", stream.written[1].getString("t"))
+        assertTrue(KotlinWire.verifyRaw(fixture.device_pub, stream.written[1].getString("sig"), KotlinWire.authBody(peerNonce)))
+        assertEquals("refused", stream.written[2].getString("t"))
+        assertEquals(setOf("t"), stream.written[2].keys().asSequence().toSet())
+
+        assertTrue("respondHandshake must not close the stream", !stream.closed)
+    }
+
+    /** Own-identity exemption (mirrors hearth's comment at sync.py:633-636):
+     *  a SIBLING device (peer's identity_pub == our own fixture identity)
+     *  whose device is in our revoked set is NOT refused here -- this is
+     *  exactly the channel a sibling learns of its own revocation over
+     *  (KotlinSync.serve's REVOCATIONS phase -> SelfRevoked -> wipe), so
+     *  admission must not be blocked before that can happen. */
+    @Test fun respondHandshakeOwnIdentitySiblingExemptFromRevokedGate() {
+        // Built inline (not via buildFixture()) so the identity PRIVATE key
+        // stays in scope -- buildFixture discards it after signing fixture's
+        // own device cert, but a genuine sibling cert must be signed by that
+        // SAME shared identity key, not a fresh/unrelated one (a cert signed
+        // by any other key fails verifyCert's signature check regardless of
+        // what identity_pub it claims).
+        val (identityPriv, identityPub) = genKeypair()
+        val (fixtureDevicePriv, fixtureDevicePub) = genKeypair()
+        val fixtureCert = signedCert(identityPriv, identityPub, fixtureDevicePub, name = "Responder Device")
+        val fixture = KotlinHandshake.Fixture(fixtureDevicePriv, fixtureDevicePub, fixtureCert, "responder.onion:9997")
+
+        val myNonce = "ee55".repeat(4)
+        // Same identity as `fixture` (a sibling device) -- signed with the
+        // SAME identity private key, a different device keypair.
+        val (siblingDevicePriv, siblingDevicePub) = genKeypair()
+        val peerCert = signedCert(identityPriv, identityPub, siblingDevicePub, name = "Sibling Device")
+        assertEquals(fixture.cert.identity_pub, peerCert.identity_pub)
+
+        val peerNonce = KotlinHandshake.randomHex16()
+        val peerHello = mapOf("t" to "hello", "cert" to certMap(peerCert), "nonce" to peerNonce)
+        val peerAuth = mapOf("t" to "auth", "sig" to KotlinWire.signRaw(siblingDevicePriv, KotlinWire.authBody(myNonce)))
+
+        val stream = RespondingStream(listOf(peerHello, peerAuth))
+        val result = KotlinHandshake.respondHandshake(
+            stream, fixture, isKnown = { true }, isRevoked = { it == siblingDevicePub }, rnd = { myNonce })
+
+        assertTrue("own-identity sibling must be admitted (Ok) even though its device is revoked -- " +
+            "got $result", result is KotlinHandshake.HandshakeResult.Ok)
+        assertEquals("exactly two frames written: own HELLO then own AUTH, no refused frame",
+            2, stream.written.size)
+        assertTrue("respondHandshake must not close the stream", !stream.closed)
+    }
 }

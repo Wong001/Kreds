@@ -186,12 +186,14 @@ object KotlinHandshake {
      *  "node failed device-key proof" either).
      *
      *  hearth ALSO refuses post-AUTH when the peer's own device is revoked
-     *  in our views (sync.py:635-641, `peer_identity != own` guarded). NOT
-     *  mirrored here: the Kotlin store models no revocations at all yet
-     *  (SyncStore.enckeys' doc comment already documents this as a known
-     *  outbound limitation) -- there is no per-device revocation state to
-     *  consult without new store plumbing, which is out of this task's
-     *  scope. Tracked as a parity follow-up (see task-2-report.md).
+     *  in our views (sync.py:635-641, `peer_identity != own` guarded). NOW
+     *  MIRRORED (phone-onion-reachability Task 5, closing the arc-1
+     *  whole-branch-review blocking finding): the revoked-device gate below,
+     *  same wire slot as the stranger gate just above it, backed by the
+     *  `isRevoked` lambda (SyncStore.isRevokedDevice, plumbed by the store
+     *  primitives/wire-ingest work of Tasks 2-3). Was previously tracked as
+     *  a parity follow-up (see task-2-report.md) when the store had no
+     *  revocation state to consult at all.
      *
      *  Never closes the stream on any path (including refusal) -- unlike
      *  runOverStream, whose caller (the standalone Tor heartbeat) never
@@ -202,6 +204,12 @@ object KotlinHandshake {
      *  (sync.py:560-567), not the responder itself. */
     fun respondHandshake(
         stream: Stream, fixture: Fixture, isKnown: (identityPub: String) -> Boolean,
+        // Revoked-device check (phone-onion-reachability Task 5), threaded
+        // the same way as `isKnown` -- a lambda, not the store directly, so
+        // this function stays store-agnostic. Defaults to "never revoked" so
+        // every pre-existing call site/test that doesn't care about
+        // revocation compiles and behaves identically unchanged.
+        isRevoked: (devicePub: String) -> Boolean = { false },
         rnd: () -> String = ::randomHex16,
     ): HandshakeResult {
         // HELLO -- read peer's first.
@@ -231,6 +239,25 @@ object KotlinHandshake {
         if (!isKnown(peerCert.identity_pub)) {
             writeFrame(stream, mapOf("t" to "refused"))
             return HandshakeResult.Failed("auth", "refused")
+        }
+
+        // Revoked-device gate (phone-onion-reachability Task 5, mirrors
+        // sync.py:637-641) -- SAME wire slot as the stranger gate just
+        // above (a bare write, no read first, landing where a real
+        // initiator's REVOCATIONS-swap read expects it): a KNOWN peer whose
+        // DEVICE we already hold as revoked (`isRevoked`, backed by
+        // SyncStore.isRevokedDevice) is refused here too, before this
+        // device ever answers REVOCATIONS/DEFRIENDS/HAVE/MESSAGES/BLOBS for
+        // it. Own-identity peers are EXEMPT (guarded by
+        // `peerCert.identity_pub != fixture.cert.identity_pub`), exactly
+        // mirroring hearth's own comment at sync.py:633-636: this is the
+        // very channel a sibling device learns of ITS OWN revocation over
+        // (KotlinSync.serve's REVOCATIONS phase -> SelfRevoked -> wipe), so
+        // it must never be refused admission here for being the target of a
+        // revocation it doesn't yet know about.
+        if (peerCert.identity_pub != fixture.cert.identity_pub && isRevoked(peerCert.device_pub)) {
+            writeFrame(stream, mapOf("t" to "refused"))
+            return HandshakeResult.Failed("auth", "revoked")
         }
 
         return HandshakeResult.Ok(peerCert)
