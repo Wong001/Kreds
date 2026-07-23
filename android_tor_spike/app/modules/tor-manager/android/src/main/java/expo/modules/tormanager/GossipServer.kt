@@ -54,7 +54,46 @@ import kotlin.concurrent.thread
  *  connection is mid-serve; only the PROTOCOL work (which needs the lock)
  *  queues. One bad connection (garbage frame, peer closes early, malformed
  *  JSON, ...) is caught per-connection in `handle` and never escapes to kill
- *  the accept loop or another connection's worker thread. */
+ *  the accept loop or another connection's worker thread.
+ *
+ *  GRACEFUL CLOSE (found via a real hearth-node loopback gate, task-5,
+ *  kotlin-gossip-server): a bare `sock.close()` right after
+ *  `respondHandshake` refuses a stranger is a genuine RST race, not a
+ *  theoretical one -- reproduced empirically (java.net.SocketException:
+ *  Software caused connection abort / WinError 10053 on the REAL hearth
+ *  initiator's REVOCATIONS-phase read, ~3ms after AUTH, in ~1 of 15 runs
+ *  under concurrent system load). Sequence: `respondHandshake` WRITES
+ *  `{"t":"refused"}` (landing in the wire slot the initiator's REVOCATIONS
+ *  swap will read) and returns WITHOUT reading anything further -- the
+ *  peer's own REVOCATIONS-request frame (which a real initiator's `_swap`
+ *  writes before it reads, sync.py's initiator branch) is very likely
+ *  still in-flight or sitting unread in this socket's receive buffer at
+ *  that exact moment. Windows' default abortive-ish behavior for a
+ *  `close()` performed with UNREAD received data still pending can send an
+ *  RST instead of a plain FIN -- and an RST can discard OUR OWN
+ *  already-written "refused" frame before the peer's kernel ever hands it
+ *  to their application, even though `write()` on our side already
+ *  returned successfully. The peer then sees a hard connection reset where
+ *  it expected to cleanly read `{"t":"refused"}` -- `PeerRefused` is lost,
+ *  degrading to a generic connection failure. `gracefulClose` (below)
+ *  eliminates this: `shutdownOutput()` sends a clean FIN once our own
+ *  writes are flushed (never an abortive reset just because bytes are
+ *  still unread on OUR receive side), then drains and discards whatever
+ *  the peer still sends (their REVOCATIONS-request, in the refusal case)
+ *  until EOF, mirroring the graceful shutdown hearth's own initiator
+ *  performs on its `writer` (`_sync_session`'s `finally: writer.close();
+ *  await writer.wait_closed()` -- asyncio's StreamWriter.close() is
+ *  likewise a graceful FIN-based teardown, not an abortive reset) --
+ *  responder and initiator now close the SAME polite way. Runs OUTSIDE
+ *  the shared `syncLock` (by construction: it lives in `handle`'s OUTER
+ *  `finally`, which only runs after the inner `try/finally` around
+ *  `lock.lock()`/`lock.unlock()` has already fully unwound) so a slow or
+ *  hostile peer's drain can never block another connection's turn at the
+ *  lock -- only this one worker thread, for at most `SOCKET_TIMEOUT_MS`
+ *  (the same existing SO_TIMEOUT budget, already bounding every read on
+ *  this socket). Harmless on the NORMAL-completion path too: the peer's
+ *  own side has nothing left to send once a real session finishes, so the
+ *  drain read returns EOF immediately. */
 class GossipServer(
     private val store: SyncStore,
     private val fixtureProvider: () -> KotlinHandshake.Fixture?,
@@ -165,7 +204,45 @@ class GossipServer(
             // bad connection must never kill this worker thread or the
             // accept loop -- swallow and fall through to close.
         } finally {
-            runCatching { sock.close() }
+            // Runs AFTER the inner try/finally above has already released
+            // `lock` (Kotlin finally blocks always complete before control
+            // reaches an outer catch/finally) -- the drain below never holds
+            // the shared syncLock. See the class doc's "GRACEFUL CLOSE"
+            // section for why a bare close() here is a real RST race, not a
+            // theoretical one.
+            gracefulClose(sock)
         }
+    }
+
+    /** Best-effort GRACEFUL teardown -- never a bare `sock.close()` alone
+     *  (see the class doc's "GRACEFUL CLOSE" section for the RST race this
+     *  fixes). `shutdownOutput()` flushes and FIN's our write side cleanly
+     *  (so anything we already wrote, e.g. `respondHandshake`'s
+     *  `{"t":"refused"}`, is not vulnerable to being discarded by an
+     *  abortive reset just because bytes are still unread on OUR receive
+     *  side); the drain loop then reads and discards whatever the peer
+     *  still sends until EOF, bounded by the socket's existing
+     *  `SOCKET_TIMEOUT_MS` SO_TIMEOUT (set at the top of `handle`, still in
+     *  effect here) so a stalled/hostile peer can delay this ONE worker
+     *  thread for at most that long, never indefinitely. Every step is
+     *  `runCatching`-wrapped: a drain/shutdown error (peer already gone,
+     *  socket already broken, ...) is expected and must never mask the
+     *  connection's real outcome or escape to the caller -- `sock.close()`
+     *  always still runs after, same as the code this replaces. Safe to
+     *  call on any socket state, including one where the session already
+     *  completed normally (the peer has nothing left to send, so the drain
+     *  read returns EOF immediately) or one that's already broken (the
+     *  drain read throws, caught, falls through to close()). */
+    private fun gracefulClose(sock: Socket) {
+        runCatching {
+            sock.getOutputStream().flush()
+            sock.shutdownOutput()
+            val buf = ByteArray(4096)
+            val inp = sock.getInputStream()
+            while (inp.read(buf) >= 0) {
+                // discard -- draining is the point, not the content
+            }
+        }
+        runCatching { sock.close() }
     }
 }
