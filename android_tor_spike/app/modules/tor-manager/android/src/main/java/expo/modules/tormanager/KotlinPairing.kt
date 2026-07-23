@@ -174,13 +174,35 @@ object KotlinPairing {
      *  - `store.addIdentity(ident)` per `friends` entry -- direct mirror of
      *    `node.store.add_identity(ident)` in the pair_install loop.
      *  - `peers` + `my_addr` (`node.store.add_peer(address, identity_pub)`)
-     *    -- DELIBERATELY DROPPED for `peers`: the phone's SyncStore has no
-     *    peer table / addPeer method at all (grepped SyncStore.kt -- none
-     *    exists), and the phone only ever syncs with its own home node
-     *    today, so friends' addresses have no consumer yet. `my_addr` (the
-     *    home node's own address) is NOT dropped -- it's carried out via the
-     *    returned Identity.onion_addr, which IS this phone's one peer record
-     *    (its home node's dial address, used by KotlinHandshake/SyncRunner).
+     *    -- friend-peering Task 3: the phone now HAS a peer table
+     *    (addPeer/listPeers/removePeer/addressFor, SyncStore.kt) plus
+     *    `mergePeerAddress` (onion-preferred, host-keyed eviction), so both
+     *    are learned rather than dropped:
+     *      - `peers`: for each `{identity_pub, address}` entry,
+     *        `store.mergePeerAddress(identity_pub, address)` -- but ONLY for
+     *        an `identity_pub` already in `store.knownIdentities()` at that
+     *        point (i.e. a friend from the `friends` loop just above) --
+     *        defense-in-depth against a malformed/hostile package handing us
+     *        an address for an identity we have no other reason to trust or
+     *        dial. This is why the peers loop runs strictly AFTER the
+     *        friends loop: is_known must already be true for a
+     *        legitimately-known friend's entry to pass. An entry naming OUR
+     *        OWN identity is excluded from this loop entirely (see `my_addr`
+     *        immediately below) -- an arbitrary claim inside `peers` is
+     *        never trusted for our own identity's address, only the
+     *        package's dedicated `my_addr` field is.
+     *      - `my_addr` (the home node's own address) is ADDITIONALLY seeded
+     *        as a peer of OUR OWN identity --
+     *        `store.mergePeerAddress(cert.identity_pub, my_addr)` -- mirrors
+     *        hearth's own `pair_install` (node.py:2057-2058:
+     *        `node.store.add_peer(pkg["my_addr"], device.identity_pub)`) and
+     *        runner.py's `_drain_self_peers` doc ("pair_install deliberately
+     *        seeds the sibling's my_addr as a peer under our shared
+     *        identity_pub so the two devices sync"). This is what lets the
+     *        peer-loop (Task 4) dial the home node like any other peer,
+     *        instead of relying solely on the returned Identity.onion_addr
+     *        passthrough (kept below, unchanged, for backward compat with
+     *        the fixture-based callers that still read it directly).
      *
      *  `deviceName` is accepted for interface-shape parity with
      *  buildRequestFrame's params (the pairing screen has it in scope from
@@ -227,6 +249,7 @@ object KotlinPairing {
         val identityPriv: String
         val friends: List<String>
         val onionAddr: String
+        val peerEntries: List<Pair<String, String>>
         try {
             val certJson = pkg.getJSONObject("cert")
             cert = KotlinWire.CertDict(
@@ -238,6 +261,16 @@ object KotlinPairing {
             friends = if (friendsArr != null) (0 until friendsArr.length()).map { friendsArr.getString(it) }
                       else emptyList()
             onionAddr = pkg.optString("my_addr", "")
+            // friend-peering Task 3: real hearth peers shape (node.py
+            // store.list_peers()) -- [{address, identity_pub}, ...]. Parsed
+            // eagerly here (before verification, alongside every other
+            // field) but only ever MERGED into the store further below,
+            // after verification passes and friends have been added.
+            val peersArr = pkg.optJSONArray("peers")
+            peerEntries = if (peersArr != null) (0 until peersArr.length()).map { i ->
+                val p = peersArr.getJSONObject(i)
+                p.getString("identity_pub") to p.getString("address")
+            } else emptyList()
         } catch (e: JSONException) {
             throw IllegalArgumentException("bad package")
         }
@@ -252,7 +285,27 @@ object KotlinPairing {
 
         store.addIdentity(cert.identity_pub)
         for (f in friends) store.addIdentity(f)
-        // peers: intentionally dropped (see doc above)
+
+        // friend-peering Task 3 (see doc above): merge the package's peers
+        // list, gated on knownIdentities() -- runs strictly AFTER the
+        // friends loop just above, so a legitimately-known friend's entry
+        // actually passes is_known. Excludes an entry naming our OWN
+        // identity: that case is handled exclusively by the my_addr seed
+        // immediately below, which is the one address this ceremony can
+        // actually vouch for (the package's own self-report of its
+        // identity's address, not an arbitrary claim inside `peers`).
+        for ((identityPub, address) in peerEntries) {
+            if (identityPub == cert.identity_pub) continue
+            if (!store.knownIdentities().contains(identityPub)) continue
+            store.mergePeerAddress(identityPub, address)
+        }
+
+        // Seed the home node: my_addr is a peer of OUR OWN identity (the
+        // home node is our own sibling device) -- lets the peer-loop
+        // (Task 4) dial the home node like any other peer.
+        if (onionAddr.isNotEmpty()) {
+            store.mergePeerAddress(cert.identity_pub, onionAddr)
+        }
 
         return PairingStore.Identity(devicePriv, devicePub, cert, identityPriv, onionAddr)
     }

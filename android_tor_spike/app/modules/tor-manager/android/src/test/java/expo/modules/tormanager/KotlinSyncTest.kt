@@ -6,6 +6,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -548,6 +549,216 @@ class KotlinSyncTest {
         assertTrue("expected Ok, got $result", result is SyncResult.Ok)
         assertEquals("arc-1 parity for the absent case -- empty string, never null/omitted",
             "", stream.written[2].getString("addr"))
+    }
+
+    // =======================================================================
+    // HAVE phase -- friend-peering Task 3: address learning (installPackage's
+    // counterpart at pairing install lives in KotlinPairingTest.kt; these
+    // cover the ONGOING learning path, every sync round). Mirrors sync.py's
+    // _session HAVE phase (sync.py:773-781) on both the direct addr merge
+    // (774-776) and the transitive peers[] relay (777-781). Same
+    // RespondingStream/full-phase-queue idiom, `have` is written/read at
+    // index 2 either way (see the section header above).
+    //
+    // `run`'s ONE production caller (SyncRunner.runTransport) always dials
+    // exactly the phone's own home node, pinning the authenticated peer's
+    // identity_pub to `fx.cert.identity_pub` BEFORE KotlinSync.run ever
+    // runs (see that pinning check, SyncRunner.kt:195-198) -- so for `run`,
+    // "the peer we're syncing with" (what `serve` gets explicitly as
+    // `peerCert.identity_pub`) IS the `ownIdentity` param already threaded
+    // through every other phase in this file (DEFRIENDS/REVOCATIONS). These
+    // tests seed `store.addIdentity(ownIdentity)` to mirror that real
+    // pre-seeding (KotlinPairing.installPackage / SyncRunner.runTransport),
+    // exactly like the pre-existing REVOCATIONS/DEFRIENDS `run` tests above.
+    // =======================================================================
+
+    @Test fun runMergesHomeNodeAddrAndRelayedKnownFriendAddress() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        store.addIdentity(ownIdentity)   // mirrors production seeding (pairing / every sync)
+        val friendPub = "bb".repeat(32)
+        store.addIdentity(friendPub)
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to listOf(mapOf("identity_pub" to friendPub, "address" to "friendnode.onion:9997")),
+                "addr" to "homenode.onion:9997"),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32), ownIdentity = ownIdentity)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+
+        assertEquals("the peer's own onion merged under the identity we share with it " +
+            "(mirrors sync.py:774-776)", "homenode.onion:9997", store.addressFor(ownIdentity))
+        assertEquals("relayed known-friend address merged transitively (mirrors sync.py:777-781)",
+            "friendnode.onion:9997", store.addressFor(friendPub))
+    }
+
+    @Test fun runDoesNotMergeRelayedAddressForUnknownIdentity() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        store.addIdentity(ownIdentity)
+        val strangerPub = "cc".repeat(32)   // deliberately NOT known
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to listOf(mapOf("identity_pub" to strangerPub, "address" to "stranger.onion:9997")),
+                "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32), ownIdentity = ownIdentity)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertNull("unknown identity's relayed address must be dropped -- is_known gate",
+            store.addressFor(strangerPub))
+    }
+
+    @Test fun runNeverMergesAddrEqualToOwnOnion() {
+        val store = InMemorySyncStore()
+        store.setMeta("gossip_addr", "myphone.onion:9997")
+        val ownIdentity = "aa".repeat(32)
+        store.addIdentity(ownIdentity)
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to "myphone.onion:9997"),   // == our own onion
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32), ownIdentity = ownIdentity)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertNull("must never merge our own onion address as a peer of ourselves",
+            store.addressFor(ownIdentity))
+    }
+
+    @Test fun runOwnOutgoingHaveAlwaysSendsEmptyPeers() {
+        val store = InMemorySyncStore()
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.run(stream, store, ownDevicePub = "ff".repeat(32))
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        val wroteHave = stream.written[2]
+        assertEquals("the phone is an endpoint, not a relay -- its own outgoing HAVE always sends peers:[]",
+            0, wroteHave.getJSONArray("peers").length())
+    }
+
+    @Test fun serveMergesPeerAddrAndRelayedKnownFriendAddress() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+        store.addIdentity(peerPub)
+        val friendPub = "bb".repeat(32)
+        store.addIdentity(friendPub)
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to listOf(mapOf("identity_pub" to friendPub, "address" to "friendnode.onion:9997")),
+                "addr" to "peernode.onion:9997"),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertEquals("the authenticated peer's own onion merged (mirrors sync.py:774-776)",
+            "peernode.onion:9997", store.addressFor(peerPub))
+        assertEquals("relayed known-friend address merged transitively (mirrors sync.py:777-781)",
+            "friendnode.onion:9997", store.addressFor(friendPub))
+    }
+
+    @Test fun serveDoesNotMergeRelayedAddressForUnknownIdentity() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+        store.addIdentity(peerPub)
+        val strangerPub = "cc".repeat(32)
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to listOf(mapOf("identity_pub" to strangerPub, "address" to "stranger.onion:9997")),
+                "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertNull("unknown identity's relayed address must be dropped -- is_known gate",
+            store.addressFor(strangerPub))
+    }
+
+    @Test fun serveNeverMergesAddrEqualToOwnOnion() {
+        val store = InMemorySyncStore()
+        store.setMeta("gossip_addr", "myphone.onion:9997")
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+        store.addIdentity(peerPub)
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to "myphone.onion:9997"),   // == our own onion
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertNull("must never merge our own onion address as a peer of the authenticated peer",
+            store.addressFor(peerPub))
+    }
+
+    @Test fun serveOwnOutgoingHaveAlwaysSendsEmptyPeers() {
+        val store = InMemorySyncStore()
+        val fixture = buildFixture("aa".repeat(32))
+        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
+        store.addIdentity(peerPub)
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(), "known" to emptyList<Any?>(),
+                "peers" to emptyList<Any?>(), "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        val wroteHave = stream.written[2]
+        assertEquals("the phone is an endpoint, not a relay -- its own outgoing HAVE always sends peers:[]",
+            0, wroteHave.getJSONArray("peers").length())
     }
 
     // =======================================================================
