@@ -2258,6 +2258,92 @@ class HearthNode:
                 self._publish(make_wrap_grant(self.device, msg.msg_id,
                                               wraps, now=now))
 
+    def maintain_received_post_grants(self, now: Optional[float] = None):
+        """Re-wrap FRIEND-AUTHORED posts' content keys to this identity's
+        OWN other devices via RECIPIENT-signed wrap_grants -- so a phone
+        that never saw the friend online can still read a wall/journal
+        post the desk already decrypted. Mirrors maintain_received_dm_
+        grants (node.py:2190+) exactly, for KIND_POST instead of KIND_DM:
+        same disclosure argument (the recipient already holds the
+        plaintext; re-wrapping to its own enrolled device discloses
+        nothing new), same 'targets derived solely from the own
+        identity's enckeys' rule, same guard, same full-coverage mint.
+
+        Trust model: a grant minted HERE for a friend's post is RECIPIENT-
+        signed (make_wrap_grant signs with whoever mints). Consumers must
+        honor a recipient-signed grant only for the recipient's OWN
+        devices, so the mint side wraps to nothing but own satellite
+        devices (store.enckeys(own) minus self) -- this sweep can never
+        reach a friend. (Extending node._content_key's KIND_POST branch to
+        actually TRUST this shape of grant is a separate change -- today
+        it only honors grants signed by the post's own author.)
+
+        Distinct from maintain_wrap_grants (author-side friend audience
+        for kreds wall posts) and maintain_own_device_grants (this
+        identity's OWN-authored content) -- both left UNTOUCHED. A
+        received post has author != self, so neither of those sweeps ever
+        iterates it. Also distinct from maintain_received_dm_grants
+        (KIND_DM only) -- untouched. No carry-forward is needed: the
+        (author=self, target=received-post-id) prune key is minted by
+        this sweep alone. maintain_wrap_grants, when it grants THIS same
+        post to friends, signs as the POST'S AUTHOR (a different
+        identity_pub from this node's own), so it lives in a completely
+        different (identity_pub, target) prune row -- no collision.
+
+        Guard identical to the other three sweeps: minting signs, so
+        locked/revoked/unenrolled skip the whole sweep."""
+        if self.revoked or self.locked or self.device.identity_pub is None:
+            return
+        now = now if now is not None else time.time()
+        own = self.store.enckeys(self.identity_pub)
+        targets = {d: e for d, e in own.items()
+                   if d != self.device.device_pub}
+        if not targets:
+            return
+        friends = [i for i in self.store.known_identities()
+                   if i != self.identity_pub]
+        if not friends:
+            return
+        # Recipient-signed grants ARE own-minted (kind=WRAP_GRANT, author
+        # self), so _latest_own_wrap_grants already surfaces the prune-
+        # surviving grant for each received-post target -- keyspace
+        # exclusive to this sweep (see docstring), so `latest` reflects
+        # only prior rounds of it.
+        latest = self._latest_own_wrap_grants()
+        for identity in friends:
+            for msg in self.store.post_messages(identity):
+                wrapped = set(msg.payload.get("wraps", {}))
+                grant = latest.get(msg.msg_id, {})
+                grantable = {}   # every own target device NOT inline-wrapped
+                                 # -> its CURRENT enc key (full-coverage set)
+                missing = False  # any own device lacking current coverage?
+                for dpub, enc_pub in targets.items():
+                    if dpub in wrapped:
+                        continue     # inline envelope wins; no grant needed
+                    grantable[dpub] = enc_pub
+                    g = grant.get(dpub)
+                    # Covered only if the LATEST grant sealed to the
+                    # device's CURRENT enc key (mirrors the enc_pub
+                    # annotation check; a pre-annotation grant counts as
+                    # covered).
+                    if g is None or g.get("enc_pub", enc_pub) != enc_pub:
+                        missing = True
+                if not missing:
+                    continue
+                key, aad = self._content_key(msg)
+                if key is None:      # not (yet) decryptable here: never
+                    continue         # mint garbage, never crash the sweep
+                # FULL-COVERAGE mint: wrap to ALL grantable own devices
+                # (not just the missing ones), annotate each with its
+                # current enc_pub. No carry-forward: this sweep owns the
+                # (self, this-post) prune key.
+                wraps = wrap_key(key, grantable, aad)
+                for dpub in wraps:
+                    wraps[dpub]["enc_pub"] = grantable[dpub]
+                if wraps:
+                    self._publish(make_wrap_grant(self.device, msg.msg_id,
+                                                  wraps, now=now))
+
     def _received_dms(self):
         """Friend-authored DMs addressed to this identity (kind==KIND_DM,
         author != self, payload['to'] == self). There is no single received-
