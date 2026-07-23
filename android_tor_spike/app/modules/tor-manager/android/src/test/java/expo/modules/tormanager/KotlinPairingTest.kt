@@ -300,6 +300,50 @@ class KotlinPairingTest {
         })
     }
 
+    /** Code review fix (LOW): a `peers[]` entry with a missing OR explicit-
+     *  null `identity_pub` must be SKIPPED, not reject the whole package --
+     *  mirrors hearth's own schema (store.py's peers.identity_pub is
+     *  `Optional[str] = None`; node.py:2056's pair_install reads it via
+     *  `p.get("identity_pub")`, not `p["identity_pub"]`). Built directly
+     *  with `JSONObject`/`JSONArray` rather than via `packageJson`'s
+     *  `Pair<String,String>` peers param, which can't express an entry
+     *  missing a field entirely. A well-formed entry for a known friend, in
+     *  the SAME package, still installs and merges -- proving one bad entry
+     *  doesn't poison the rest. */
+    @Test fun installPackageSkipsPeersEntryWithMissingOrNullIdentityPubButInstallsRestOfPackage() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
+        val friendA = "44".repeat(32)
+
+        val o = JSONObject()
+        o.put("t", "hearth-pair-package")
+        o.put("protocol", KotlinWire.PROTOCOL)
+        o.put("cert", certJson(cert))
+        o.put("identity_priv", identityPriv)
+        o.put("friends", JSONArray(listOf(friendA)))
+        val peersArr = JSONArray()
+        peersArr.put(JSONObject().apply { put("address", "noidentitykey.onion:9997") })            // identity_pub key entirely absent
+        peersArr.put(JSONObject().apply { put("address", "nullidentity.onion:9997"); put("identity_pub", JSONObject.NULL) })   // explicit JSON null
+        peersArr.put(JSONObject().apply { put("address", "friendnode.onion:9997"); put("identity_pub", friendA) })             // well-formed, known friend
+        o.put("peers", peersArr)
+        o.put("my_addr", JSONObject.NULL)
+        val pkg = o.toString()
+
+        val identity = KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "My Phone")
+
+        // The whole package still installs -- not rejected over the two bad entries.
+        assertEquals(identityPub, identity.cert.identity_pub)
+        assertTrue(store.knownIdentities().contains(friendA))
+        // The well-formed entry (known friend) still merges.
+        assertEquals("friendnode.onion:9997", store.addressFor(friendA))
+        // Nothing landed under either malformed entry's address.
+        assertTrue(store.listPeers().none { it.address == "noidentitykey.onion:9997" })
+        assertTrue(store.listPeers().none { it.address == "nullidentity.onion:9997" })
+        assertEquals("only the one well-formed peer landed", 1, store.listPeers().size)
+    }
+
     /** Post-review Important fix: installPackage must VERIFY BEFORE
      *  MUTATING, mirroring hearth's device.install (identity.py:295-303,
      *  called by pair_install BEFORE its store writes, node.py:2044-2050). */

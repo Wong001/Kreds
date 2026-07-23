@@ -266,10 +266,26 @@ object KotlinPairing {
             // eagerly here (before verification, alongside every other
             // field) but only ever MERGED into the store further below,
             // after verification passes and friends have been added.
+            //
+            // `identity_pub` is LENIENT (code review fix), not strict like
+            // every other field this function parses: hearth's own schema
+            // allows it (store.py's peers.identity_pub is
+            // `Optional[str] = None`, and node.py:2056's pair_install reads
+            // it via `p.get("identity_pub")`, not `p["identity_pub"]`) --
+            // only `address` is a required key there (`p["address"]`,
+            // direct indexing). A peers entry with a missing/null
+            // `identity_pub` has no identity for the merge loop below to
+            // gate `knownIdentities()` against anyway (it could never
+            // usefully merge), so it is simply SKIPPED here rather than
+            // rejecting the WHOLE package over one entry hearth itself would
+            // have tolerated -- `address` stays required (`getString`,
+            // still throws "bad package" if absent on an entry that DOES
+            // carry an identity_pub), matching hearth's own asymmetry.
             val peersArr = pkg.optJSONArray("peers")
-            peerEntries = if (peersArr != null) (0 until peersArr.length()).map { i ->
+            peerEntries = if (peersArr != null) (0 until peersArr.length()).mapNotNull { i ->
                 val p = peersArr.getJSONObject(i)
-                p.getString("identity_pub") to p.getString("address")
+                val identityPub = p.optString("identity_pub", "")
+                if (identityPub.isEmpty()) null else identityPub to p.getString("address")
             } else emptyList()
         } catch (e: JSONException) {
             throw IllegalArgumentException("bad package")

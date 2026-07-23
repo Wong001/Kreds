@@ -632,32 +632,6 @@ object KotlinSync {
             // -- the phone is an ENDPOINT, not a relay (friend-peering
             // Task 3): it never gossips its own peer table onward, only
             // learns from what it reads below.
-            //
-            // friend-peering Task 3: address learning from the PEER's `have`
-            // (mirrors sync.py's own HAVE-phase merge, sync.py:774-781).
-            // Direct addr (774-776): the authenticated peer's own onion,
-            // merged under peerCert.identity_pub -- gated on is_known
-            // (already guaranteed by the mid-session re-check just above,
-            // kept explicit here for defense-in-depth/parity with `run`'s
-            // own gate) and never our own onion.
-            val myAddr = store.getMeta("gossip_addr") ?: ""
-            val peerAddr = have.optString("addr", "")
-            if (peerAddr.isNotEmpty() && peerAddr != myAddr && store.knownIdentities().contains(peerCert.identity_pub)) {
-                store.mergePeerAddress(peerCert.identity_pub, peerAddr)
-            }
-            // Transitive relay (777-781): each `{identity_pub, address}`
-            // entry the peer relays, merged ONLY for an identity we already
-            // know and whose address isn't our own onion.
-            val relayedPeers = have.optJSONArray("peers") ?: JSONArray()
-            for (i in 0 until relayedPeers.length()) {
-                val p = relayedPeers.optJSONObject(i) ?: continue
-                val ident = p.optString("identity_pub", "")
-                val addr = p.optString("address", "")
-                if (ident.isEmpty() || addr.isEmpty() || addr == myAddr) continue
-                if (!store.knownIdentities().contains(ident)) continue
-                store.mergePeerAddress(ident, addr)
-            }
-
             val knownArr = have.optJSONArray("known") ?: JSONArray()
             val peerKnown = (0 until knownArr.length()).map { knownArr.getString(it) }.toSet()
             // Own-device trust (sync.py:768-772): only a verified SIBLING
@@ -668,6 +642,46 @@ object KotlinSync {
             // into our friend graph.
             if (peerCert.identity_pub == fixture.cert.identity_pub) {
                 for (ident in peerKnown) store.addIdentity(ident)
+            }
+
+            // friend-peering Task 3: address learning from the PEER's `have`
+            // (mirrors sync.py's own HAVE-phase merge, sync.py:774-781).
+            // Runs AFTER the known[]-widening block just above (code review
+            // fix -- was BEFORE, which is backwards vs. both hearth and
+            // `run`'s own ordering): hearth widens known[] first, THEN
+            // merges addr/peers (sync.py:768-781, in that order), so an
+            // identity newly introduced by THIS SAME frame's `known[]` (an
+            // own-device-trust widening) is already is_known by the time its
+            // relayed address in `peers[]` is evaluated below. Merging
+            // BEFORE the widening silently dropped that address for the
+            // round it was introduced in (self-healing only on a later
+            // retry once is_known finally caught up) -- see
+            // `serveMergesRelayedAddressForIdentityIntroducedBySameFrames-
+            // KnownWidening` in KotlinSyncTest.kt, which fails under the old
+            // order.
+            //
+            // Direct addr (774-776): the authenticated peer's own onion,
+            // merged under peerCert.identity_pub -- gated on is_known
+            // (already guaranteed by the mid-session re-check above HAVE,
+            // kept explicit here for defense-in-depth/parity with `run`'s
+            // own gate) and never our own onion.
+            val myAddr = store.getMeta("gossip_addr") ?: ""
+            val peerAddr = have.optString("addr", "")
+            if (peerAddr.isNotEmpty() && peerAddr != myAddr && store.knownIdentities().contains(peerCert.identity_pub)) {
+                store.mergePeerAddress(peerCert.identity_pub, peerAddr)
+            }
+            // Transitive relay (777-781): each `{identity_pub, address}`
+            // entry the peer relays, merged ONLY for an identity we already
+            // know (INCLUDING one this same frame's known[] just widened us
+            // to, above) and whose address isn't our own onion.
+            val relayedPeers = have.optJSONArray("peers") ?: JSONArray()
+            for (i in 0 until relayedPeers.length()) {
+                val p = relayedPeers.optJSONObject(i) ?: continue
+                val ident = p.optString("identity_pub", "")
+                val addr = p.optString("address", "")
+                if (ident.isEmpty() || addr.isEmpty() || addr == myAddr) continue
+                if (!store.knownIdentities().contains(ident)) continue
+                store.mergePeerAddress(ident, addr)
             }
 
             // -- MESSAGES -- (responder: read peer's first, THEN write ours

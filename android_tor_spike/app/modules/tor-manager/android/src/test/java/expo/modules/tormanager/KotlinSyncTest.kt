@@ -761,6 +761,53 @@ class KotlinSyncTest {
             0, wroteHave.getJSONArray("peers").length())
     }
 
+    /** Code review regression guard (MEDIUM): serve's addr+relayedPeers merge
+     *  must run AFTER the known[]-widening (own-device-trust) block, matching
+     *  both hearth (sync.py:768-781 -- widen known[] FIRST, THEN merge
+     *  addr/peers) and `run`'s own ordering (KotlinSync.kt:354-389, known-merge
+     *  before the addr/peers block). Under the OLD (backwards) order, the
+     *  peers-loop's is_known check ran against PRE-widening state, so an
+     *  identity introduced by THIS SAME frame's known[] had its relayed
+     *  address silently dropped for the round it was introduced in
+     *  (self-healing only on a later retry once is_known finally caught up).
+     *
+     *  The authenticated peer here IS our own sibling device (own-device
+     *  trust, peerCert.identity_pub == fixture.cert.identity_pub) -- only a
+     *  sibling's `known` list is ever allowed to widen our identity set
+     *  (sync.py:768-772) -- and its SAME HAVE frame both introduces a brand
+     *  new identity X via `known[]` and relays X's address via `peers[]`. */
+    @Test fun serveMergesRelayedAddressForIdentityIntroducedBySameFramesKnownWidening() {
+        val store = InMemorySyncStore()
+        val ownIdentityPub = "aa".repeat(32)
+        store.addIdentity(ownIdentityPub)
+        val fixture = buildFixture(ownIdentityPub)
+        val siblingDevPriv = "bb".repeat(32)
+        val peerCert = KotlinWire.CertDict(ownIdentityPub, devPub(siblingDevPriv), "Sibling Phone", 1752900000.0, "")
+
+        val newIdentityX = "cc".repeat(32)
+        assertFalse("X not yet known before this sync round", store.knownIdentities().contains(newIdentityX))
+
+        val stream = RespondingStream(listOf(
+            mapOf("t" to "revocations", "revs" to emptyList<Any?>()),
+            mapOf("t" to "defriends", "notices" to emptyList<Any?>()),
+            mapOf("t" to "have", "summary" to emptyMap<String, Any?>(),
+                "known" to listOf(newIdentityX),   // introduces X via own-device-trust widening
+                "peers" to listOf(mapOf("identity_pub" to newIdentityX, "address" to "xnode.onion:9997")),   // relays X's address, SAME frame
+                "addr" to ""),
+            mapOf("t" to "messages", "msgs" to emptyList<Any?>()),
+            mapOf("t" to "blob_want", "hashes" to emptyList<Any?>()),
+            mapOf("t" to "blobs", "blobs" to emptyMap<String, Any?>()),
+        ))
+
+        val result = KotlinSync.serve(stream, store, fixture, peerCert)
+        assertTrue("expected Ok, got $result", result is SyncResult.Ok)
+        assertTrue("X adopted via own-device trust (known[]-widening)", store.knownIdentities().contains(newIdentityX))
+        assertEquals("X's relayed address must be merged THIS round -- it was introduced by the SAME frame's " +
+            "known[] widening, which must be applied before the peers[] relay loop's is_known check runs " +
+            "(this fails under the old merge-before-widening order)",
+            "xnode.onion:9997", store.addressFor(newIdentityX))
+    }
+
     // =======================================================================
     // serve() -- the RESPONDER content phases (gossip server Task 3).
     // Mirrors _session (sync.py:643-825) in REVERSE I/O order vs. `run`
