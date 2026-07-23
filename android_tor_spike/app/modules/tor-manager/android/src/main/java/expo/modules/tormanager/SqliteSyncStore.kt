@@ -685,4 +685,53 @@ class SqliteSyncStore(context: Context) :
         }
         return SignedMessageKt.fromDict(MsgJson.toMap(msgJson))
     }
+
+    /** See the SyncStore interface doc: the SQLite mirror of
+     *  InMemorySyncStore.messagesNotIn, differing only in how `GossipRow`s
+     *  are built (SQL scan + msg_json parse here, vs. native in-memory
+     *  SignedMessage fields there) -- the actual entitlement algorithm is
+     *  the shared `filterMessagesNotIn`, so the two impls cannot diverge on
+     *  this security-critical path. `msg_json` is parsed once per row (a
+     *  single `JSONObject(msgJson)`) and reused for both the row's `payload`
+     *  sub-map (`filterMessagesNotIn`'s gates) and its full dict (`raw`,
+     *  reconstructed via `SignedMessageKt.fromDict`) -- avoids the
+     *  double-parse a naive `MsgJson.toMap(msgJson)` + separate
+     *  `optJSONObject("payload")` re-read would cost per row. */
+    override fun messagesNotIn(
+        summaries: Map<Pair<String, String>, SeenSet>, entitled: Set<String>, peerIdentity: String
+    ): List<SignedMessage> {
+        val rows = mutableListOf<GossipRow>()
+        readableDatabase.rawQuery(
+            "SELECT msg_id, identity_pub, device_pub, seq, kind, msg_json FROM messages ORDER BY seq ASC", null
+        ).use { c ->
+            while (c.moveToNext()) {
+                val msgId = c.getString(0)
+                val ipub = c.getString(1)
+                val dpub = c.getString(2)
+                val seq = c.getInt(3)
+                val kind = c.getString(4) ?: ""
+                val msgJson = c.getString(5)
+                val obj = JSONObject(msgJson)
+                val payload = MsgJson.jsonToMap(obj.optJSONObject("payload") ?: JSONObject())
+                rows.add(GossipRow(msgId, ipub, dpub, seq, kind, payload, SignedMessageKt.fromDict(MsgJson.jsonToMap(obj))))
+            }
+        }
+        return filterMessagesNotIn(rows, summaries, entitled, peerIdentity, deviceViews(peerIdentity))
+    }
+
+    /** See the SyncStore interface doc: byte length of each stored blob in
+     *  `hashes`, via SQL `length(data)` (no full-blob read -- avoids the
+     *  CursorWindow concern `getBlob` guards against, since only an
+     *  aggregate length is fetched here, never row data). Empty `hashes`
+     *  returns without touching SQL -- same `IN ()`-is-invalid-syntax
+     *  reasoning as `wrapGrantsFor`'s empty-`acceptedSigners` guard. */
+    override fun blobSizes(hashes: List<String>): Map<String, Long> {
+        if (hashes.isEmpty()) return emptyMap()
+        val out = linkedMapOf<String, Long>()
+        val placeholders = hashes.joinToString(",") { "?" }
+        readableDatabase.rawQuery(
+            "SELECT hash, length(data) FROM blobs WHERE hash IN ($placeholders)", hashes.toTypedArray()
+        ).use { c -> while (c.moveToNext()) out[c.getString(0)] = c.getLong(1) }
+        return out
+    }
 }
