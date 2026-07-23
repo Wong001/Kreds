@@ -2949,13 +2949,54 @@ class HearthNode:
                 else:
                     self._cache_message_key(msg.msg_id, key)
                 return key, aad
-        # 3) wall wrap-grant unwrap (kreds back-catalog): only grants
-        # signed by the POST'S author count -- store.wrap_grants filters
-        # on author, so a hostile friend's grant naming someone else's
-        # post is inert here (and in routing).
+        # 3) wall wrap-grant unwrap (kreds back-catalog): author-signed
+        # grants (existing) UNION recipient-signed grants (Task 2,
+        # recipient-post-regrants: maintain_received_post_grants' backfill
+        # to THIS identity's own other devices, node.py:2261+). Either
+        # way, store.wrap_grants filters on signer identity_pub in SQL
+        # (store.py:773-790), so a hostile identity's grant -- author-
+        # shaped or recipient-shaped -- naming someone else's post is
+        # inert here no matter which of the two calls below returns it
+        # (and in routing: messages_not_in's KIND_WRAP_GRANT gate,
+        # store.py:730-733, routes a grant to its own signer or to peers
+        # whose devices it names -- signer-and-target-agnostic, so a
+        # recipient-signed grant -- whose wraps name only OWN devices,
+        # per maintain_received_post_grants' targets rule -- can already
+        # never reach a friend; no routing change needed).
         if kind == KIND_POST:
-            grants = self.store.wrap_grants(msg.msg_id,
-                                            msg.cert.identity_pub)
+            author = msg.cert.identity_pub
+            grants = self.store.wrap_grants(msg.msg_id, author)
+            # Recipient-signed backfill: a grant WE minted for a friend's
+            # post also counts, so a second own device with no inline
+            # wrap and no author-side coverage can still unwrap. Gated on
+            # the post's author being a friend (known, not self) -- the
+            # posts analog of the DM branch's own recipient-trust guard
+            # (DecryptPass.kt's `payload.to == ownIdentityPub`: posts
+            # carry no per-message addressee field, so "the author is
+            # someone we regard as a friend" is the closest equivalent --
+            # see docs/superpowers/specs/2026-07-23-recipient-post-
+            # regrants-design.md). Own-authored posts are excluded
+            # (author == self): own-device coverage for those is
+            # maintain_own_device_grants' job, which signs as the author
+            # (self) and is therefore already covered by the call above.
+            if (author != self.identity_pub
+                    and author in self.store.known_identities()):
+                recipient_grants = self.store.wrap_grants(
+                    msg.msg_id, self.identity_pub)
+                # Union order: author-signed wins on a same-device
+                # collision. The DM consumer precedent (DecryptPass.kt's
+                # resolveWrap, mirrored here since hearth's own
+                # store.wrap_grants is single-signer-per-call, unlike
+                # Kotlin's wrapGrantsFor) folds ALL accepted signers'
+                # grants in one chronological pass and keeps the latest
+                # -- author-signed coverage there is the audience-scoped,
+                # canonical grant (re-minted on OUR OWN enc-key rotation
+                # by maintain_wrap_grants, fab2d52), while a recipient-
+                # signed grant exists purely to backfill gaps that sweep
+                # has not (yet) reached (maintain_received_post_grants'
+                # own docstring) -- never meant to override it. Letting
+                # `grants` (author) apply last preserves exactly that.
+                grants = {**recipient_grants, **grants}
             if grants:
                 for priv in self.device.enc_privs():
                     key = unwrap_key(grants, self.device.device_pub, priv,
