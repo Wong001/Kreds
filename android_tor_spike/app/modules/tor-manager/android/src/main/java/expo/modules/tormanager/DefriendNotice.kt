@@ -62,8 +62,9 @@ data class DefriendNotice(
  *     author, a re-delivered notice fails this gate and returns false,
  *     exactly like ingestRevocation's is_known gate (RevocationCert.kt).
  *
- *  5. `store.purgeAuthoredBy(author)` + `store.removeIdentity(author)` ->
- *     true.
+ *  5. `store.purgeAuthoredBy(author)` + `store.removeIdentity(author)` +
+ *     drop every peer-table row naming `author` (friend-peering Task 5;
+ *     mirrors hearth `remove_peer_identity`, node.py:1770) -> true.
  *
  *  A free/extension function rather than a `SyncStore` interface member,
  *  for the same reason `ingestRevocation` is one (RevocationCert.kt's doc
@@ -79,18 +80,23 @@ data class DefriendNotice(
  *  Deliberately NOT full hearth parity -- phone-subset omissions,
  *  matching this task's brief:
  *
- *  1. No peer-table / device-views / disconnected-list cleanup. hearth's
- *     apply_defriend_notice additionally calls store.remove_peer_identity
- *     (stop dialing the ex-friend's address), store.remove_device_views
- *     (drop stale enrollment/revocation rows for them), and
+ *  1. No device-views / disconnected-list cleanup. hearth's
+ *     apply_defriend_notice additionally calls store.remove_device_views
+ *     (drop stale enrollment/revocation rows for them) and
  *     store.add_disconnected (surface them in a "recently disconnected"
- *     UI list) -- node.py:1770-1777. The phone has no peer table or
- *     device-views model at all (a pre-existing gap, same one
- *     RevocationCert.kt's doc already flags for ingestRevocation), and no
- *     disconnected-list UI concept yet. Purging content + dropping the
- *     identity from knownIdentities() is the security-critical part (stop
- *     serving them anything, stop trusting their signed content); the
- *     address-dialing and UI-list pieces are deferred, not fixed here.
+ *     UI list) -- node.py:1771-1777. The phone has no device-views model
+ *     at all (a pre-existing gap, same one RevocationCert.kt's doc
+ *     already flags for ingestRevocation), and no disconnected-list UI
+ *     concept yet. Peer-table cleanup (stop dialing the ex-friend's
+ *     address) WAS a phone-subset omission through friend-peering Task 4
+ *     but is now covered (friend-peering Task 5, gate 5 above) -- once
+ *     the phone grew a peer table at all (friend-peering Tasks 1-4), this
+ *     omission became the security-relevant one (an ex-friend's row would
+ *     otherwise keep being dialed by SyncRunner's peer-loop) and was
+ *     closed rather than left deferred. Purging content, dropping the
+ *     identity from knownIdentities(), and dropping their peer rows is
+ *     the security-critical part; the device-views and UI-list pieces
+ *     remain deferred.
  *
  *  2. No `notify()` call -- that is a hearth Node-level UI-refresh hook
  *     with no Kotlin equivalent at this layer; callers (KotlinSync) are
@@ -103,5 +109,9 @@ fun SyncStore.applyDefriendNotice(notice: DefriendNotice, ownIdentity: String): 
     if (!knownIdentities().contains(author)) return false
     purgeAuthoredBy(author)
     removeIdentity(author)
+    // friend-peering Task 5: mirror hearth remove_peer_identity (node.py:
+    // 1770) -- drop every peer-table row naming the ex-friend, not just
+    // the first, so SyncRunner's peer-loop (Task 4) stops dialing them.
+    listPeers().filter { it.identityPub == author }.forEach { removePeer(it.address) }
     return true
 }

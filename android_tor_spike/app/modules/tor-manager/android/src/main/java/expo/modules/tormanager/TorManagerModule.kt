@@ -454,6 +454,11 @@ class TorManagerModule : Module() {
         Function("startNode") { appContext.reactContext?.let { TorNodeService.start(it) } }
         Function("stopNode") { appContext.reactContext?.let { TorNodeService.stop(it) } }
         Function("beatNow") { appContext.reactContext?.let { TorNodeService.beatNow(it) } }
+        // Foreground-fast cadence: bridges WebShell.tsx's AppState listener
+        // to TorNodeService.setForeground -- see that function's own doc for
+        // the not-yet-started-service no-op shape (mirrors beatNow/stopNode
+        // above, same `?.let` guard for a missing reactContext).
+        Function("setAppForeground") { active: Boolean -> appContext.reactContext?.let { TorNodeService.setForeground(it, active) } }
 
         AsyncFunction("getHistory") {
             val ctx = appContext.reactContext ?: return@AsyncFunction emptyList<Map<String, Any?>>()

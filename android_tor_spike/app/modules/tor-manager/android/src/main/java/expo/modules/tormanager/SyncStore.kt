@@ -38,6 +38,12 @@ data class ProfileLayout(
     val sizes: Map<String, String>,
     val texts: Map<String, Map<String, Any?>>)
 
+/** One stored dialable peer (friend-peering Task 1; mirrors hearth
+ *  store.py's `peers` table, store.py:39-40: `address TEXT PRIMARY KEY,
+ *  identity_pub TEXT`). `identityPub` is null when only the address is
+ *  known so far (e.g. before the peer's identity has been confirmed). */
+data class Peer(val address: String, val identityPub: String?)
+
 /** Parse a layout payload's pins/spans/texts field (a JSON object of
  *  msgId -> sub-object) into a plain Kotlin map, dropping any entry whose
  *  key isn't a String or whose value isn't itself a map. Shared by both
@@ -373,6 +379,39 @@ interface SyncStore {
      *  ties hash to content). Empty `hashes` returns an empty map without
      *  touching storage. */
     fun blobSizes(hashes: List<String>): Map<String, Long>
+
+    // -- friend-peering Task 1: peer table (addPeer/listPeers/removePeer/
+    //    addressFor) -- mirrors hearth store.py's peers table (schema
+    //    store.py:39-40; add_peer store.py:217-221; list_peers store.py:
+    //    223-227; remove_peer store.py:229-232; address_for store.py:
+    //    234-239).
+
+    /** Adds (or updates) a peer address this device knows how to dial
+     *  (friend-peering Task 1; mirrors hearth store.py:217-221 add_peer's
+     *  `INSERT OR REPLACE INTO peers VALUES(?,?)`). `address` is the peers
+     *  table's PRIMARY KEY: a second call for the SAME address overwrites
+     *  its identityPub (newest call wins) rather than erroring or
+     *  duplicating -- there is at most one row per address. `identityPub`
+     *  is null when only the address is known so far (mirrors store.py's
+     *  `identity_pub: Optional[str] = None`). */
+    fun addPeer(address: String, identityPub: String?)
+    /** Every stored peer (friend-peering Task 1; mirrors hearth store.py:
+     *  223-227 list_peers). Order is unspecified, same as store.py's own
+     *  `SELECT address, identity_pub FROM peers` (no ORDER BY). */
+    fun listPeers(): List<Peer>
+    /** Drops the peer at `address`, if any (friend-peering Task 1; mirrors
+     *  hearth store.py:229-232 remove_peer's plain `DELETE FROM peers WHERE
+     *  address=?`). Removing an address that was never added is a no-op. */
+    fun removePeer(address: String)
+    /** The address of the FIRST stored peer whose identityPub equals
+     *  `identityPub`, or null if no peer names that identity (friend-
+     *  peering Task 1; mirrors hearth store.py:234-239 address_for's
+     *  `SELECT address FROM peers WHERE identity_pub=?` + `fetchone()`).
+     *  `address` is the peers table's primary key but `identity_pub` is
+     *  not, so more than one address could in principle name the same
+     *  identity; like store.py, this returns only the first match, not the
+     *  full set. */
+    fun addressFor(identityPub: String): String?
 }
 
 /** One stored message's fields `filterMessagesNotIn` needs, kept
@@ -395,13 +434,65 @@ internal data class GossipRow(
 internal fun wrapKeys(payload: Map<String, Any?>): Set<String> =
     (payload["wraps"] as? Map<*, *>)?.keys?.filterIsInstance<String>()?.toSet() ?: emptySet()
 
+/** THE per-message audience predicate (friend-peering review fix, Finding 1,
+ *  CRITICAL): given one message's `kind`/`payload`/`authorIdentity`/`msgId`,
+ *  may `peerIdentity` receive it? Extracted out of `filterMessagesNotIn`'s
+ *  own `when(kind)` block so the GIVE side (`filterMessagesNotIn`, below)
+ *  and the PUSH side (`SyncRunner.filterPendingForPeer`, which fans the
+ *  phone's own composed-but-unsent outbound queue to each dialed peer) share
+ *  ONE decision and cannot silently diverge -- before this extraction,
+ *  `SyncRunner` had no gate at all on the push path and fanned the WHOLE
+ *  pending queue (posts/DMs/responses) to every peer unfiltered: a DM meant
+ *  for one friend reached every other friend too, and a reaction/comment
+ *  (kind "response") -- whose whole point is responder-anonymity -- was
+ *  pushed to every friend as a raw wire dict naming the plaintext target
+ *  msg_id, de-anonymizing responder->post attribution.
+ *
+ *  Exact same rules `filterMessagesNotIn` always enforced (byte-faithful to
+ *  hearth's store.messages_not_in, store.py:702-750): DM relays only to
+ *  (author, recipient); RING is author-private; POST's audience is its
+ *  inline `wraps` keys UNIONED with `grantDevs[authorIdentity to msgId]`
+ *  (author-keyed grant union -- see `filterMessagesNotIn`'s own doc on why a
+ *  hostile grant naming someone else's post can never widen it);
+ *  WRAP_GRANT/RESPONSE/RESPONSES gate on their own inline `wraps` keys only,
+ *  deliberately NO grant-union (a response is never broadcast to the target
+ *  post's audience). Every other kind (profile/story/enckey/album/
+ *  profile_layout/delete/...) is unconditionally allowed -- store.py's
+ *  function has no audience gate for them either. */
+internal fun peerMayReceive(
+    kind: String,
+    payload: Map<String, Any?>,
+    authorIdentity: String,
+    msgId: String,
+    peerIdentity: String,
+    peerDevices: Set<String>,
+    grantDevs: Map<Pair<String, String>, Set<String>>,
+): Boolean = when (kind) {
+    "dm" -> {
+        val recipient = payload["to"] as? String
+        peerIdentity == authorIdentity || peerIdentity == recipient
+    }
+    "ring" -> peerIdentity == authorIdentity
+    "post" -> {
+        val wr = wrapKeys(payload) + (grantDevs[authorIdentity to msgId] ?: emptySet())
+        peerIdentity == authorIdentity || peerDevices.any { it in wr }
+    }
+    "wrap_grant", "response", "responses" -> {
+        val wr = wrapKeys(payload)
+        peerIdentity == authorIdentity || peerDevices.any { it in wr }
+    }
+    else -> true
+}
+
 /** The give-side entitlement filter itself (gossip server Task 1) -- the
  *  exact port of hearth's store.messages_not_in (store.py:702-750),
  *  factored out of both `SyncStore` impls so they cannot diverge on this
  *  security-critical boundary. `rows` must already be ordered by seq
  *  ascending (mirrors store.py's `ORDER BY seq ASC`); `peerDevices` must
  *  already be `deviceViews(peerIdentity)` (the caller's job, since both
- *  store impls already have their own `deviceViews`). */
+ *  store impls already have their own `deviceViews`). The audience decision
+ *  itself is `peerMayReceive` (above) -- this function's own remaining job
+ *  is building `grantDevs` from `rows` and applying the seen-delta check. */
 internal fun filterMessagesNotIn(
     rows: List<GossipRow>, summaries: Map<Pair<String, String>, SeenSet>,
     entitled: Set<String>, peerIdentity: String, peerDevices: Set<String>,
@@ -426,34 +517,8 @@ internal fun filterMessagesNotIn(
     val out = mutableListOf<SignedMessage>()
     for (r in rows) {
         if (r.identityPub !in entitled) continue
-        when (r.kind) {
-            "dm" -> {
-                val recipient = r.payload["to"] as? String
-                if (peerIdentity != r.identityPub && peerIdentity != recipient)
-                    continue      // DMs never relay through friends
-            }
-            "ring" -> {
-                if (peerIdentity != r.identityPub)
-                    continue      // ring records are author-private
-            }
-            "post" -> {
-                val wr = wrapKeys(r.payload) + (grantDevs[r.identityPub to r.msgId] ?: emptySet())
-                if (peerIdentity != r.identityPub && peerDevices.none { it in wr })
-                    continue      // wrap-set union grant audience + author
-            }
-            "wrap_grant", "response", "responses" -> {
-                // Responder -> author only (spec 2026-07-18): deliberately
-                // NO grant-union here, unlike POST above -- a response's
-                // whole point is that it is NOT broadcast to the author's
-                // audience.
-                val wr = wrapKeys(r.payload)
-                if (peerIdentity != r.identityPub && peerDevices.none { it in wr })
-                    continue      // routes to wrapped devices + author only
-            }
-            // Every other kind (profile/story/enckey/album/profile_layout/
-            // delete/...) has no audience gate in store.py either -- falls
-            // through unconditionally to the seen-delta check below.
-        }
+        if (!peerMayReceive(r.kind, r.payload, r.identityPub, r.msgId, peerIdentity, peerDevices, grantDevs))
+            continue
         val dev = summaries[r.identityPub to r.devicePub]
         if (dev != null && dev.has(r.seq)) continue
         out.add(r.raw)
@@ -736,5 +801,85 @@ class InMemorySyncStore : SyncStore {
         val out = linkedMapOf<String, Long>()
         for (h in hashes) blobs[h]?.let { out[h] = it.size.toLong() }
         return out
+    }
+
+    // address -> identityPub (friend-peering Task 1; mirrors hearth
+    // store.py's peers table, address as PRIMARY KEY). LinkedHashMap.put
+    // naturally gives addPeer's INSERT OR REPLACE semantics -- one row per
+    // address, newest identityPub wins.
+    private val peers = linkedMapOf<String, String?>()
+
+    override fun addPeer(address: String, identityPub: String?) { peers[address] = identityPub }
+
+    override fun listPeers(): List<Peer> = peers.map { (address, identityPub) -> Peer(address, identityPub) }
+
+    override fun removePeer(address: String) { peers.remove(address) }
+
+    override fun addressFor(identityPub: String): String? =
+        peers.entries.firstOrNull { it.value == identityPub }?.key
+}
+
+// -- friend-peering Task 2: mergePeerAddress (onion-preferred, host-keyed
+//    eviction) -- mirrors hearth sync.py's _is_onion (sync.py:71-73) and
+//    _merge_peer_address (sync.py:93-131).
+
+/** True if `address`'s host (everything before the LAST `:`) ends in
+ *  `.onion` -- byte-faithful port of hearth's `_is_onion` (sync.py:71-73:
+ *  `host = address.rsplit(":", 1)[0]; return host.endswith(".onion")`).
+ *  `substringBeforeLast(":")` matches `rsplit(":", 1)[0]` exactly,
+ *  including the no-colon case (both return the whole string unchanged).
+ *  A free top-level function, not a SyncStore member, matching hearth's
+ *  own module-level `_is_onion` -- it needs no store state at all. */
+internal fun isOnion(address: String): Boolean =
+    address.substringBeforeLast(":").endsWith(".onion")
+
+/** Onion-preferred peer store (friend-peering Task 2): a byte-faithful
+ *  port of hearth sync.py's `_merge_peer_address` (sync.py:93-131). An
+ *  onion address is always kept; a non-onion address is stored only if we
+ *  hold no onion address for that identity yet. Never let a plain-TCP
+ *  address shadow a known onion one -- that would route a Tor peer's
+ *  gossip over the clearnet.
+ *
+ *  Onion eviction is HOST-keyed, not identity-keyed (sync.py's own doc
+ *  comment, reproduced here because the reasoning is load-bearing and this
+ *  is a port, not a paraphrase): TorTransport.connect normalizes every
+ *  .onion dial to the fixed ONION_VIRTUAL_PORT regardless of the stored
+ *  port, so a same-host row at an old port is always a stale duplicate of
+ *  the same node (an onion host uniquely identifies one service) and must
+ *  be drained -- stale-port rows would otherwise both dial the same live
+ *  service: redundant full gossip sessions every round, a stale self-row
+ *  syncing with itself over Tor, and the stale row propagating family-wide
+ *  via HAVE/pairing. A single identity CAN legitimately own multiple
+ *  different onion hosts across devices, so those must not be collapsed --
+ *  only same-host, different-port rows are evicted.
+ *
+ *  A free/extension function rather than a `SyncStore` interface member,
+ *  for the same reason `ingestRevocation`/`applyDefriendNotice` are
+ *  (RevocationCert.kt's doc): it needs no store-impl-specific state beyond
+ *  already-public interface methods (`listPeers`, `addPeer`,
+ *  `removePeer`), so implementing it ONCE here gives both
+ *  `InMemorySyncStore` and `SqliteSyncStore` identical behavior for free. */
+fun SyncStore.mergePeerAddress(identity: String, addr: String) {
+    if (isOnion(addr)) {
+        val host = addr.substringBeforeLast(":")
+        // Evict any non-onion rows for this identity: otherwise the
+        // gossip loop keeps dialing the stale clearnet address every
+        // round, and a have-frame built from listPeers() would keep
+        // propagating a non-onion address for a peer with a known onion --
+        // exactly what this guardrail exists to prevent.
+        for (pe in listPeers()) {
+            if (pe.identityPub != identity) continue
+            if (!isOnion(pe.address)) {
+                removePeer(pe.address)
+            } else if (pe.address != addr && pe.address.substringBeforeLast(":") == host) {
+                removePeer(pe.address)          // stale same-host, old port
+            }
+        }
+        addPeer(addr, identity)
+        return
+    }
+    val known = listPeers().filter { it.identityPub == identity }.map { it.address }
+    if (known.none { isOnion(it) }) {
+        addPeer(addr, identity)
     }
 }

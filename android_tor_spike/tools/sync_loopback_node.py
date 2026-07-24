@@ -670,6 +670,152 @@ async def _run_dm(data_dir) -> None:
         await sync.stop()
 
 
+async def _run_peer_friend(data_dir) -> None:
+    """Task 7 (friend-peering loopback gate, PHONE-DIALS-FRIEND direction):
+    the served node here IS a FRIEND identity, not the phone's own home
+    identity -- every OTHER scenario in this file has the served node
+    SHARE the phone's identity (mint_fixture enrolls the phone as a
+    sibling device of whichever node is listening). That is exactly the
+    NEW capability friend-peering Tasks 1-6 added on the Kotlin side
+    (SyncRunner's peer loop now dials every stored PEER row, not just the
+    hardcoded home node), so this gate needs a topology no earlier
+    scenario has: a real "own" identity (the phone's actual home
+    identity -- never listened on, never dialed, exactly the role
+    `node`/"Desk" plays in _run_outbound_compose/_run_responses/_run_dm)
+    and a separate real "friend" identity that IS the one listening, the
+    one the phone dials DIRECTLY.
+
+    Seed mirrors _run_outbound_compose's own/friend cross-registration
+    (store.add_identity both ways + ensure_enckey on both + a single
+    _gossip_until_converged) -- by the time the phone ever connects, each
+    side already has a DeviceView + published enc key for the other's
+    PRIMARY device.
+
+    NON-ENTITLED item: `friend.set_ring(own.identity_pub, "inner")` -- a
+    KIND_RING record naming own.identity_pub as an inner-ring member.
+    RING records are author-private (store.py:723-724, and SyncStore.kt's
+    identical port): `peer_identity != ipub` skips UNCONDITIONALLY -- an
+    IDENTITY-level gate, not a device-level one. That distinction is
+    load-bearing and is why this is a `set_ring` call and NOT a second
+    `compose_post`: compose_post's automatic friend-wrap on a "kreds"
+    post wraps to EVERY enc-keyed device of every known friend, and
+    hearth's own POST routing gate (`messages_not_in`, store.py:725-729)
+    checks `peer_devices & wr` where `peer_devices = load_views(
+    peer_identity)` is EVERY device friend has EVER seen from THAT WHOLE
+    IDENTITY -- once the phone's device is registered (which it must be,
+    to prime the entitled post below), a "kreds" post wrapped ONLY to
+    own's PRIMARY device would ALSO satisfy that intersection (own's
+    primary device is itself one of `peer_devices`) and would be ROUTED
+    to the phone's connection regardless of which specific device is
+    asking -- a real but DIFFERENT proof (own-device fanout, the exact
+    mechanism _run_regrants/maintain_own_device_grants exists to
+    eventually bridge), not the over-pull negative this scenario needs.
+    RING's author-private gate has no such loophole: `peer_identity !=
+    ipub` refuses ANY identity other than friend itself, phone's device
+    or not.
+
+    ENTITLED item: composed REACTIVELY, in the wrapped _on_conn below,
+    the FIRST time friend.store's enc-key table for `own.identity_pub`
+    already contains the phone's own device_pub -- i.e. only once a
+    connection's real MESSAGES phase has generically ingested the
+    phone's own device-signed `enckey` message (pushed as connection 1's
+    `outbound`, via KotlinSync.composeEncKey exactly like every other
+    outbound-push gate in this file). At that point `_scope_device_pubs`'s
+    union naturally includes the phone's device directly (an INLINE wrap,
+    no grant/backfill machinery needed or exercised -- that mechanism is
+    already proven by _run_regrants/phoneReadsFriendContentEndToEnd;
+    deliberately not reused here so this stays a clean single-hop proof).
+    Prints `{"event":"entitled_ready","msg_id":...,"pushed_ids":[...]}`
+    once composed -- the deterministic handoff the Kotlin test blocks on
+    (mirrors _run_outbound_compose's "composed"/_run_responses's
+    "responded" event idiom) before opening a second connection to pull
+    it. `pushed_ids` (every message friend's store now holds authored by
+    `own.identity_pub`) is the friend's own independent confirmation of
+    "the phone pushes its own [content], the friend receives it" -- the
+    OTHER half of Task 7's brief for this direction -- read directly off
+    ingested messages, not a script-side shortcut; this event firing AT
+    ALL already implies it (compose_post's wrap could not otherwise cover
+    the phone's device), but the field gives the Kotlin test something
+    concrete to cross-check the exact msg_id against.
+
+    `fx["friend_identity_pub"]` (same field name/purpose as every other
+    friend-seeding scenario here) and `fx["nonentitled_msg_id"]` (the
+    non-entitled ring record's id, known up front since it is composed
+    before the phone ever connects) ride the initial fixture line.
+    friend's own advertised address (`friend.store.set_meta("gossip_addr",
+    ...)`, set AFTER the port is known, mirroring _run_pairing's
+    identical pattern) is what the Kotlin test's own peer-table
+    assertions cross-check against `KotlinSync.run`'s HAVE-phase
+    address-merge (friend-peering Task 3, Task 4 review Finding 1) --
+    proving a friend's advertised address lands under the FRIEND's own
+    identity_pub in the phone's peer table, not the phone's own.
+
+    `expect` is a placeholder, not `_compute_expect(...)`: that helper's
+    own-identity semantics (entitled == {node.identity_pub}, peer_identity
+    == node.identity_pub) assume the served node and the phone share an
+    identity, which is false here by design -- and, like every other
+    two-node own-plus-friend scenario in this file (outbound_compose/
+    responses/dm/regrants), the Kotlin counterpart never reads this field
+    at all (only SyncLoopbackTest's solo/two_node tests do)."""
+    own = HearthNode.create(Path(data_dir) / "n", "Desk", "desk")
+    own.ensure_enckey()          # own's PRIMARY device enc key -- a real
+                                  # (own-identity) enc-keyed device for
+                                  # friend's cross-registration to union at
+                                  # compose time.
+
+    friend = HearthNode.create(Path(data_dir) / "f", "Freja", "freja-desk")
+    own.store.add_identity(friend.identity_pub)
+    friend.store.add_identity(own.identity_pub)
+    friend.ensure_enckey()
+    _gossip_until_converged(own, friend)   # cross-registers device views +
+                                            # delivers both enc keys
+
+    nonentitled_id = friend.set_ring(own.identity_pub, "inner")
+
+    sync = SyncService(friend)
+
+    entitled_id = None
+    orig_on_conn = sync._on_conn
+
+    async def _on_conn_then_check(reader, writer):
+        nonlocal entitled_id
+        await orig_on_conn(reader, writer)
+        if entitled_id is None and fx["device_pub"] in friend.store.enckeys(own.identity_pub):
+            entitled_id = friend.compose_post(
+                "freja's post for the phone", scope="kreds", placement="journal")
+            pushed_ids = [m.msg_id for m in
+                         friend.store.messages_by_author(own.identity_pub)]
+            print(json.dumps({
+                "event": "entitled_ready",
+                "msg_id": entitled_id,
+                "pushed_ids": pushed_ids,
+            }), flush=True)
+
+    sync._on_conn = _on_conn_then_check
+
+    port = await sync.start("127.0.0.1", 0)
+    # friend's own advertised address (friend-peering Task 3 parity,
+    # mirrors _run_pairing's identical pattern) -- what KotlinSync.run's
+    # HAVE-phase address-merge is supposed to learn and attribute to
+    # friend.identity_pub, never to the phone's own.
+    friend.store.set_meta("gossip_addr", f"127.0.0.1:{port}")
+    try:
+        fx = mint_fixture(own)
+        fx["onion_addr"] = f"127.0.0.1:{port}"
+        fx["friend_identity_pub"] = friend.identity_pub
+        fx["nonentitled_msg_id"] = nonentitled_id
+        # Placeholder -- see this function's own doc for why
+        # _compute_expect's own-identity semantics don't apply to this
+        # scenario's topology, and why no sibling own+friend scenario's
+        # Kotlin counterpart reads this field.
+        expect = {"messages": 0, "blobs": 0, "identities": 0}
+        print(json.dumps({"port": port, "fixture": fx, "expect": expect}),
+              flush=True)
+        await asyncio.Event().wait()   # serve until killed
+    finally:
+        await sync.stop()
+
+
 def _deliver_referenced_blobs(dst, src, msg_id: str) -> None:
     """Task 4 (recipient-post-regrants loopback gate): copies every blob
     hash `msg_id`'s payload references (blobs/poster/thumbs -- the same
@@ -1265,7 +1411,20 @@ async def _run_dial(data_dir, spec: dict) -> None:
        "device_name": str, "cert": {EnrollmentCert.to_dict() shape},
        "also_known": [identity_pub, ...],
        "phone_device_pub": hex,       # own_sibling only
-       "phone_identity_pub": hex}     # friend + defriend
+       "phone_identity_pub": hex,     # friend + defriend
+       "gossip_addr": str}            # optional, Task 7 (friend-peering) only
+
+    `gossip_addr` (Task 7, friend-peering loopback gate -- SyncPeerLoopback
+    Test.kt's friend-dials-phone gap-filling test is the only caller that
+    ever sets this; every pre-existing dialSpec call site omits it and is
+    byte-unchanged): when present, this node's own `store.set_meta(
+    "gossip_addr", ...)` is set BEFORE it ever dials, so its real
+    `_session`'s own HAVE-phase write ("addr": store.get_meta(
+    "gossip_addr"), sync.py:764) carries a real value instead of the
+    permanent None every prior sub-scenario has sent -- exercising
+    KotlinSync.serve's own HAVE-phase address merge (the RESPONDER-side
+    twin of `run`'s already-proven copy) at the real wire for the first
+    time.
 
     own_sibling: the node's identity IS the phone fixture's identity (an
     own/sibling device) -- BEFORE dialing, publishes one PLAINTEXT marker
@@ -1356,6 +1515,14 @@ async def _run_dial(data_dir, spec: dict) -> None:
     node = _node_from_external_keys(
         Path(data_dir) / "n", spec["identity_priv"], spec["device_priv"],
         spec["cert"], spec.get("device_name", "node"), also_known=also_known)
+
+    # Task 7 (friend-peering loopback gate): OPTIONAL, additive -- see
+    # dialSpec's own doc above for the full rationale. Every pre-existing
+    # sub-scenario/call site never sets this, so `gossip_addr` is None and
+    # this is a no-op, byte-identical to before this task.
+    gossip_addr = spec.get("gossip_addr")
+    if gossip_addr:
+        node.store.set_meta("gossip_addr", gossip_addr)
 
     if scenario == "own_sibling":
         node.set_profile("PushedFromNode")
@@ -1537,5 +1704,14 @@ if __name__ == "__main__":
         # _run_responses, _run_dm) stays provably byte-identical to
         # before this task.
         asyncio.run(_run_pairing(sys.argv[1], deny=(_scenario == "pairing_deny")))
+    elif _scenario == "peer_friend":
+        # Task 7 (friend-peering loopback gate): a structurally different
+        # entry point from every scenario above -- the SERVED node is a
+        # FRIEND identity, not the phone's own home identity (see
+        # _run_peer_friend's own doc). Kept as its own entry point for the
+        # same reason outbound_compose/responses/dm/regrants/pairing are:
+        # every pre-Task-7 call site stays provably byte-identical to
+        # before this task.
+        asyncio.run(_run_peer_friend(sys.argv[1]))
     else:
         asyncio.run(main(sys.argv[1], _scenario))

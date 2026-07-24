@@ -142,12 +142,19 @@ class KotlinPairingTest {
         put("signature", c.signature)
     }
 
+    /** `peers` (friend-peering Task 3): null keeps the original default
+     *  shape (one entry naming `friends[0]`, when `friends` is non-empty) so
+     *  every pre-existing call site is unaffected; pass an explicit list
+     *  (including `emptyList()`) to control exactly which `{identity_pub,
+     *  address}` entries the package carries, for the address-learning
+     *  tests below. */
     private fun packageJson(
         cert: KotlinWire.CertDict,
         identityPriv: String,
         friends: List<String> = listOf("44".repeat(32), "55".repeat(32)),
         myAddr: String? = "abcexampleaddr.onion:9997",
         t: String = "hearth-pair-package",
+        peers: List<Pair<String, String>>? = null,
     ): String {
         val o = JSONObject()
         o.put("t", t)
@@ -156,12 +163,13 @@ class KotlinPairingTest {
         o.put("identity_priv", identityPriv)
         o.put("friends", JSONArray(friends))
         // Real hearth peers shape (node.py store.list_peers()): [{address,
-        // identity_pub}, ...] -- included to prove installPackage tolerates
-        // (and deliberately drops) it, not merely that it's absent.
-        val peers = JSONArray()
-        if (friends.isNotEmpty())
-            peers.put(JSONObject().apply { put("address", "friendnode.onion:9997"); put("identity_pub", friends[0]) })
-        o.put("peers", peers)
+        // identity_pub}, ...].
+        val effectivePeers = peers ?: (if (friends.isNotEmpty())
+            listOf(friends[0] to "friendnode.onion:9997") else emptyList())
+        val peersArr = JSONArray()
+        for ((identityPub, address) in effectivePeers)
+            peersArr.put(JSONObject().apply { put("address", address); put("identity_pub", identityPub) })
+        o.put("peers", peersArr)
         if (myAddr != null) o.put("my_addr", myAddr) else o.put("my_addr", JSONObject.NULL)
         return o.toString()
     }
@@ -218,6 +226,122 @@ class KotlinPairingTest {
         val identity = KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "name")
         assertEquals("", identity.onion_addr)
         assertEquals(setOf(identityPub), store.knownIdentities().toSet())
+        assertTrue("no my_addr -- nothing to seed as the home node peer", store.listPeers().isEmpty())
+    }
+
+    // =======================================================================
+    // KotlinPairing.installPackage -- friend-peering Task 3: address
+    // learning at pairing install (peers[] merge + home-node seed).
+    // =======================================================================
+
+    /** A `peers[]` entry naming a KNOWN friend (added to `store` via the
+     *  `friends[]` loop that runs just above the peers merge in
+     *  installPackage) gets merged into the peer table -- `friends` must be
+     *  added BEFORE peers are consulted, or the is_known gate below would
+     *  never pass for a legitimately-known friend. */
+    @Test fun installPackageMergesPeerAddressForKnownFriend() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
+        val friendA = "44".repeat(32)
+        val pkg = packageJson(cert, identityPriv, friends = listOf(friendA),
+            peers = listOf(friendA to "friendnode.onion:9997"))
+
+        KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "My Phone")
+
+        assertTrue(store.knownIdentities().contains(friendA))
+        assertEquals("friendnode.onion:9997", store.addressFor(friendA))
+    }
+
+    /** A `peers[]` entry naming an identity NOT in `friends[]` (so
+     *  `store.knownIdentities()` never contains it) must NOT be merged --
+     *  the is_known gate, defense-in-depth against a malformed/hostile
+     *  package injecting an address for an identity this device has no
+     *  other reason to trust or dial. */
+    @Test fun installPackageDoesNotMergePeerAddressForUnknownIdentity() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
+        val strangerPub = "99".repeat(32)   // deliberately NOT in friends[]
+        val pkg = packageJson(cert, identityPriv, friends = emptyList(), myAddr = null,
+            peers = listOf(strangerPub to "stranger.onion:9997"))
+
+        KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "My Phone")
+
+        assertFalse(store.knownIdentities().contains(strangerPub))
+        assertNull("unknown identity's address must not be added -- is_known gate",
+            store.addressFor(strangerPub))
+        // myAddr=null here (isolates this test to the peers[]-gate only, not
+        // the separate home-node seed, which has its own dedicated test below).
+        assertTrue("nothing else should have landed in the peer table either", store.listPeers().isEmpty())
+    }
+
+    /** `my_addr` (the home node's own address) is seeded as a peer of the
+     *  OWN identity -- `mergePeerAddress(store, cert.identity_pub, my_addr)`
+     *  -- so the peer-loop (Task 4) dials the home node like any other
+     *  peer, instead of relying solely on the returned Identity.onion_addr
+     *  passthrough. */
+    @Test fun installPackageSeedsHomeNodeAsPeerForOwnIdentity() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
+        val pkg = packageJson(cert, identityPriv, friends = emptyList(),
+            myAddr = "homenode.onion:9997", peers = emptyList())
+
+        val identity = KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "My Phone")
+
+        assertEquals("homenode.onion:9997", identity.onion_addr)   // unchanged passthrough
+        assertEquals("homenode.onion:9997", store.addressFor(identityPub))
+        assertTrue(store.listPeers().any {
+            it.address == "homenode.onion:9997" && it.identityPub == identityPub
+        })
+    }
+
+    /** Code review fix (LOW): a `peers[]` entry with a missing OR explicit-
+     *  null `identity_pub` must be SKIPPED, not reject the whole package --
+     *  mirrors hearth's own schema (store.py's peers.identity_pub is
+     *  `Optional[str] = None`; node.py:2056's pair_install reads it via
+     *  `p.get("identity_pub")`, not `p["identity_pub"]`). Built directly
+     *  with `JSONObject`/`JSONArray` rather than via `packageJson`'s
+     *  `Pair<String,String>` peers param, which can't express an entry
+     *  missing a field entirely. A well-formed entry for a known friend, in
+     *  the SAME package, still installs and merges -- proving one bad entry
+     *  doesn't poison the rest. */
+    @Test fun installPackageSkipsPeersEntryWithMissingOrNullIdentityPubButInstallsRestOfPackage() {
+        val store = InMemorySyncStore()
+        val (identityPriv, identityPub) = genKeypair()
+        val (localDevicePriv, localDevicePub) = genKeypair()
+        val cert = signedCert(identityPriv, identityPub, localDevicePub)
+        val friendA = "44".repeat(32)
+
+        val o = JSONObject()
+        o.put("t", "hearth-pair-package")
+        o.put("protocol", KotlinWire.PROTOCOL)
+        o.put("cert", certJson(cert))
+        o.put("identity_priv", identityPriv)
+        o.put("friends", JSONArray(listOf(friendA)))
+        val peersArr = JSONArray()
+        peersArr.put(JSONObject().apply { put("address", "noidentitykey.onion:9997") })            // identity_pub key entirely absent
+        peersArr.put(JSONObject().apply { put("address", "nullidentity.onion:9997"); put("identity_pub", JSONObject.NULL) })   // explicit JSON null
+        peersArr.put(JSONObject().apply { put("address", "friendnode.onion:9997"); put("identity_pub", friendA) })             // well-formed, known friend
+        o.put("peers", peersArr)
+        o.put("my_addr", JSONObject.NULL)
+        val pkg = o.toString()
+
+        val identity = KotlinPairing.installPackage(store, pkg, localDevicePriv, localDevicePub, "My Phone")
+
+        // The whole package still installs -- not rejected over the two bad entries.
+        assertEquals(identityPub, identity.cert.identity_pub)
+        assertTrue(store.knownIdentities().contains(friendA))
+        // The well-formed entry (known friend) still merges.
+        assertEquals("friendnode.onion:9997", store.addressFor(friendA))
+        // Nothing landed under either malformed entry's address.
+        assertTrue(store.listPeers().none { it.address == "noidentitykey.onion:9997" })
+        assertTrue(store.listPeers().none { it.address == "nullidentity.onion:9997" })
+        assertEquals("only the one well-formed peer landed", 1, store.listPeers().size)
     }
 
     /** Post-review Important fix: installPackage must VERIFY BEFORE

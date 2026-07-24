@@ -107,6 +107,16 @@ class LocalApi(private val ctx: Context) {
         val expiresSeconds = form.fields["expires_seconds"]?.toDoubleOrNull()
         return try {
             Compose.post(sharedStore, fx, encPriv, encPub, text, jpegs, scope, createdAt, expiresSeconds)
+            // Task 6 (friend-peering, cadence overhaul): on-compose event
+            // trigger -- a successful enqueue should sync out soon, not wait
+            // for the adaptive cadence's current (possibly backed-off)
+            // interval. beatNow resets TorNodeService's AdaptiveBackoff to
+            // base AND runs one sweep now (see its own doc); best-effort
+            // exactly like publishOnion's discipline elsewhere in this
+            // service -- ctx.startService can throw on-device (e.g. a
+            // background-start restriction), and a trigger failing here must
+            // never turn a successful compose response into a 500.
+            runCatching { TorNodeService.beatNow(ctx) }
             json("{\"ok\":true}")
         } catch (e: Exception) { HttpResponse(500, mapOf("Content-Type" to "text/plain"), ("compose failed: ${e.message}").toByteArray()) }
     }
@@ -146,6 +156,10 @@ class LocalApi(private val ctx: Context) {
             val storyRef = parseStoryRef(form.fields["story_ref"].orEmpty())
             val r = ComposeDm.compose(sharedStore, fx, encPriv, encPub, to, text, jpegs, expiresSeconds, storyRef, createdAt)
             dmKeysCache = dmKeysCache + (r.msgId to r.contentKey)
+            // Task 6: on-compose event trigger -- see composePost's identical
+            // note above for the full reasoning (best-effort, never turns a
+            // successful compose into a 500).
+            runCatching { TorNodeService.beatNow(ctx) }
             json(JSONObject().put("msg_id", r.msgId).toString())
         } catch (e: IllegalArgumentException) {
             badRequest(e.message ?: "bad request")
@@ -232,6 +246,10 @@ class LocalApi(private val ctx: Context) {
         val createdAt = System.currentTimeMillis() / 1000.0
         return try {
             ComposeResponse.compose(sharedStore, fx, encPriv, encPub, msgId, rkind, body, createdAt)
+            // Task 6: on-compose event trigger, shared by /api/react,
+            // /api/comment, /api/retract (all three funnel through this one
+            // function) -- see composePost's identical note above.
+            runCatching { TorNodeService.beatNow(ctx) }
             json("{\"ok\":true}")
         } catch (e: IllegalArgumentException) {
             badRequest(e.message ?: "bad request")

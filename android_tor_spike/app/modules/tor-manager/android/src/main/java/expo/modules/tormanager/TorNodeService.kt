@@ -21,7 +21,38 @@ class TorNodeService : Service() {
     companion object {
         const val CHANNEL_ID = "kreds-node"
         const val NOTIF_ID = 1
-        private const val SYNC_INTERVAL_MS = 900_000L    // N = 15 min (Brick C: was the 5-min AUTH heartbeat)
+        // Task 6 (friend-peering, cadence overhaul): replaces the old fixed
+        // SYNC_INTERVAL_MS = 900_000L (15 min, was Brick C's 5-min AUTH
+        // heartbeat before that) with an adaptive floor/ceiling -- see
+        // AdaptiveBackoff. BASE is the interval used right after a sweep
+        // pulls new content AND right after any event trigger (on-compose /
+        // on-app-resume); MAX is the ceiling idle sweeps double toward and
+        // hold at, so a quiet peer is still checked at least once an hour.
+        private const val BASE_SYNC_MS = 600_000L    // 10 min
+        private const val MAX_SYNC_MS = 3_600_000L   // 1 hr
+        // Foreground-fast cadence (post-Task-6 follow-up, friend-peering
+        // arc): Task 6's adaptive backoff (above) is correct for BACKGROUND
+        // (battery/Doze), but while the app is FOREGROUND (screen on, user
+        // watching the feed) it left passively-arriving content waiting up
+        // to BASE_SYNC_MS (10 min) even with the app open -- the desktop
+        // node syncs near-real-time (a ~3s gossip loop). FOREGROUND_SYNC_MS
+        // is the sweep interval used instead of the adaptive-backoff value
+        // while `appForeground` is true (see chooseSweepDelay below).
+        // `internal`, not `private`: mirrors ONION_VIRTUAL_PORT's own
+        // precedent just below -- referenced directly from a JVM test
+        // (TorNodeServiceCadenceTest) with zero Android dependency, same
+        // reasoning as that constant's doc.
+        //
+        // 30s, not shorter: SyncRunner's ONION_SYNC_INTERVAL_MS (~45s) is
+        // the per-peer onion-dial floor and is UNCHANGED by this task -- a
+        // sweep more frequent than that throttle window dials the same
+        // onion address before its own floor has elapsed and is a no-op for
+        // that peer. 30s sweeps mean a given peer is effectively dialed
+        // roughly once per throttle window, which is the practical
+        // near-real-time ceiling over Tor today; a true push (the nudge
+        // channel, a carried follow-up ticket from the peering arc's DoD)
+        // is the eventual upgrade past this polling floor.
+        internal const val FOREGROUND_SYNC_MS = 30_000L   // 30 sec
         // Task 7 (phone-onion-reachability): the public port peers dial on
         // this phone's onion service. FIXED FOREVER (mirrors hearth's own
         // tor.py:41 ONION_VIRTUAL_PORT) -- re-picking this once deadlocked
@@ -30,13 +61,34 @@ class TorNodeService : Service() {
         // regardless of what a stored address says, so a value that ever
         // drifted from the desktop's own constant would silently strand
         // dialbacks.
-        private const val ONION_VIRTUAL_PORT = 9997
+        // `internal` (whole-branch review fix, Finding 2 -- was `private`):
+        // SyncRunner's dial path (`runTransport`) needs this same constant
+        // to normalize every `.onion` dial to this fixed port, mirroring
+        // hearth transport.py's `TorTransport.connect` -- see
+        // `SyncRunner.dialTarget`'s own doc for the DoS this normalization
+        // closes (a poisoned/relayed same-host, different-port peer row
+        // evicting the correct `:9997` row via `mergePeerAddress`'s host-
+        // keyed eviction, whose own safety premise -- documented on
+        // `SyncStore.kt`'s `mergePeerAddress` -- assumes this normalization
+        // already holds at dial time).
+        internal const val ONION_VIRTUAL_PORT = 9997
         // No pre-existing android.util.Log usage anywhere in this file to
         // mirror; TorManagerModule.kt set the "module name as tag" precedent
         // (its own TAG doc comment) -- followed here with this class's name.
         private const val TAG = "TorNodeService"
         const val ACTION_STOP = "eu.kreds.torspike.STOP"
         const val ACTION_BEAT_NOW = "eu.kreds.torspike.BEAT_NOW"
+        // Foreground-fast cadence: the app's AppState transition bridge (RN
+        // WebShell.tsx -> TorManagerModule.setAppForeground -> here) flips
+        // `appForeground`, which sweepAndReschedule's next tick picks up via
+        // chooseSweepDelay. Deliberately a SEPARATE action from
+        // ACTION_BEAT_NOW: entering foreground both flips this flag AND (via
+        // the RN side calling beatNow() alongside, unchanged from Task 6)
+        // kicks one immediate sweep -- see setForeground's own doc for why
+        // this action does not ALSO trigger a sweep itself (that would
+        // double a sweep already requested by the same transition).
+        const val ACTION_SET_FOREGROUND = "eu.kreds.torspike.SET_FOREGROUND"
+        const val EXTRA_FOREGROUND = "foreground"
         const val BROADCAST_BEAT = "eu.kreds.torspike.BEAT"
         const val BROADCAST_STATE = "eu.kreds.torspike.STATE"
         // Task 6 (phone-onion-reachability): self-revoke -> full wipe to
@@ -52,6 +104,26 @@ class TorNodeService : Service() {
         }
         fun stop(ctx: Context) = ctx.startService(Intent(ctx, TorNodeService::class.java).setAction(ACTION_STOP))
         fun beatNow(ctx: Context) = ctx.startService(Intent(ctx, TorNodeService::class.java).setAction(ACTION_BEAT_NOW))
+
+        /** Foreground-fast cadence: sets `appForeground` on whatever
+         *  TorNodeService instance is currently running (a bare
+         *  `startService` + action, exactly like `beatNow`/`stop` above --
+         *  if the service isn't running, this starts a fresh instance whose
+         *  `onStartCommand` sees ACTION_SET_FOREGROUND, sets the flag, and
+         *  returns WITHOUT calling `startNode()` -- see onStartCommand's
+         *  `when` block, the same no-op-safe shape `ACTION_BEAT_NOW` already
+         *  has for a not-yet-started service: `scheduler` stays null, no
+         *  Tor/gossip/sync work is kicked off, nothing throws). Does NOT
+         *  itself trigger a sweep -- the RN caller (WebShell.tsx's AppState
+         *  listener) calls `beatNow()` alongside this on the SAME
+         *  active-transition, so a redundant sweep here would just double
+         *  that one up. Only the flag flips; the single self-rescheduling
+         *  chain (sweepAndReschedule) picks up the new interval on its own
+         *  next tick, per chooseSweepDelay below. */
+        fun setForeground(ctx: Context, active: Boolean) =
+            ctx.startService(Intent(ctx, TorNodeService::class.java)
+                .setAction(ACTION_SET_FOREGROUND)
+                .putExtra(EXTRA_FOREGROUND, active))
 
         /** Self-revoke -> full wipe to First-Load (Task 6; node.py:3144's
          *  `enter_revoked_state` is the desktop analog: destroy ALL key
@@ -99,11 +171,55 @@ class TorNodeService : Service() {
             stop(ctx)
             ctx.sendBroadcast(Intent(BROADCAST_REVOKED).setPackage(ctx.packageName))
         }
+
+        /** Foreground-fast cadence: the pure choice `sweepAndReschedule`
+         *  makes between the two candidate next-sweep intervals it already
+         *  has in hand -- `foregroundMs` (FOREGROUND_SYNC_MS) while the app
+         *  is active, else whatever AdaptiveBackoff.nextInterval just
+         *  computed (`backoffNext`). Extracted into its own function (rather
+         *  than an inline `if` at the call site) purely so it's unit-testable
+         *  on a plain JVM with no Android/Service dependency -- same
+         *  reasoning as AdaptiveBackoff.pulledNewContent's own doc for why
+         *  that decision is a standalone function rather than inlined into
+         *  syncCycle. `internal`: referenced directly from
+         *  TorNodeServiceCadenceTest, mirroring ONION_VIRTUAL_PORT's own
+         *  internal-for-JVM-test-access precedent above. */
+        internal fun chooseSweepDelay(foreground: Boolean, foregroundMs: Long, backoffNext: Long): Long =
+            if (foreground) foregroundMs else backoffNext
     }
 
     @Volatile private var scheduler: ScheduledExecutorService? = null
     @Volatile private var syncs = 0
     @Volatile private var lastLine = "starting"
+    // Foreground-fast cadence: flipped by ACTION_SET_FOREGROUND (from
+    // TorManagerModule.setAppForeground, driven by WebShell.tsx's AppState
+    // listener) -- true while the app is active/visible. Read by
+    // sweepAndReschedule (the single self-rescheduling chain's own thread)
+    // via chooseSweepDelay; written from onStartCommand, which can run on a
+    // different thread (the same cross-thread shape ACTION_BEAT_NOW's
+    // backoff.reset() already has) -- @Volatile for the same
+    // cross-thread-visibility discipline as every other mutable field on
+    // this class, not because reads/writes need to be atomic-compound (a
+    // plain boolean flag has no read-modify-write to protect, unlike
+    // AdaptiveBackoff's AtomicLong `current`).
+    @Volatile private var appForeground: Boolean = false
+    // Task 6 review fix (Finding 1): previous round's absolute store total
+    // (messages+blobs+identities), the baseline `syncCycle` diffs against
+    // to derive `pulledNew` -- see AdaptiveBackoff.pulledNewContent's own
+    // doc for why an absolute-total>0 check was wrong. -1L sentinel == "no
+    // successful (ran && ok) round yet this process"; the very first real
+    // sweep then counts as pulled-new, resetting the cadence to base, which
+    // is the desired startup behavior. Only ever written from syncCycle,
+    // which always runs on the single scheduler thread -- @Volatile for the
+    // same cross-thread-visibility discipline as `syncs`/`lastLine` above,
+    // not because there's a concurrent writer.
+    @Volatile private var lastSyncTotal: Long = -1L
+
+    // Task 6: one AdaptiveBackoff per service instance, driving the
+    // self-rescheduling chain in startNode()'s onDone below. reset() is
+    // called from ACTION_BEAT_NOW (a different thread than the scheduler
+    // chain) -- see AdaptiveBackoff's own thread-safety doc.
+    private val backoff = AdaptiveBackoff(BASE_SYNC_MS, MAX_SYNC_MS)
 
     // Gossip server Task 4: the inbound (answering) counterpart to the
     // outbound syncCycle below. One SqliteSyncStore, opened once here and
@@ -126,7 +242,26 @@ class TorNodeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> { shutdown(); return START_NOT_STICKY }
-            ACTION_BEAT_NOW -> { scheduler?.execute { syncCycle() }; return START_STICKY }   // manual "beat now" now triggers a full sync
+            // Task 6: an event trigger (on-compose / on-app-resume, both
+            // funneled through TorNodeService.beatNow -> this action) resets
+            // the adaptive cadence to base REGARDLESS of what this extra
+            // sweep itself finds, then runs one sweep right now. It does NOT
+            // start a second recurring chain -- only sweepAndReschedule
+            // (the startup chain) reschedules itself; this is a one-off.
+            ACTION_BEAT_NOW -> { backoff.reset(); scheduler?.execute { syncCycle() }; return START_STICKY }
+            // Foreground-fast cadence: flips `appForeground` only -- no
+            // sweep kicked here (see setForeground's own doc for why: the RN
+            // caller already fires beatNow() on the same transition). Safe
+            // on a not-yet-started instance exactly like ACTION_BEAT_NOW
+            // above -- this branch never touches `scheduler`, so there is
+            // nothing here that can NPE or need it non-null; the flag simply
+            // sits set until (or unless) startNode() ever runs. The single
+            // self-rescheduling chain (sweepAndReschedule) picks the new
+            // interval up on its own next tick via chooseSweepDelay.
+            ACTION_SET_FOREGROUND -> {
+                appForeground = intent.getBooleanExtra(EXTRA_FOREGROUND, false)
+                return START_STICKY
+            }
         }
         if (scheduler == null) startNode()
         return START_STICKY      // OS restarts us after process death
@@ -169,9 +304,12 @@ class TorNodeService : Service() {
                         // HAVE has the best chance of already advertising the
                         // (possibly freshly republished) gossip_addr.
                         s?.execute { publishOnion() }
-                        s?.execute { syncCycle() }   // immediate first sync, on the scheduler thread
-                        s?.scheduleAtFixedRate({ syncCycle() },
-                            SYNC_INTERVAL_MS, SYNC_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                        // Task 6: immediate first sweep, then self-reschedules
+                        // adaptively -- replaces the old immediate
+                        // s?.execute { syncCycle() } + s?.scheduleAtFixedRate(
+                        // syncCycle, SYNC_INTERVAL_MS, SYNC_INTERVAL_MS) pair
+                        // with the ONE call below. See sweepAndReschedule's doc.
+                        s?.execute { sweepAndReschedule() }
                     }
                 },
                 onError = { code, msg ->
@@ -281,12 +419,45 @@ class TorNodeService : Service() {
     // foreground module's syncNow. SyncRunner NEVER decrypts (background
     // stores encrypted only; decrypt-on-read happens in the foreground), so
     // no decrypt/content-key/feed-cache work is introduced here.
-    private fun syncCycle() {
+    // Task 6: now RETURNS whether this sweep pulled new content --
+    // sweepAndReschedule below feeds this straight into
+    // AdaptiveBackoff.nextInterval to pick the next interval. Everything
+    // else is unchanged from before Task 6.
+    // Task 6 review fix (Finding 1): "pulled new" used to be `ran && ok &&
+    // (total > 0)`, where `total` is SyncRunner's messages+blobs+identities
+    // -- but those are ABSOLUTE store totals (store.stats() is an
+    // unconditional SELECT COUNT(*)), not "new this round". Own identity is
+    // always seeded (identities >= 1 on every successful AUTH) and
+    // messages/blobs never shrink, so `total > 0` was true on essentially
+    // every successful sync -- the adaptive feature never actually backed
+    // off. Now derived as a DELTA against `lastSyncTotal` via
+    // AdaptiveBackoff.pulledNewContent; see that function's doc for the
+    // full rationale.
+    //
+    // Whole-branch review fix (Finding 4): `nowTotal` used to be
+    // `o.messages + o.blobs + o.identities` off the AGGREGATED (summed-
+    // across-peers) SyncOutcome -- but each peer's own counts are already
+    // this device's ABSOLUTE whole-store totals (SyncRunner.runTransport's
+    // `mapSyncResult` reads them straight from `store.stats()` per peer), so
+    // with N successful peers `nowTotal` scaled to roughly N times the real
+    // store size, and a flapping peer count alone could spuriously reset or
+    // suppress the backoff. `o.storeTotalAfter` is SyncRunner's own single
+    // post-round `store.stats()` read (peer-count-independent) -- see that
+    // field's doc.
+    private fun syncCycle(): Boolean {
         val start = System.currentTimeMillis()
+        var pulledNew = false
         val beat = try {
             if (!TorEngine.isUp) throw IllegalStateException("tor not up")
             val fx = fixture()
             val o = SyncRunner.runSync(this, fx)     // default no-op progress; NEVER decrypts
+            val nowTotal = o.storeTotalAfter
+            pulledNew = AdaptiveBackoff.pulledNewContent(lastSyncTotal, nowTotal, o.ran, o.ok)
+            // Advance the baseline ONLY on a real ran&&ok round -- a
+            // skipped (mutex-contended) or failed round must not overwrite
+            // it, or it would corrupt the NEXT round's delta (see
+            // pulledNewContent's doc).
+            if (o.ran && o.ok) lastSyncTotal = nowTotal
             // skipped = true (Brick C Task 3 fix): SyncRunner.ran == false is
             // a benign mutex contention (the foreground syncNow held the
             // lock), not a real failure -- flagged with a dedicated boolean
@@ -300,12 +471,89 @@ class TorNodeService : Service() {
             Beat(start, false, System.currentTimeMillis() - start, "io: ${e.message}")
         }
         // recordAndBroadcast does prefs I/O + notify + sendBroadcast, all of
-        // which can throw on-device. An uncaught throwable in a
-        // scheduleAtFixedRate task SILENTLY CANCELS all future syncs, so this
-        // MUST be guarded -- a transient notify/prefs hiccup must not
-        // permanently kill the sync cadence. syncCycle() therefore never
-        // throws to the executor.
+        // which can throw on-device. An uncaught throwable here must not
+        // propagate to the scheduler thread -- see sweepAndReschedule's own
+        // doc for why an uncaught throwable there would silently end the
+        // whole cadence. syncCycle() therefore never throws to the caller.
         runCatching { recordAndBroadcast(beat) }
+        return pulledNew
+    }
+
+    /** Task 6: self-rescheduling replacement for the old
+     *  `s.scheduleAtFixedRate(syncCycle, SYNC_INTERVAL_MS, SYNC_INTERVAL_MS)`
+     *  fixed cadence. Runs one sweep, then reschedules ITSELF after an
+     *  interval AdaptiveBackoff computes from whether that sweep pulled new
+     *  content -- never a fixed period.
+     *
+     *  Task 6 review fix (Finding 2): interval computation and the
+     *  reschedule call are TWO INDEPENDENT runCatching blocks, not one.
+     *  Under the original single-runCatching shape, a throw out of
+     *  `backoff.nextInterval` would skip the `scheduler?.schedule(...)`
+     *  call entirely -- silently ending the whole chain, since nothing else
+     *  re-arms it, killing the sync cadence for the rest of the process's
+     *  life. Now a failed interval computation falls back to
+     *  `BASE_SYNC_MS` and the reschedule still happens unconditionally;
+     *  only a failure in the `schedule()` call itself (e.g. the
+     *  stop-during-bootstrap race nulling `scheduler`) can end the chain,
+     *  exactly as intended before.
+     *
+     *  This is the ONLY function that reschedules itself. ACTION_BEAT_NOW
+     *  (the on-compose / on-app-resume event trigger, via beatNow) does NOT
+     *  call this -- it only resets `backoff` to base and runs one extra,
+     *  one-off `syncCycle()` alongside (see onStartCommand). There is
+     *  therefore always exactly one live chain per running service
+     *  instance, regardless of how many event triggers fire in between.
+     *
+     *  Whole-branch review fix, Finding M1 (MINOR -- chain can die on a JVM
+     *  Error): `syncCycle()` itself is documented to "never throw to the
+     *  caller" (see its own closing comment), but that guarantee is built on
+     *  `runCatching`/try-catch blocks that only catch `Exception`, not
+     *  `Throwable` -- a JVM `Error` (e.g. `OutOfMemoryError` during the
+     *  1-2 min sync) would propagate straight out of `syncCycle()`, past
+     *  this call, and kill this scheduler thread -- ending the cadence chain
+     *  permanently, contradicting this doc's own "always exactly one live
+     *  chain" guarantee. `runCatching { syncCycle() }.getOrDefault(false)`
+     *  closes that last gap: now only a failure in `scheduler?.schedule`
+     *  itself (e.g. the stop-during-bootstrap race nulling `scheduler`) can
+     *  ever end the chain, matching the Task 6 review fix (Finding 2)
+     *  two-independent-runCatching-blocks reasoning just below -- a bad
+     *  sweep must never take the reschedule down with it.
+     *
+     *  Foreground-fast cadence: the interval actually scheduled is now
+     *  `chooseSweepDelay(appForeground, FOREGROUND_SYNC_MS, backoffNext)`,
+     *  not the raw adaptive-backoff value -- while the app is foreground
+     *  (`appForeground == true`, flipped by ACTION_SET_FOREGROUND) every
+     *  tick reschedules at the short, fixed FOREGROUND_SYNC_MS regardless of
+     *  what AdaptiveBackoff itself is holding; while backgrounded, behavior
+     *  is byte-for-byte the Task 6 adaptive value, unchanged.
+     *
+     *  `backoff.nextInterval` is deliberately SKIPPED (not just discarded)
+     *  while foreground, rather than computed-but-unused every tick: calling
+     *  it anyway would silently advance its internal state once per
+     *  FOREGROUND_SYNC_MS tick regardless of the result being needed, and
+     *  `nextInterval(false)` DOUBLES toward MAX_SYNC_MS on every idle sweep
+     *  (a foreground sweep that pulls nothing new is exactly that) -- a long
+     *  foreground session with a quiet peer would silently walk the backoff
+     *  all the way to the 1 hr cap in the background, undetected because
+     *  nothing was reading it. The moment the app then backgrounds,
+     *  `sweepAndReschedule`'s NEXT tick would read that stale, fully-doubled
+     *  value instead of the short interval the user just had while
+     *  watching -- a jarring cliff exactly backwards from Task 6's intent
+     *  (idle backs off gradually, not in one leap). `beatNow()` already
+     *  calls `backoff.reset()` at the START of every foreground session
+     *  (fired alongside `setAppForeground(true)` on the same 'active'
+     *  transition, see `setForeground`'s doc) -- freezing the backoff
+     *  untouched for the REST of that session means it is still sitting at
+     *  exactly `BASE_SYNC_MS` whenever foreground ends, which is precisely
+     *  the "next reschedule starts from base" behavior the background
+     *  transition is specified to have. */
+    private fun sweepAndReschedule() {
+        val pulledNew = runCatching { syncCycle() }.getOrDefault(false)
+        val foreground = appForeground
+        val backoffNext = if (foreground) BASE_SYNC_MS
+            else runCatching { backoff.nextInterval(pulledNew) }.getOrDefault(BASE_SYNC_MS)
+        val next = chooseSweepDelay(foreground, FOREGROUND_SYNC_MS, backoffNext)
+        runCatching { scheduler?.schedule({ sweepAndReschedule() }, next, TimeUnit.MILLISECONDS) }
     }
 
     private fun recordAndBroadcast(beat: Beat) {

@@ -225,7 +225,23 @@ object KotlinSync {
     fun run(stream: Stream, store: SyncStore, ownDevicePub: String,
             outbound: List<Map<String, Any?>> = emptyList(),
             onProgress: (phase: String, count: Int) -> Unit = { _, _ -> },
-            ownIdentity: String = ""): SyncResult {
+            ownIdentity: String = "",
+            // friend-peering Task 4 review fix (Finding 1, HIGH -- security):
+            // the AUTH'd peer's identity_pub, established by the caller
+            // (SyncRunner.runTransport) BEFORE `run` is ever invoked --
+            // mirrors `serve`'s own `peerCert: KotlinWire.CertDict` param,
+            // just narrowed to the one field the HAVE phase's own-device-
+            // trust gate below needs. See that gate's own doc comment for the
+            // full reasoning. Nullable, defaulting to null (never a bare
+            // `""`, which WOULD accidentally equal `ownIdentity`'s own
+            // default and fail OPEN) -- a caller that never passes this (an
+            // old/incomplete integration, or most of this file's own tests,
+            // which don't exercise the HAVE-widening phase at all) fails
+            // CLOSED: the gate below is simply never satisfied, so no
+            // widening happens, matching this file's established
+            // fail-closed-by-default posture (see `ownIdentity`'s own doc on
+            // the SelfRevoked gate just above).
+            peerIdentity: String? = null): SyncResult {
         fun progress(phase: String, count: Int) {
             try { onProgress(phase, count) } catch (_: Throwable) {}
         }
@@ -352,7 +368,92 @@ object KotlinSync {
                 "peers" to emptyList<Any>(), "addr" to (store.getMeta("gossip_addr") ?: "")))
             val have = readFrame(stream)
             val known = have.optJSONArray("known") ?: JSONArray()
-            for (i in 0 until known.length()) store.addIdentity(known.getString(i))
+            // THE SECURITY FIX (friend-peering Task 4 review, Finding 1,
+            // HIGH): own-device trust (sync.py:768-772; mirrors `serve`'s own
+            // gate, KotlinSync.kt's own-device-trust comparison a few hundred
+            // lines below) -- only a verified SIBLING device (peerIdentity ==
+            // our own identity, established by AUTH before `run` is ever
+            // called -- never a frame claim) may widen our known-identities
+            // set from what it reports. Was UNCONDITIONAL before this fix
+            // (every `known[]` entry added regardless of who the peer was) --
+            // harmless while `run`'s ONE caller (SyncRunner.runTransport)
+            // only ever dialed the phone's own home node, but friend-peering
+            // Task 4 made `run` dial FRIENDS too, activating a real hole: a
+            // malicious/compromised friend's `known:[attackerId]` would
+            // widen us to `attackerId`, which would then ALSO satisfy the
+            // peers[] relay-merge's is_known gate a few lines below for that
+            // SAME attacker identity in the SAME frame -- planting a
+            // dialable stranger's address in our peer table, which a later
+            // round would then actually dial and sync with. An ordinary
+            // friend's `known[]` must NEVER widen this set; only our own
+            // sibling devices (the home node, or another paired phone) are
+            // trusted to report new identities this way.
+            if (peerIdentity != null && peerIdentity == ownIdentity) {
+                for (i in 0 until known.length()) store.addIdentity(known.getString(i))
+            }
+
+            // -- friend-peering Task 3: address learning (mirrors sync.py's
+            // own HAVE-phase merge, sync.py:774-781).
+            //
+            // FIX (direct-addr merge follow-up to the Task 4 review's Finding
+            // 1): this merge used to hardcode `ownIdentity` -- written back
+            // when `run`'s ONE production caller (SyncRunner.runTransport)
+            // only ever dialed the phone's own home node, so "the peer we're
+            // syncing with" and `ownIdentity` were always the same value.
+            // That stopped being true once friend-peering Task 4 made `run`
+            // also dial FRIENDS: syncing with a FRIEND merged the FRIEND's
+            // own reported `addr` under OUR OWN identity_pub instead of the
+            // friend's -- mislabeled peer-table data, and NOT harmless: the
+            // `peers` table is keyed by `address` as PRIMARY KEY (`addPeer`
+            // is INSERT-OR-REPLACE on address), so
+            // `mergePeerAddress(ownIdentity, friendsAddr)` OVERWRITES the
+            // pre-existing correct `peers[friendsAddr] = friendIdentity` row
+            // with `peers[friendsAddr] = ownIdentity` -- breaking
+            // `addressFor(friendIdentity)` and permanently refusing every
+            // future direct dial of that row via `acceptPeerIdentity`'s
+            // wrong-address guard (`expectedIdentity` would be `ownIdentity`,
+            // never matching the friend's real AUTH'd identity), until some
+            // third node re-heals the mapping via relay -- which does not
+            // exist during a home-node outage, the exact scenario
+            // friend-peering exists for. Fixed: attribute this merge to the
+            // AUTH'd `peerIdentity` instead, exactly like `serve`'s own
+            // version of this same merge
+            // (`store.mergePeerAddress(peerCert.identity_pub, peerAddr)`, a
+            // few hundred lines below) and hearth's own
+            // `_merge_peer_address(store, peer_identity, peer_have["addr"])`
+            // (sync.py:776). Gated on `peerIdentity != null` -- never a
+            // fallback to `ownIdentity` (that fallback IS the bug just
+            // described) -- a null `peerIdentity` means we cannot correctly
+            // attribute this address to anyone, so the merge is simply
+            // skipped for this round rather than mislabeled.
+            //
+            // Direct addr (sync.py:774-776): the peer's own onion, merged
+            // under the AUTH'd PEER's identity_pub -- gated on is_known
+            // (mirrors `serve`'s own gate on this same merge; belt-and-
+            // braces, hearth's own sync.py:774-776 has no equivalent
+            // is_known gate here) and never our own onion (a peer must never
+            // be able to make us dial ourselves).
+            val myAddr = store.getMeta("gossip_addr") ?: ""
+            val peerAddr = have.optString("addr", "")
+            if (peerIdentity != null && peerAddr.isNotEmpty() && peerAddr != myAddr &&
+                store.knownIdentities().contains(peerIdentity)) {
+                store.mergePeerAddress(peerIdentity, peerAddr)
+            }
+            // Transitive relay (sync.py:777-781): each `{identity_pub,
+            // address}` entry the peer relays, merged ONLY for an identity
+            // we already know (is_known) and whose address isn't our own
+            // onion -- this is what lets a friend's address propagate to us
+            // via the home node without ever syncing with that friend
+            // directly.
+            val relayedPeers = have.optJSONArray("peers") ?: JSONArray()
+            for (i in 0 until relayedPeers.length()) {
+                val p = relayedPeers.optJSONObject(i) ?: continue
+                val ident = p.optString("identity_pub", "")
+                val addr = p.optString("address", "")
+                if (ident.isEmpty() || addr.isEmpty() || addr == myAddr) continue
+                if (!store.knownIdentities().contains(ident)) continue
+                store.mergePeerAddress(ident, addr)
+            }
             progress("handshake", 0)
 
             // -- MESSAGES -- (push outbound -- for B.2, at most the phone's
@@ -461,18 +562,17 @@ object KotlinSync {
      *  respondHandshake explains why: a stray close here would break a
      *  caller -- this one -- that continues on the same connection).
      *
-     *  Deliberately NOT full hearth parity in two places, each documented
-     *  at its phase below: DEFRIENDS (phone-onion-reachability Task 4) now
-     *  DOES apply-then-ack, mirroring hearth's responder branch
-     *  (sync.py:705-721), but as a SUBSET -- store.applyDefriendNotice
-     *  skips the peer-table/device-views/disconnected-list cleanup
+     *  Deliberately NOT full hearth parity in one place, documented at its
+     *  phase below: DEFRIENDS (phone-onion-reachability Task 4) now DOES
+     *  apply-then-ack, mirroring hearth's responder branch (sync.py:
+     *  705-721), but as a SUBSET -- store.applyDefriendNotice skips the
+     *  peer-table/device-views/disconnected-list cleanup
      *  node.apply_defriend_notice also does (see DefriendNotice.kt's doc
-     *  comment for the full list; the phone has no peer table yet). And
-     *  peer-address/peer-table merging is dropped entirely (HAVE's
-     *  `peers`/`addr` fields are read but never consulted -- arc 3, no peer
-     *  table exists on the phone yet, the same "read it, drop it" shape
-     *  `KotlinPairing.installPackage` already set for `peers`,
-     *  KotlinPairing.kt:176-183).
+     *  comment for the full list). Peer-address/peer-table merging (HAVE's
+     *  `peers`/`addr` fields) IS now consulted -- friend-peering Task 3, see
+     *  that phase's doc below -- no longer the "read it, drop it" shape
+     *  `KotlinPairing.installPackage` used to share with this file before
+     *  its own Task 3 update (KotlinPairing.kt's installPackage doc).
      *  REVOCATIONS (Task 3, phone-onion-reachability) is now a REAL
      *  ingest, matching `run`'s own REVOCATIONS phase -- see that phase's
      *  doc below and `RevocationCert.kt`'s `SyncStore.ingestRevocation`. */
@@ -587,20 +687,18 @@ object KotlinSync {
             writeFrame(stream, mapOf("t" to "have",
                 "summary" to store.summary(), "known" to store.knownIdentities(),
                 "peers" to emptyList<Any>(), "addr" to (store.getMeta("gossip_addr") ?: "")))
-            // peers (the peer's own gossiped peer table): read above as part
-            // of `have`, but intentionally never consulted below -- arc 3
-            // (friend peering / address merge), no peer table exists on the
-            // phone yet. Same "read it, drop it" shape
-            // KotlinPairing.installPackage already set for `peers`
-            // (KotlinPairing.kt:176-183). Our own `addr` (phone-onion-
-            // reachability Task 7, mirrors `run`'s own HAVE write above) is
-            // now the stored gossip_addr -- set by TorNodeService.
-            // publishOnion after a successful ADD_ONION -- or "" if onion
-            // publish never ran/succeeded yet this boot. This is the SAME
-            // shared on-disk store `serve`'s caller (GossipServer) and
-            // TorNodeService's onion publish both read/write (SqliteSyncStore,
-            // fixed DB_NAME), so a `gossip_addr` set moments ago by this same
-            // boot's publish is already visible here.
+            // Our own `addr` (phone-onion-reachability Task 7, mirrors
+            // `run`'s own HAVE write above) is the stored gossip_addr -- set
+            // by TorNodeService.publishOnion after a successful ADD_ONION --
+            // or "" if onion publish never ran/succeeded yet this boot. This
+            // is the SAME shared on-disk store `serve`'s caller
+            // (GossipServer) and TorNodeService's onion publish both
+            // read/write (SqliteSyncStore, fixed DB_NAME), so a
+            // `gossip_addr` set moments ago by this same boot's publish is
+            // already visible here. Our own `peers` is unconditionally `[]`
+            // -- the phone is an ENDPOINT, not a relay (friend-peering
+            // Task 3): it never gossips its own peer table onward, only
+            // learns from what it reads below.
             val knownArr = have.optJSONArray("known") ?: JSONArray()
             val peerKnown = (0 until knownArr.length()).map { knownArr.getString(it) }.toSet()
             // Own-device trust (sync.py:768-772): only a verified SIBLING
@@ -611,6 +709,46 @@ object KotlinSync {
             // into our friend graph.
             if (peerCert.identity_pub == fixture.cert.identity_pub) {
                 for (ident in peerKnown) store.addIdentity(ident)
+            }
+
+            // friend-peering Task 3: address learning from the PEER's `have`
+            // (mirrors sync.py's own HAVE-phase merge, sync.py:774-781).
+            // Runs AFTER the known[]-widening block just above (code review
+            // fix -- was BEFORE, which is backwards vs. both hearth and
+            // `run`'s own ordering): hearth widens known[] first, THEN
+            // merges addr/peers (sync.py:768-781, in that order), so an
+            // identity newly introduced by THIS SAME frame's `known[]` (an
+            // own-device-trust widening) is already is_known by the time its
+            // relayed address in `peers[]` is evaluated below. Merging
+            // BEFORE the widening silently dropped that address for the
+            // round it was introduced in (self-healing only on a later
+            // retry once is_known finally caught up) -- see
+            // `serveMergesRelayedAddressForIdentityIntroducedBySameFrames-
+            // KnownWidening` in KotlinSyncTest.kt, which fails under the old
+            // order.
+            //
+            // Direct addr (774-776): the authenticated peer's own onion,
+            // merged under peerCert.identity_pub -- gated on is_known
+            // (already guaranteed by the mid-session re-check above HAVE,
+            // kept explicit here for defense-in-depth/parity with `run`'s
+            // own gate) and never our own onion.
+            val myAddr = store.getMeta("gossip_addr") ?: ""
+            val peerAddr = have.optString("addr", "")
+            if (peerAddr.isNotEmpty() && peerAddr != myAddr && store.knownIdentities().contains(peerCert.identity_pub)) {
+                store.mergePeerAddress(peerCert.identity_pub, peerAddr)
+            }
+            // Transitive relay (777-781): each `{identity_pub, address}`
+            // entry the peer relays, merged ONLY for an identity we already
+            // know (INCLUDING one this same frame's known[] just widened us
+            // to, above) and whose address isn't our own onion.
+            val relayedPeers = have.optJSONArray("peers") ?: JSONArray()
+            for (i in 0 until relayedPeers.length()) {
+                val p = relayedPeers.optJSONObject(i) ?: continue
+                val ident = p.optString("identity_pub", "")
+                val addr = p.optString("address", "")
+                if (ident.isEmpty() || addr.isEmpty() || addr == myAddr) continue
+                if (!store.knownIdentities().contains(ident)) continue
+                store.mergePeerAddress(ident, addr)
             }
 
             // -- MESSAGES -- (responder: read peer's first, THEN write ours

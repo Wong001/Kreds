@@ -191,6 +191,10 @@ internal fun dialSpec(
     devicePub: String, deviceName: String, cert: KotlinWire.CertDict,
     alsoKnown: List<String> = emptyList(),
     phoneDevicePub: String? = null, phoneIdentityPub: String? = null,
+    // Task 7 (friend-peering loopback gate): optional, additive -- see
+    // sync_loopback_node.py's dialSpec-shape doc for the full rationale.
+    // Every pre-Task-7 call site omits this and is byte-unchanged.
+    gossipAddr: String? = null,
 ): String {
     val m = linkedMapOf<String, Any?>(
         "scenario" to scenario, "port" to port,
@@ -200,6 +204,7 @@ internal fun dialSpec(
     )
     if (phoneDevicePub != null) m["phone_device_pub"] = phoneDevicePub
     if (phoneIdentityPub != null) m["phone_identity_pub"] = phoneIdentityPub
+    if (gossipAddr != null) m["gossip_addr"] = gossipAddr
     return KotlinWire.dumps(m)
 }
 

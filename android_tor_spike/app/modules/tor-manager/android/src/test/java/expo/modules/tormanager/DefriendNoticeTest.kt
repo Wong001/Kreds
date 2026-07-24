@@ -177,4 +177,66 @@ class DefriendNoticeTest {
         assertFalse("unknown author -> rejected, even with a valid signature and target",
             store.applyDefriendNotice(notice, ownIdentity))
     }
+
+    // =======================================================================
+    // friend-peering Task 5: applyDefriendNotice ALSO drops the defriended
+    // author's peer-table row(s) (mirrors hearth remove_peer_identity,
+    // node.py:1770) so SyncRunner's peer-loop (Task 4) stops dialing them.
+    // =======================================================================
+
+    @Test fun appliesValidNoticeAlsoRemovesAllPeerRowsForAuthor() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val (authorPriv, authorPub) = genKeypair()
+        store.addIdentity(authorPub)
+        // Two peer rows for the same identity -- multiple known device
+        // addresses for the ex-friend -- BOTH must go, not just the first.
+        store.addPeer("onion1.onion:9050", authorPub)
+        store.addPeer("onion2.onion:9050", authorPub)
+        // An unrelated peer row must survive untouched.
+        store.addPeer("unrelated.onion:9050", "cc".repeat(32))
+
+        val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
+        assertTrue("valid notice targeting us from a known author -> applied",
+            store.applyDefriendNotice(notice, ownIdentity))
+
+        val remainingPeers = store.listPeers()
+        assertTrue("author's peer rows all removed",
+            remainingPeers.none { it.identityPub == authorPub })
+        assertTrue("unrelated peer row untouched",
+            remainingPeers.any { it.address == "unrelated.onion:9050" })
+        // Existing defriend effects (arc 2) must still hold alongside the
+        // new peer-removal effect.
+        assertFalse("author no longer known", store.knownIdentities().contains(authorPub))
+    }
+
+    @Test fun defriendOfAuthorWithNoPeerRowIsNoopNotAnError() {
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val (authorPriv, authorPub) = genKeypair()
+        store.addIdentity(authorPub)
+        // Deliberately no addPeer call for authorPub.
+
+        val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
+        assertTrue("valid notice still applies even with no peer row to remove",
+            store.applyDefriendNotice(notice, ownIdentity))
+        assertFalse("author no longer known", store.knownIdentities().contains(authorPub))
+    }
+
+    @Test fun noticeFailingIsKnownGateDoesNotRemovePeerRow() {
+        // Falsifiable against a reordering bug: seed a peer row for an
+        // author who is deliberately NOT addIdentity'd, so the notice is
+        // validly signed and correctly targeted but fails gate 4
+        // (isKnown(author)). If peer removal were hoisted outside the
+        // gated block, this row would vanish despite the gate failing.
+        val store = InMemorySyncStore()
+        val ownIdentity = "aa".repeat(32)
+        val (authorPriv, authorPub) = genKeypair()   // deliberately NOT addIdentity'd
+        store.addPeer("onion1.onion:9050", authorPub)
+
+        val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
+        assertFalse("unknown author -> rejected", store.applyDefriendNotice(notice, ownIdentity))
+        assertTrue("peer row untouched -- gate failed before any removal",
+            store.listPeers().any { it.address == "onion1.onion:9050" && it.identityPub == authorPub })
+    }
 }

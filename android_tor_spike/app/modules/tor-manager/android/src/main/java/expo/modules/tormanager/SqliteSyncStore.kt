@@ -72,6 +72,14 @@ class SqliteSyncStore(context: Context) :
         // non-destructive IF NOT EXISTS pattern as the tables above.
         private const val CREATE_REVOKED_DEVICES_TABLE_SQL =
             "CREATE TABLE IF NOT EXISTS revoked_devices (device_pub TEXT PRIMARY KEY, last_valid_seq INTEGER NOT NULL)"
+        // friend-peering Task 1: peer addresses this device knows how to
+        // dial, mirrors hearth store.py's `peers` table (store.py:39-40:
+        // address TEXT PRIMARY KEY, identity_pub TEXT). Same non-destructive
+        // IF NOT EXISTS / onCreate+onOpen pattern as keys/pending_outbound/
+        // meta/revoked_devices above -- no DB_VERSION bump (see the
+        // DB_VERSION comment for why a bump would be unacceptable here).
+        private const val CREATE_PEERS_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS peers (address TEXT PRIMARY KEY, identity_pub TEXT)"
 
         /** Task 6 (phone-onion-reachability): revocation wipe -- drops the
          *  WHOLE on-disk sync_store.db (identities/messages/blobs/keys --
@@ -133,6 +141,11 @@ class SqliteSyncStore(context: Context) :
         // bump must not silently wipe, same as keys' enc-key material.
         db.execSQL(CREATE_META_TABLE_SQL)
         db.execSQL(CREATE_REVOKED_DEVICES_TABLE_SQL)
+        // Same IF NOT EXISTS reasoning as keys/pending_outbound/meta/
+        // revoked_devices above -- also deliberately not in onUpgrade's
+        // drop list (see onUpgrade comment): peers holds durable dial-
+        // address bookkeeping that a schema bump must not silently wipe.
+        db.execSQL(CREATE_PEERS_TABLE_SQL)
     }
 
     // Field bug (G20, B.2 live run): DB_VERSION was never bumped past 1, so
@@ -154,6 +167,7 @@ class SqliteSyncStore(context: Context) :
         db.execSQL(CREATE_PENDING_OUTBOUND_TABLE_SQL)
         db.execSQL(CREATE_META_TABLE_SQL)
         db.execSQL(CREATE_REVOKED_DEVICES_TABLE_SQL)
+        db.execSQL(CREATE_PEERS_TABLE_SQL)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -190,6 +204,12 @@ class SqliteSyncStore(context: Context) :
         // neither of which resyncs from the home node the way identities/
         // messages/blobs do -- dropping revoked_devices in particular would
         // silently un-revoke a device until the next revocation re-arrives.
+        //
+        // `peers` (friend-peering Task 1) is likewise NOT dropped here: it
+        // holds durable dial-address bookkeeping with no server-side resync
+        // path at all (unlike identities/messages/blobs, which the next
+        // sync repopulates) -- dropping it would silently strand this
+        // device with no way to reach an already-paired friend.
         onCreate(db)
     }
 
@@ -298,6 +318,47 @@ class SqliteSyncStore(context: Context) :
         val cv = ContentValues().apply { put("k", k); put("v", v) }
         writableDatabase.insertWithOnConflict("meta", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
+
+    // -- friend-peering Task 1: peer table (addPeer/listPeers/removePeer/
+    //    addressFor) -- mirrors hearth store.py's peers table (schema
+    //    store.py:39-40; add_peer store.py:217-221; list_peers store.py:
+    //    223-227; remove_peer store.py:229-232; address_for store.py:
+    //    234-239).
+
+    /** See the SyncStore interface doc: INSERT OR REPLACE keyed on
+     *  `address` (the peers table's PRIMARY KEY), same CONFLICT_REPLACE
+     *  pattern as setMeta/markRevoked above -- a second addPeer for the
+     *  same address overwrites its identityPub rather than duplicating. */
+    override fun addPeer(address: String, identityPub: String?) {
+        val cv = ContentValues().apply {
+            put("address", address)
+            put("identity_pub", identityPub)
+        }
+        writableDatabase.insertWithOnConflict("peers", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    /** See the SyncStore interface doc: every stored peer, mirroring hearth
+     *  store.py:223-227 list_peers's `SELECT address, identity_pub FROM
+     *  peers` (no ORDER BY -- order is unspecified here too). */
+    override fun listPeers(): List<Peer> {
+        val out = mutableListOf<Peer>()
+        readableDatabase.rawQuery("SELECT address, identity_pub FROM peers", null).use { c ->
+            while (c.moveToNext()) out.add(Peer(c.getString(0), c.getString(1)))
+        }
+        return out
+    }
+
+    override fun removePeer(address: String) {
+        writableDatabase.delete("peers", "address = ?", arrayOf(address))
+    }
+
+    /** See the SyncStore interface doc: mirrors hearth store.py:234-239
+     *  address_for's `SELECT address FROM peers WHERE identity_pub=?` +
+     *  `fetchone()` -- LIMIT 1 gives the same first-match-or-null shape. */
+    override fun addressFor(identityPub: String): String? =
+        readableDatabase.rawQuery(
+            "SELECT address FROM peers WHERE identity_pub = ? LIMIT 1", arrayOf(identityPub)
+        ).use { if (it.moveToFirst()) it.getString(0) else null }
 
     override fun ingestMessage(m: SignedMessage): Boolean {
         val db = writableDatabase
