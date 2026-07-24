@@ -66,6 +66,20 @@ export interface Beat {
 export function startNode(): void { native.startNode(); }
 export function stopNode(): void { native.stopNode(); }
 export function beatNow(): void { native.beatNow(); }
+
+// Foreground-fast cadence: tells TorNodeService whether the app is
+// currently foreground/active (true) or backgrounded (false) --
+// TorNodeService.chooseSweepDelay uses this to pick a short, fixed sweep
+// interval (FOREGROUND_SYNC_MS, 30s) while active instead of the Task 6
+// adaptive-backoff value, so passively-arriving content shows up in well
+// under the adaptive backoff's ~10 min base while the user is actually
+// watching the feed. Backgrounded behavior (the adaptive backoff itself) is
+// unchanged. WebShell.tsx's AppState listener is the only caller today --
+// see its own doc for why this is called ALONGSIDE beatNow() on the
+// transition into 'active', not as a replacement for it (this only flips
+// the flag the NEXT scheduled sweep reads; beatNow() is what makes that
+// next sweep happen right away rather than up to FOREGROUND_SYNC_MS later).
+export function setAppForeground(active: boolean): void { native.setAppForeground(active); }
 export function getHistory(): Promise<Beat[]> { return native.getHistory(); }
 export function isBatteryExempt(): boolean { return native.isBatteryExempt(); }
 export function requestBatteryExemption(): void { native.requestBatteryExemption(); }

@@ -30,6 +30,29 @@ class TorNodeService : Service() {
         // hold at, so a quiet peer is still checked at least once an hour.
         private const val BASE_SYNC_MS = 600_000L    // 10 min
         private const val MAX_SYNC_MS = 3_600_000L   // 1 hr
+        // Foreground-fast cadence (post-Task-6 follow-up, friend-peering
+        // arc): Task 6's adaptive backoff (above) is correct for BACKGROUND
+        // (battery/Doze), but while the app is FOREGROUND (screen on, user
+        // watching the feed) it left passively-arriving content waiting up
+        // to BASE_SYNC_MS (10 min) even with the app open -- the desktop
+        // node syncs near-real-time (a ~3s gossip loop). FOREGROUND_SYNC_MS
+        // is the sweep interval used instead of the adaptive-backoff value
+        // while `appForeground` is true (see chooseSweepDelay below).
+        // `internal`, not `private`: mirrors ONION_VIRTUAL_PORT's own
+        // precedent just below -- referenced directly from a JVM test
+        // (TorNodeServiceCadenceTest) with zero Android dependency, same
+        // reasoning as that constant's doc.
+        //
+        // 30s, not shorter: SyncRunner's ONION_SYNC_INTERVAL_MS (~45s) is
+        // the per-peer onion-dial floor and is UNCHANGED by this task -- a
+        // sweep more frequent than that throttle window dials the same
+        // onion address before its own floor has elapsed and is a no-op for
+        // that peer. 30s sweeps mean a given peer is effectively dialed
+        // roughly once per throttle window, which is the practical
+        // near-real-time ceiling over Tor today; a true push (the nudge
+        // channel, a carried follow-up ticket from the peering arc's DoD)
+        // is the eventual upgrade past this polling floor.
+        internal const val FOREGROUND_SYNC_MS = 30_000L   // 30 sec
         // Task 7 (phone-onion-reachability): the public port peers dial on
         // this phone's onion service. FIXED FOREVER (mirrors hearth's own
         // tor.py:41 ONION_VIRTUAL_PORT) -- re-picking this once deadlocked
@@ -55,6 +78,17 @@ class TorNodeService : Service() {
         private const val TAG = "TorNodeService"
         const val ACTION_STOP = "eu.kreds.torspike.STOP"
         const val ACTION_BEAT_NOW = "eu.kreds.torspike.BEAT_NOW"
+        // Foreground-fast cadence: the app's AppState transition bridge (RN
+        // WebShell.tsx -> TorManagerModule.setAppForeground -> here) flips
+        // `appForeground`, which sweepAndReschedule's next tick picks up via
+        // chooseSweepDelay. Deliberately a SEPARATE action from
+        // ACTION_BEAT_NOW: entering foreground both flips this flag AND (via
+        // the RN side calling beatNow() alongside, unchanged from Task 6)
+        // kicks one immediate sweep -- see setForeground's own doc for why
+        // this action does not ALSO trigger a sweep itself (that would
+        // double a sweep already requested by the same transition).
+        const val ACTION_SET_FOREGROUND = "eu.kreds.torspike.SET_FOREGROUND"
+        const val EXTRA_FOREGROUND = "foreground"
         const val BROADCAST_BEAT = "eu.kreds.torspike.BEAT"
         const val BROADCAST_STATE = "eu.kreds.torspike.STATE"
         // Task 6 (phone-onion-reachability): self-revoke -> full wipe to
@@ -70,6 +104,26 @@ class TorNodeService : Service() {
         }
         fun stop(ctx: Context) = ctx.startService(Intent(ctx, TorNodeService::class.java).setAction(ACTION_STOP))
         fun beatNow(ctx: Context) = ctx.startService(Intent(ctx, TorNodeService::class.java).setAction(ACTION_BEAT_NOW))
+
+        /** Foreground-fast cadence: sets `appForeground` on whatever
+         *  TorNodeService instance is currently running (a bare
+         *  `startService` + action, exactly like `beatNow`/`stop` above --
+         *  if the service isn't running, this starts a fresh instance whose
+         *  `onStartCommand` sees ACTION_SET_FOREGROUND, sets the flag, and
+         *  returns WITHOUT calling `startNode()` -- see onStartCommand's
+         *  `when` block, the same no-op-safe shape `ACTION_BEAT_NOW` already
+         *  has for a not-yet-started service: `scheduler` stays null, no
+         *  Tor/gossip/sync work is kicked off, nothing throws). Does NOT
+         *  itself trigger a sweep -- the RN caller (WebShell.tsx's AppState
+         *  listener) calls `beatNow()` alongside this on the SAME
+         *  active-transition, so a redundant sweep here would just double
+         *  that one up. Only the flag flips; the single self-rescheduling
+         *  chain (sweepAndReschedule) picks up the new interval on its own
+         *  next tick, per chooseSweepDelay below. */
+        fun setForeground(ctx: Context, active: Boolean) =
+            ctx.startService(Intent(ctx, TorNodeService::class.java)
+                .setAction(ACTION_SET_FOREGROUND)
+                .putExtra(EXTRA_FOREGROUND, active))
 
         /** Self-revoke -> full wipe to First-Load (Task 6; node.py:3144's
          *  `enter_revoked_state` is the desktop analog: destroy ALL key
@@ -117,11 +171,38 @@ class TorNodeService : Service() {
             stop(ctx)
             ctx.sendBroadcast(Intent(BROADCAST_REVOKED).setPackage(ctx.packageName))
         }
+
+        /** Foreground-fast cadence: the pure choice `sweepAndReschedule`
+         *  makes between the two candidate next-sweep intervals it already
+         *  has in hand -- `foregroundMs` (FOREGROUND_SYNC_MS) while the app
+         *  is active, else whatever AdaptiveBackoff.nextInterval just
+         *  computed (`backoffNext`). Extracted into its own function (rather
+         *  than an inline `if` at the call site) purely so it's unit-testable
+         *  on a plain JVM with no Android/Service dependency -- same
+         *  reasoning as AdaptiveBackoff.pulledNewContent's own doc for why
+         *  that decision is a standalone function rather than inlined into
+         *  syncCycle. `internal`: referenced directly from
+         *  TorNodeServiceCadenceTest, mirroring ONION_VIRTUAL_PORT's own
+         *  internal-for-JVM-test-access precedent above. */
+        internal fun chooseSweepDelay(foreground: Boolean, foregroundMs: Long, backoffNext: Long): Long =
+            if (foreground) foregroundMs else backoffNext
     }
 
     @Volatile private var scheduler: ScheduledExecutorService? = null
     @Volatile private var syncs = 0
     @Volatile private var lastLine = "starting"
+    // Foreground-fast cadence: flipped by ACTION_SET_FOREGROUND (from
+    // TorManagerModule.setAppForeground, driven by WebShell.tsx's AppState
+    // listener) -- true while the app is active/visible. Read by
+    // sweepAndReschedule (the single self-rescheduling chain's own thread)
+    // via chooseSweepDelay; written from onStartCommand, which can run on a
+    // different thread (the same cross-thread shape ACTION_BEAT_NOW's
+    // backoff.reset() already has) -- @Volatile for the same
+    // cross-thread-visibility discipline as every other mutable field on
+    // this class, not because reads/writes need to be atomic-compound (a
+    // plain boolean flag has no read-modify-write to protect, unlike
+    // AdaptiveBackoff's AtomicLong `current`).
+    @Volatile private var appForeground: Boolean = false
     // Task 6 review fix (Finding 1): previous round's absolute store total
     // (messages+blobs+identities), the baseline `syncCycle` diffs against
     // to derive `pulledNew` -- see AdaptiveBackoff.pulledNewContent's own
@@ -168,6 +249,19 @@ class TorNodeService : Service() {
             // start a second recurring chain -- only sweepAndReschedule
             // (the startup chain) reschedules itself; this is a one-off.
             ACTION_BEAT_NOW -> { backoff.reset(); scheduler?.execute { syncCycle() }; return START_STICKY }
+            // Foreground-fast cadence: flips `appForeground` only -- no
+            // sweep kicked here (see setForeground's own doc for why: the RN
+            // caller already fires beatNow() on the same transition). Safe
+            // on a not-yet-started instance exactly like ACTION_BEAT_NOW
+            // above -- this branch never touches `scheduler`, so there is
+            // nothing here that can NPE or need it non-null; the flag simply
+            // sits set until (or unless) startNode() ever runs. The single
+            // self-rescheduling chain (sweepAndReschedule) picks the new
+            // interval up on its own next tick via chooseSweepDelay.
+            ACTION_SET_FOREGROUND -> {
+                appForeground = intent.getBooleanExtra(EXTRA_FOREGROUND, false)
+                return START_STICKY
+            }
         }
         if (scheduler == null) startNode()
         return START_STICKY      // OS restarts us after process death
@@ -423,10 +517,42 @@ class TorNodeService : Service() {
      *  itself (e.g. the stop-during-bootstrap race nulling `scheduler`) can
      *  ever end the chain, matching the Task 6 review fix (Finding 2)
      *  two-independent-runCatching-blocks reasoning just below -- a bad
-     *  sweep must never take the reschedule down with it. */
+     *  sweep must never take the reschedule down with it.
+     *
+     *  Foreground-fast cadence: the interval actually scheduled is now
+     *  `chooseSweepDelay(appForeground, FOREGROUND_SYNC_MS, backoffNext)`,
+     *  not the raw adaptive-backoff value -- while the app is foreground
+     *  (`appForeground == true`, flipped by ACTION_SET_FOREGROUND) every
+     *  tick reschedules at the short, fixed FOREGROUND_SYNC_MS regardless of
+     *  what AdaptiveBackoff itself is holding; while backgrounded, behavior
+     *  is byte-for-byte the Task 6 adaptive value, unchanged.
+     *
+     *  `backoff.nextInterval` is deliberately SKIPPED (not just discarded)
+     *  while foreground, rather than computed-but-unused every tick: calling
+     *  it anyway would silently advance its internal state once per
+     *  FOREGROUND_SYNC_MS tick regardless of the result being needed, and
+     *  `nextInterval(false)` DOUBLES toward MAX_SYNC_MS on every idle sweep
+     *  (a foreground sweep that pulls nothing new is exactly that) -- a long
+     *  foreground session with a quiet peer would silently walk the backoff
+     *  all the way to the 1 hr cap in the background, undetected because
+     *  nothing was reading it. The moment the app then backgrounds,
+     *  `sweepAndReschedule`'s NEXT tick would read that stale, fully-doubled
+     *  value instead of the short interval the user just had while
+     *  watching -- a jarring cliff exactly backwards from Task 6's intent
+     *  (idle backs off gradually, not in one leap). `beatNow()` already
+     *  calls `backoff.reset()` at the START of every foreground session
+     *  (fired alongside `setAppForeground(true)` on the same 'active'
+     *  transition, see `setForeground`'s doc) -- freezing the backoff
+     *  untouched for the REST of that session means it is still sitting at
+     *  exactly `BASE_SYNC_MS` whenever foreground ends, which is precisely
+     *  the "next reschedule starts from base" behavior the background
+     *  transition is specified to have. */
     private fun sweepAndReschedule() {
         val pulledNew = runCatching { syncCycle() }.getOrDefault(false)
-        val next = runCatching { backoff.nextInterval(pulledNew) }.getOrDefault(BASE_SYNC_MS)
+        val foreground = appForeground
+        val backoffNext = if (foreground) BASE_SYNC_MS
+            else runCatching { backoff.nextInterval(pulledNew) }.getOrDefault(BASE_SYNC_MS)
+        val next = chooseSweepDelay(foreground, FOREGROUND_SYNC_MS, backoffNext)
         runCatching { scheduler?.schedule({ sweepAndReschedule() }, next, TimeUnit.MILLISECONDS) }
     }
 

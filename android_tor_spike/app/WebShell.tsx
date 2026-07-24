@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { ActivityIndicator, AppState, StyleSheet, Text, View, useColorScheme } from "react-native";
 import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-import { beatNow, bootstrap, startNode, syncNow, getWebUrl } from "./modules/tor-manager";
+import { beatNow, bootstrap, setAppForeground, startNode, syncNow, getWebUrl } from "./modules/tor-manager";
 
 /** vp1: full-screen host for the desktop web UI, served by the native loopback
  *  server. For slice 1 this component also owns the engine bootstrap (Tor +
@@ -54,10 +54,32 @@ function Shell() {
   // syncNow() above -- mount always fires once on a fresh launch; this
   // fires on every subsequent return to the foreground, which mount alone
   // does not cover (a backgrounded-then-resumed app does not remount).
+  //
+  // Foreground-fast cadence (post-Task-6 follow-up): setAppForeground(true)
+  // ALONGSIDE beatNow() on the same transition into 'active' -- beatNow()
+  // makes the very next sweep happen right away; setAppForeground(true)
+  // is what keeps EVERY sweep after that fast (TorNodeService.
+  // FOREGROUND_SYNC_MS, 30s) for as long as the app stays active, instead of
+  // falling back to the adaptive-backoff interval after that first sweep.
+  // The symmetric leaving-active transition (-> 'background' or 'inactive')
+  // calls setAppForeground(false) so the NEXT scheduled sweep reverts to
+  // the adaptive-backoff cadence -- battery/Doze-safe while the user isn't
+  // looking, same as Task 6's original background behavior. Guarded on
+  // `prev === "active"` (not "every non-active state") so a transition
+  // BETWEEN two non-active states (e.g. 'inactive' -> 'background', part of
+  // the same backgrounding gesture) doesn't re-send an already-in-effect
+  // false -- exactly one call per real active/inactive edge, mirroring the
+  // `prev !== "active" && next === "active"` guard already used for the
+  // entering-active edge above.
   useEffect(() => {
     let prev = AppState.currentState;
     const sub = AppState.addEventListener("change", (next) => {
-      if (prev !== "active" && next === "active") beatNow();
+      if (prev !== "active" && next === "active") {
+        beatNow();
+        setAppForeground(true);
+      } else if (prev === "active" && next !== "active") {
+        setAppForeground(false);
+      }
       prev = next;
     });
     return () => sub.remove();
