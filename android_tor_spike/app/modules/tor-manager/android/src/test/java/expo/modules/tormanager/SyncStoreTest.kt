@@ -14,13 +14,18 @@ class SyncStoreTest {
     private fun sha(b: ByteArray) = KotlinWire.toHex(MessageDigest.getInstance("SHA-256").digest(b))
 
     // Build a REAL signed message via the same primitives (device key = 0x22..).
+    // Security-fix note: the embedded cert is now a GENUINELY enrollment-signed
+    // one (via the hoisted `signedCert`, GossipServerTest.kt), not a placeholder
+    // "00" signature -- ingestMessage now verifies the enrollment cert itself
+    // (KotlinWire.verifyCert), so a fixture with a garbage cert signature would
+    // be rejected before ever reaching the checks these tests actually exercise.
     private fun msg(seq: Int, payload: Map<String, Any?>): SignedMessage {
         // sign with device priv 0x22.. so verifyDeviceSignature passes;
-        // identity_pub/device_pub are the matching pubs.
+        // identity_pub/device_pub are the matching pubs. Cert is signed by
+        // the IDENTITY priv (0x11..), matching idPub above.
         val devPriv = "22".repeat(32)
-        val idPub = KotlinWire.toHex(org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(KotlinWire.fromHex("11".repeat(32)), 0).generatePublicKey().encoded)
         val dvPub = KotlinWire.toHex(org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(KotlinWire.fromHex(devPriv), 0).generatePublicKey().encoded)
-        val cert = KotlinWire.CertDict(idPub, dvPub, "d", 1752900000.0, "00")
+        val cert = signedCert(idp, idPub, dvPub, "d")
         val unsigned = SignedMessage(cert, seq, payload, "")
         return unsigned.copy(signature = KotlinWire.signRaw(devPriv, unsigned.body()))
     }
@@ -43,6 +48,104 @@ class SyncStoreTest {
         val forged = good.copy(payload = mapOf("kind" to "post", "text" to "EVIL", "blobs" to emptyList<String>()))
         assertFalse(s.ingestMessage(forged))          // sig no longer matches body
         assertEquals(0, s.stats().messages)
+    }
+
+    // -- Security fix: enrollment-cert gate at ingest (forgeable enckey /
+    //    device injection). Closes a vulnerability where ingestMessage gated
+    //    ONLY on is_known + the message BODY signature
+    //    (verifyDeviceSignature), never the embedded enrollment cert's OWN
+    //    signature (cert.signature, which must be signed by cert.
+    //    identity_pub's own private key -- KotlinWire.verifyCert, the EXACT
+    //    SAME check KotlinHandshake already runs on a peer's cert at HELLO,
+    //    see runOverStream/respondHandshake/authOnlyOverStream). Without it,
+    //    any AUTH'd peer (a directly-peering friend, not just the trusted
+    //    home node) could inject a message whose cert.identity_pub names a
+    //    VICTIM identity and cert.device_pub names the ATTACKER's own
+    //    device, signing only the message body while leaving the enrollment
+    //    signature garbage -- e.g. a forged KIND_ENCKEY that would surface
+    //    in enckeys(victim) and let content get wrapped/re-granted to the
+    //    attacker's device. hearth's own ingest closes this via Verifier.
+    //    verify_message's FIRST check (identity.py:562, `msg.cert.verify()`)
+    //    -- mirrored here in the same gate position (before the device-body
+    //    signature check).
+
+    @Test fun rejectsForgedEnrollmentCertWithValidDeviceSignatureButInvalidCertSignature() {
+        val s = InMemorySyncStore()
+        val victimIdentityPub = idPub                  // the phone's own known identity
+        s.addIdentity(victimIdentityPub)
+
+        // Attacker mints their OWN device keypair AND their OWN identity
+        // keypair (the identity key is used only to produce a REAL,
+        // well-formed Ed25519 signature -- NOT the victim's key -- so this
+        // is a genuinely forged-signature scenario, not a malformed/
+        // truncated one).
+        val (attackerIdentityPriv, _) = genKeypair()
+        val (attackerDevicePriv, attackerDevicePub) = genKeypair()
+
+        // The forged cert: claims the VICTIM's identity_pub, names the
+        // ATTACKER's device_pub, but is signed by the ATTACKER's OWN
+        // identity key (a real signature, just over the wrong keypair) --
+        // exactly the "garbage enrollment sig" shape the fix must catch:
+        // well-formed bytes that verify() rejects because they don't verify
+        // against victimIdentityPub.
+        val forgedCert = signedCert(attackerIdentityPriv, victimIdentityPub, attackerDevicePub, "Attacker Device")
+        assertFalse("sanity: the forged cert must NOT verify", KotlinWire.verifyCert(forgedCert))
+
+        val unsigned = SignedMessage(forgedCert, 1, mapOf(
+            "kind" to "enckey", "enc_pub" to "ee".repeat(32), "created_at" to 100.0), "")
+        // The message BODY is genuinely signed by the attacker's OWN device
+        // key (matching cert.device_pub) -- verifyDeviceSignature ALONE
+        // would pass; this proves the enrollment check specifically, not
+        // the body-signature check.
+        val forgedMsg = unsigned.copy(signature = KotlinWire.signRaw(attackerDevicePriv, unsigned.body()))
+        assertTrue("sanity: the device-body signature alone is genuinely valid",
+            forgedMsg.verifyDeviceSignature())
+
+        assertFalse("forged enrollment cert must be rejected even though the device signature is valid",
+            s.ingestMessage(forgedMsg))
+        assertEquals(0, s.stats().messages)
+        assertTrue("must not surface in enckeys() -- the exact attack this closes",
+            s.enckeys(victimIdentityPub).isEmpty())
+    }
+
+    @Test fun rejectsForgedEnrollmentCertOnAGenericPostMessageToo() {
+        // Same attack shape as above, on a generic (kind=post) message --
+        // proves the gate is not KIND_ENCKEY-specific.
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val (attackerIdentityPriv, _) = genKeypair()
+        val (attackerDevicePriv, attackerDevicePub) = genKeypair()
+        val forgedCert = signedCert(attackerIdentityPriv, idPub, attackerDevicePub, "Attacker Device")
+        val unsigned = SignedMessage(forgedCert, 1, mapOf(
+            "kind" to "post", "text" to "injected", "blobs" to emptyList<String>()), "")
+        val forgedMsg = unsigned.copy(signature = KotlinWire.signRaw(attackerDevicePriv, unsigned.body()))
+        assertTrue("sanity: device-body signature alone is genuinely valid", forgedMsg.verifyDeviceSignature())
+        assertFalse(s.ingestMessage(forgedMsg))
+        assertEquals(0, s.stats().messages)
+    }
+
+    @Test fun legitEnrollmentSignedCertStillIngestsOwnAndFriendMessages() {
+        // Own compose: the idPub/idp fixture (msg() helper), genuinely
+        // enrollment-signed via signedCert -- must still ingest exactly as
+        // before the security fix.
+        val s = InMemorySyncStore()
+        s.addIdentity(idPub)
+        val own = msg(1, mapOf("kind" to "post", "text" to "own post", "blobs" to emptyList<String>()))
+        assertTrue("own composed message with a legit enrollment cert must still ingest", s.ingestMessage(own))
+
+        // A real friend: separate identity+device keypair, genuinely
+        // enrolled (signedCert), a genuinely signed message body -- must
+        // ingest too.
+        val (friendIdentityPriv, friendIdentityPub) = genKeypair()
+        val (friendDevicePriv, friendDevicePub) = genKeypair()
+        s.addIdentity(friendIdentityPub)
+        val friendCert = signedCert(friendIdentityPriv, friendIdentityPub, friendDevicePub, "Friend Device")
+        val unsigned = SignedMessage(friendCert, 1, mapOf(
+            "kind" to "profile", "name" to "Friend", "created_at" to 1.0), "")
+        val friendMsg = unsigned.copy(signature = KotlinWire.signRaw(friendDevicePriv, unsigned.body()))
+        assertTrue("a real friend message with a legit enrollment cert must still ingest", s.ingestMessage(friendMsg))
+
+        assertEquals(2, s.stats().messages)
     }
 
     @Test fun rejectsUnknownIdentity() {
@@ -401,17 +504,28 @@ class SyncStoreTest {
     // SECURITY-CRITICAL: an over-serve here is a privacy breach. Exact port
     // of hearth's store.messages_not_in (store.py:702-750).
 
-    // Builds a SIGNED message for an EXPLICIT identity_pub (unlike msg()
-    // above, which is hardwired to a single fixed identity) -- entitlement
-    // scenarios need several distinct identities (friend/peer/hostile
-    // friend/third party) in one store. Mirrors DecryptPassTest's own
-    // signedMessage() helper exactly: device_pub is a REAL derived Ed25519
-    // point (verifyDeviceSignature must pass), identity_pub is passed
-    // straight through as signed DATA, never itself verified as a derived
-    // key (ingestMessage/verifyDeviceSignature never check that).
-    private fun identityMsg(identityPub: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+    // Builds a SIGNED message for an EXPLICIT identity (unlike msg() above,
+    // which is hardwired to a single fixed identity) -- entitlement scenarios
+    // need several distinct identities (friend/peer/hostile friend/third
+    // party) in one store. Mirrors DecryptPassTest's own signedMessage()
+    // helper exactly: device_pub is a REAL derived Ed25519 point
+    // (verifyDeviceSignature must pass).
+    //
+    // Security-fix note: this now takes the identity's PRIVATE key
+    // (identityPrivHex), not a bare identity_pub -- ingestMessage's new
+    // enrollment-cert gate (KotlinWire.verifyCert) requires the cert be
+    // genuinely signed by identity_pub's own private key, so a fixture can no
+    // longer hand identity_pub in as arbitrary unsigned data (that was
+    // exactly the placeholder-"00"-signature shape the security fix closes).
+    // Every call site was updated to pass the identity's PRIV hex (the same
+    // literal that used to be handed in as the bare pub) -- `identityPubOf`
+    // derives the matching pub, so callers that stored the old value in an
+    // `xPub` variable now simply derive it via `identityPubOf(xIdentityPriv)`
+    // instead of hardcoding it, with no other change to the test's logic.
+    private fun identityMsg(identityPrivHex: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+        val identityPub = identityPubOf(identityPrivHex)
         val devPub = devicePubOf(devPrivHex)
-        val cert = KotlinWire.CertDict(identityPub, devPub, "d", 1752900000.0, "00")
+        val cert = signedCert(identityPrivHex, identityPub, devPub, "d")
         val unsigned = SignedMessage(cert, seq, payload, "")
         return unsigned.copy(signature = KotlinWire.signRaw(devPrivHex, unsigned.body()))
     }
@@ -419,13 +533,21 @@ class SyncStoreTest {
     private fun devicePubOf(devPrivHex: String): String = KotlinWire.toHex(
         org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(KotlinWire.fromHex(devPrivHex), 0).generatePublicKey().encoded)
 
+    // Same derivation as devicePubOf, named separately for readability at
+    // call sites that derive an IDENTITY pub (as opposed to a device pub)
+    // from its private key.
+    private fun identityPubOf(identityPrivHex: String): String = devicePubOf(identityPrivHex)
+
     @Test fun messagesNotInServesEntitledAndNeverOverServes() {
         val store = InMemorySyncStore()
-        val friendPub = "b1".repeat(32)
+        val friendIdentityPriv = "b1".repeat(32)
+        val friendPub = identityPubOf(friendIdentityPriv)
         val friendDevPriv = "b2".repeat(32)
-        val ringAuthorPub = "c1".repeat(32)
+        val ringAuthorIdentityPriv = "c1".repeat(32)
+        val ringAuthorPub = identityPubOf(ringAuthorIdentityPriv)
         val ringAuthorDevPriv = "c2".repeat(32)
-        val peerPub = "d1".repeat(32)
+        val peerIdentityPriv = "d1".repeat(32)
+        val peerPub = identityPubOf(peerIdentityPriv)
         val peerDevPriv = "d2".repeat(32)
         val thirdPartyPub = "e1".repeat(32)
         val peerDevPub = devicePubOf(peerDevPriv)
@@ -438,13 +560,13 @@ class SyncStoreTest {
         // deviceViews is derived purely from stored (identity_pub,
         // device_pub) pairs, so the peer needs at least one message of its
         // own on record for its device set to be known.
-        val peerOwnMsg = identityMsg(peerPub, 1,
+        val peerOwnMsg = identityMsg(peerIdentityPriv, 1,
             mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)
         assertTrue(store.ingestMessage(peerOwnMsg))
 
         // A friend POST wrapped to the peer's device -- entitled author,
         // peer's device is in the wrap-set -> must be served.
-        val kredsFriendPost = identityMsg(friendPub, 1, mapOf(
+        val kredsFriendPost = identityMsg(friendIdentityPriv, 1, mapOf(
             "kind" to "post", "scope" to "kreds", "text" to "hi",
             "wraps" to mapOf(peerDevPub to mapOf("x" to 1)), "blobs" to emptyList<String>()), friendDevPriv)
         assertTrue(store.ingestMessage(kredsFriendPost))
@@ -452,20 +574,20 @@ class SyncStoreTest {
         // An inner-ring RING record, authored by someone who is NOT the
         // peer -- RING is author-private, must never relay through a friend
         // no matter how entitled that friend otherwise is.
-        val innerRingRecord = identityMsg(ringAuthorPub, 1, mapOf(
+        val innerRingRecord = identityMsg(ringAuthorIdentityPriv, 1, mapOf(
             "kind" to "ring", "member" to "cc".repeat(32), "ring" to "inner", "created_at" to 1.0), ringAuthorDevPriv)
         assertTrue(store.ingestMessage(innerRingRecord))
 
         // A DM whose recipient is a THIRD party -- the peer is neither its
         // author nor its recipient -> DMs never relay through friends.
-        val dmToThirdParty = identityMsg(friendPub, 2, mapOf(
+        val dmToThirdParty = identityMsg(friendIdentityPriv, 2, mapOf(
             "kind" to "dm", "to" to thirdPartyPub, "body_nonce" to "ab".repeat(12), "body_ct" to "cd".repeat(20),
             "wraps" to emptyMap<String, Any?>(), "blobs" to emptyList<String>()), friendDevPriv)
         assertTrue(store.ingestMessage(dmToThirdParty))
 
         // A POST wrapped to some OTHER device, NOT the peer's -- entitled
         // author, but outside the wrap-set -> wrap-set gate blocks it.
-        val postNotWrappedToPeer = identityMsg(friendPub, 3, mapOf(
+        val postNotWrappedToPeer = identityMsg(friendIdentityPriv, 3, mapOf(
             "kind" to "post", "scope" to "kreds", "text" to "nope",
             "wraps" to mapOf("ff".repeat(32) to mapOf("x" to 1)), "blobs" to emptyList<String>()), friendDevPriv)
         assertTrue(store.ingestMessage(postNotWrappedToPeer))
@@ -480,7 +602,8 @@ class SyncStoreTest {
 
     @Test fun messagesNotInDropsWhatPeerAlreadyHas() {
         val store = InMemorySyncStore()
-        val peerPub = "f1".repeat(32)
+        val peerIdentityPriv = "f1".repeat(32)
+        val peerPub = identityPubOf(peerIdentityPriv)
         val peerDevPriv = "f2".repeat(32)
         val peerDevPub = devicePubOf(peerDevPriv)
         store.addIdentity(peerPub)
@@ -489,9 +612,9 @@ class SyncStoreTest {
         // bypasses the wrap-set gate entirely (store.py's `peer_identity !=
         // ipub` guard is false), isolating the seen-delta behavior under
         // test from the wrap-set gate exercised above.
-        val m1 = identityMsg(peerPub, 1,
+        val m1 = identityMsg(peerIdentityPriv, 1,
             mapOf("kind" to "post", "scope" to "kreds", "text" to "one", "blobs" to emptyList<String>()), peerDevPriv)
-        val m2 = identityMsg(peerPub, 2,
+        val m2 = identityMsg(peerIdentityPriv, 2,
             mapOf("kind" to "post", "scope" to "kreds", "text" to "two", "blobs" to emptyList<String>()), peerDevPriv)
         assertTrue(store.ingestMessage(m1))
         assertTrue(store.ingestMessage(m2))
@@ -504,12 +627,15 @@ class SyncStoreTest {
     }
 
     @Test fun messagesNotInPostUnionsAuthorKeyedGrantDevices() {
-        val authorPub = "12".repeat(32)
+        val authorIdentityPriv = "12".repeat(32)
+        val authorPub = identityPubOf(authorIdentityPriv)
         val authorDevPriv1 = "13".repeat(32)
         val authorDevPriv2 = "14".repeat(32)
-        val hostileFriendPub = "15".repeat(32)
+        val hostileFriendIdentityPriv = "15".repeat(32)
+        val hostileFriendPub = identityPubOf(hostileFriendIdentityPriv)
         val hostileFriendDevPriv = "16".repeat(32)
-        val peerPub = "17".repeat(32)
+        val peerIdentityPriv = "17".repeat(32)
+        val peerPub = identityPubOf(peerIdentityPriv)
         val peerDevPriv = "18".repeat(32)
         val peerDevPub = devicePubOf(peerDevPriv)
 
@@ -519,15 +645,15 @@ class SyncStoreTest {
         val store = InMemorySyncStore()
         store.addIdentity(authorPub)
         store.addIdentity(peerPub)
-        assertTrue(store.ingestMessage(identityMsg(peerPub, 1,
+        assertTrue(store.ingestMessage(identityMsg(peerIdentityPriv, 1,
             mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)))
-        val post = identityMsg(authorPub, 1, mapOf(
+        val post = identityMsg(authorIdentityPriv, 1, mapOf(
             "kind" to "post", "scope" to "kreds", "text" to "grant test",
             "wraps" to mapOf("ff".repeat(32) to mapOf("x" to 1)), "blobs" to emptyList<String>()), authorDevPriv1)
         assertTrue(store.ingestMessage(post))
         // Signed by a DIFFERENT device of the SAME author identity -- proves
         // the grant match is on identity_pub, not device_pub.
-        val authorGrant = identityMsg(authorPub, 2, mapOf(
+        val authorGrant = identityMsg(authorIdentityPriv, 2, mapOf(
             "kind" to "wrap_grant", "target" to post.msgId(), "created_at" to 1.0,
             "wraps" to mapOf(peerDevPub to mapOf("x" to 1))), authorDevPriv2)
         assertTrue(store.ingestMessage(authorGrant))
@@ -544,13 +670,13 @@ class SyncStoreTest {
         store2.addIdentity(authorPub)
         store2.addIdentity(hostileFriendPub)
         store2.addIdentity(peerPub)
-        assertTrue(store2.ingestMessage(identityMsg(peerPub, 1,
+        assertTrue(store2.ingestMessage(identityMsg(peerIdentityPriv, 1,
             mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)))
-        val post2 = identityMsg(authorPub, 1, mapOf(
+        val post2 = identityMsg(authorIdentityPriv, 1, mapOf(
             "kind" to "post", "scope" to "kreds", "text" to "grant test 2",
             "wraps" to mapOf("ff".repeat(32) to mapOf("x" to 1)), "blobs" to emptyList<String>()), authorDevPriv1)
         assertTrue(store2.ingestMessage(post2))
-        val hostileGrant = identityMsg(hostileFriendPub, 1, mapOf(
+        val hostileGrant = identityMsg(hostileFriendIdentityPriv, 1, mapOf(
             "kind" to "wrap_grant", "target" to post2.msgId(), "created_at" to 1.0,
             "wraps" to mapOf(peerDevPub to mapOf("x" to 1))), hostileFriendDevPriv)
         assertTrue(store2.ingestMessage(hostileGrant))
@@ -587,10 +713,11 @@ class SyncStoreTest {
     // from the wrap/DM/ring audience gates exercised elsewhere in this file.
     @Test fun removeIdentityStopsMessagesNotInServingViaEntitledFromKnownIdentities() {
         val s = InMemorySyncStore()
-        val authorPub = "31".repeat(32)
+        val authorIdentityPriv = "31".repeat(32)
+        val authorPub = identityPubOf(authorIdentityPriv)
         val authorDevPriv = "32".repeat(32)
         s.addIdentity(authorPub)
-        val profileMsg = identityMsg(authorPub, 1,
+        val profileMsg = identityMsg(authorIdentityPriv, 1,
             mapOf("kind" to "profile", "name" to "Author", "created_at" to 1.0), authorDevPriv)
         assertTrue(s.ingestMessage(profileMsg))
 
@@ -607,15 +734,17 @@ class SyncStoreTest {
 
     @Test fun purgeAuthoredByDeletesOnlyThatAuthorsMessagesAndReturnsCount() {
         val s = InMemorySyncStore()
-        val authorPub = "41".repeat(32)
+        val authorIdentityPriv = "41".repeat(32)
+        val authorPub = identityPubOf(authorIdentityPriv)
         val authorDevPriv = "42".repeat(32)
-        val otherPub = "43".repeat(32)
+        val otherIdentityPriv = "43".repeat(32)
+        val otherPub = identityPubOf(otherIdentityPriv)
         val otherDevPriv = "44".repeat(32)
         s.addIdentity(authorPub)
         s.addIdentity(otherPub)
-        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "A1", "created_at" to 1.0), authorDevPriv)
-        val m2 = identityMsg(authorPub, 2, mapOf("kind" to "profile", "name" to "A2", "created_at" to 2.0), authorDevPriv)
-        val other = identityMsg(otherPub, 1, mapOf("kind" to "profile", "name" to "O", "created_at" to 1.0), otherDevPriv)
+        val m1 = identityMsg(authorIdentityPriv, 1, mapOf("kind" to "profile", "name" to "A1", "created_at" to 1.0), authorDevPriv)
+        val m2 = identityMsg(authorIdentityPriv, 2, mapOf("kind" to "profile", "name" to "A2", "created_at" to 2.0), authorDevPriv)
+        val other = identityMsg(otherIdentityPriv, 1, mapOf("kind" to "profile", "name" to "O", "created_at" to 1.0), otherDevPriv)
         assertTrue(s.ingestMessage(m1))
         assertTrue(s.ingestMessage(m2))
         assertTrue(s.ingestMessage(other))
@@ -637,10 +766,11 @@ class SyncStoreTest {
     // because of the entitled-set gate.
     @Test fun purgeAuthoredByMessagesNotInNoLongerServesPurgedAuthorEvenIfStillEntitled() {
         val s = InMemorySyncStore()
-        val authorPub = "51".repeat(32)
+        val authorIdentityPriv = "51".repeat(32)
+        val authorPub = identityPubOf(authorIdentityPriv)
         val authorDevPriv = "52".repeat(32)
         s.addIdentity(authorPub)
-        val m = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "A", "created_at" to 1.0), authorDevPriv)
+        val m = identityMsg(authorIdentityPriv, 1, mapOf("kind" to "profile", "name" to "A", "created_at" to 1.0), authorDevPriv)
         assertTrue(s.ingestMessage(m))
 
         val entitled = setOf(authorPub)
@@ -668,14 +798,15 @@ class SyncStoreTest {
     // (it was validly signed before the revocation took effect).
     @Test fun markRevokedRetroDropsSeqAboveLastValidKeepsSeqAtOrBelow() {
         val s = InMemorySyncStore()
-        val authorPub = "71".repeat(32)
+        val authorIdentityPriv = "71".repeat(32)
+        val authorPub = identityPubOf(authorIdentityPriv)
         val devPriv = "72".repeat(32)
         val devPub = devicePubOf(devPriv)
         s.addIdentity(authorPub)
-        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devPriv)
-        val m2 = identityMsg(authorPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devPriv)
-        val m3 = identityMsg(authorPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devPriv)
-        val m4 = identityMsg(authorPub, 4, mapOf("kind" to "profile", "name" to "s4", "created_at" to 4.0), devPriv)
+        val m1 = identityMsg(authorIdentityPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devPriv)
+        val m2 = identityMsg(authorIdentityPriv, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devPriv)
+        val m3 = identityMsg(authorIdentityPriv, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devPriv)
+        val m4 = identityMsg(authorIdentityPriv, 4, mapOf("kind" to "profile", "name" to "s4", "created_at" to 4.0), devPriv)
         assertTrue(s.ingestMessage(m1))
         assertTrue(s.ingestMessage(m2))
         assertTrue(s.ingestMessage(m3))

@@ -37,11 +37,17 @@ class RevocationCertTest {
         return unsigned.copy(signature = KotlinWire.signRaw(identityPriv, unsigned.body()))
     }
 
-    // Builds a SIGNED message for an explicit identity_pub/device, mirroring
+    // Builds a SIGNED message for an explicit identity/device, mirroring
     // SyncStoreTest's identityMsg idiom exactly.
-    private fun identityMsg(identityPub: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+    //
+    // Security-fix note: takes the identity's PRIVATE key (identityPriv), not
+    // a bare identity_pub -- ingestMessage's enrollment-cert gate
+    // (KotlinWire.verifyCert) requires the cert be genuinely signed by
+    // identity_pub's own private key.
+    private fun identityMsg(identityPriv: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+        val identityPub = devPub(identityPriv)
         val devicePub = devPub(devPrivHex)
-        val cert = KotlinWire.CertDict(identityPub, devicePub, "d", 1752900000.0, "00")
+        val cert = signedCert(identityPriv, identityPub, devicePub, "d")
         val unsigned = SignedMessage(cert, seq, payload, "")
         return unsigned.copy(signature = KotlinWire.signRaw(devPrivHex, unsigned.body()))
     }
@@ -105,9 +111,9 @@ class RevocationCertTest {
         val devicePub = devPub(devicePriv)
         store.addIdentity(identityPub)
 
-        val m1 = identityMsg(identityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
-        val m2 = identityMsg(identityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devicePriv)
-        val m3 = identityMsg(identityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devicePriv)
+        val m1 = identityMsg(identityPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
+        val m2 = identityMsg(identityPriv, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devicePriv)
+        val m3 = identityMsg(identityPriv, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devicePriv)
         assertTrue(store.ingestMessage(m1))
         assertTrue(store.ingestMessage(m2))
         assertTrue(store.ingestMessage(m3))
@@ -139,7 +145,7 @@ class RevocationCertTest {
         val devicePub = devPub(devicePriv)
         store.addIdentity(identityPub)
 
-        val m1 = identityMsg(identityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
+        val m1 = identityMsg(identityPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
         assertTrue(store.ingestMessage(m1))
 
         val good = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 0)

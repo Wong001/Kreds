@@ -585,6 +585,22 @@ class InMemorySyncStore : SyncStore {
         // seeded before sync, friends are added during HAVE. Do NOT
         // auto-register senders.
         if (m.cert.identity_pub !in identities) return false
+        // Enrollment-cert gate (security fix: forgeable enckey / device
+        // injection) -- mirrors hearth's Verifier.verify_message FIRST check
+        // (identity.py:562, `msg.cert.verify()`), which runs BEFORE the
+        // device-body signature check just below. Without this, any AUTH'd
+        // peer (a directly-peering friend, not just the trusted home node)
+        // could inject a message whose cert.identity_pub names a VICTIM
+        // identity and cert.device_pub names the ATTACKER's own device,
+        // signing only the message body (what verifyDeviceSignature checks)
+        // while leaving the enrollment signature garbage -- e.g. a forged
+        // KIND_ENCKEY that would surface in enckeys(victim) and let content
+        // get wrapped/re-granted to the attacker's device. verifyCert is the
+        // EXACT SAME function KotlinHandshake already uses to authenticate a
+        // peer's own cert at HELLO (KotlinHandshake.kt: runOverStream/
+        // respondHandshake/authOnlyOverStream all call
+        // KotlinWire.verifyCert(peerCert)) -- reused here, not reinvented.
+        if (!KotlinWire.verifyCert(m.cert)) return false
         if (!m.verifyDeviceSignature()) return false
         val id = m.msgId()
         if (messages.containsKey(id)) return false            // already have this exact message

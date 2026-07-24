@@ -16,8 +16,9 @@ process_responses sweep) -- see _build_responses_case below."""
 import json, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from hearth.dmcrypt import new_content_key, encrypt_body, wrap_key, post_aad, dm_aad
-from hearth.identity import _gen_x25519_pair
+from hearth.identity import _gen_x25519_pair, priv_hex, pub_hex
 from hearth.node import HearthNode
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "dmcrypt_vectors.json"
 
@@ -95,6 +96,14 @@ def _build_responses_case():
 
             result = {
                 "kind": "responses", "author": author.identity_pub,
+                # Android security fix (verify enrollment cert at ingest):
+                # the Kotlin side must mint a GENUINELY identity-signed
+                # EnrollmentCert for this author before it can call
+                # ingestMessage, so the author's real Ed25519 identity
+                # private key (already minted internally by
+                # HearthNode.create() -- device._identity_priv) is exposed
+                # here too, additive to every other committed field.
+                "author_priv": priv_hex(author.device._identity_priv),
                 "target": pid, "created_at": rec.payload["created_at"],
                 "enc_priv": reactor.device.enc_priv, "wrap": reactor_wrap,
                 "body_nonce": rec.payload["body_nonce"],
@@ -119,7 +128,18 @@ def build():
     cases = []
     # a POST body wrapped to a device with a fresh enc keypair
     enc_priv, enc_pub = _gen_x25519_pair()
-    author = "11" * 32
+    # Android security fix (verify enrollment cert at ingest): `author` was
+    # an arbitrary placeholder ("11" * 32) with no matching private key --
+    # fine while the Kotlin side never verified the embedded EnrollmentCert's
+    # own signature, but the fix now REQUIRES a genuinely identity-signed
+    # cert at ingestMessage. Minting a REAL Ed25519 identity keypair here
+    # (and exposing `author_priv` alongside `author` on every case that uses
+    # it) is purely additive -- the AAD/wrap/ciphertext bytes below are
+    # unaffected by WHAT the author string is, only that it is used
+    # consistently, which this generator already guarantees.
+    author_priv_key = Ed25519PrivateKey.generate()
+    author = pub_hex(author_priv_key.public_key())
+    author_priv = priv_hex(author_priv_key)
     created_at = 1752900000.123456
     aad = post_aad(author, "kreds", created_at)
     key = new_content_key()
@@ -127,21 +147,28 @@ def build():
     nonce_hex, ct_hex = encrypt_body(key, body, aad)
     wraps = wrap_key(key, {"dev1": enc_pub}, aad)
     cases.append({
-        "kind": "post", "author": author, "scope": "kreds",
+        "kind": "post", "author": author, "author_priv": author_priv,
+        "scope": "kreds",
         "created_at": created_at, "enc_priv": enc_priv,
         "wrap": wraps["dev1"], "body_nonce": nonce_hex, "body_ct": ct_hex,
         "content_key": key.hex(), "plaintext": body,
     })
-    # a DM body
+    # a DM body -- `to` (the recipient identity) gets the same real-keypair
+    # treatment as `author` above, for the same reason: a recipient-signed
+    # wrap_grant (DecryptPassTest's decryptsReceivedFriendDmViaRecipient-
+    # SignedGrantOnly) must mint a genuinely `to`-signed EnrollmentCert too.
     enc_priv2, enc_pub2 = _gen_x25519_pair()
-    to = "22" * 32
+    to_priv_key = Ed25519PrivateKey.generate()
+    to = pub_hex(to_priv_key.public_key())
+    to_priv = priv_hex(to_priv_key)
     aad2 = dm_aad(author, to, created_at)
     key2 = new_content_key()
     body2 = {"kind": "dm", "text": "secret dm", "to": to}
     n2, c2 = encrypt_body(key2, body2, aad2)
     w2 = wrap_key(key2, {"dev2": enc_pub2}, aad2)
     cases.append({
-        "kind": "dm", "author": author, "to": to, "created_at": created_at,
+        "kind": "dm", "author": author, "author_priv": author_priv,
+        "to": to, "to_priv": to_priv, "created_at": created_at,
         "enc_priv": enc_priv2, "wrap": w2["dev2"], "body_nonce": n2,
         "body_ct": c2, "content_key": key2.hex(), "plaintext": body2,
     })
@@ -159,7 +186,8 @@ def build():
     n3, c3 = encrypt_body(key3, body3, aad3)
     w3 = wrap_key(key3, {"dev1": enc_pub}, aad3)
     cases.append({
-        "kind": "post", "author": author, "scope": "kreds",
+        "kind": "post", "author": author, "author_priv": author_priv,
+        "scope": "kreds",
         "created_at": created_earlier, "enc_priv": enc_priv,
         "wrap": w3["dev1"], "body_nonce": n3, "body_ct": c3,
         "content_key": key3.hex(), "plaintext": body3,
@@ -171,7 +199,8 @@ def build():
     n4, c4 = encrypt_body(key4, body4, aad4)
     w4 = wrap_key(key4, {"dev1": enc_pub}, aad4)
     cases.append({
-        "kind": "post", "author": author, "scope": "kreds",
+        "kind": "post", "author": author, "author_priv": author_priv,
+        "scope": "kreds",
         "created_at": created_later, "enc_priv": enc_priv,
         "wrap": w4["dev1"], "body_nonce": n4, "body_ct": c4,
         "content_key": key4.hex(), "plaintext": body4,
@@ -197,7 +226,8 @@ def build():
     n5, c5 = encrypt_body(key5, body5, aad5)
     w5 = wrap_key(key5, {"dev1": enc_pub5}, aad5)
     cases.append({
-        "kind": "post", "author": author, "scope": "kreds",
+        "kind": "post", "author": author, "author_priv": author_priv,
+        "scope": "kreds",
         "created_at": created_5, "enc_priv": enc_priv5,
         "wrap": w5["dev1"], "body_nonce": n5, "body_ct": c5,
         "content_key": key5.hex(), "plaintext": body5,
