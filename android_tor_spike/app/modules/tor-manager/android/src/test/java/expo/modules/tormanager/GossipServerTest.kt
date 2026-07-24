@@ -84,11 +84,21 @@ class GossipServerTest {
         return KotlinHandshake.Fixture(devicePriv, devicePub, cert, "unused.onion:9997")
     }
 
-    // Builds a SIGNED message for an explicit identity_pub -- mirrors
+    // Builds a SIGNED message for an explicit identity -- mirrors
     // KotlinSyncTest's identityMsg idiom exactly.
-    private fun identityMsg(identityPub: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+    //
+    // Security-fix note: takes the identity's PRIVATE key (identityPrivHex),
+    // not a bare identity_pub -- ingestMessage's enrollment-cert gate
+    // (KotlinWire.verifyCert) requires the cert be genuinely signed by
+    // identity_pub's own private key. Call sites that previously hardcoded a
+    // bare "xPub" literal now hold the corresponding "xIdentityPriv" literal
+    // instead and derive the pub via `devPub` (a plain Ed25519-priv-to-pub
+    // derivation, despite the name -- same helper already used for device
+    // keys just below).
+    private fun identityMsg(identityPrivHex: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+        val identityPub = devPub(identityPrivHex)
         val devicePub = devPub(devPrivHex)
-        val cert = KotlinWire.CertDict(identityPub, devicePub, "d", 1752900000.0, "00")
+        val cert = signedCert(identityPrivHex, identityPub, devicePub, "d")
         val unsigned = SignedMessage(cert, seq, payload, "")
         return unsigned.copy(signature = KotlinWire.signRaw(devPrivHex, unsigned.body()))
     }
@@ -108,7 +118,8 @@ class GossipServerTest {
         val serverFixture = buildFixture("Server Device")
         val clientFixture = buildFixture("Client Device")
         val friendPriv = "f2".repeat(32)
-        val friendPub = "f1".repeat(32)
+        val friendIdentityPriv = "f1".repeat(32)
+        val friendPub = devPub(friendIdentityPriv)
 
         val serverStore = InMemorySyncStore()
         // AUTH gate: the server must know the client's identity, or respondHandshake refuses.
@@ -117,7 +128,7 @@ class GossipServerTest {
         // audience gate (SyncStore.messagesNotIn's doc), so it is servable
         // to any entitled peer purely off the entitled-identity intersection.
         serverStore.addIdentity(friendPub)
-        val seeded = identityMsg(friendPub, 1, mapOf("kind" to "profile", "name" to "Friend", "created_at" to 1.0), friendPriv)
+        val seeded = identityMsg(friendIdentityPriv, 1, mapOf("kind" to "profile", "name" to "Friend", "created_at" to 1.0), friendPriv)
         assertTrue(serverStore.ingestMessage(seeded))
 
         val gossipServer = GossipServer(serverStore, { serverFixture }, ReentrantLock(), 0)
@@ -235,12 +246,13 @@ class GossipServerTest {
         val serverFixture = buildFixture("Server Device")
         val clientFixture = buildFixture("Client Device")
         val friendPriv = "e2".repeat(32)
-        val friendPub = "e1".repeat(32)
+        val friendIdentityPriv = "e1".repeat(32)
+        val friendPub = devPub(friendIdentityPriv)
 
         val serverStore = InMemorySyncStore()
         serverStore.addIdentity(clientFixture.cert.identity_pub)
         serverStore.addIdentity(friendPub)
-        val seeded = identityMsg(friendPub, 1, mapOf("kind" to "profile", "name" to "Friend", "created_at" to 1.0), friendPriv)
+        val seeded = identityMsg(friendIdentityPriv, 1, mapOf("kind" to "profile", "name" to "Friend", "created_at" to 1.0), friendPriv)
         assertTrue(serverStore.ingestMessage(seeded))
 
         val gossipServer = GossipServer(serverStore, { serverFixture }, ReentrantLock(), 0)

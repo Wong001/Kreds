@@ -373,25 +373,42 @@ class SqliteSyncStore(context: Context) :
         ).use { it.moveToFirst() }
         if (!known) return false
 
-        // 2. verify
+        // 2. enrollment-cert gate (security fix: forgeable enckey / device
+        // injection) -- mirrors hearth's Verifier.verify_message FIRST check
+        // (identity.py:562, `msg.cert.verify()`), which runs BEFORE the
+        // device-body signature check just below. Without this, any AUTH'd
+        // peer (a directly-peering friend, not just the trusted home node)
+        // could inject a message whose cert.identity_pub names a VICTIM
+        // identity and cert.device_pub names the ATTACKER's own device,
+        // signing only the message body (what verifyDeviceSignature checks
+        // in step 3) while leaving the enrollment signature garbage -- e.g.
+        // a forged KIND_ENCKEY that would surface in enckeys(victim) and let
+        // content get wrapped/re-granted to the attacker's device.
+        // verifyCert is the EXACT SAME function KotlinHandshake already uses
+        // to authenticate a peer's own cert at HELLO (KotlinHandshake.kt:
+        // runOverStream/respondHandshake/authOnlyOverStream all call
+        // KotlinWire.verifyCert(peerCert)) -- reused here, not reinvented.
+        if (!KotlinWire.verifyCert(m.cert)) return false
+
+        // 3. verify device-body signature
         if (!m.verifyDeviceSignature()) return false
 
         val id = m.msgId()
 
-        // 3. dedup by msg_id -- already have this exact message.
+        // 4. dedup by msg_id -- already have this exact message.
         val alreadyHave = db.rawQuery(
             "SELECT 1 FROM messages WHERE msg_id = ? LIMIT 1", arrayOf(id)
         ).use { it.moveToFirst() }
         if (alreadyHave) return false
 
-        // 4a. seq<1 rejection -- SeenSet.add(seq) rejects seq<1
+        // 5a. seq<1 rejection -- SeenSet.add(seq) rejects seq<1
         // unconditionally (`if (seq < 1 || has(seq)) return false`), before
         // it even checks reuse. A row-existence query alone can't express
         // that (a first message at seq=0/negative has no existing row to
         // collide with), so it needs its own explicit gate here.
         if (m.seq < 1) return false
 
-        // 4b. seq-reuse rejection -- SeenSet's whole purpose in the in-memory
+        // 5b. seq-reuse rejection -- SeenSet's whole purpose in the in-memory
         // reference (D2 Ambush 2; hearth Verifier.verify_message: `if not
         // seen.add(seq): reject`). Rows are never deleted, so a row here
         // with the same (identity_pub, device_pub, seq) can only have a
@@ -403,7 +420,7 @@ class SqliteSyncStore(context: Context) :
         ).use { it.moveToFirst() }
         if (reused) return false
 
-        // 5. accept
+        // 6. accept
         val cv = ContentValues().apply {
             put("msg_id", id)
             put("identity_pub", m.cert.identity_pub)

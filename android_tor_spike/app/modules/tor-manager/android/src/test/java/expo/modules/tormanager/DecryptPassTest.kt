@@ -28,14 +28,38 @@ class DecryptPassTest {
     // looks up in payload.wraps / a grant's wraps, exactly like production.
     private val phoneDevicePub = "44".repeat(32)
     private val otherDevicePub = "55".repeat(32)
+
+    // Security-fix note (verify enrollment cert at ingest): ingestMessage now
+    // requires every message's embedded EnrollmentCert be GENUINELY signed by
+    // cert.identity_pub's own private key (KotlinWire.verifyCert) -- an
+    // identity_pub can no longer be arbitrary unsigned data. Every identity
+    // this file uses now has a REAL Ed25519 keypair behind it: the fixture's
+    // "author"/"to" fields carry a committed "author_priv"/"to_priv" (see
+    // make_dmcrypt_vectors.py), and the Kotlin-local identities below are
+    // freshly minted. Rather than touch every one of this file's ~50
+    // signedMessage(identityPub, ...) call sites (which must keep passing
+    // the PUB -- that value is also used for addIdentity/AAD/equality
+    // checks throughout), signedMessage looks up the matching PRIV in this
+    // registry by pub. registerIdentity is called once per identity actually
+    // used to author a message in a given test (see each test body).
+    private val identitySigners = mutableMapOf<String, String>()   // identity_pub -> identity_priv
+
+    private fun registerIdentity(identityPub: String, identityPriv: String): String {
+        identitySigners[identityPub] = identityPriv
+        return identityPub
+    }
+
     // A DIFFERENT (but known -- i.e. a synced "friend") identity, used by
     // the two author-scoping tests below. Distinct from phoneDevicePub/
-    // otherDevicePub, which are DEVICE keys, not identities.
-    private val foreignIdentityPub = "99".repeat(32)
+    // otherDevicePub, which are DEVICE keys, not identities. Auto-registered
+    // here (not per-test) since it plays the exact same role -- an
+    // independent, real, known identity -- everywhere it's used.
+    private val foreignIdentityPub: String = genKeypair().let { (priv, pub) -> registerIdentity(pub, priv) }
     // The phone's OWN identity for the own-content-only regression test
-    // below -- deliberately distinct from the fixture's "11"-repeat author
-    // (make_dmcrypt_vectors.py), which plays the role of a FRIEND there.
-    private val phoneOwnIdentityPub = "77".repeat(32)
+    // below -- deliberately distinct from the fixture's real "author"
+    // keypair (make_dmcrypt_vectors.py), which plays the role of a FRIEND
+    // there. Auto-registered, same reasoning as foreignIdentityPub above.
+    private val phoneOwnIdentityPub: String = genKeypair().let { (priv, pub) -> registerIdentity(pub, priv) }
 
     private fun cases(): JSONArray {
         val t = javaClass.classLoader!!.getResourceAsStream("dmcrypt_vectors.json")!!
@@ -63,9 +87,16 @@ class DecryptPassTest {
         devPrivHex to KotlinWire.toHex(
             Ed25519PrivateKeyParameters(KotlinWire.fromHex(devPrivHex), 0).generatePublicKey().encoded)
 
+    // Security-fix note: the enrollment cert is now GENUINELY identity-signed
+    // (via the hoisted `signedCert`, GossipServerTest.kt) -- `identityPub`
+    // must have been registered (registerIdentity) with its real private key
+    // beforehand, or this throws immediately with a clear message rather
+    // than silently building an unsignable cert.
     private fun signedMessage(identityPub: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+        val identityPriv = identitySigners[identityPub]
+            ?: error("no registered identity priv for $identityPub -- call registerIdentity() first")
         val (devPriv, devPub) = devicePair(devPrivHex)
-        val cert = KotlinWire.CertDict(identityPub, devPub, "d", 1752900000.0, "00")
+        val cert = signedCert(identityPriv, identityPub, devPub, "d")
         val unsigned = SignedMessage(cert, seq, payload, "")
         return unsigned.copy(signature = KotlinWire.signRaw(devPriv, unsigned.body()))
     }
@@ -88,7 +119,7 @@ class DecryptPassTest {
         val c = cases().getJSONObject(0)
         assertEquals("post", c.getString("kind"))
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -105,7 +136,7 @@ class DecryptPassTest {
         val c = cases().getJSONObject(1)
         assertEquals("dm", c.getString("kind"))
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         // NOT wrapped to our device inline -- only some OTHER device's wrap
         // rides in the payload, so the backfill grant is the ONLY path to
         // the content key.
@@ -130,7 +161,7 @@ class DecryptPassTest {
     @Test fun skipsWrongDeviceAndTamperedCiphertextWithoutCrashing() {
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
 
         // (a) wrapped only to a DIFFERENT device, no grant at all -- our
         // device has no way in.
@@ -164,7 +195,7 @@ class DecryptPassTest {
             sameKeyCases.size >= 3)
 
         val store = InMemorySyncStore()
-        store.addIdentity(sameKeyCases[0].getString("author"))
+        store.addIdentity(registerIdentity(sameKeyCases[0].getString("author"), sameKeyCases[0].getString("author_priv")))
         for ((i, c) in sameKeyCases.withIndex()) {
             val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
             val msg = signedMessage(c.getString("author"), i + 1, postPayload(c, wraps), ("d%d".format(i + 1)).repeat(32))
@@ -193,7 +224,7 @@ class DecryptPassTest {
         // post -- must reject the foreign grant regardless of its timestamp.
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         store.addIdentity(foreignIdentityPub)
 
         // Not wrapped inline -- both the real content key and the "attack"
@@ -232,7 +263,7 @@ class DecryptPassTest {
     @Test fun skipsWhenOnlyAForeignAuthoredGrantExists() {
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         store.addIdentity(foreignIdentityPub)
 
         val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
@@ -273,7 +304,7 @@ class DecryptPassTest {
         // The fixture's "author" plays a KNOWN FRIEND here (not the phone's
         // own identity, which is phoneOwnIdentityPub) -- addIdentity mirrors
         // B.1 sync's HAVE phase admitting a friend's identity as known.
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "f1".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -294,7 +325,7 @@ class DecryptPassTest {
         val c = cases().getJSONObject(0)
         assertEquals("post", c.getString("kind"))
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
 
         val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "a5".repeat(32))
@@ -322,9 +353,9 @@ class DecryptPassTest {
         // `to == ownIdentityPub`).
         val c = cases().getJSONObject(1)
         assertEquals("dm", c.getString("kind"))
-        val ownIdentityPub = c.getString("to")   // fixture's DM recipient plays "us"
+        val ownIdentityPub = registerIdentity(c.getString("to"), c.getString("to_priv"))   // fixture's DM recipient plays "us"
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))   // the friend who sent the DM
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))   // the friend who sent the DM
         store.addIdentity(ownIdentityPub)           // our own identity, also known to itself
 
         // Not wrapped inline to the phone -- only some OTHER device's wrap
@@ -357,9 +388,9 @@ class DecryptPassTest {
         // come purely from the signer's identity, not the wrap's validity.
         val c = cases().getJSONObject(1)
         assertEquals("dm", c.getString("kind"))
-        val ownIdentityPub = c.getString("to")
+        val ownIdentityPub = registerIdentity(c.getString("to"), c.getString("to_priv"))
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         store.addIdentity(ownIdentityPub)
         store.addIdentity(foreignIdentityPub)   // the hostile third identity, also known
 
@@ -404,7 +435,7 @@ class DecryptPassTest {
             expectedBlobs.isNotEmpty())
 
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))         // the friend who posted
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))         // the friend who posted
         store.addIdentity(phoneOwnIdentityPub)            // our own identity, also known to itself
 
         val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
@@ -438,7 +469,7 @@ class DecryptPassTest {
         // skipsReceivedDmGrantSignedByAHostileThirdIdentity's DM analog).
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         store.addIdentity(phoneOwnIdentityPub)
         store.addIdentity(foreignIdentityPub)   // the hostile third identity, also known
 
@@ -482,7 +513,7 @@ class DecryptPassTest {
         // wrap inside it.
         val c = cases().getJSONObject(0)
         val backing = InMemorySyncStore()
-        backing.addIdentity(c.getString("author"))       // known AT INGEST TIME...
+        backing.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))       // known AT INGEST TIME...
         backing.addIdentity(phoneOwnIdentityPub)
 
         val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
@@ -516,7 +547,7 @@ class DecryptPassTest {
         val c = cases().getJSONObject(0)
         assertEquals("post", c.getString("kind"))
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
 
         val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, noInlineWraps), "18".repeat(32))
@@ -550,7 +581,7 @@ class DecryptPassTest {
         // author-priority must keep it decrypting.
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         store.addIdentity(phoneOwnIdentityPub)
 
         val noInlineWraps = mapOf(otherDevicePub to jsonToMap(c.getJSONObject("wrap")))
@@ -606,7 +637,7 @@ class DecryptPassTest {
         val dmCase = cases().getJSONObject(1)
         val newerPostCase = cases().getJSONObject(3)  // created_at ...100.123456 (newest)
         val olderPostCase = cases().getJSONObject(2)  // created_at ...900.123456 (oldest)
-        val ownIdentityPub = postCase.getString("author")
+        val ownIdentityPub = registerIdentity(postCase.getString("author"), postCase.getString("author_priv"))
         assertEquals("fixture precondition: dm and post cases share one AUTHOR identity",
             ownIdentityPub, dmCase.getString("author"))
         assertEquals("fixture precondition: cases sharing one enc key for a single run() call",
@@ -676,7 +707,7 @@ class DecryptPassTest {
     @Test fun resolvesAuthorFromStoredFriendProfile() {
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -693,7 +724,7 @@ class DecryptPassTest {
     @Test fun fallsBackToIdentityPrefixWithoutAStoredProfile() {
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -713,7 +744,7 @@ class DecryptPassTest {
         // WORSE candidate than absent, not a valid empty display name.
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -729,7 +760,7 @@ class DecryptPassTest {
 
     @Test fun resolvesOwnAuthorToOwnStoredProfileName() {
         val c = cases().getJSONObject(0)
-        val ownIdentityPub = c.getString("author")   // we authored this post ourselves
+        val ownIdentityPub = registerIdentity(c.getString("author"), c.getString("author_priv"))   // we authored this post ourselves
         val store = InMemorySyncStore()
         store.addIdentity(ownIdentityPub)
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
@@ -747,7 +778,7 @@ class DecryptPassTest {
 
     @Test fun resolvesOwnAuthorToMeWithoutAStoredOwnProfile() {
         val c = cases().getJSONObject(0)
-        val ownIdentityPub = c.getString("author")
+        val ownIdentityPub = registerIdentity(c.getString("author"), c.getString("author_priv"))
         val store = InMemorySyncStore()
         store.addIdentity(ownIdentityPub)
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
@@ -763,7 +794,7 @@ class DecryptPassTest {
     @Test fun latestProfileMessageWinsForAuthorResolution() {
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "a1".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -822,7 +853,7 @@ class DecryptPassTest {
             decoyPayloadBlobs != expectedBlobs)
 
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         // Outer payload carries the DECOY blobs (never the real ones) plus
         // "thumbs" -- the ONLY place hearth ever puts them.
@@ -856,7 +887,7 @@ class DecryptPassTest {
     @Test fun surfacesVideoMediaAndPosterFromOuterPayload() {
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val posterHash = "ab".repeat(32)
         val payload = postPayload(c, wraps).toMutableMap().apply {
@@ -876,7 +907,7 @@ class DecryptPassTest {
     @Test fun defaultsToPhotoMediaWithNullPosterWhenAbsentFromOuterPayload() {
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         // postPayload(c, wraps) carries no "media"/"poster" key at all --
         // the ordinary photo-post shape.
@@ -903,7 +934,7 @@ class DecryptPassTest {
         val c = cases().getJSONObject(1)
         assertEquals("dm", c.getString("kind"))
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val mediaHash = "cd".repeat(32)
         val payload = dmPayload(c, wraps).toMutableMap().apply {
@@ -920,7 +951,7 @@ class DecryptPassTest {
     @Test fun nullStoryRefMediaHashWhenAbsentFromOrdinaryDm() {
         val c = cases().getJSONObject(1)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         // dmPayload(c, wraps) carries no "story_ref" key at all -- the
         // ordinary (non-story-reply) DM shape.
@@ -942,7 +973,7 @@ class DecryptPassTest {
         val c = cases().getJSONObject(0)
         assertEquals("post", c.getString("kind"))
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val payload = postPayload(c, wraps).toMutableMap().apply {
             put("story_ref", mapOf("story_id" to "s1", "media_hash" to "ab".repeat(32)))
@@ -968,7 +999,7 @@ class DecryptPassTest {
         val c = cases().getJSONObject(1)
         assertEquals("dm", c.getString("kind"))
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val notHex64MediaHash = "AB".repeat(32)   // 64 chars, valid hex digits, wrong case
         assertEquals("test precondition: exactly 64 chars", 64, notHex64MediaHash.length)
@@ -991,7 +1022,7 @@ class DecryptPassTest {
         // nothing downstream would ever use it to decrypt a blob.
         val c = cases().getJSONObject(0)
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, postPayload(c, wraps), "b7".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -1049,7 +1080,7 @@ class DecryptPassTest {
     @Test fun decryptsLatestResponsesRecordForItsOwnPostAuthor() {
         val c = responsesCase()
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, responsesPayload(c, wraps), "c3".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -1071,7 +1102,7 @@ class DecryptPassTest {
     @Test fun latestByCreatedAtResponsesRecordWinsOverAnOlderOne() {
         val c = responsesCase()
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
 
         // The REAL, valid vector record -- ingested FIRST (seq 1) but is
         // the NEWER of the two candidates by created_at. If responsesPass
@@ -1118,7 +1149,7 @@ class DecryptPassTest {
         // do not own.
         val c = responsesCase()
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, responsesPayload(c, wraps), "c6".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -1133,7 +1164,7 @@ class DecryptPassTest {
     @Test fun ignoresResponsesRecordWhenTargetPostIsNotKnownToThisStore() {
         val c = responsesCase()
         val store = InMemorySyncStore()
-        store.addIdentity(c.getString("author"))
+        store.addIdentity(registerIdentity(c.getString("author"), c.getString("author_priv")))
         val wraps = mapOf(phoneDevicePub to jsonToMap(c.getJSONObject("wrap")))
         val msg = signedMessage(c.getString("author"), 1, responsesPayload(c, wraps), "c7".repeat(32))
         assertTrue(store.ingestMessage(msg))
@@ -1376,7 +1407,8 @@ class DecryptPassTest {
         // THIS identity's own composed rows populate ownRawByCreatedAt.
         val store = InMemorySyncStore()
         store.addIdentity(phoneOwnIdentityPub)
-        val friendIdentity = "cd".repeat(32)
+        val (friendIdentityPriv, friendIdentity) = genKeypair()
+        registerIdentity(friendIdentity, friendIdentityPriv)
         store.addIdentity(friendIdentity)
         val (encPriv, encPub) = genEncKeyPair()
         val target = journalPost(store, phoneOwnIdentityPub, "e5".repeat(32))

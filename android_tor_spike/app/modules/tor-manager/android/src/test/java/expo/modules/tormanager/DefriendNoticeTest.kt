@@ -35,11 +35,17 @@ class DefriendNoticeTest {
         return unsigned.copy(signature = KotlinWire.signRaw(authorPriv, unsigned.body()))
     }
 
-    // Builds a SIGNED message for an explicit identity_pub/device, mirroring
+    // Builds a SIGNED message for an explicit identity/device, mirroring
     // RevocationCertTest's identityMsg idiom exactly.
-    private fun identityMsg(identityPub: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+    //
+    // Security-fix note: takes the identity's PRIVATE key (identityPriv), not
+    // a bare identity_pub -- ingestMessage's enrollment-cert gate
+    // (KotlinWire.verifyCert) requires the cert be genuinely signed by
+    // identity_pub's own private key.
+    private fun identityMsg(identityPriv: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+        val identityPub = devPub(identityPriv)
         val devicePub = devPub(devPrivHex)
-        val cert = KotlinWire.CertDict(identityPub, devicePub, "d", 1752900000.0, "00")
+        val cert = signedCert(identityPriv, identityPub, devicePub, "d")
         val unsigned = SignedMessage(cert, seq, payload, "")
         return unsigned.copy(signature = KotlinWire.signRaw(devPrivHex, unsigned.body()))
     }
@@ -103,8 +109,8 @@ class DefriendNoticeTest {
         val authorDevPriv = "44".repeat(32)
         store.addIdentity(authorPub)
 
-        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), authorDevPriv)
-        val m2 = identityMsg(authorPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), authorDevPriv)
+        val m1 = identityMsg(authorPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), authorDevPriv)
+        val m2 = identityMsg(authorPriv, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), authorDevPriv)
         assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2))
 
         val notice = signedDefriend(authorPriv, authorPub, ownIdentity)

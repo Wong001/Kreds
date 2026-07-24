@@ -124,15 +124,25 @@ class KotlinResponsesTest {
     // ---- responseSigPayload (5 fields, PyFloat created_at, canonical) ----
 
     @Test fun responseSigPayloadByteMatchesHearth() {
-        // Verified against hearth _response_sig_payload (venv canonical()):
-        // {"body":...,"created_at":1784568399.425043,"responder":...,"rkind":...,"target":...}
+        // Verified against hearth _response_sig_payload (venv canonical()).
+        // Security-fix note (verify enrollment cert at ingest): the
+        // committed "responses" vector case was regenerated (make_dmcrypt_
+        // vectors.json) to also expose the author's real Ed25519 identity
+        // private key (author_priv) alongside every other field, since
+        // ingestMessage now requires a genuinely identity-signed enrollment
+        // cert -- DecryptPassTest's responses-case tests need it. The
+        // aggregated record's author/commenter/reactor identities and
+        // created_at are freshly minted per generator run (_build_responses_
+        // case drives real HearthNode/compose_response), so this pinned
+        // byte string and target()/publicIdentity()'s createdAt below are
+        // re-derived from the CURRENT committed fixture, not the old one.
         val expected =
-            "{\"body\":\"nice post!\",\"created_at\":1784568399.425043," +
-            "\"responder\":\"15a2d12336536699d59d1cd355f2162031b5713481c520b29f7f08b7b4e556ee\"," +
+            "{\"body\":\"nice post!\",\"created_at\":1784925860.7662318," +
+            "\"responder\":\"1a92d8fcfb773aeca6046f5ff45bbf20cc10207c0f3dd84e96dfdbc8b42e412e\"," +
             "\"rkind\":\"comment\"," +
-            "\"target\":\"d722d9a309cb43e145dfa7143b8bb54f1dce76816f6ea512f2474cc2bc51b32a\"}"
+            "\"target\":\"96a0c9bdcdfc881a562f2978adf1ad47e06fd04c91e69b9d55dd95924ecc9e0a\"}"
         val got = KotlinResponses.responseSigPayload(
-            target(), "comment", "nice post!", 1784568399.425043, publicIdentity())
+            target(), "comment", "nice post!", 1784925860.7662318, publicIdentity())
         assertEquals(expected, got.toString(Charsets.US_ASCII))
     }
 
@@ -141,7 +151,7 @@ class KotlinResponsesTest {
     @Test fun publicEntryValidSigAndDeviceBoundResolvesName() {
         val (display, color) = KotlinResponses.resolveDisplay(
             publicEntry(), target(), emptyMap(), { _, _ -> true })
-        assertEquals("friend-15a2d123", display)   // no profile name stored -> friend- prefix
+        assertEquals("friend-1a92d8fc", display)   // no profile name stored -> friend- prefix
         assertNull(color)                          // resolved -> no alias color
     }
 
@@ -158,8 +168,8 @@ class KotlinResponsesTest {
         e["responder_sig"] = "0000" + sig.substring(4)   // still hex128, but no longer a valid sig
         val (display, color) = KotlinResponses.resolveDisplay(
             e, target(), emptyMap(), { _, _ -> true })
-        assertEquals("Curious Crane", display)
-        assertEquals(351, color)
+        assertEquals("Sharp Fox", display)
+        assertEquals(250, color)
     }
 
     @Test fun validSigButNotDeviceBoundFallsToAlias() {
@@ -167,8 +177,8 @@ class KotlinResponsesTest {
         // sig-alone is forgeable, so we MUST render the alias, never the name.
         val (display, color) = KotlinResponses.resolveDisplay(
             publicEntry(), target(), emptyMap(), { _, _ -> false })
-        assertEquals("Curious Crane", display)
-        assertEquals(351, color)
+        assertEquals("Sharp Fox", display)
+        assertEquals(250, color)
     }
 
     @Test fun wrongTargetFallsToAlias() {
@@ -176,8 +186,8 @@ class KotlinResponsesTest {
         // target must fail -> alias.
         val (display, color) = KotlinResponses.resolveDisplay(
             publicEntry(), "ff".repeat(32), emptyMap(), { _, _ -> true })
-        assertEquals("Curious Crane", display)
-        assertEquals(351, color)
+        assertEquals("Sharp Fox", display)
+        assertEquals(250, color)
     }
 
     @Test fun privateEntryAlwaysAliasWhenNoEncPrivSupplied() {
@@ -191,8 +201,8 @@ class KotlinResponsesTest {
         // (dmcrypt_vectors.json case "responses"), not a synthetic one.
         val (display, color) = KotlinResponses.resolveDisplay(
             privateEntry(), target(), emptyMap(), { _, _ -> true })
-        assertEquals("Swift Seal", display)
-        assertEquals(88, color)
+        assertEquals("Merry Owl", display)
+        assertEquals(324, color)
     }
 
     // ---- aggregate ----
@@ -213,7 +223,7 @@ class KotlinResponsesTest {
         assertEquals(1, r.reactions["fire"])
         assertEquals(1, r.comments.size)
         assertEquals("nice post!", r.comments[0].body)
-        assertEquals("friend-15a2d123", r.comments[0].display)
+        assertEquals("friend-1a92d8fc", r.comments[0].display)
         assertNull(r.comments[0].aliasColor)
     }
 
@@ -358,8 +368,8 @@ class KotlinResponsesTest {
         val encPriv = responsesCase().getString("enc_priv")
         val (display, color) = KotlinResponses.resolveDisplay(
             privateEntry(), target(), emptyMap(), { _, _ -> true }, encPriv)
-        assertEquals("Swift Seal", display)
-        assertEquals(88, color)
+        assertEquals("Merry Owl", display)
+        assertEquals(324, color)
     }
 
     @Test fun mutualBoxOpensButTamperedResponderSigStaysAlias() {

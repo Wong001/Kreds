@@ -15,15 +15,20 @@ import java.security.MessageDigest
 class ComposeTest {
     // A locally-minted device keypair + a cert whose identity_pub we
     // control. Mirrors DecryptPassTest's devicePair()/signedMessage()
-    // idiom: cert.signature is never itself verified on this path (only
-    // ingestMessage's verifyDeviceSignature is exercised, which checks
-    // cert.device_pub against a signature made with fx.device_priv).
+    // idiom. Security-fix note: the cert is now GENUINELY enrollment-signed
+    // (via the hoisted `signedCert`, GossipServerTest.kt) by a matching
+    // identity private key -- ingestMessage's new enrollment-cert gate
+    // (KotlinWire.verifyCert) rejects a placeholder/garbage cert signature,
+    // so `identityPub` can no longer be an arbitrary literal with no
+    // matching private key.
     private fun testFixture(): KotlinHandshake.Fixture {
         val devPriv = "a1".repeat(32)
         val devPub = KotlinWire.toHex(
             Ed25519PrivateKeyParameters(KotlinWire.fromHex(devPriv), 0).generatePublicKey().encoded)
-        val identityPub = "b2".repeat(32)
-        val cert = KotlinWire.CertDict(identityPub, devPub, "d", 1752900000.0, "00")
+        val identityPriv = "b1".repeat(32)
+        val identityPub = KotlinWire.toHex(
+            Ed25519PrivateKeyParameters(KotlinWire.fromHex(identityPriv), 0).generatePublicKey().encoded)
+        val cert = signedCert(identityPriv, identityPub, devPub, "d")
         return KotlinHandshake.Fixture(devPriv, devPub, cert, "dummy.onion:9001")
     }
 

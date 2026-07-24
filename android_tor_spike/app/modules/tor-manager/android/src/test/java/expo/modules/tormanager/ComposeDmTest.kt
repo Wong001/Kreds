@@ -22,15 +22,23 @@ import java.security.SecureRandom
  *  real identity so the recipient-wrap check is never a tautology). */
 class ComposeDmTest {
 
-    private fun fixture(devPrivHex: String, identityPubHex: String): KotlinHandshake.Fixture {
+    // Security-fix note: takes the identity's PRIVATE key (identityPrivHex),
+    // not a bare identity_pub -- ingestMessage's enrollment-cert gate
+    // (KotlinWire.verifyCert) requires the cert be genuinely signed by
+    // identity_pub's own private key (via the hoisted `signedCert`,
+    // GossipServerTest.kt), so a placeholder/garbage cert signature is no
+    // longer accepted.
+    private fun fixture(devPrivHex: String, identityPrivHex: String): KotlinHandshake.Fixture {
         val devPub = KotlinWire.toHex(
             Ed25519PrivateKeyParameters(KotlinWire.fromHex(devPrivHex), 0).generatePublicKey().encoded)
-        val cert = KotlinWire.CertDict(identityPubHex, devPub, "d", 1752900000.0, "00")
+        val identityPubHex = KotlinWire.toHex(
+            Ed25519PrivateKeyParameters(KotlinWire.fromHex(identityPrivHex), 0).generatePublicKey().encoded)
+        val cert = signedCert(identityPrivHex, identityPubHex, devPub, "d")
         return KotlinHandshake.Fixture(devPrivHex, devPub, cert, "dummy.onion:9001")
     }
 
-    private fun own() = fixture("a1".repeat(32), "b2".repeat(32))
-    private fun friend() = fixture("c3".repeat(32), "d4".repeat(32))
+    private fun own() = fixture("a1".repeat(32), "b1".repeat(32))
+    private fun friend() = fixture("c3".repeat(32), "d3".repeat(32))
 
     // Same throwaway-signature-then-real-signature idiom as ComposeTest/ComposeResponseTest.
     private fun SignedMessageSigned(fx: KotlinHandshake.Fixture, seq: Int, payload: Map<String, Any?>): SignedMessage {

@@ -182,9 +182,9 @@ class KotlinSyncTest {
         val devicePriv = "44".repeat(32)
         val devicePub = devPub(devicePriv)
         store.addIdentity(identityPub)
-        val m1 = identityMsg(identityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
-        val m2 = identityMsg(identityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devicePriv)
-        val m3 = identityMsg(identityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devicePriv)
+        val m1 = identityMsg(identityPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
+        val m2 = identityMsg(identityPriv, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devicePriv)
+        val m3 = identityMsg(identityPriv, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devicePriv)
         assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2)); assertTrue(store.ingestMessage(m3))
 
         val rev = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 2)
@@ -355,9 +355,9 @@ class KotlinSyncTest {
         val ownDevicePub = devPub(ownDevicePriv)
         store.addIdentity(ownIdentityPub)   // mirrors production seeding (KotlinPairing.kt / SyncRunner.kt)
 
-        val m1 = identityMsg(ownIdentityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), ownDevicePriv)
-        val m2 = identityMsg(ownIdentityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), ownDevicePriv)
-        val m3 = identityMsg(ownIdentityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), ownDevicePriv)
+        val m1 = identityMsg(ownIdentityPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), ownDevicePriv)
+        val m2 = identityMsg(ownIdentityPriv, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), ownDevicePriv)
+        val m3 = identityMsg(ownIdentityPriv, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), ownDevicePriv)
         assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2)); assertTrue(store.ingestMessage(m3))
 
         val rev = signedRevocation(ownIdentityPriv, ownIdentityPub, ownDevicePub, lastValidSeq = 2)
@@ -408,7 +408,7 @@ class KotlinSyncTest {
         val (authorPriv, authorPub) = genKeypair()
         val authorDevPriv = "44".repeat(32)
         store.addIdentity(authorPub)
-        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), authorDevPriv)
+        val m1 = identityMsg(authorPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), authorDevPriv)
         assertTrue(store.ingestMessage(m1))
 
         val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
@@ -1030,12 +1030,20 @@ class KotlinSyncTest {
         override fun close() {}
     }
 
-    // Builds a SIGNED message for an EXPLICIT identity_pub, mirroring
+    // Builds a SIGNED message for an EXPLICIT identity, mirroring
     // SyncStoreTest's identityMsg/devicePubOf idiom exactly (reusing this
     // file's own devPub() in place of a second devicePubOf()).
-    private fun identityMsg(identityPub: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+    //
+    // Security-fix note: takes the identity's PRIVATE key (identityPrivHex),
+    // not a bare identity_pub -- ingestMessage's enrollment-cert gate
+    // (KotlinWire.verifyCert) requires the cert be genuinely signed by
+    // identity_pub's own private key (via the hoisted `signedCert`,
+    // GossipServerTest.kt), so a placeholder/garbage cert signature is no
+    // longer accepted.
+    private fun identityMsg(identityPrivHex: String, seq: Int, payload: Map<String, Any?>, devPrivHex: String): SignedMessage {
+        val identityPub = devPub(identityPrivHex)
         val devicePub = devPub(devPrivHex)
-        val cert = KotlinWire.CertDict(identityPub, devicePub, "d", 1752900000.0, "00")
+        val cert = signedCert(identityPrivHex, identityPub, devicePub, "d")
         val unsigned = SignedMessage(cert, seq, payload, "")
         return unsigned.copy(signature = KotlinWire.signRaw(devPrivHex, unsigned.body()))
     }
@@ -1075,16 +1083,16 @@ class KotlinSyncTest {
         val store = InMemorySyncStore()
         val fixture = buildFixture("aa".repeat(32))   // unrelated to the peer below
 
-        val friendPub = "b1".repeat(32); val friendDevPriv = "b2".repeat(32)
-        val ringAuthorPub = "c1".repeat(32); val ringAuthorDevPriv = "c2".repeat(32)
-        val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
+        val friendIdentityPriv = "b1".repeat(32); val friendPub = devPub(friendIdentityPriv); val friendDevPriv = "b2".repeat(32)
+        val ringAuthorIdentityPriv = "c1".repeat(32); val ringAuthorPub = devPub(ringAuthorIdentityPriv); val ringAuthorDevPriv = "c2".repeat(32)
+        val peerIdentityPriv = "d1".repeat(32); val peerPub = devPub(peerIdentityPriv); val peerDevPriv = "d2".repeat(32)
         val peerDevPub = devPub(peerDevPriv)
         val unknownToUsPub = "ee".repeat(32)   // peer reports it as "known"; we must never adopt it (non-sibling)
         // Known to US (addIdentity below) but NOT reported by the peer's own
         // HAVE.known -- excluded ONLY by the entitled intersection, since its
         // post below IS wrapped to the peer's device (wrap-set gate alone
         // would pass it).
-        val notMutualFriendPub = "f1".repeat(32); val notMutualFriendDevPriv = "f2".repeat(32)
+        val notMutualFriendIdentityPriv = "f1".repeat(32); val notMutualFriendPub = devPub(notMutualFriendIdentityPriv); val notMutualFriendDevPriv = "f2".repeat(32)
 
         store.addIdentity(friendPub)
         store.addIdentity(ringAuthorPub)
@@ -1092,22 +1100,22 @@ class KotlinSyncTest {
         store.addIdentity(notMutualFriendPub)
         // Seed the peer's own device so deviceViews(peerPub) is non-empty --
         // needed for the wrap-set gate on the POSTs below.
-        assertTrue(store.ingestMessage(identityMsg(peerPub, 1,
+        assertTrue(store.ingestMessage(identityMsg(peerIdentityPriv, 1,
             mapOf("kind" to "profile", "name" to "Peer", "created_at" to 1.0), peerDevPriv)))
 
-        val kredsFriendPost = identityMsg(friendPub, 1, mapOf(
+        val kredsFriendPost = identityMsg(friendIdentityPriv, 1, mapOf(
             "kind" to "post", "scope" to "kreds", "text" to "hi",
             "wraps" to mapOf(peerDevPub to mapOf("x" to 1)), "blobs" to emptyList<String>()), friendDevPriv)
         assertTrue(store.ingestMessage(kredsFriendPost))
 
-        val innerRingRecord = identityMsg(ringAuthorPub, 1, mapOf(
+        val innerRingRecord = identityMsg(ringAuthorIdentityPriv, 1, mapOf(
             "kind" to "ring", "member" to "cc".repeat(32), "ring" to "inner", "created_at" to 1.0), ringAuthorDevPriv)
         assertTrue(store.ingestMessage(innerRingRecord))
 
         // Wrapped to the peer's device -- the wrap-set gate alone would
         // serve this. Only exclusion from `entitled` (peerKnown does NOT
         // list notMutualFriendPub below) can block it.
-        val postFromNonMutualFriend = identityMsg(notMutualFriendPub, 1, mapOf(
+        val postFromNonMutualFriend = identityMsg(notMutualFriendIdentityPriv, 1, mapOf(
             "kind" to "post", "scope" to "kreds", "text" to "not mutual",
             "wraps" to mapOf(peerDevPub to mapOf("x" to 1)), "blobs" to emptyList<String>()), notMutualFriendDevPriv)
         assertTrue(store.ingestMessage(postFromNonMutualFriend))
@@ -1116,7 +1124,7 @@ class KotlinSyncTest {
 
         // The peer OFFERS a new message from the already-entitled friend
         // identity -- must be ingested via the existing verify/ingest gates.
-        val offered = identityMsg(friendPub, 2,
+        val offered = identityMsg(friendIdentityPriv, 2,
             mapOf("kind" to "profile", "name" to "Friend", "created_at" to 2.0), friendDevPriv)
 
         val stream = RespondingStream(listOf(
@@ -1273,9 +1281,9 @@ class KotlinSyncTest {
         val devicePriv = "77".repeat(32)
         val devicePub = devPub(devicePriv)
         store.addIdentity(identityPub)
-        val m1 = identityMsg(identityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
-        val m2 = identityMsg(identityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devicePriv)
-        val m3 = identityMsg(identityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devicePriv)
+        val m1 = identityMsg(identityPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), devicePriv)
+        val m2 = identityMsg(identityPriv, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), devicePriv)
+        val m3 = identityMsg(identityPriv, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), devicePriv)
         assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2)); assertTrue(store.ingestMessage(m3))
 
         val rev = signedRevocation(identityPriv, identityPub, devicePub, lastValidSeq = 2)
@@ -1439,9 +1447,9 @@ class KotlinSyncTest {
         val peerPub = "d1".repeat(32); val peerDevPriv = "d2".repeat(32)
         val peerCert = KotlinWire.CertDict(peerPub, devPub(peerDevPriv), "Peer", 1752900000.0, "")
 
-        val m1 = identityMsg(ownIdentityPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), ownDevicePriv)
-        val m2 = identityMsg(ownIdentityPub, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), ownDevicePriv)
-        val m3 = identityMsg(ownIdentityPub, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), ownDevicePriv)
+        val m1 = identityMsg(ownIdentityPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), ownDevicePriv)
+        val m2 = identityMsg(ownIdentityPriv, 2, mapOf("kind" to "profile", "name" to "s2", "created_at" to 2.0), ownDevicePriv)
+        val m3 = identityMsg(ownIdentityPriv, 3, mapOf("kind" to "profile", "name" to "s3", "created_at" to 3.0), ownDevicePriv)
         assertTrue(store.ingestMessage(m1)); assertTrue(store.ingestMessage(m2)); assertTrue(store.ingestMessage(m3))
 
         val rev = signedRevocation(ownIdentityPriv, ownIdentityPub, fixture.device_pub, lastValidSeq = 2)
@@ -1478,7 +1486,7 @@ class KotlinSyncTest {
         store.addIdentity(authorPub)
         val peerCert = KotlinWire.CertDict(authorPub, devPub(authorDevPriv), "Peer", 1752900000.0, "")
 
-        val m1 = identityMsg(authorPub, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), authorDevPriv)
+        val m1 = identityMsg(authorPriv, 1, mapOf("kind" to "profile", "name" to "s1", "created_at" to 1.0), authorDevPriv)
         assertTrue(store.ingestMessage(m1))
 
         val notice = signedDefriend(authorPriv, authorPub, ownIdentity)
