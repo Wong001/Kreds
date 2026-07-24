@@ -1,5 +1,17 @@
 # Nudge Channel — Direct-Push on Write (Model B) — Design
 
+> **PARKED 2026-07-24 (saved for a rainy day).** After the measure-first
+> spike, this was judged **largely redundant**: the phone already pushes its
+> own composes immediately (on-compose), hearth nodes already deliver to a
+> reachable phone within ~45s (gossip loop), and the phone was measured
+> reachable even through Doze. So push-on-write's only real add is
+> ~45s→immediate for hearth-authored content, which shrinks to nothing as the
+> network goes phone-majority. Revisit ONLY if a phone-majority network ever
+> needs sub-45s delivery of hearth-authored content. The one useful piece —
+> **dead-onion liveness** (Part C) — was salvaged as a small standalone fix.
+> The real pains it did NOT address (onion publish-warmup, desktop↔laptop
+> direct-sync, per-device grant coverage) are handled by other work.
+
 Date: 2026-07-24. The next arc after friend-peering. Inbound content
 latency today is *poll-bound*: the phone only learns of new content on its
 next sweep that reaches the peer (foreground ~30-45s, backgrounded up to the
