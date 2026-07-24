@@ -33,6 +33,17 @@ function Shell() {
                                     // adaptive background cadence (Task 6:
                                     // AdaptiveBackoff, 10 min - 1 hr) keeps it
                                     // current after that).
+        setAppForeground(true);     // Cold-launch fix: the AppState 'change' listener
+                                    // below only fires on a prev-active -> active
+                                    // TRANSITION, so a cold launch (already 'active'
+                                    // when the listener mounts) never fires it and the
+                                    // native flag stays at its default false for the
+                                    // whole first session -- foreground-fast cadence
+                                    // (30s) never engages until a real background/
+                                    // foreground round trip. The component is
+                                    // foreground by construction at mount, so set the
+                                    // flag here too, symmetric with syncNow() above.
+                                    // Idempotent with the listener's later calls.
         const url = await getWebUrl();
         if (!url) { setErr("web server not available"); return; }
         setUri(url);
